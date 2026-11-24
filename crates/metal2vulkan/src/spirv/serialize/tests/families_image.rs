@@ -572,8 +572,6 @@ fn image_atomics() {
         let tp = f.image_texel_pointer(pf, c2, zero).expect("texel pointer");
         f.atomic(AtomicOp::Exchange, tp, Scope::Device, r, x)
             .expect("float exchange");
-        f.atomic(AtomicOp::FAdd, tp, Scope::Device, r, x)
-            .expect("float add");
     });
     assert_spirv_valid(finish_compute(b, main));
 }
@@ -707,10 +705,10 @@ fn non_uniform_descriptor_array_elements() {
 }
 
 /// A non-uniform element reaches the instruction consuming it decorated through every value that
-/// carries it (VUID-RuntimeSpirv-NonUniform-06274): the chain, its loaded image, a sampled image
-/// of that image and the sampled image's `OpImage`, and an image texel pointer an atomic uses.
-/// The builder refuses the uses that would carry one undecorated (a call argument, a composite
-/// part).
+/// carries it (VUID-RuntimeSpirv-None-10148 and VUID-RuntimeSpirv-subgroupSize-10149): the chain,
+/// its loaded image, a sampled image of that image and the sampled image's `OpImage`, and an image
+/// texel pointer an atomic uses. The builder refuses the uses that would carry one undecorated (a
+/// call argument, a composite part).
 #[test]
 fn non_uniform_elements_are_decorated_through_what_carries_them() {
     use crate::pipeline::sym::{HandleClass, ImageAccess, ImageDim, ImageHandleClass};
@@ -865,8 +863,8 @@ fn non_uniform_elements_are_decorated_through_what_carries_them() {
     });
 }
 
-/// A non-uniform element of a storage-buffer array of blocks (the function-table heap): the
-/// element's chain and the chain into it are decorated `NonUniform`, and the load, the store, and
+/// A non-uniform element of a descriptor array of storage-buffer blocks: the element's chain and
+/// the chain into it are decorated `NonUniform`, and the load, the store, and
 /// `OpArrayLength` read through them; a word loaded from it is data, undecorated, which a `select`
 /// may take. The module requires `ShaderNonUniform` and storage-buffer non-uniform indexing (not
 /// its dynamic one), and `spirv-val` accepts it.

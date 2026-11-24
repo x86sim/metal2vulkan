@@ -16,11 +16,8 @@ use crate::vk;
 pub struct PipelineLayout {
     /// Set 0 (always) and set 1 (only for the handle heap), in set order.
     pub sets: Vec<DescriptorSetLayout>,
-    /// One range per stage that has push fields: the fixed windows.
+    /// One range per stage that has push fields, over the bytes its fields take.
     pub push_constants: Vec<PushConstantRange>,
-    /// Set 0 fits `maxPushDescriptors`. When false, the same layout is used as a pooled set; the
-    /// layout is never split.
-    pub push_descriptor_eligible: bool,
 }
 
 /// One descriptor set of a [`PipelineLayout`].
@@ -55,8 +52,8 @@ pub struct DescriptorBinding {
     /// The most variables one stage's entry point uses at the binding (those its `OpEntryPoint`
     /// lists): a function that reaches a buffer through several types uses a variable of each
     /// type at the buffer's binding (each `Aliased` where it is writable). 0 where only a stage
-    /// the pipeline adds at its creation uses it (a tessellation pipeline's control stage, a
-    /// synthesized geometry stage), whose module the layout does not see, or no stage uses it. A
+    /// the pipeline adds at its creation uses it (a tessellation pipeline's control stage), whose
+    /// module the layout does not see, or no stage uses it. A
     /// translator from SPIR-V to another language may handle a binding of several variables
     /// apart: MoltenVK 1.4.1's SPIRV-Cross writes Metal that does not compile for a dynamic buffer
     /// binding of more than one.
@@ -101,6 +98,11 @@ pub enum BindingSource {
     },
     /// One runtime array of the set-1 heap.
     Heap(HandleClass),
+    /// An array of the identity domains' set 1: binding 0 the sampled images, binding 1 the
+    /// storage images, element `i` the texture whose resource ID holds index `i`
+    /// (`docs/RESOURCE-ID.md`). The consumer writes an element as it makes a texture, for every
+    /// pipeline at once.
+    IdentityArray,
     /// A separate sampler of `stage` that samples set-1 heap images. A constexpr sampler is the
     /// binding's `immutable_sampler`, which takes no descriptor write.
     HeapSampler {
@@ -119,7 +121,7 @@ pub enum BindingSource {
     /// A tile function's color attachment of this color index, bound as a storage image.
     TileAttachment(u32),
     /// The tile map of the sparse texture bound at a Metal `[[texture(n)]]` slot, a read-only
-    /// storage buffer (`pipeline::tile_map`, `bind::SparseTileMap`).
+    /// storage buffer (`pipeline::tile_map`).
     TileMap(SlotRef),
     /// The image half of a texture slot and a sampler a stage samples through separate
     /// descriptors: the texture as a sampled image of its own type (a cube is a cube view), with
@@ -136,13 +138,6 @@ pub enum BindingSource {
         stage: Stage,
         sampler: CombinedSampler,
     },
-    /// The `half` shadow of the extended-range color attachment of this color index that the
-    /// draw's render pass instance holds (`ResourceKind::ExtendedShadow`), bound as a storage
-    /// image.
-    ExtendedShadow(u32),
-    /// The snapshot of the texture the draw binds at this fragment texture slot
-    /// (`ResourceKind::SnapshotTexels`), bound as a storage image.
-    SnapshotTexels(u32),
     /// A constexpr sampler array of `stage` (`ResourceKind::SamplerArray`) that samples set-1
     /// heap images, made for the use with comparison or without (`compare`) of an integer texture
     /// or not (`integer`): its samplers are the binding's `immutable_samplers`, which take no

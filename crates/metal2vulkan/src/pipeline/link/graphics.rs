@@ -51,21 +51,14 @@
 //!   scissor, depth bias, blend constants, and the stencil reference and masks; with extended
 //!   dynamic state also cull mode, front face, topology, the depth/stencil test state, and the
 //!   vertex strides of `PerBind` layouts.
-//! - **Storage attachments**: an attachment the fragment stage reads in the interlocked storage
-//!   form (`ResourceKind::TileAttachment`) has no color attachment state: the subpass leaves it
-//!   out, and `link::fetch` states how the consumer binds it.
 //! - **Input attachments**: one per framebuffer-fetch binding of the fragment stage. Metal orders
-//!   each fetch after the earlier fragments of the draw that cover the pixel; Vulkan does only
-//!   under rasterization-order attachment access, so a pipeline with input attachments on a profile
-//!   with `rasterizationOrderColorAttachmentAccess` states `rasterization_order_attachment_access`
-//!   (and the compiled pipeline requires the feature). Without the feature a fragment stage reads
-//!   an input attachment only on a device without the pixel interlock either
-//!   (`lower::fragment::color`), whose consumer orders the draws by barriers alone. In a
-//!   multisampled pipeline
+//!   each fetch after the earlier fragments of the draw that cover the pixel; a fragment stage reads
+//!   an input attachment ordered between draws alone (`lower::fragment::color`), whose consumer
+//!   orders the draws by barriers. In a multisampled pipeline
 //!   (`rasterSampleCount` above 1) Metal runs a function that reads a color attachment once per
 //!   covered sample, each invocation reading its own sample (measured), so the stage, compiled for
-//!   the pipeline (`LoweringInputs::multisampled`), reads a multisampled `SubpassData` image (or,
-//!   in the storage form, a multisampled storage image) at its `SampleId`, whose input runs it once
+//!   the pipeline (`LoweringInputs::multisampled`), reads a multisampled `SubpassData` image at
+//!   its `SampleId`, whose input runs it once
 //!   per covered sample: it is a per-sample function under the sample invocations below. A fetching
 //!   stage compiled for the other kind of pipeline (one sample against more, or the reverse)
 //!   declares an image of the wrong sample count: `NeedsInput(Multisampled)`. A color input the
@@ -73,64 +66,52 @@
 //!   per sample, and an Apple M3 Max ran a function with a device atomic once per covered sample
 //!   under 4x multisampling with or without one.
 //! - **Fragment invocations under multisampling**. With `rasterSampleCount` above 1 and
-//!   rasterization on, Metal (Apple M3 Max, 4x, measured) runs a fragment function that writes
-//!   memory once per covered sample, whatever its inputs, and every invocation reads `[[position]]`
-//!   (x, y, z, and w), its center and centroid varyings, `[[point_coord]]`, and
-//!   `[[barycentric_coord]]` as the pixel's, and `[[sample_mask]]` as the pixel's coverage; only
-//!   `[[sample_id]]` and sample-qualified varyings are the sample's. Vulkan runs a fragment shader
-//!   once per covered sample only under sample shading, which a `SampleId` input turns on and a
-//!   `Sample` input may, and sample shading moves `FragCoord` to the sample, lets an undecorated or
-//!   `Centroid` input interpolate anywhere in the sample's area, may move `PointCoord` there, and
-//!   leaves in `SampleMask` only the invocation's samples. A fragment compiled for the pipeline
+//!   rasterization on, Metal runs a fragment function that reads `[[sample_id]]` or a
+//!   sample-qualified varying per sample (MSL 5.5: the function "may execute per-sample"), and
+//!   every invocation reads `[[position]]` (x, y, z, and w), its center and centroid varyings,
+//!   `[[point_coord]]`, and `[[barycentric_coord]]` as the pixel's, and `[[sample_mask]]` as the
+//!   pixel's coverage; only `[[sample_id]]` and sample-qualified varyings are the sample's (Apple
+//!   M3 Max, 4x, measured). Documented Metal names no run count for any other function: one that
+//!   writes memory runs as any other, as many times as the device runs it (Apple's GPUs were
+//!   measured to run it once per covered sample; Vulkan runs a fragment shader at least once per
+//!   pixel, `PrecisionNote::DeviceFragmentRuns`). Vulkan runs a fragment shader once per covered
+//!   sample only under sample shading, which a `SampleId` input turns on and a `Sample` input may,
+//!   and sample shading moves `FragCoord` to the sample, lets an undecorated or `Centroid` input
+//!   interpolate anywhere in the sample's area, may move `PointCoord` there, and leaves in
+//!   `SampleMask` only the invocation's samples. A fragment compiled for the pipeline
 //!   (`LoweringInputs::multisampled`) reads `[[position]]`'s x and y as `floor(FragCoord.xy) + 0.5`
 //!   and, where the device has interpolation functions whose `InterpolateAtOffset` reads from the
-//!   pixel center, its center varyings through that instruction at offset 0, or, where the device
-//!   reads them at the pixel center itself as Metal does (`VkProperty::MetalCenterVaryings`,
-//!   MoltenVK), as they are: both the pixel center whatever the invocation shades
-//!   (`StageIo::{multisampled, varyings_at_pixel, position_depth}`). A function that writes memory
-//!   (`StageInterface::writes_memory`) runs under the pipeline's sample shading at a minimum of 1.0
-//!   (`GraphicsState::sample_shading`, needing `sampleRateShading`), as one that reads
-//!   `[[sample_id]]` does: once per covered sample, where a Vulkan stage without sample shading
-//!   runs at least once per pixel. A function that runs per sample (one of those, or one that
-//!   reads a sample-qualified varying) beside `[[sample_mask]]` cannot run under sample shading:
-//!   Vulkan gives an invocation under sample shading only the bits of the samples it shades, a quad
-//!   holds one sample index, and no subgroup is promised to hold a pixel's other sample
-//!   invocations, so no form gathers the pixel's coverage. Compiled for the pipeline, such a
-//!   function runs once per pixel instead, without sample shading, and its body once per covered
-//!   sample from a loop over the coverage (`StageIo::coverage_loop`), its outputs the last pass's
+//!   pixel center, its center varyings through that instruction at offset 0: both the pixel center
+//!   whatever the invocation shades (`StageIo::{multisampled, varyings_at_pixel, position_depth}`).
+//!   A function that runs per sample (one that reads `[[sample_id]]` or a sample-qualified varying)
+//!   beside `[[sample_mask]]` cannot run under sample shading: Vulkan gives an invocation under
+//!   sample shading only the bits of the samples it shades, a quad holds one sample index, and no
+//!   subgroup is promised to hold a pixel's other sample invocations, so no form gathers the
+//!   pixel's coverage. Compiled for the pipeline, such a function runs once per pixel instead,
+//!   without sample shading, and its body once per covered sample from a loop over the coverage
+//!   (`StageIo::coverage_loop`), its outputs the last pass's
 //!   (`PrecisionNote::LoopedSampleOutputs`); compiled without `multisampled` it is
 //!   `NeedsInput(Multisampled)`, and one the loop does not fit is refused for the reason its
-//!   interface records (`CoverageLoopRefusal`). On a driver that runs a
-//!   memory-writing function once per covered sample itself (`CoverageLoop::DriverRunsPerSample`,
-//!   MoltenVK on Apple's GPU) the function runs as written, without sample shading, and its other
-//!   reads are checked as below. A per-sample function reads the pixel values Vulkan has no pixel
-//!   form for where Vulkan evaluates them, as a pixel-rate function does: `[[position]]`'s z and w
-//!   (the interpolated depth and `1/w`, at a position Vulkan does not state), `[[point_coord]]`
-//!   ("the fragment center, or the location of a sample"), `[[barycentric_coord]]`, and a centroid
-//!   varying (at the invocation's sample under sample shading), each within half a pixel of the
-//!   pixel center Metal reads it at; the compile layer notes `PrecisionNote::MultisamplePosition`
-//!   for them, as for a pixel-rate function's. Link refuses a per-sample function's center varying
-//!   on a device without the varyings' pixel form, naming what the device lacks:
-//!   `VkProperty::InterpolateAtOffsetCentered` (a device whose `InterpolateAtOffset` does not read
-//!   from the pixel center, as MoltenVK's does not, has no such form, and has a pixel form only
-//!   where it reads the varying at the pixel center itself) and
+//!   interface records (`CoverageLoopRefusal`). A per-sample function reads the pixel values Vulkan
+//!   has no pixel form for where Vulkan evaluates them, as a pixel-rate function does:
+//!   `[[position]]`'s z and w (the interpolated depth and `1/w`, at a position Vulkan does not
+//!   state), `[[point_coord]]` ("the fragment center, or the location of a sample"),
+//!   `[[barycentric_coord]]`, and a centroid varying (at the invocation's sample under sample
+//!   shading), each within half a pixel of the pixel center Metal reads it at; the compile layer
+//!   notes `PrecisionNote::MultisamplePosition` for them, as for a pixel-rate function's. Link
+//!   refuses a per-sample function's center varying on a device without the varyings' pixel form,
+//!   naming what the device lacks: `VkProperty::InterpolateAtOffsetCentered` (a device whose
+//!   `InterpolateAtOffset` does not read from the pixel center, as MoltenVK's does not, has no such
+//!   form, and has a pixel form only where it reads the varying at the pixel center itself) and
 //!   `shaderSampleRateInterpolationFunctions`; and a function that needs sample shading, or reads
 //!   `[[position]]` or a center varying per sample, on a device without `sampleRateShading`. Such a
 //!   function whose pixel reads all have forms on the device, but which was compiled without
 //!   `multisampled`, is `NeedsInput(Multisampled)`: compiled for the pipeline it links. A function
 //!   compiled for another device's forms is `Unsupported{SampleRateShading, NotImplemented}`. A
-//!   function that runs per
-//!   pixel, or a pipeline of one sample, has no sample shading: `FragCoord`'s x and y are the
-//!   pixel's center and `SampleMask` the fragment's coverage. The sample mask a function returns
-//!   keeps, under either API, the samples of the invocation whose bits it sets (measured with
-//!   `[[sample_id]]` and with a device atomic).
-//! - **Split pixel fragments**. A driver that rasterizes a triangle it clips as several
-//!   (`DriverWorkaround::ClippedTrianglesSplitPixelFragments`: lavapipe) runs a pixel-rate function
-//!   once per piece in each pixel on the pieces' shared edges, with that piece's coverage, where
-//!   Metal runs it once with the pixel's: its `[[sample_mask]]` holds part of the samples and a
-//!   centroid varying moves to a covered sample. There link refuses a pipeline of more than one
-//!   sample whose fragment function reads either (`Unsupported{PixelCoverage}` or
-//!   `Unsupported{CentroidVarying}`, `Needs::DriverDefect`).
+//!   function that runs per pixel, or a pipeline of one sample, has no sample shading:
+//!   `FragCoord`'s x and y are the pixel's center and `SampleMask` the fragment's coverage. The
+//!   sample mask a function returns keeps, under either API, the samples of the invocation whose
+//!   bits it sets (measured with `[[sample_id]]` and with a device atomic).
 //! - **Fragment outputs**: a color output to an attachment the descriptor sets must have the
 //!   attachment's numeric class (`float` to a float, normalized, or sRGB format, `uint` to an
 //!   unsigned-integer one, `int` to a signed-integer one); an output of another class is Metal's
@@ -164,9 +145,7 @@
 //!   coverage of an alpha depends on the pixel's place in a 2x2 ordered dither at two and four
 //!   samples (`PrecisionNote::DeviceAlphaCoverage` states it), and Vulkan specifies no algorithm
 //!   for converting the alpha to a coverage mask, so a pipeline that keeps alpha to coverage records
-//!   `PrecisionNote::DeviceAlphaCoverage` on its fragment stage, or, on a profile measured to cover
-//!   as Metal does (`DriverDeviation::MetalAlphaCoverage`), requires
-//!   `VkProperty::MetalAlphaCoverage` in its place ([`coverage_notes`]).
+//!   `PrecisionNote::DeviceAlphaCoverage` on its fragment stage ([`coverage_notes`]).
 //! - **Alpha to one** is `VkPipelineMultisampleStateCreateInfo::alphaToOneEnable`
 //!   (`GraphicsState::alpha_to_one`), the exact counterpart of Metal's `alphaToOneEnabled`: both
 //!   replace the fragment's alpha with one before the blend reads it and before the write mask
@@ -188,13 +167,12 @@
 //!   ordinary layered rendering. A mesh pipeline keeps its count and needs no `multiview`: its
 //!   draws of more than one amplification are refused at the draw (`bind::graphics`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::device::requirements::{FormatUsage, VkFeature, VkLimit, VkProperty};
-use crate::device::{DeviceProfile, DriverWorkaround};
+use crate::device::DeviceProfile;
 use crate::error::{
-    Attachment, Capability, DescriptorError, DriverDeviation, Error, Feature, MetalAnswer,
-    RuntimeInput, Unsupported,
+    Attachment, Capability, DescriptorError, Error, Feature, MetalAnswer, RuntimeInput, Unsupported,
 };
 use crate::metal;
 use crate::metal::format::{
@@ -210,15 +188,52 @@ use crate::pipeline::graphics::{
     ColorAttachmentState, GraphicsState, InputAttachmentUse, TessellationState,
 };
 use crate::pipeline::interface::StageInterface;
-use crate::pipeline::link::vertex::FixedFunctionNotes;
 use crate::pipeline::link::RenderLinkInputs;
 use crate::pipeline::rotated_blend::{alpha_in_red_blend, rotated_blend, RotatedBlend};
 use crate::pipeline::stage_io::{
     CoverageLoop, Interpolation, IoNumeric, IoRole, Sampling, StageBuiltin, StageIo,
 };
-use crate::pipeline::sym::{ResourceKind, SampledType, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, SampledType, Stage};
 use crate::pipeline::vertex::{VertexInputState, VertexStride};
 use crate::vk;
+
+/// Whether the fragment stage `fs` reads a color attachment of render inputs `r` through the
+/// sampled-texture array's element the consumer pushes for it (`PushField::FetchedColor`, the
+/// identity domains' form), each such attachment
+/// checked as an input attachment of it is: the pipeline has it, its view holds Metal's channels
+/// (no rotated, two-plane YCbCr or extended-range format, whose texels the view does not hold as
+/// Metal's), and its format's numeric class is the one the stage reads, else Metal's pipeline
+/// error.
+fn textured_fetches(r: &RenderLinkInputs, fs: Option<&StageInterface>) -> Result<bool, Error> {
+    let mut any = false;
+    for placed in fs.into_iter().flat_map(|f| &f.push.fields) {
+        let PushField::FetchedColor { color, texels } = placed.field else {
+            continue;
+        };
+        any = true;
+        let invalid = || {
+            Error::InvalidDescriptor(DescriptorError::ColorAttachment {
+                index: color,
+                metal: MetalAnswer::NilWithError,
+            })
+        };
+        let attachment =
+            (r.color_attachments.get(color as usize).copied().flatten()).ok_or_else(invalid)?;
+        let pf = attachment.pixel_format;
+        if metal::format::rotated_channels(pf)
+            || metal::format::ycbcr_renders(pf)
+            || metal::format::ycbcr_pass_refused(pf)
+            || ExtendedRange::of(pf).is_some()
+        {
+            let refused = Unsupported::not_implemented(Feature::Format);
+            return Err(refused.at_attachment(Attachment::Color(color)).into());
+        }
+        if sampled_type(pf).unwrap_or(SampledType::Float) != texels {
+            return Err(invalid());
+        }
+    }
+    Ok(any)
+}
 
 /// The sample-count flag of a raster sample count.
 fn samples(count: u32) -> Result<vk::SampleCountFlags, Error> {
@@ -250,30 +265,6 @@ fn topology(class: PrimitiveTopologyClass) -> vk::PrimitiveTopology {
     }
 }
 
-/// Check the color group of render inputs `r` (`RenderLinkInputs::color_group`) with vertex stage
-/// `vs`, fragment stage `fs`, a tessellation pipeline where `tessellated`, on `p`: the fragment
-/// stage compiled for the variant's own group (`NeedsInput(ColorWrites)` for one compiled for
-/// another, or for none), and, where the pipeline takes more than one group, neither stage writes
-/// memory and the pipeline is no tessellation pipeline, which each group's draw would run again
-/// (the limit refusal, `compile::color_group`).
-fn color_group(
-    r: &RenderLinkInputs,
-    (vs, fs): (&StageInterface, Option<&StageInterface>),
-    tessellated: bool,
-    p: &DeviceProfile,
-) -> Result<(), Error> {
-    if fs.is_some_and(|fs| fs.io.color_group != r.color_group) {
-        return Err(Error::NeedsInput(RuntimeInput::ColorWrites));
-    }
-    let Some(g) = r.color_group.as_ref().filter(|g| g.groups() > 1) else {
-        return Ok(());
-    };
-    if tessellated || vs.writes_memory || fs.is_some_and(|fs| fs.writes_memory) {
-        return Err(crate::pipeline::compile::color_group::refusal(g, p));
-    }
-    Ok(())
-}
-
 /// The vertex amplification count of render inputs `r` (see the module docs), of a mesh pipeline
 /// where `mesh`: it draws no amplification as a view, so it needs no multiview (its draws of more
 /// than one amplification are refused at the draw, `bind::graphics`).
@@ -302,16 +293,11 @@ fn vertex_amplification(r: &RenderLinkInputs, mesh: bool, p: &DeviceProfile) -> 
 /// The graphics state of render inputs `r` with vertex stage `vs`, fragment stage `fs`, vertex
 /// input `vi`, and, for a tessellation pipeline, its tessellation state `tessellation`: its
 /// topology is `PATCH_LIST` and never dynamic state, as its draws draw patches only.
-/// `input_blends`: the extended-range attachments whose blend the fragment function computes over
-/// their input attachments, and the channels each write keeps (`link::fetch::input_blends`);
-/// `rotated_inputs`: those of them held with their channels rotated, whose blend the function
-/// states as `RuntimeFact::RotatedInputBlend`.
 pub fn graphics_state(
     r: &RenderLinkInputs,
     (vs, fs): (&StageInterface, Option<&StageInterface>),
     vi: &VertexInputState,
     tessellation: Option<TessellationState>,
-    (input_blends, rotated_inputs): (&BTreeMap<u32, vk::ColorComponentFlags>, &BTreeSet<u32>),
     p: &DeviceProfile,
 ) -> Result<GraphicsState, Error> {
     if r.alpha_to_one && !p.fields().enabled.features.contains(&VkFeature::AlphaToOne) {
@@ -321,15 +307,12 @@ pub fn graphics_state(
         )
         .into());
     }
-    color_group(r, (vs, fs), tessellation.is_some(), p)?;
     let max_vertex_amplification_count = vertex_amplification(r, vs.stage == Stage::Mesh, p)?;
-    // A vertex function that selects its slice through the synthesized geometry stage
-    // (`IoRole::SelectedLayer`) declares `Layer` there, and a fragment function that reads it as 0
-    // (`StageIo::zero_indices`) reads it as Metal does only where no amplification moves it.
+    // A fragment function that reads `Layer` as 0 (`StageIo::zero_indices`) reads it as Metal
+    // does only where no amplification moves it.
     let declares_layer = std::iter::once(vs).chain(fs).any(|s| {
         s.io.builtins.contains(&StageBuiltin::Layer)
             || s.io.zero_indices.contains(&StageBuiltin::Layer)
-            || s.io.outputs.iter().any(|o| o.role == IoRole::SelectedLayer)
     });
     let limits = &p.fields().limits;
     let used = r
@@ -362,16 +345,6 @@ pub fn graphics_state(
     };
     let written = colors(false);
     let declared = colors(true);
-    // An attachment the function reads in the interlocked storage form is no color attachment of
-    // the subpass (`link::fetch`).
-    let storage: BTreeSet<u32> = fs
-        .into_iter()
-        .flat_map(|f| &f.descriptors)
-        .filter_map(|d| match d.slot.kind {
-            ResourceKind::TileAttachment(color) => Some(color),
-            _ => None,
-        })
-        .collect();
     // A blend into a bfloat attachment is Metal's pipeline error, whatever the fragment function
     // writes there and whatever the mask: its pipeline validation asserts that the format is not
     // blendable (an Apple M3 Max under macOS 27.0.1, with and without the validation layer, with
@@ -392,14 +365,12 @@ pub fn graphics_state(
     for (index, a) in r.color_attachments.iter().take(used as usize).enumerate() {
         color_attachments.push(match a {
             None => None,
-            Some(_) if storage.contains(&(index as u32)) => None,
             Some(a) => {
                 let state = || -> Result<ColorAttachmentState, Error> {
                     // A word attachment renders through the view of its word, which the function
                     // writes whole and unblended (`color_writes::word_color`): its one component,
                     // where the function writes the attachment and the mask keeps some of the
-                    // format's channels (all of them, or some where the function merges the word
-                    // into its input attachment's, `fetch::word_merges`).
+                    // format's channels (all of them).
                     if let Some(word) =
                         color_writes::word_color(index as u32, a, r.alpha_to_coverage, p)
                     {
@@ -448,10 +419,6 @@ pub fn graphics_state(
                     let keeps_zero =
                         fs.is_some_and(|f| color_writes::keeps_zero(&f.io, index as u32, a));
                     let replaced = stored && color_writes::replaces(a) && !keeps_zero;
-                    // An extended-range attachment whose blend the function computes over its
-                    // input attachment takes no Vulkan blend, and the function's write stores
-                    // every raw component (none where it keeps every channel).
-                    let input_blend = input_blends.get(&(index as u32)).copied();
                     // An extended-range attachment no first output writes (every attachment of a
                     // pipeline without a fragment function) is left as it is, as Metal leaves an
                     // unwritten attachment (the module docs), so its blend changes nothing: it
@@ -467,10 +434,7 @@ pub fn graphics_state(
                     // alpha, the mask's alpha bit in red, and Metal's alpha blend in red.
                     let alpha_red = metal::format::alpha_in_red(a.pixel_format, p);
                     let rotated = metal::format::rotated_channels(a.pixel_format) || alpha_red;
-                    let blended = a.blending_enabled
-                        && !replaced
-                        && input_blend.is_none()
-                        && !unwritten_extended;
+                    let blended = a.blending_enabled && !replaced && !unwritten_extended;
                     // A blend into a two-plane YCbCr `_sRGB` twin a pass renders is not measured
                     // (`metal::format::ycbcr_renders`): whether Metal's tile blends the texels'
                     // linear values or their encoding.
@@ -493,60 +457,29 @@ pub fn graphics_state(
                     // An extended-range attachment holds its raw texels, whose components the
                     // function writes whole (`extended_write_mask`). An unwritten attachment's mask
                     // is empty whatever the descriptor's.
-                    let write_mask = match (extended, input_blend) {
+                    let write_mask = match extended {
                         _ if !written_here => vk::ColorComponentFlags::empty(),
-                        (Some(form), Some(kept)) => {
-                            let stored = match kept == vk::ColorComponentFlags::known_bits() {
-                                true => vk::ColorComponentFlags::empty(),
-                                false => vk::ColorComponentFlags::known_bits(),
-                            };
-                            extended_write_mask(form, stored)?
-                        }
-                        // A mask of some of the codes one word holds, which a stage compiled for
-                        // this pipeline merges where the device orders fetch (one that reaches here
-                        // was compiled for another): on a device that orders it in neither form,
-                        // the orderings the merge needs.
-                        (Some(form), None) => {
-                            extended_write_mask(form, descriptor_mask).map_err(|e| {
-                                let unordered = crate::lower::fragment::fetch::fetch_unordered(p);
-                                match (color_writes::merged_extended(a), unordered) {
-                                    (true, true) => {
-                                        crate::lower::fragment::fetch::unordered_extended_fetch()
-                                            .into()
-                                    }
-                                    (true, false) => {
-                                        Error::NeedsInput(RuntimeInput::FramebufferFetch)
-                                    }
-                                    (false, _) => e,
+                        // A mask of some of the codes one word holds, which the function would
+                        // merge into the word over an ordered read of the attachment: not built.
+                        Some(form) => extended_write_mask(form, descriptor_mask).map_err(|e| {
+                            match color_writes::merged_extended(a) {
+                                true => {
+                                    crate::lower::fragment::fetch::computed_write_refused().into()
                                 }
-                            })?
-                        }
-                        (None, _) => descriptor_mask,
+                                false => e,
+                            }
+                        })?,
+                        None => descriptor_mask,
                     };
-                    let blend = match (
-                        replaced || input_blend.is_some() || unwritten_extended,
-                        rotated,
-                    ) {
+                    let blend = match (replaced || unwritten_extended, rotated) {
                         (true, _) => None,
                         (false, false) => blend_factors(a, p)?,
                         (false, true) if alpha_red => alpha_in_red_blend(a, p)?,
-                        // A blend no Vulkan state on the rotated image gives, which a stage
-                        // compiled for this pipeline computes itself, in the storage form (no
-                        // color attachment here) or over the input attachment (above): one that
-                        // does not was compiled for another pipeline. Unwritten, it writes nothing.
-                        (false, true) if color_writes::shader_rotated_blend(a, p) => {
-                            match written_here {
-                                true => {
-                                    return Err(Error::NeedsInput(RuntimeInput::FramebufferFetch))
-                                }
-                                false => None,
-                            }
-                        }
-                        // Where the device orders fetch in neither form, the orderings that
-                        // blend needs.
+                        // A blend no Vulkan state on the rotated image gives, which the function
+                        // would compute over an ordered read of the attachment: not built.
                         (false, true) if color_writes::rotated_blend_in_shader(a, p) => {
                             return Err(
-                                crate::lower::fragment::fetch::unordered_extended_fetch().into()
+                                crate::lower::fragment::fetch::computed_write_refused().into()
                             );
                         }
                         // The second output the rotation needs is the function's only beside
@@ -629,16 +562,12 @@ pub fn graphics_state(
                 }))?;
             // An input attachment of an image holding Metal's channels rotated reads them so: a
             // color input of one is not modelled, which a stage compiled for the attachment refuses
-            // (`lower::fragment::color`), so the one input attachment such a stage reads of it is
-            // the one its own blend there rotates into Metal's order
-            // (`RuntimeFact::RotatedInputBlend`, which `fetch::input_blends` held to the pipeline's
-            // state above); any other is a stage's compiled for another pipeline. (One holding
-            // Metal's alpha in red is read as Metal's alpha by a stage compiled for it,
+            // (`lower::fragment::color`), so one is a stage's compiled for another pipeline. (One
+            // holding Metal's alpha in red is read as Metal's alpha by a stage compiled for it,
             // `StageIo::alpha_in_red_colors`, which `color_writes::check` holds to the pipeline's.)
             // Nor is a two-plane YCbCr attachment's, whose texels Metal holds as halves and the
             // attachment as the function's floats.
-            if (metal::format::rotated_channels(attachment.pixel_format)
-                && !rotated_inputs.contains(&color))
+            if metal::format::rotated_channels(attachment.pixel_format)
                 || metal::format::ycbcr_renders(attachment.pixel_format)
                 || metal::format::ycbcr_pass_refused(attachment.pixel_format)
             {
@@ -647,7 +576,7 @@ pub fn graphics_state(
             }
             // An extended-range attachment's input reads its raw texels, the raw format's
             // `uint`s, which a stage compiled for the attachment decodes (`color_writes::check`);
-            // a word attachment's reads its word, which a stage merges (`fetch::word_merges`).
+            // a word attachment's reads its word (`color_writes::word_color`).
             let word =
                 color_writes::word_color(color, &attachment, r.alpha_to_coverage, p).is_some();
             let format_class = match ExtendedRange::of(attachment.pixel_format) {
@@ -662,18 +591,19 @@ pub fn graphics_state(
             });
         }
     }
+    let textured = textured_fetches(r, fs)?;
     let rasterization_samples = samples(r.raster_sample_count)?;
-    // A fetched attachment is read (and, in the storage form, written) at the invocation's own
+    // A fetched attachment is read at the invocation's own
     // sample by a stage compiled for a multisampled pipeline, and at the pixel by one compiled
     // for one sample (see the module docs): a stage compiled for the other kind declares an image
     // of the wrong sample count.
     if let Some(fs) = fs {
-        let fetches = !input_attachments.is_empty() || !storage.is_empty();
+        let fetches = !input_attachments.is_empty() || textured;
         if fetches && fs.io.multisampled != (r.raster_sample_count > 1) {
             return Err(Error::NeedsInput(RuntimeInput::Multisampled));
         }
     }
-    let sample_shading = sample_invocations(r, fs, p)?;
+    sample_invocations(r, fs, p)?;
     use vk::DynamicState as D;
     let mut dynamic_states = vec![
         D::VIEWPORT,
@@ -723,15 +653,6 @@ pub fn graphics_state(
             dynamic_states.push(D::VERTEX_INPUT_BINDING_STRIDE);
         }
     }
-    // A fragment stage that binds a snapshot reads through it, drawn twice with its color write
-    // masks as dynamic state (`GraphicsState::snapshot_reads`).
-    let snapshot_reads = fs
-        .into_iter()
-        .flat_map(|f| &f.descriptors)
-        .any(|d| matches!(d.slot.kind, ResourceKind::SnapshotTexels(_)));
-    if snapshot_reads {
-        dynamic_states.push(D::COLOR_WRITE_MASK_EXT);
-    }
     let state = GraphicsState {
         topology: match tessellation {
             Some(_) => vk::PrimitiveTopology::PATCH_LIST,
@@ -745,50 +666,22 @@ pub fn graphics_state(
         alpha_to_one: r.alpha_to_one,
         rasterizer_discard: !r.rasterization_enabled,
         dynamic_states,
-        // Ordered wherever the device can order the reads.
-        rasterization_order_attachment_access: !input_attachments.is_empty()
-            && p.fields().fragment.rasterization_order_color_access,
         input_attachments,
         max_vertex_amplification_count,
         declares_layer,
         tessellation,
-        // The fragment stage's facts decide it (`link::imageblock`).
-        fragment_imageblock: None,
-        // The fragment stage's facts decide them (`link::fetch`).
-        storage_attachments: Vec::new(),
-        shadow_stencil: None,
-        sample_shading,
         vertex_writes_memory: vs.writes_memory,
-        // Stored as the builtin, through the synthesized geometry stages, or (on a device with
-        // one viewport) nowhere: the raw varying is written in every case.
+        // Stored as the builtin or (on a device with one viewport) nowhere: the raw varying is
+        // written in both.
         writes_viewport_index: vs.io.builtins.contains(&StageBuiltin::ViewportIndex)
             || vs
                 .io
                 .outputs
                 .iter()
-                .any(|o| matches!(o.role, IoRole::SelectedViewport | IoRole::ViewportIndex)),
-        early_fragment_tests: fs.is_some_and(|fs| fs.io.early_fragment_tests),
-        writes_sample_mask: fs
-            .is_some_and(|fs| fs.io.builtins.contains(&StageBuiltin::SampleMaskOut)),
-        // An emulated mesh function's pipeline states its records (`link`).
-        mesh_records: None,
-        mesh_corners: None,
-        emulated_tessellation: None,
+                .any(|o| o.role == IoRole::ViewportIndex),
         // A band variant's pipeline states its band (`link`).
         line_band: None,
-        // A fan-out variant's pipeline states its fan-out (`link`).
-        region_fan_out: None,
         writes_point_size: vs.writes_point_size(),
-        flat_fragment_inputs: fs.is_some_and(|fs| reads_flat_inputs(&fs.io)),
-        clip_distances: vs
-            .io
-            .builtins
-            .iter()
-            .find_map(|b| match b {
-                StageBuiltin::ClipDistance { count } => Some(*count),
-                _ => None,
-            })
-            .unwrap_or(0),
         writes_depth: fs.is_some_and(|fs| {
             fs.io
                 .builtins
@@ -797,39 +690,25 @@ pub fn graphics_state(
         }),
         reads_barycentric_coord: fs.is_some_and(|fs| reads_barycentric_coord(&fs.io)),
         reads_primitive_id: fs.is_some_and(|fs| reads_primitive_id(&fs.io)),
-        reads_position_depth: fs.is_some_and(|fs| {
-            fs.io.builtins.contains(&StageBuiltin::FragCoord) && fs.io.position_depth
-        }),
         fragment_writes_memory: fs.is_some_and(|fs| fs.writes_memory),
-        // The storage form's writes join the outputs' once `link::fetch` decided them.
+        // The outputs' writes, once the color attachments are decided.
         color_outputs: 0,
         sample_mask: None,
-        // The fragment stage's facts decide it (`link::shader_tests`).
-        shader_tests: None,
-        snapshot_reads,
-        color_group: r.color_group.clone(),
         // The pipeline's private logic operation, once compile decided it
         // (`private_state::logic_operation`).
         logic_op: None,
-        interpolates_at_sample: fs.is_some_and(|fs| interpolates_at_sample(&fs.io)),
     };
     // The sample count against the attachments' sample counts.
     state.sample_count_properties(&p.fields().enabled.properties)?;
-    split_pixel_fragments(r, fs, p, state.sample_shading)?;
     Ok(state)
 }
 
 /// Whether a fragment stage of interface `io` reads `[[barycentric_coord]]`
-/// (`GraphicsState::reads_barycentric_coord`): either `BaryCoord` builtin, or either form's
-/// varying (`IoRole::Barycentric`), perspective-correct or not.
+/// (`GraphicsState::reads_barycentric_coord`): either `BaryCoord` builtin.
 fn reads_barycentric_coord(io: &StageIo) -> bool {
     io.builtins
         .iter()
         .any(|b| matches!(b, StageBuiltin::BaryCoord { .. }))
-        || io
-            .inputs
-            .iter()
-            .any(|v| matches!(v.role, IoRole::Barycentric { .. }))
 }
 
 /// Whether a fragment stage of interface `io` reads `[[primitive_id]]`
@@ -840,123 +719,35 @@ fn reads_primitive_id(io: &StageIo) -> bool {
         || io.inputs.iter().any(|v| v.role == IoRole::PrimitiveId)
 }
 
-/// Whether a fragment stage of interface `io` reads a flat input
-/// (`GraphicsState::flat_fragment_inputs`): a flat user varying, the render target array or
-/// viewport index a vertex function wrote, as an input of its own role or as its builtin, or the
-/// primitive ID's varying.
-fn reads_flat_inputs(io: &StageIo) -> bool {
-    let flat = io.inputs.iter().any(|v| {
-        matches!(
-            v.role,
-            IoRole::Varying {
-                interpolation: Some(Interpolation::Flat),
-                ..
-            } | IoRole::ViewportIndex
-                | IoRole::RenderTargetArrayIndex
-                | IoRole::PrimitiveId
-                | IoRole::MergedCommand
-        )
-    });
-    flat || io
-        .builtins
-        .iter()
-        .any(|b| matches!(b, StageBuiltin::Layer | StageBuiltin::ViewportIndex))
-}
-
-/// Whether a fragment stage of interface `io` reads an interpolant at a sample it names
-/// (`GraphicsState::interpolates_at_sample`).
-fn interpolates_at_sample(io: &StageIo) -> bool {
-    io.inputs.iter().any(|v| {
-        matches!(
-            v.role,
-            IoRole::Varying {
-                interpolation: Some(Interpolation::Smooth {
-                    sampling: Sampling::Interpolant { sample: true, .. },
-                    ..
-                }),
-                ..
-            }
-        )
-    })
-}
-
-/// Refuse what a fragment stage `fs` of a multisampled pipeline reads of its coverage on a
-/// driver that rasterizes a clipped triangle as several
-/// ([`DriverWorkaround::ClippedTrianglesSplitPixelFragments`]): `[[sample_mask]]` and a centroid
-/// varying, each of which such a split changes in the pixels on the pieces' shared edges.
-/// `[[sample_mask]]` is read once per pixel here: `sample_invocations` refused it beside a function
-/// that runs per sample under sample shading. A function sample shading surely runs per sample
-/// (the pipeline's, `sample_shading`, or the one a `SampleId` input enables; a `Sample` input only
-/// may enable it) reads a centroid varying at its own sample, which lies in one piece: no split
-/// changes it.
-fn split_pixel_fragments(
-    r: &RenderLinkInputs,
-    fs: Option<&StageInterface>,
-    p: &DeviceProfile,
-    sample_shading: bool,
-) -> Result<(), Error> {
-    let defect = DriverWorkaround::ClippedTrianglesSplitPixelFragments;
-    let Some(fs) = fs else {
-        return Ok(());
-    };
-    if r.raster_sample_count <= 1 || !p.fields().workarounds.contains(&defect) {
-        return Ok(());
-    }
-    let io = &fs.io;
-    if io.builtins.contains(&StageBuiltin::SampleMaskIn) {
-        return Err(Unsupported::driver_defect(Feature::PixelCoverage, defect).into());
-    }
-    if sample_shading || io.builtins.contains(&StageBuiltin::SampleId) {
-        return Ok(());
-    }
-    let centroid = io.inputs.iter().any(|v| {
-        matches!(
-            v.role,
-            IoRole::Varying {
-                interpolation: Some(Interpolation::Smooth { sampling, .. }),
-                ..
-            } if sampling.reads_centroid()
-        )
-    });
-    if centroid {
-        return Err(Unsupported::driver_defect(Feature::CentroidVarying, defect).into());
-    }
-    Ok(())
-}
-
-/// Check how the fragment stage `fs` runs and reads under multisampling (see the module docs),
-/// returning whether the pipeline enables sample shading at a minimum of 1.0
-/// (`GraphicsState::sample_shading`). With more than one sample and rasterization on, a function
-/// that writes memory runs per covered sample under sample shading, which needs
-/// `sampleRateShading`; a function that runs per sample (that one, or one that reads
-/// `[[sample_id]]`, as a per-sample framebuffer fetch's stage does, or a sample-qualified varying)
-/// reads `[[position]]`'s x and y and its center varyings at the pixel through their pixel forms,
-/// is refused for a center varying where the device has no pixel form, and needs `multisampled`
-/// where it has one but was compiled without it. Its other pixel reads (`[[position]]`'s z and w,
-/// `[[point_coord]]`, `[[barycentric_coord]]`, a centroid varying) read where Vulkan evaluates
-/// them, noted by the compile layer.
+/// Check how the fragment stage `fs` runs and reads under multisampling (see the module docs).
+/// With more than one sample and rasterization on, a function that runs per sample (one that
+/// reads `[[sample_id]]`, as a per-sample framebuffer fetch's stage does, or a sample-qualified
+/// varying) reads `[[position]]`'s x and y and its center varyings at the pixel through their pixel
+/// forms, is refused for a center varying where the device has no pixel form, and needs
+/// `multisampled` where it has one but was compiled without it. Its other pixel reads
+/// (`[[position]]`'s z and w, `[[point_coord]]`, `[[barycentric_coord]]`, a centroid varying) read
+/// where Vulkan evaluates them, noted by the compile layer. A function that writes memory runs as
+/// any other, as many times as the device runs it (`PrecisionNote::DeviceFragmentRuns`).
 fn sample_invocations(
     r: &RenderLinkInputs,
     fs: Option<&StageInterface>,
     p: &DeviceProfile,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     // A pipeline has a fragment stage only with rasterization on.
     let Some(fs) = fs else {
-        return Ok(false);
+        return Ok(());
     };
     if r.raster_sample_count <= 1 {
-        return Ok(false);
+        return Ok(());
     }
     let io = &fs.io;
-    // The barycentric weights' varyings are center varyings, and an interpolant read at the
-    // center is read as one.
+    // An interpolant read at the center is read as a center varying.
     let interpolated = |reads: fn(Sampling) -> bool| {
         io.inputs.iter().any(|v| match v.role {
             IoRole::Varying {
                 interpolation: Some(Interpolation::Smooth { sampling, .. }),
                 ..
             } => reads(sampling),
-            IoRole::Barycentric { .. } => reads(Sampling::Center),
             _ => false,
         })
     };
@@ -972,28 +763,21 @@ fn sample_invocations(
         }
         .into()
     };
-    // Metal repeats the side effects per covered sample; Vulkan does under sample shading at a
-    // minimum of 1.0, which the pipeline enables (a `SampleId` input enables it too).
-    let sample_shading = fs.writes_memory;
-    let per_sample = sample_shading
-        || io.builtins.contains(&StageBuiltin::SampleId)
-        || interpolated(|s| s == Sampling::Sample);
+    // A `SampleId` input, or a `Sample` one, runs the stage once per covered sample.
+    let per_sample =
+        io.builtins.contains(&StageBuiltin::SampleId) || interpolated(|s| s == Sampling::Sample);
     if !per_sample {
-        return Ok(false);
+        return Ok(());
     }
     // Metal hands each of the pixel's sample invocations the pixel's coverage. A Vulkan
     // invocation under sample shading sees only its own samples' bits, and nothing gathers a
     // pixel's sample invocations: a quad holds one sample index, and no subgroup is promised to
     // hold the rest. The function runs once per pixel instead, compiled for the pipeline, and its
     // body once per covered sample, without sample shading; one the loop does not fit is refused
-    // for the reason its interface records. A driver that runs a
-    // memory-writing function once per covered sample whatever the pipeline's sample shading hands
-    // each run the pixel's coverage itself, as Metal does: the function's other reads are checked
-    // as any per-sample function's, and the pipeline enables no sample shading, under which that
-    // driver would mask the coverage.
+    // for the reason its interface records.
     if io.builtins.contains(&StageBuiltin::SampleMaskIn) {
         match io.coverage_loop {
-            CoverageLoop::Looped => return Ok(false),
+            CoverageLoop::Looped => return Ok(()),
             CoverageLoop::Unlooped => return Err(Error::NeedsInput(RuntimeInput::Multisampled)),
             CoverageLoop::Refused(r) => return Err(r.error()),
             CoverageLoop::NotNeeded => {
@@ -1001,12 +785,7 @@ fn sample_invocations(
                     Unsupported::not_representable(Feature::PixelCoverageAtSampleRate).into(),
                 )
             }
-            CoverageLoop::DriverRunsPerSample => {}
         }
-    }
-    let sample_shading = sample_shading && io.coverage_loop != CoverageLoop::DriverRunsPerSample;
-    if sample_shading && !rate {
-        return Err(refused());
     }
     // Compiled for a multisampled pipeline, the function reads `[[position]]`'s x and y and
     // (with the pixel form) its center varyings at the pixel. `[[position]]`'s z and w,
@@ -1016,20 +795,13 @@ fn sample_invocations(
     let position = io.builtins.contains(&StageBuiltin::FragCoord);
     let center = interpolated(Sampling::reads_center);
     if !position && !center {
-        return Ok(sample_shading);
+        return Ok(());
     }
     if !rate {
         return Err(refused());
     }
     let enabled = &p.fields().enabled;
-    // A device that reads center varyings at the pixel center itself, as Metal does, has their
-    // pixel form: their read as it is.
-    if center
-        && !io.varyings_at_pixel
-        && !enabled
-            .properties
-            .contains(&VkProperty::MetalCenterVaryings)
-    {
+    if center && !io.varyings_at_pixel {
         // Beside `sampleRateShading`, the varyings' pixel form needs an `InterpolateAtOffset` that
         // reads from the pixel center and the interpolation functions a portability-subset device
         // withholds.
@@ -1059,26 +831,19 @@ fn sample_invocations(
         // Compiled for another device.
         return Err(refused());
     }
-    Ok(sample_shading)
+    Ok(())
 }
 
 /// What the device's alpha to coverage gives a render pipeline whose graphics state is `g` on `p`
 /// (see the module docs): where it covers by alpha (`GraphicsState::alpha_to_coverage`), the
 /// device converts the alpha to a coverage mask by its own algorithm, which Vulkan does not
-/// specify, so the fragment stage records `PrecisionNote::DeviceAlphaCoverage`; but where `p`
-/// takes `DriverDeviation::MetalAlphaCoverage`, the device covers Metal's samples, and the
-/// pipeline requires `VkProperty::MetalAlphaCoverage` in place of the note. Nothing where the
+/// specify, so the fragment stage records `PrecisionNote::DeviceAlphaCoverage`. Nothing where the
 /// pipeline does not cover by alpha.
-pub(crate) fn coverage_notes(g: &GraphicsState, p: &DeviceProfile) -> FixedFunctionNotes {
-    let mut out = FixedFunctionNotes::default();
-    if g.alpha_to_coverage {
-        if p.takes_driver_deviation(DriverDeviation::MetalAlphaCoverage) {
-            out.properties.insert(VkProperty::MetalAlphaCoverage);
-        } else {
-            out.notes.push(PrecisionNote::DeviceAlphaCoverage);
-        }
+pub(crate) fn coverage_notes(g: &GraphicsState) -> Vec<PrecisionNote> {
+    match g.alpha_to_coverage {
+        true => vec![PrecisionNote::DeviceAlphaCoverage],
+        false => Vec::new(),
     }
-    out
 }
 
 /// Whether the pipeline's alpha to coverage stays enabled (see the module docs): only over a
@@ -1222,13 +987,9 @@ fn uniform_blend(
 /// Max and an M4, byte-identical). A mask of some of the channels one component holds
 /// (`BGR10_XR`'s word, `RGB10A2Unorm_sRGB`'s, the two-plane forms' color word) is
 /// `NotImplemented(Format)` here: no mask of the raw components keeps one code of a word and
-/// writes another. A stage that writes `BGR10_XR` or a two-plane form so merges the codes
-/// (`color_writes::merged_extended`): in the interlocked storage form, which leaves the attachment
-/// out of the subpass, where the device orders fetch through the pixel interlock, and over the
-/// input attachment, whose write the caller makes of every raw component, where it orders fetch
-/// through rasterization-order input attachments, so a stage that reaches here so was compiled
-/// for another pipeline (the caller answers `NeedsInput(FramebufferFetch)`); on a device that
-/// orders it in neither form, the caller names the orderings the merge needs. A bfloat form's channels
+/// writes another. The merge of such a mask's codes into the word over an ordered read of the
+/// attachment (`color_writes::merged_extended`) is not built: the caller refuses it
+/// (`fetch::computed_write_refused`). A bfloat form's channels
 /// are its own (red; red and green; all four), each a raw component; a mask of some of them is
 /// unmeasured and refused as above.
 fn extended_write_mask(

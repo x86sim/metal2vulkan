@@ -57,12 +57,55 @@ impl<'m> FunctionBuilder<'m> {
         self.cursor
     }
 
+    /// The module's [`ModuleBuilder::footprint`], and the capacity its containers that grow with
+    /// the code reserve while `ahead` more entries go in each: the value table, one entry per
+    /// result of the module; the block table, one draft per block; and the open block's
+    /// instruction storage. Each doubles when full, so the emitters charge this at their poll
+    /// points to put a doubling on the ledger before it is reserved, whenever fewer than `ahead`
+    /// results, blocks or instructions come before the next poll.
+    pub fn footprint_ahead(&self, ahead: usize) -> usize {
+        /// The bytes `v` reserves while `ahead` more elements are pushed one at a time.
+        fn reserved<T>(v: &Vec<T>, ahead: usize) -> usize {
+            let needed = v.len().saturating_add(ahead);
+            let mut cap = v.capacity();
+            while cap < needed {
+                cap = cap.saturating_mul(2).max(4);
+            }
+            (cap - v.capacity()).saturating_mul(std::mem::size_of::<T>())
+        }
+        let open = self
+            .cursor
+            .and_then(|b| self.m.blocks.get(b.index()))
+            .map_or(0, |bd| reserved(&bd.insts, ahead));
+        self.m.footprint()
+            + reserved(&self.m.values, ahead)
+            + reserved(&self.m.blocks, ahead)
+            + open
+    }
+
     /// The function's entry block, which dominates every block of the function.
     pub fn entry_block(&self) -> Option<BlockId> {
         self.m
             .functions
             .get(self.func.index())
             .and_then(|f| f.blocks.first().copied())
+    }
+
+    /// Run `f` with the function's entry block open, then reopen the block that was open: what
+    /// `f` appends goes after the entry block's instructions, before its terminator, where it
+    /// dominates every block of the function. `f` appends only instructions whose operands are
+    /// defined in the entry block or are module-scope, and opens and closes no block.
+    pub fn in_entry_block<T>(&mut self, f: impl FnOnce(&mut Self) -> BResult<T>) -> BResult<T> {
+        let entry = self
+            .entry_block()
+            .ok_or(BuildError::Control(ControlRule::NoCurrentBlock))?;
+        let open = self
+            .cursor
+            .replace(entry)
+            .ok_or(BuildError::Control(ControlRule::NoCurrentBlock))?;
+        let r = f(self);
+        self.cursor = Some(open);
+        r
     }
 
     /// The type of a value.
@@ -134,6 +177,16 @@ impl<'m> FunctionBuilder<'m> {
         self.m.lanes.get(&y).copied()
     }
 
+    /// Note that `y`, a 32-bit unsigned integer, is `x + c` modulo 2^32: `x` dominates `y`.
+    pub fn note_sum(&mut self, y: Value, x: Value, c: u32) {
+        self.m.sums.insert(y, (x, c));
+    }
+
+    /// The value and constant `y` was noted to add.
+    pub fn sum_of(&self, y: Value) -> Option<(Value, u32)> {
+        self.m.sums.get(&y).copied()
+    }
+
     /// Note that `y`, a 32-bit unsigned integer, is the zero extension of 16-bit integer `of`:
     /// `of` dominates `y`.
     pub fn note_widened16(&mut self, y: Value, of: Value) {
@@ -173,6 +226,22 @@ impl<'m> FunctionBuilder<'m> {
     /// The vector, lane value, and lane index `y` was noted to insert.
     pub fn insert_of(&self, y: Value) -> Option<(Value, Value, u32)> {
         self.m.inserts.get(&y).copied()
+    }
+
+    /// Record that vector `y`, of `f32` lanes, is the construct of `parts`
+    /// ([`FunctionBuilder::vector_parts`]).
+    pub(super) fn note_vector_parts(&mut self, y: Value, parts: &[Value]) {
+        self.m.vector_part_bytes = self
+            .m
+            .vector_part_bytes
+            .saturating_add(std::mem::size_of_val(parts));
+        self.m.vector_parts.insert(y, parts.into());
+    }
+
+    /// The parts, scalars or vectors, of `f32` vector `y` where the builder made it by
+    /// `OpCompositeConstruct`, in lane order: each dominates `y`.
+    pub fn vector_parts(&self, y: Value) -> Option<Vec<Value>> {
+        self.m.vector_parts.get(&y).map(|parts| parts.to_vec())
     }
 
     /// Record how struct `y` holds its members, or which member of a struct it reads
@@ -317,9 +386,22 @@ impl<'m> FunctionBuilder<'m> {
             ptr_ty,
             value,
             init,
+            trip_local: false,
         });
         self.draft_mut()?.vars.push(id);
         Ok(id)
+    }
+
+    /// Mark `Function` variable `var` of this function [`LocalVar::trip_local`]: no trip of a
+    /// loop whose body holds all of its whole stores reads the value an earlier trip left in it.
+    pub fn mark_trip_local(&mut self, var: VarId) -> BResult<()> {
+        match self.m.vars.get_mut(var.index()) {
+            Some(v) if v.func == self.func => {
+                v.trip_local = true;
+                Ok(())
+            }
+            Some(_) | None => Err(BuildError::Dangling(Dangling::Var(var))),
+        }
     }
 
     /// The pointer value of a `Function` variable of this function.

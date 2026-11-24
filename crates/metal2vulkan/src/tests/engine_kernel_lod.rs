@@ -6,9 +6,8 @@
 //! sixty-fourths of its `half` clamp. No query asks the device (`OpImageQueryLod`). A depth
 //! texture's query was not measured and is refused.
 //!
-//! The values are checked on devices by `runtime_lane::kernel_lod` and by the fixture's authored
-//! cases on Metal; here the structure. `llvm-as` assembles the fixture; without it the tests skip
-//! visibly.
+//! The values are checked by the fixture's authored cases on Metal; here the structure. `llvm-as`
+//! assembles the fixture; without it the tests skip visibly.
 
 use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
@@ -48,7 +47,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 /// The instructions of a SPIR-V module: opcode and word offset.

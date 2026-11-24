@@ -17,9 +17,8 @@
 //! `Sample0` is one value, so a case over it alone has no filter axis to sweep: it can show that
 //! sample 0's stencil is what the resolve holds, and no more. The question a *pair* asks is the one
 //! the runtime's own code makes answerable and no case has ever put beside Metal — the stencil
-//! resolve and the depth resolve are chosen together
-//! (`metal2vulkan_runtime`'s `resolve.rs`, one `match` over `(stencil_resolves, stencil_filter)`
-//! whose other arm reads `depth_filter`), so a side that let the depth attachment's filter decide
+//! resolve and the depth resolve are chosen together, so a side that let the depth attachment's
+//! filter decide
 //! the stencil's would be **right on one of the three depth filters and wrong on the other two**.
 //! No sweep of either filter on its own can see that. `resolve-stencil-under-depth-filters` states
 //! both in one pass, three times, and reads both resolve textures:
@@ -85,13 +84,8 @@
 //! sweep of either store action cannot make that claim.
 //!
 //! `resolve-stencil-under-depth-filters` states `MultisampleResolve` on both aspects and **not**
-//! `StoreAndMultisampleResolve`, deliberately: a separate depth texture stored beside a separate
-//! stencil one renders through a combined scratch image whose multisampled aspects are copied back
-//! after the pass, and on a device whose fragment depth does not store a value unchanged that copy
-//! is an announced near-equivalent (`metal2vulkan_runtime`'s `depth_stencil_scratch.rs`,
-//! `Degradation::DrawnDepthCopy`). A resolving store that keeps no samples needs no copy back, so
-//! the cell asks about the resolve and nothing else. The store-action pair is already answered by
-//! the case above it and by `resolve-depth-filters-4`.
+//! `StoreAndMultisampleResolve`, deliberately: the cell asks about the resolve and nothing else.
+//! The store-action pair is already answered by the case above it and by `resolve-depth-filters-4`.
 //!
 //! # What is not asked, and why
 //!
@@ -121,7 +115,6 @@
 //! count refuses the target and the suite counts the case
 //! [`LacksFeature`](crate::verdict::Verdict::LacksFeature) rather than leaving it uncompared.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -132,11 +125,9 @@ use crate::render::{
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::{MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, StoreAction};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType, StencilOperation};
-use metal2vulkan_runtime::{
-    Degradation, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, StoreAction,
-};
 
 /// The owned fixture both cases draw with: the fullscreen triangle at buffer 0's depth, and the
 /// fragment whose sample mask is buffer 0's.
@@ -325,9 +316,8 @@ fn cell(at: usize) -> ScissorBox {
 ///
 /// `MTLTextureUsageShaderRead` beside the render-target usage, and not a detail: a device that
 /// resolves a combined format's aspects one at a time, or has no mode for the depth filter beside
-/// it, reads the attachment's samples through a sampled view
-/// (`metal2vulkan_runtime`'s `depth_stencil_resolve.rs` and `depth_stencil_scratch.rs`), and an
-/// attachment Metal made without the usage is a texture those paths cannot take. The usage is
+/// it, reads the attachment's samples through a sampled view, and an attachment Metal made without
+/// the usage is a texture those paths cannot take. The usage is
 /// therefore part of what the case means on every venue, not something the side may choose.
 fn stencil_target() -> TargetSpec {
     TargetSpec::read(STENCIL_FORMAT, [SIDE; 2]).multisampled(SAMPLES)
@@ -537,7 +527,6 @@ fn depth_filter_name(filter: MultisampleDepthResolveFilter) -> &'static str {
         MultisampleDepthResolveFilter::Sample0 => "MTLMultisampleDepthResolveFilterSample0",
         MultisampleDepthResolveFilter::Min => "MTLMultisampleDepthResolveFilterMin",
         MultisampleDepthResolveFilter::Max => "MTLMultisampleDepthResolveFilterMax",
-        _ => "MTLMultisampleDepthResolveFilterUnknown",
     }
 }
 
@@ -548,7 +537,6 @@ fn stencil_filter_name(filter: MultisampleStencilResolveFilter) -> &'static str 
         MultisampleStencilResolveFilter::DepthResolvedSample => {
             "MTLMultisampleStencilResolveFilterDepthResolvedSample"
         }
-        _ => "MTLMultisampleStencilResolveFilterUnknown",
     }
 }
 
@@ -660,40 +648,6 @@ impl Case for StencilResolves {
 
     fn record_runs(&self) -> u32 {
         RUNS
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // **No value is loosened**: every resolved byte and every resolved depth Metal leaves is
-        // one we must leave, and the whole declared set is notices. Each is a `Performance`
-        // degradation — a structurally different path to the same bits — and each is named with
-        // the shape of this case that provokes it, so a reader can tell a notice this family
-        // earns from one copied in.
-        let mut named = vec![
-            // The colour attachment nothing reads is stored `DontCare`, and a device whose
-            // `DontCare` store is not Metal's announces that it took the near-equivalent.
-            // Measured not to fire on MoltenVK, where the store is the device's own.
-            crate::replay::notice_allowance(Degradation::DontCareStore.code()),
-            // The buffer each pass reads its resolved aspects back through is `Shared`
-            // ([`crate::replay::shared_memory_notice`], measured firing on the 5080).
-            crate::replay::shared_memory_notice(),
-        ];
-        if self.has_depth() {
-            named.extend([
-                // The pair case's depth and stencil are **two textures**, which renders through a
-                // scratch image of the combined format: announced on every venue, and measured
-                // firing on MoltenVK.
-                crate::replay::notice_allowance(Degradation::SeparateDepthStencil.code()),
-                // And their two aspects resolve into two textures, which resolves one aspect at a
-                // time: announced on every venue, and measured firing on MoltenVK.
-                crate::replay::notice_allowance(Degradation::OneAspectResolve.code()),
-                // A device with no `MIN` or `MAX` depth resolve mode reaches Metal's depth
-                // through a draw after the pass rather than through the store. On MoltenVK the
-                // modes are the device's and this does not fire; on a device that lacks them the
-                // notice is what says the exact path ran.
-                crate::replay::notice_allowance(Degradation::ShaderResolve.code()),
-            ]);
-        }
-        named
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1232,14 +1186,8 @@ mod tests {
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
-            // The declared allowances loosen no value: each names a notice and nothing else, and
-            // the pair case declares the three its separate textures and split resolve provoke
-            // beside the one both cases share.
-            let expected = match case.name() {
-                "resolve-stencil-under-depth-filters" => 5,
-                _ => 2,
-            };
-            assert_eq!(case.allowances().len(), expected, "{}", case.name());
+            // No value is loosened and no notice is declared.
+            assert!(case.allowances().is_empty(), "{}", case.name());
         }
         let stores = StencilResolves {
             cross: Cross::Stores,

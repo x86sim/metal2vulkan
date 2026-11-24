@@ -86,7 +86,7 @@ fn a_texture_buffer_argument_is_a_texel_buffer_heap_class() {
     let mut desc = description("nvidia-rtx50-linux").expect("description");
     desc.features
         .remove(&VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind);
-    let device = Device::new(desc, DevicePolicy::default()).expect("device");
+    let device = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
     match compile(&bc, entry, device.profile()) {
         Err(Error::Unsupported(u)) => {
             assert_eq!(u.feature, Feature::ArgumentBufferTextures);
@@ -99,4 +99,28 @@ fn a_texture_buffer_argument_is_a_texel_buffer_heap_class() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+/// `runtime-floor`'s recommendation holds the texel-buffer update-after-bind features it reports:
+/// it names no `robustBufferAccess`, beside which `runtime-floor` may not enable them
+/// (VUID-VkDeviceCreateInfo-robustBufferAccess-10247). A device made from that recommendation
+/// compiles a texture buffer member.
+#[test]
+fn a_device_made_from_the_recommendation_compiles_texture_buffers() {
+    let Some(bc) = fixture() else {
+        return;
+    };
+    let entry = "abt_frag_texel_buffer";
+    let desc = description("runtime-floor").expect("description");
+    let rec = desc.recommended_enables();
+    for f in [
+        VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind,
+        VkFeature::DescriptorBindingStorageTexelBufferUpdateAfterBind,
+    ] {
+        assert!(rec.features.contains(&f), "{f:?}");
+    }
+    let enabled = desc.with_enabled(&rec).expect("enabled");
+    let device = Device::from_queries(enabled, DevicePolicy::RESIDENT_TABLES).expect("device");
+    let a = compile(&bc, entry, device.profile()).expect("a texture buffer member");
+    assert_eq!(heap(&a).len(), 1, "{:?}", heap(&a));
 }

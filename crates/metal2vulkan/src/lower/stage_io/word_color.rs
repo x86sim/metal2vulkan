@@ -20,12 +20,8 @@
 //!
 //! An integer output to such an attachment is Metal's pipeline error: it is not encoded, and link
 //! refuses it (`ColorAttachment`).
-//!
-//! The interlocked storage form writes such an attachment through the same encode where it blends
-//! or keeps some channels (`lower::fragment::fetch`), and a blend there reads the word read first
-//! as Metal's blend reads it ([`decode`]).
 
-use crate::air::intrinsics::{PackDir, PackFormat};
+use crate::air::intrinsics::PackFormat;
 use crate::error::{Error, Feature, Unsupported};
 use crate::lower::arith::color_write::half_rounded;
 use crate::lower::arith::ops::{fsplat, splat, ty};
@@ -39,26 +35,6 @@ use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::BResult;
 use crate::spirv::ids::Value;
 use crate::spirv::ir::{BinOp, ConvOp, GlslOp, UnOp};
-
-/// An upper estimate of the SPIR-V words of one output's [`encode`]: per channel the rounding to
-/// `half`, the clamp, the product's rounding, the conversion, shift and merge.
-pub(crate) const WORDS: u64 = 4 * (40 * 6 + 12 * 6);
-
-/// An upper estimate of the SPIR-V words of one output's [`encode`] into `word`: [`WORDS`], and
-/// for an 8-bit sRGB word `arith::pack::pack`'s encode.
-pub(crate) fn encode_words(word: WordAttachment) -> u64 {
-    match word {
-        WordAttachment::Packed16 { .. } => WORDS,
-        WordAttachment::Srgb8 { .. } => {
-            let f4 = Form {
-                held: Held::Float(FloatFmt::F32),
-                lanes: 4,
-            };
-            WORDS + u64::from(pack::words(PackFormat::Unorm4x8Srgb, PackDir::Pack, f4))
-        }
-        WordAttachment::Rgb9e5 => crate::lower::texture::RGB9E5_WORDS + 6 * 8,
-    }
-}
 
 /// Plan output `f` (dual-source `index`) of a fragment function to color attachment `color`:
 /// where `LoweringInputs::word_colors` lists the attachment and the output is `float` or `half` of
@@ -204,62 +180,4 @@ pub(crate) fn encode(
         out = fb.binary(BinOp::BitwiseOr, out, c)?;
     }
     Ok(out)
-}
-
-/// An upper estimate of the SPIR-V words of one [`decode`]: per channel the shift, mask,
-/// conversion, product and rounding to `half`, and the vector's construction.
-pub(crate) const DECODE_WORDS: u64 = 4 * (12 * 6 + 40 * 6) + 12;
-
-/// The four channels Metal's blend reads from word `x` (a `u32`) of packed 16-bit word attachment
-/// `word` (`WordAttachment::Packed16`), as a
-/// `vec4` of `f32`, red first: each channel's code over its maximum code rounded to `half`, nearest
-/// even, a channel the format lacks 0, alpha 1 (measured: the packed 16-bit blend sweep,
-/// `extended_range::Blend::packed16`). The code times the `f32` nearest the maximum's reciprocal
-/// lies within two `f32` steps of the quotient, whose `half` it rounds to: the quotient of a code
-/// by `2^k - 1` repeats `k` bits without end (or is 0 or 1), which keeps it far from a `half`
-/// midpoint, more than `2^-(k+1)` of a `half` step for `k` up to 6.
-pub(crate) fn decode(
-    fb: &mut FunctionBuilder<'_>,
-    word: WordAttachment,
-    x: Value,
-) -> BResult<Value> {
-    let s = Form {
-        held: Held::Float(FloatFmt::F32),
-        lanes: 1,
-    };
-    let u = Form {
-        held: Held::Int {
-            bits: 32,
-            container: 32,
-        },
-        lanes: 1,
-    };
-    let st = ty(fb, s)?;
-    let mut lanes = Vec::with_capacity(4);
-    for (lane, field) in word.fields().iter().enumerate() {
-        let Some(field) = field else {
-            lanes.push(fsplat(fb, s, if lane == 3 { 1.0 } else { 0.0 })?);
-            continue;
-        };
-        let max = (1u32 << field.bits) - 1;
-        let code = match field.shift {
-            0 => x,
-            shift => {
-                let shift = splat(fb, u, u64::from(shift))?;
-                fb.binary(BinOp::ShiftRightLogical, x, shift)?
-            }
-        };
-        let mask = splat(fb, u, u64::from(max))?;
-        let code = fb.binary(BinOp::BitwiseAnd, code, mask)?;
-        let c = fb.convert(ConvOp::ConvertUToF, code, st)?;
-        let r = fsplat(fb, s, f64::from(1.0f32 / max as f32))?;
-        let v = fb.binary_no_contraction(BinOp::FMul, c, r)?;
-        lanes.push(half_rounded(fb, s, v)?);
-    }
-    let v4 = Form {
-        held: Held::Float(FloatFmt::F32),
-        lanes: 4,
-    };
-    let t = ty(fb, v4)?;
-    fb.composite_construct(t, &lanes)
 }

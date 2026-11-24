@@ -3,8 +3,8 @@
 //!
 //! A `half` texture (`texture2d<half>` and the like) reads or samples whatever format is bound
 //! to it, and Metal's conversion of the texel to `half` depends on the format, which only the
-//! binder knows. The translation reads the bound format's treatment from the texture slot's
-//! `SpecKey::TexelFormat` specialization, which [`texel_format`] computes: the bits of
+//! binder knows. The bound format's treatment is its class, which [`texel_format`] computes, and
+//! which a specialized note's test reads (`SpecKey::BoundTexelFormat`): the bits of
 //! [`BicubicTexels`] (its family flags and channels) for a format whose conversion is measured,
 //! an 8-bit sRGB format's own bits (below), a cube gather's corner alone for some other formats
 //! (below), else [`TexelFormat::OTHER`].
@@ -67,13 +67,11 @@
 //!   2D sample, and in 3D the half-float residue (about 0.3% of channels half a `half` ulp off).
 //!   Its class is the half-float family.
 //! - **A cube's linear sample** of a packed format is not measured. A packed normalized format's
-//!   ([`TexelFormat::packed_exact`]) keeps the device's filter: its made-up corner texel lies off
+//!   (a [`BicubicTexels::EXACT`] class with a `PACKED` field) keeps the device's filter: its made-up corner texel lies off
 //!   the code scale its sum recovers the codes on. A small float's takes the half-float family's
 //!   emulation, an inference from its parts, each measured on the small floats: the face
 //!   position (format-independent), the 2D sum above, and the corner tap, the `x` face's texel
 //!   (its gathers', below).
-//! - **A swizzled texture's class** drops the field, and a packed normalized format's family with
-//!   it ([`TexelFormat::swizzled`]).
 //!
 //! `ARGB8Unorm` takes a field too ([`PackedTexels::Argb8`]): Metal reads its one texel as `c / 255`
 //! correctly rounded, its bytes rotated in the view; its cube gathers and its linear filter are not
@@ -109,8 +107,7 @@
 //! EOTF to the codes before filtering, within the device's precision), and that is the only form
 //! wherever the device samples the format: a texture slot's reads, samples, gathers and bicubic
 //! taps take it, recording `PrecisionNote::SrgbTexelDecode` where the bound format's class has
-//! [`SRGB`](BicubicTexels::SRGB) on a device that does not decode through Metal's own texture
-//! unit (`VkProperty::MetalSampler`, whose decode is Metal's). The class is
+//! [`SRGB`](BicubicTexels::SRGB). The class is
 //! [`UNORM`](BicubicTexels::UNORM) and [`SRGB`](BicubicTexels::SRGB) with its channels, never
 //! [`EXACT`](BicubicTexels::EXACT): a `half` result rounds the device's `float` value, and a
 //! bicubic sample sums the device's decoded taps. The formats ([`srgb_coded`]) are
@@ -121,7 +118,7 @@
 //! codes (`bind::AstcDecode`, `bind::PvrtcDecode`, `bind::EtcDecode`), its own decode again.
 //!
 //! A device that cannot sample an 8-bit sRGB format holds a sampled texture of it as the format's
-//! UNORM twin (`metal::format::srgb_raw_twin`, [`srgb_twin_on`]: `R8Unorm_sRGB` and
+//! UNORM twin (`metal::format::srgb_raw_twin`: `R8Unorm_sRGB` and
 //! `RG8Unorm_sRGB` on lavapipe, `RG8Unorm_sRGB` on ANV and NVIDIA among the committed profiles),
 //! whose views read the codes as `c / 255`. Having no sRGB decode there, the slot's
 //! `RuntimeFact::SrgbTexture` variant decodes what the view reads (one texel's codes, or the
@@ -155,9 +152,8 @@
 use crate::metal::bicubic::{texels, BicubicTexels};
 use crate::metal::{PixelFormat, TextureSwizzleChannels};
 
-/// The treatment of a bound format's texels with a `half` result: the value of the
-/// `SpecKey::TexelFormat` specialization constant, the bits of [`BicubicTexels`] for a measured
-/// format.
+/// The treatment of a bound format's texels with a `half` result: the value a specialized note's
+/// test of `SpecKey::BoundTexelFormat` reads, the bits of [`BicubicTexels`] for a measured format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TexelFormat(pub u32);
 
@@ -172,53 +168,14 @@ impl TexelFormat {
     /// 0. No other access reads them: such a format's class is otherwise [`OTHER`](Self::OTHER)'s.
     pub const CORNER: u32 = 24;
 
-    /// The [`CORNER`](Self::CORNER) field's mask, in place.
-    pub const CORNER_MASK: u32 = 0xF << TexelFormat::CORNER;
-
     /// Bits `PACKED` to `PACKED + 3`: the [`PackedTexels`] of a packed format, whose one texel a
-    /// read, a 2D gather, or a sample reading one texel converts from its codes, else 0. The binder
-    /// clears it for a swizzled texture, but at a slot whose function applies the swizzle after
-    /// converting.
+    /// read, a 2D gather, or a sample reading one texel converts from its codes, else 0. A heap
+    /// texture whose swizzle does not read as none takes [`OTHER`](Self::OTHER) instead
+    /// ([`heap_class`]).
     pub const PACKED: u32 = 28;
 
     /// The [`PACKED`](Self::PACKED) field's mask, in place.
     pub const PACKED_MASK: u32 = 0xF << TexelFormat::PACKED;
-
-    /// The [`PACKED`](Self::PACKED) field's top bit, set in exactly the fields of the grid `8192`
-    /// ([`PackedTexels::YCbCr8192`], [`PackedTexels::YCbCrExtended8192`] and
-    /// [`PackedTexels::Rgb10A2Srgb`]), whose one texel's `half` rounds with ties away from zero: what the `half` routine of a device that
-    /// samples through Metal's own texture unit reads of the field (`lower::texture::half`), so
-    /// that every other field's class specializes as a slot bound to nothing does.
-    pub const YCBCR_8192: u32 = 8 << TexelFormat::PACKED;
-
-    /// The bits of a class whose `half` conversion is measured on a device that samples through
-    /// Metal's own texture unit: a measured family ([`BicubicTexels::LINEAR`],
-    /// [`BicubicTexels::HALF`], [`BicubicTexels::EXACT`]), an 8-bit sRGB format's
-    /// ([`BicubicTexels::SRGB`]) or a packed field. A class with none of them
-    /// ([`unmeasured_on_metal_sampler`](Self::unmeasured_on_metal_sampler)) converts by the
-    /// `OTHER` arm, whose rounding of Metal's `float` texel Metal's `half` may not be.
-    pub const MEASURED_ON_METAL_SAMPLER: u32 = BicubicTexels::LINEAR
-        | BicubicTexels::HALF
-        | BicubicTexels::EXACT
-        | BicubicTexels::SRGB
-        | TexelFormat::PACKED_MASK;
-
-    /// Whether the class has none of [`MEASURED_ON_METAL_SAMPLER`](Self::MEASURED_ON_METAL_SAMPLER)'s
-    /// bits: a format outside the measured families, or a swizzled packed normalized format
-    /// ([`swizzled`](Self::swizzled)), whose `half` conversion the module notes on such a device
-    /// (`SpecKey::UnmeasuredTexels`).
-    pub fn unmeasured_on_metal_sampler(self) -> bool {
-        self.0 & TexelFormat::MEASURED_ON_METAL_SAMPLER == 0
-    }
-
-    /// Whether, on a device that samples through Metal's own texture unit, every access's `half`
-    /// result of the class is the device's `float` texel rounded to nearest even
-    /// (`SpecKey::PlainHalfTexels`): the class has no YCbCr field on the grid `8192`
-    /// ([`TexelFormat::YCBCR_8192`], ties away), the routine's one arm other than its rounding to
-    /// nearest even (`lower::texture::half`).
-    pub fn plain_on_metal_sampler(self) -> bool {
-        self.0 & TexelFormat::YCBCR_8192 == 0
-    }
 
     /// The families whose texels decode to no NaN: normalized channels, signed or not
     /// ([`BicubicTexels::UNORM`], [`BicubicTexels::SNORM`]), 8-bit sRGB codes
@@ -232,39 +189,10 @@ impl TexelFormat {
     pub const NAN_FREE: u32 =
         BicubicTexels::UNORM | BicubicTexels::SNORM | BicubicTexels::SRGB | BicubicTexels::EXTENDED;
 
-    /// Whether the class's [`PACKED`](Self::PACKED) field is a two-plane YCbCr format's
-    /// ([`PackedTexels::ycbcr`]): a texture Metal's own sampler filters as a float texture's
-    /// texels, not on the field's grid (`lower::sampler::linear`).
-    pub(crate) fn two_plane_ycbcr(self) -> bool {
-        PackedTexels::ALL
-            .iter()
-            .any(|p| p.ycbcr() && self.0 & TexelFormat::PACKED_MASK == p.class().0)
-    }
-
     /// Whether the class states channels ([`BicubicTexels::PRESENT`]): a measured family's does,
     /// a [`CubeCorner`] alone does not, so the binder states no border texel for it.
     pub fn has_channels(self) -> bool {
         self.0 >> BicubicTexels::PRESENT & 0xF != 0
-    }
-
-    /// Whether the class sums its channels on its [`PACKED`](Self::PACKED) field's grids
-    /// ([`PackedTexels::filter_grids`]): a packed normalized format's [`BicubicTexels::EXACT`]
-    /// class (module docs).
-    pub fn packed_exact(self) -> bool {
-        self.0 & BicubicTexels::EXACT != 0 && self.0 & TexelFormat::PACKED_MASK != 0
-    }
-
-    /// The class of a texture of this class's format made with a swizzle, which permutes the
-    /// channels before the function converts or filters them: without the
-    /// [`PACKED`](Self::PACKED) field, whose code scales are per channel, and for a
-    /// [`packed_exact`](Self::packed_exact) class without the family, whose grids are the
-    /// field's, its channels, and its border texels too, leaving the [`CORNER`](Self::CORNER)
-    /// field alone (its class before Metal's filter of it was measured).
-    pub fn swizzled(self) -> TexelFormat {
-        match self.packed_exact() {
-            true => TexelFormat(self.0 & TexelFormat::CORNER_MASK),
-            false => TexelFormat(self.0 & !TexelFormat::PACKED_MASK),
-        }
     }
 }
 
@@ -385,8 +313,7 @@ pub enum PackedTexels {
     /// small float's is, so the field has no code scales. Metal's linear filter sums the steps on
     /// that grid, each 2D term `k · w` truncated by `2^7` (an Apple M3 Max on macOS 26.7 and an
     /// Apple M4 on macOS 27.0.1, byte-identical, every channel of `YCBCR8_420_2P`; every 8- and
-    /// 10-bit format, packed or not, at each subsampling and range;
-    /// [`filter_truncation`](Self::filter_truncation)).
+    /// 10-bit format, packed or not, at each subsampling and range).
     YCbCr2048 = 7,
     /// The `_sRGB` twins' and the unpacked 12-bit YCbCr formats' channels as their view holds them:
     /// steps `k / 8192` of `[0, 1]`, alpha 1, which Metal's linear filter sums as
@@ -409,20 +336,6 @@ pub enum PackedTexels {
 }
 
 impl PackedTexels {
-    /// Every value, in field order.
-    pub const ALL: [PackedTexels; 10] = [
-        PackedTexels::Rgb565,
-        PackedTexels::Rgb5A1,
-        PackedTexels::Rgba4,
-        PackedTexels::Rgb10A2,
-        PackedTexels::SmallFloat,
-        PackedTexels::Argb8,
-        PackedTexels::YCbCr2048,
-        PackedTexels::YCbCr8192,
-        PackedTexels::YCbCrExtended8192,
-        PackedTexels::Rgb10A2Srgb,
-    ];
-
     /// The packed channels of `pf`, where Metal's reads of them are measured, a two-plane YCbCr
     /// format's by its layout ([`of_ycbcr`](Self::of_ycbcr)).
     pub fn of(pf: PixelFormat) -> Option<PackedTexels> {
@@ -468,24 +381,6 @@ impl PackedTexels {
         })
     }
 
-    /// Each channel's code scale `2^b - 1`, red to alpha (an absent alpha's 1, which its value
-    /// 1 recovers), or `None` where the device's value is Metal's exactly: the small floats, the
-    /// YCbCr fields and `RGB10A2Unorm_sRGB`'s, whose function decodes Metal's values itself.
-    pub fn scales(self) -> Option<[u32; 4]> {
-        Some(match self {
-            PackedTexels::Rgb565 => [31, 63, 31, 1],
-            PackedTexels::Rgb5A1 => [31, 31, 31, 1],
-            PackedTexels::Rgba4 => [15; 4],
-            PackedTexels::Rgb10A2 => [1023, 1023, 1023, 3],
-            PackedTexels::Argb8 => [255; 4],
-            PackedTexels::SmallFloat
-            | PackedTexels::YCbCr2048
-            | PackedTexels::YCbCr8192
-            | PackedTexels::YCbCrExtended8192
-            | PackedTexels::Rgb10A2Srgb => return None,
-        })
-    }
-
     /// This field in place.
     pub fn class(self) -> TexelFormat {
         TexelFormat((self as u32) << TexelFormat::PACKED)
@@ -496,7 +391,7 @@ impl PackedTexels {
     /// 10, or 12 bits, `16 · 255` for a channel of 1, 2, or 4 bits, `4 · 1023` for one of 5 or 10,
     /// `4095` for one of 6; the YCbCr fields' `2048` or `8192`, on which their steps are their
     /// codes (`S = D` below). Each
-    /// is a multiple of the channel's code scale ([`scales`](Self::scales)), so a code `c` lies on
+    /// is a multiple of the channel's code scale, so a code `c` lies on
     /// it at `c · D / S`. `None` for the small floats, whose sum is a half-float format's, and for
     /// `ARGB8Unorm`, whose filter is not measured.
     pub fn filter_grids(self) -> Option<[u32; 4]> {
@@ -511,41 +406,6 @@ impl PackedTexels {
             PackedTexels::Rgb10A2Srgb => [8192, 8192, 8192, G8],
             PackedTexels::SmallFloat | PackedTexels::Argb8 => return None,
         })
-    }
-
-    /// The bits `s` Metal's 2D and 3D linear sums drop from each term where
-    /// [`filter_grids`](Self::filter_grids) names the grids: the term of a code `c` on its grid
-    /// under the weight `w` (in units of `2^-16`) is `⌊c · w / 2^s⌋`, and the sum's grid step
-    /// `⌊(T + 2^(15 - s)) / 2^(16 - s)⌋` (module docs). 4 for a packed normalized format's 12-bit
-    /// grids, as for an 8-bit format's, and 7 for the YCbCr fields', measured on their 2D samples;
-    /// `RGB10A2Unorm_sRGB`'s 7 for its color channels and 4 for alpha. Red to alpha.
-    pub fn filter_truncation(self) -> Option<[u32; 4]> {
-        self.filter_grids().map(|_| match self {
-            PackedTexels::Rgb10A2Srgb => [7, 7, 7, 4],
-            _ if self.ycbcr() => [7; 4],
-            _ => [4; 4],
-        })
-    }
-
-    /// Whether a `half` result of the field's one texel or linear filter rounds with ties away
-    /// from zero: the two-plane YCbCr fields' ([`ycbcr`](Self::ycbcr)) and
-    /// `RGB10A2Unorm_sRGB`'s, whose color steps lie on the grid `8192` (its alpha's values are
-    /// never a tie).
-    pub fn ties_away(self) -> bool {
-        self.ycbcr() || self == PackedTexels::Rgb10A2Srgb
-    }
-
-    /// Whether the field is a two-plane YCbCr format's: its view holds Metal's reads exactly, and a
-    /// `half` result of its linear filter is the step's value rounded with ties away from zero (on
-    /// the grid `8192`, where a step's value may lie between two halves; the grid `2048`'s are
-    /// halves), as is a `half` read or nearest sample of one texel (every channel of
-    /// `YCBCR8_420_2P_sRGB`, `YCBCR10_420_2P_sRGB` and three 12-bit and
-    /// extended-range formats on the grid `8192`).
-    pub fn ycbcr(self) -> bool {
-        matches!(
-            self,
-            PackedTexels::YCbCr2048 | PackedTexels::YCbCr8192 | PackedTexels::YCbCrExtended8192
-        )
     }
 
     /// Whether the filter's codes and steps are signed and reach `±2D`
@@ -587,7 +447,7 @@ pub fn texel_format(pf: PixelFormat) -> TexelFormat {
             | P::RGBX8Unorm
             | P::RGBX8Snorm
             // Read, sampled (nearest, linear and bicubic, `float` and `half`) and gathered as an
-            // `RGBX8Unorm` texture of their decoded codes (an Apple M3 Max, `bind::ChromaDecode`).
+            // `RGBX8Unorm` texture of their decoded codes (an Apple M3 Max).
             | P::GBGR422
             | P::BGRG422
     );
@@ -645,9 +505,7 @@ fn two_plane_family(pf: PixelFormat, field: Option<PackedTexels>) -> u32 {
 
 /// The class of a texture of pixel format `pf` made with `swizzle`, with the border texels of
 /// that swizzle where the class states its channels (a cube gather's corner alone states none):
-/// [`texel_format`]'s bits, which a function whose slot does not apply the swizzle itself reads as
-/// [`TexelFormat::swizzled`] where the swizzle is not the identity (the binder's `TexelFormat`
-/// specialization).
+/// [`texel_format`]'s bits.
 pub fn with_border(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> TexelFormat {
     match texel_format(pf) {
         class if !class.has_channels() => class,
@@ -658,7 +516,7 @@ pub fn with_border(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> TexelFor
 /// The class a heap texture of pixel format `pf` made with `swizzle` carries in its handle-table
 /// entry: a texture without a swizzle takes its slot's class ([`with_border`]); a swizzled one
 /// takes [`TexelFormat::OTHER`], whose texels the function leaves to the device, so the classes a
-/// heap names are [`heap_classes`]' few.
+/// heap names are few.
 pub fn heap_class(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> TexelFormat {
     match reads_unswizzled(pf, swizzle) {
         true => with_border(pf, swizzle),
@@ -686,30 +544,22 @@ pub fn reads_unswizzled(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> boo
     (0..4).all(|c| sources[c] == own[c] || (!present[c] && sources[c] == lacking[c]))
 }
 
-/// Every class a heap texture can carry ([`heap_class`] of each pixel format without a swizzle),
-/// sorted and without repeats, so [`TexelFormat::OTHER`] (0) is first: a texture's handle-table
-/// entry names its class by its index here ([`heap_class_index`]), which a function reading the
-/// class looks up in its own copy of this table. The binder and the function come from one build,
-/// whose `SEMANTICS_VERSION` changes with any class.
+/// The heap's class layout. First every class a heap texture can carry ([`heap_class`] of each
+/// pixel format without a swizzle), sorted and without repeats, so [`TexelFormat::OTHER`] (0) is
+/// first: a texture's handle-table entry names its class by its index here ([`heap_class_index`]).
+/// The binder and the function come from one build, whose `SEMANTICS_VERSION` changes with any
+/// class.
 ///
 /// After them, from [`heap_extended_base`], one [`TexelFormat::OTHER`] per form of
 /// `ExtendedRange::HEAP_READ` in its order: the index of a heap texture of that form, whose texels
-/// a function decodes from its raw codes where the index names it, and which every routine that
-/// reads the class takes as `OTHER`.
+/// a function decodes from its raw codes where the index names it.
 ///
 /// After those, from [`heap_numeric_base`], two more `OTHER` entries: the index of a heap texture
 /// of a signed and of an unsigned integer color format ([`heap_numeric`]), which a read of another
 /// numeric class tests to read the texture in its own class; then, from the own-only base, the
 /// classes of the formats such a read does not take ([`crosses_classes`]: depth, stencil,
-/// extended-range and two-plane formats), sorted, `OTHER` first, each the class of its own: a float
-/// read's routine takes it as the class of the same value among the own ones, and only a crossing
-/// float format's texture names an own class.
-pub fn heap_classes() -> &'static [u32] {
-    &heap_layout().classes
-}
-
-/// [`heap_classes`] and the indices where its parts start: the forms a heap reads, the numeric
-/// markers, and the classes of the formats no read of another class takes.
+/// extended-range and two-plane formats), sorted, `OTHER` first, each the class of its own, so only
+/// a crossing float format's texture names an own class.
 struct HeapLayout {
     classes: Vec<u32>,
     extended: u32,
@@ -717,7 +567,7 @@ struct HeapLayout {
     own_only: u32,
 }
 
-/// The heap's classes ([`heap_classes`]), built once.
+/// The heap's class layout ([`HeapLayout`]), built once.
 fn heap_layout() -> &'static HeapLayout {
     static LAYOUT: std::sync::OnceLock<HeapLayout> = std::sync::OnceLock::new();
     LAYOUT.get_or_init(|| {
@@ -757,14 +607,14 @@ fn heap_layout() -> &'static HeapLayout {
     })
 }
 
-/// The index in [`heap_classes`] of the first form of `ExtendedRange::HEAP_READ`: a heap texture's
-/// class index at or past it names the form `index - base` of that list.
+/// The heap class index ([`heap_class_index`]) of the first form of `ExtendedRange::HEAP_READ`: a
+/// heap texture's class index at or past it names the form `index - base` of that list.
 pub fn heap_extended_base() -> u32 {
     heap_layout().extended
 }
 
-/// The index in [`heap_classes`] of a heap texture of a signed integer color format; the next one
-/// is an unsigned integer color format's ([`heap_numeric`]).
+/// The heap class index ([`heap_class_index`]) of a texture of a signed integer color format; the
+/// next one is an unsigned integer color format's ([`heap_numeric`]).
 pub fn heap_numeric_base() -> u32 {
     heap_layout().numeric
 }
@@ -772,7 +622,7 @@ pub fn heap_numeric_base() -> u32 {
 /// Whether Metal's read of a texture of `pf` in another numeric class than its format's is
 /// measured: a color format of the float, signed or unsigned integer class, not a depth, stencil,
 /// extended-range (bfloat included) or two-plane YCbCr one. A slot of another class takes such a
-/// texture under its cross-class variant (`bind::plan::resources::cross_class`), and a heap group's
+/// texture under its cross-class variant, and a heap group's
 /// read of another class reads it in its own class ([`heap_numeric`]).
 pub fn crosses_classes(pf: PixelFormat) -> bool {
     use crate::metal::format::{is_depth_stencil, sampled_type, ycbcr_format, ExtendedRange};
@@ -796,38 +646,21 @@ pub fn heap_numeric(pf: PixelFormat) -> Option<crate::pipeline::sym::SampledType
     }
 }
 
-/// The index in [`heap_classes`] of `A8Unorm`'s class, which no other format's texture carries:
-/// a storage read or write through a heap handle carrying it converts the member's texels where
-/// the device holds such a texture's alpha in red (`metal::format::alpha_in_red`), which a heap's
-/// storage array views without a component mapping. A swizzled `A8Unorm` texture that reads as
-/// none carries it too; another swizzle's class is `OTHER`, which a heap's storage array does not
-/// hold there (`bind::heap`'s storage elements).
+/// The heap class index ([`heap_class_index`]) of `A8Unorm`'s class, which no other format's
+/// texture carries: a storage read or write through a heap handle carrying it converts the member's
+/// texels where the device holds such a texture's alpha in red (`metal::format::alpha_in_red`),
+/// which a heap's storage array views without a component mapping. A swizzled `A8Unorm` texture
+/// that reads as none carries it too; another swizzle's class is `OTHER`, which a heap's storage
+/// array does not hold there (`bind::heap`'s storage elements).
 pub fn heap_alpha_in_red_index() -> u32 {
     heap_class_index(PixelFormat::A8Unorm, TextureSwizzleChannels::DEFAULT)
 }
 
-/// Whether a texture of pixel format `pf` holds 16-bit float channels of its own: its class is
-/// the half-float family's without a packed field.
-pub fn half_channels(pf: PixelFormat) -> bool {
-    use crate::metal::bicubic::BicubicTexels;
-    texel_format(pf).0 & (BicubicTexels::HALF | TexelFormat::PACKED_MASK) == BicubicTexels::HALF
-}
-
-/// Whether Metal's `textureWriteRoundingMode` 2 stores a fragment function's write to a texture of
-/// `pf` otherwise than its default, where the translation builds only the default's rule
-/// (`RuntimeFact::StorageTextureWriteRounding`, `RuntimeFact::HeapWriteRounding`): an
-/// `RG11B10Float` or `RGB9E5Float` texture's, and where `halves` (a `float` texel) a half-float
-/// one's ([`half_channels`]).
-pub fn mode_two_rounds(pf: PixelFormat, halves: bool) -> bool {
-    matches!(pf, PixelFormat::RG11B10Float | PixelFormat::RGB9E5Float)
-        || (halves && half_channels(pf))
-}
-
-/// The index in [`heap_classes`] of the class a heap texture of pixel format `pf` made with
+/// The index among the heap's classes of the class a heap texture of pixel format `pf` made with
 /// `swizzle` carries ([`heap_class`]); for an unswizzled texture of a form of
 /// `ExtendedRange::HEAP_READ`, that form's index past [`heap_extended_base`]; for an integer color
 /// format, its numeric marker ([`heap_numeric_base`]), and for a format a read of another class
-/// does not take, its class among those past the own-only base ([`heap_classes`]).
+/// does not take, its class among those past the own-only base.
 pub fn heap_class_index(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> u32 {
     let layout = heap_layout();
     match heap_numeric(pf) {
@@ -889,21 +722,13 @@ pub fn srgb_coded(pf: PixelFormat) -> bool {
     )
 }
 
-/// Whether `profile`'s device holds a sampled texture of `pf` as its 8-bit sRGB format's UNORM twin
-/// (`metal::format::srgb_raw_twin`): it samples no format of `pf`'s and samples the twin's, whose
-/// views read the codes, so a function decodes them itself (module docs). The runtime's image plan
-/// holds the twin by the same format features.
-pub fn srgb_twin_on(pf: PixelFormat, profile: &crate::device::profile::DeviceProfile) -> bool {
-    use crate::device::requirements::FormatUsage;
-    let usages = [FormatUsage::SampledImage].into();
-    let samples = |pf| crate::metal::format::vk_format(pf, &usages, profile).is_ok();
-    !samples(pf) && crate::metal::format::srgb_raw_twin(pf).is_some_and(samples)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use BicubicTexels as T;
+
+    /// The [`CORNER`](TexelFormat::CORNER) field's mask, in place.
+    const CORNER_MASK: u32 = 0xF << TexelFormat::CORNER;
 
     /// An sRGB-coded format's twin (`metal::format::srgb_raw_twin`) is a format whose direct image
     /// format is the UNORM format of the sRGB format's own class: the same channels and bits, read
@@ -940,7 +765,7 @@ mod tests {
     }
 
     /// A 4:2:2 format reads, samples and gathers as an `RGBA8Unorm` texture of its decoded codes
-    /// with alpha 1 (our probe on an Apple M3 Max under macOS 27.0.1, `bind::ChromaDecode`):
+    /// with alpha 1 (our probe on an Apple M3 Max under macOS 27.0.1):
     /// `RGBX8Unorm`'s class, its border texels too.
     #[test]
     fn four_two_two_formats_convert_as_rgbx8_unorm() {
@@ -1038,31 +863,22 @@ mod tests {
 
     /// A format of a measured cube corner outside the families is its corner's field alone (no
     /// family, channel, or border bit, so every other access reads it as `OTHER`), but for a
-    /// packed format's family and field beside it; each field fits its four bits, and each grid
-    /// suits `texel_round::grid_value` (`1 <= D < 2^16`).
+    /// packed format's family and field beside it.
     #[test]
     fn a_cube_corner_alone_is_its_field() {
         let mut seen = std::collections::BTreeSet::new();
         for &pf in PixelFormat::ALL {
             let Some(corner) = CubeCorner::of(pf) else {
-                assert_eq!(texel_format(pf).0 & TexelFormat::CORNER_MASK, 0, "{pf:?}");
+                assert_eq!(texel_format(pf).0 & CORNER_MASK, 0, "{pf:?}");
                 continue;
             };
-            // A packed format's class holds its family beside its corner; a swizzled texture's
-            // of a packed normalized one keeps the corner alone.
+            // A packed format's class holds its family and field beside its corner.
             let class = texel_format(pf);
-            assert_eq!(
-                class.0 & TexelFormat::CORNER_MASK,
-                corner.class().0,
-                "{pf:?}"
-            );
+            assert_eq!(class.0 & CORNER_MASK, corner.class().0, "{pf:?}");
             let alone = match PackedTexels::of(pf) {
-                Some(_) => TexelFormat(class.0 & TexelFormat::CORNER_MASK),
+                Some(_) => TexelFormat(class.0 & CORNER_MASK),
                 None => class,
             };
-            if class.packed_exact() {
-                assert_eq!(class.swizzled(), alone, "{pf:?}");
-            }
             assert_eq!(alone, corner.class(), "{pf:?}");
             assert!(!alone.has_channels(), "{pf:?}");
             seen.insert(corner as u32);
@@ -1080,7 +896,7 @@ mod tests {
         for (k, corner) in every.into_iter().enumerate() {
             assert_eq!(corner as u32, k as u32 + 1);
             assert_eq!(corner.class().0 >> TexelFormat::CORNER, corner as u32);
-            assert!(corner.class().0 & TexelFormat::CORNER_MASK == corner.class().0);
+            assert!(corner.class().0 & CORNER_MASK == corner.class().0);
             assert!(seen.contains(&(corner as u32)), "{corner:?} has no format");
         }
         // The measured families keep no corner field.
@@ -1089,182 +905,9 @@ mod tests {
             PixelFormat::Depth32Float,
             PixelFormat::R16Float,
         ] {
-            assert_eq!(texel_format(pf).0 & TexelFormat::CORNER_MASK, 0, "{pf:?}");
+            assert_eq!(texel_format(pf).0 & CORNER_MASK, 0, "{pf:?}");
             assert!(texel_format(pf).has_channels(), "{pf:?}");
         }
-    }
-
-    /// Each packed format takes its field beside its corner, and nothing else does: the field fits
-    /// its four bits, each value has a format, each code scale suits `texel_round::grid_value` (`1
-    /// <= S < 2^16`), and the field touches no other field's bit. `ARGB8Unorm`'s cube gathers and
-    /// linear filter are not measured: its field stands alone, as the linear PVRTC formats' does;
-    /// BC1 to BC3's unorm forms and the 8-bit linear ETC2 and EAC formats take it beside their
-    /// corner. No cube gather of a two-plane YCbCr format is measured: its field has
-    /// no corner. A packed normalized format's class is its normalized family's with `EXACT`, a
-    /// small float's the half-float family's, each with its channels and border texels, and a
-    /// two-plane format's the normalized family's with `EXACT` (signed where its field's steps are)
-    /// and its format's channels. A field with grids states its sums' truncation, and only it.
-    #[test]
-    fn a_packed_format_takes_its_field_beside_its_corner() {
-        let mut seen = std::collections::BTreeSet::new();
-        for &pf in PixelFormat::ALL {
-            let class = texel_format(pf);
-            let field = class.0 & TexelFormat::PACKED_MASK;
-            match PackedTexels::of(pf) {
-                Some(p) => {
-                    assert_eq!(field, p.class().0, "{pf:?}");
-                    let two_plane = crate::metal::format::ycbcr_format(pf).is_some();
-                    let blocks = matches!(
-                        pf,
-                        PixelFormat::BC1RGBA
-                            | PixelFormat::BC2RGBA
-                            | PixelFormat::BC3RGBA
-                            | PixelFormat::ETC2RGB8
-                            | PixelFormat::ETC2RGB8A1
-                            | PixelFormat::EACRGBA8
-                    );
-                    assert_eq!(
-                        CubeCorner::of(pf).is_some(),
-                        (p != PackedTexels::Argb8 || blocks) && !two_plane,
-                        "{pf:?}"
-                    );
-                    assert_eq!(p.ycbcr(), two_plane && p != PackedTexels::Rgb10A2, "{pf:?}");
-                    let family = class.0 & !(TexelFormat::PACKED_MASK | TexelFormat::CORNER_MASK);
-                    let want = match p {
-                        PackedTexels::SmallFloat => T::HALF,
-                        PackedTexels::Argb8 => 0,
-                        _ if p.filter_extended() => T::SNORM | T::EXACT,
-                        _ => T::UNORM | T::EXACT,
-                    };
-                    assert_eq!(family & !(0xF << T::PRESENT | 0xfff << T::BORDER), want);
-                    // A two-plane format's channels are its format's, which the bicubic filter's
-                    // treatment does not state: red, green and blue, alpha reading 1 at the border.
-                    let t = match two_plane {
-                        true => {
-                            assert!(texels(pf).is_none(), "{pf:?}");
-                            T(0b0111 << T::PRESENT)
-                                .with_border(pf, TextureSwizzleChannels::DEFAULT)
-                                .0
-                        }
-                        false => texels(pf).map_or(0, |t| t.0),
-                    };
-                    assert_eq!(family, t | want, "{pf:?}");
-                    assert_eq!(class.packed_exact(), p.filter_grids().is_some(), "{pf:?}");
-                    seen.insert(p as u32);
-                }
-                None => {
-                    assert_eq!(field, 0, "{pf:?}");
-                    assert!(!class.packed_exact(), "{pf:?}");
-                }
-            }
-        }
-        // The two-plane YCbCr formats by the grid of Metal's reads: 9 on
-        // `1/2048`, 12 on `1/8192`, 9 on the signed `1/8192`, 6 of 10-bit codes; the 3 of 8-bit
-        // codes `RGBA8Unorm`'s family without a field; the 30 others (PQ, HLG, packed 12 bits) no
-        // class.
-        use crate::metal::format::YCbCrReads;
-        let mut by = std::collections::BTreeMap::new();
-        for &pf in PixelFormat::ALL {
-            let Some(y) = crate::metal::format::ycbcr_format(pf) else {
-                continue;
-            };
-            let class = texel_format(pf);
-            let key = match PackedTexels::of(pf) {
-                Some(p) => format!("{p:?}"),
-                None if class.0 == 0 => "other".to_owned(),
-                None => {
-                    let rgb = T(T::UNORM | T::EXACT | 0b0111 << T::PRESENT)
-                        .with_border(pf, TextureSwizzleChannels::DEFAULT);
-                    assert_eq!(class.0, rgb.0, "{pf:?}");
-                    assert_eq!((y.bits, y.reads), (8, YCbCrReads::Codes), "{pf:?}");
-                    "codes8".to_owned()
-                }
-            };
-            *by.entry(key).or_insert(0) += 1;
-        }
-        let want = [
-            ("Rgb10A2", 6),
-            ("YCbCr2048", 9),
-            ("YCbCr8192", 12),
-            ("YCbCrExtended8192", 9),
-            ("codes8", 3),
-            ("other", 30),
-        ];
-        assert_eq!(
-            by,
-            want.map(|(k, n)| (k.to_owned(), n)).into_iter().collect()
-        );
-        for (pf, p) in [
-            (
-                PixelFormat::YCBCR104442PPACKED,
-                Some(PackedTexels::YCbCr2048),
-            ),
-            (
-                PixelFormat::YCBCR104202PPACKEDSRGB,
-                Some(PackedTexels::YCbCr8192),
-            ),
-            (PixelFormat::YCBCR124222P, Some(PackedTexels::YCbCr8192)),
-            (
-                PixelFormat::YCBCR104202PPACKEDXR,
-                Some(PackedTexels::YCbCrExtended8192),
-            ),
-            (
-                PixelFormat::YCBCR124442PXR,
-                Some(PackedTexels::YCbCrExtended8192),
-            ),
-            (PixelFormat::YCBCR124202PPACKED, None),
-            (PixelFormat::YCBCR124202PPACKEDXR, None),
-            (PixelFormat::YCBCR104202PPQ, None),
-            (PixelFormat::YCBCR124442PHLG, None),
-            (PixelFormat::RGB104202PPACKED, Some(PackedTexels::Rgb10A2)),
-        ] {
-            assert_eq!(PackedTexels::of(pf), p, "{pf:?}");
-        }
-        for (k, p) in PackedTexels::ALL.into_iter().enumerate() {
-            assert_eq!(p as u32, k as u32 + 1);
-            assert_eq!(p.class().0 & !TexelFormat::PACKED_MASK, 0);
-            for s in p.scales().into_iter().flatten() {
-                assert!((1..1 << 16).contains(&s), "{p:?}");
-            }
-            // Each filter grid lies on its channel's code scale, below `2^12`.
-            if let (Some(s), Some(g)) = (p.scales(), p.filter_grids()) {
-                for (s, g) in s.into_iter().zip(g) {
-                    assert_eq!(g % s, 0, "{p:?}");
-                    assert!(g < 1 << 12, "{p:?}");
-                }
-            }
-            assert_eq!(
-                p.filter_truncation().is_some(),
-                p.filter_grids().is_some(),
-                "{p:?}"
-            );
-            // `RGB10A2Unorm_sRGB`'s field is its extended-range form's class's
-            // (`lower::sampler::extended`), which no format's own class takes.
-            let extended = p == PackedTexels::Rgb10A2Srgb;
-            assert!(
-                seen.contains(&(p as u32)) || extended,
-                "{p:?} has no format"
-            );
-        }
-        // A swizzle drops the field, and a packed normalized format's family with it.
-        for (pf, alone) in [
-            (PixelFormat::B5G6R5Unorm, true),
-            (PixelFormat::RGB10A2Unorm, true),
-            (PixelFormat::RG11B10Float, false),
-            (PixelFormat::ARGB8Unorm, false),
-            (PixelFormat::RGBA8Unorm, false),
-        ] {
-            let class = texel_format(pf);
-            let swizzled = class.swizzled();
-            assert_eq!(swizzled.0 & TexelFormat::PACKED_MASK, 0, "{pf:?}");
-            let want = match alone {
-                true => class.0 & TexelFormat::CORNER_MASK,
-                false => class.0 & !TexelFormat::PACKED_MASK,
-            };
-            assert_eq!(swizzled.0, want, "{pf:?}");
-        }
-        assert_eq!(TexelFormat::PACKED_MASK & TexelFormat::CORNER_MASK, 0);
-        assert_eq!(TexelFormat::PACKED_MASK & 0xff_ffff, 0);
     }
 
     /// The heap classes are few enough for a handle-table entry's class field, `OTHER` first; each
@@ -1278,7 +921,7 @@ mod tests {
     fn a_heap_texture_names_its_class_by_index() {
         use crate::memory::handles::FLAG_TEXEL_CLASS;
         use crate::metal::format::ExtendedRange;
-        let classes = heap_classes();
+        let classes = &heap_layout().classes;
         let base = heap_extended_base() as usize;
         assert_eq!(classes.first(), Some(&TexelFormat::OTHER.0));
         assert!(classes[..base].windows(2).all(|w| w[0] < w[1]));
@@ -1363,7 +1006,7 @@ mod tests {
     fn the_alpha_in_red_heap_class_is_a8_unorms_alone() {
         use crate::metal::TextureSwizzle as S;
         let a8 = heap_alpha_in_red_index();
-        assert_ne!(heap_classes()[a8 as usize], TexelFormat::OTHER.0);
+        assert_ne!(heap_layout().classes[a8 as usize], TexelFormat::OTHER.0);
         let swizzles = [
             TextureSwizzleChannels::DEFAULT,
             TextureSwizzleChannels::new(S::Blue, S::Green, S::Red, S::Alpha),
@@ -1390,7 +1033,8 @@ mod tests {
     #[test]
     fn a_heap_write_finds_the_half_formats_by_index() {
         use crate::metal::bicubic::BicubicTexels;
-        let half: Vec<u32> = heap_classes()
+        let half: Vec<u32> = heap_layout()
+            .classes
             .iter()
             .enumerate()
             .filter(|(_, &c)| {
@@ -1409,99 +1053,5 @@ mod tests {
             let i = heap_class_index(pf, TextureSwizzleChannels::DEFAULT);
             assert_eq!(half.contains(&i), wanted.contains(&pf), "{pf:?}");
         }
-    }
-
-    /// The bits of a class the `half` routine of a device that samples through Metal's own
-    /// texture unit reads (`lower::texture::half`).
-    const READ_ON_METAL_SAMPLER: u32 = T::LINEAR | T::SNORM | T::WIDE16 | TexelFormat::YCBCR_8192;
-
-    /// [`TexelFormat::YCBCR_8192`] is set in exactly the fields of the grid `8192`, the packed
-    /// fields whose one texel's `half` rounds with ties away from zero.
-    #[test]
-    fn the_ycbcr_8192_bit_names_exactly_the_grid_8192_fields() {
-        for p in PackedTexels::ALL {
-            let field = (p as u32) << TexelFormat::PACKED;
-            assert_eq!(field & TexelFormat::PACKED_MASK, field, "{p:?}");
-            assert_eq!(
-                field & TexelFormat::YCBCR_8192 != 0,
-                matches!(
-                    p,
-                    PackedTexels::YCbCr8192
-                        | PackedTexels::YCbCrExtended8192
-                        | PackedTexels::Rgb10A2Srgb
-                ),
-                "{p:?}"
-            );
-            assert_eq!(
-                field & TexelFormat::YCBCR_8192 != 0,
-                p.ties_away() && p != PackedTexels::YCbCr2048,
-                "{p:?}"
-            );
-        }
-    }
-
-    /// A 16-bit grid's class (`WIDE16`) is an exact family's with no packed field, so the Metal
-    /// sampler's routine, which reads the grid's bit and not the packed field, selects its grid
-    /// for nothing else.
-    #[test]
-    fn a_wide16_class_is_exact_and_unpacked() {
-        for &pf in PixelFormat::ALL {
-            let c = texel_format(pf).0;
-            if c & T::WIDE16 != 0 {
-                assert_ne!(c & T::EXACT, 0, "{pf:?}");
-                assert_eq!(c & TexelFormat::PACKED_MASK, 0, "{pf:?}");
-                assert_eq!(c & T::LINEAR, 0, "{pf:?}");
-            }
-        }
-    }
-
-    /// On a device that samples through Metal's own texture unit the 8-bit unsigned normalized,
-    /// half-float, sRGB, packed, small float and YCbCr-2048 formats' classes, swizzled or not,
-    /// read as a slot bound to nothing does, and are measured; the 32-bit float and 16-bit grids',
-    /// an 8-bit signed format's, and a YCbCr-8192 field's do not; a compressed format's class is
-    /// unmeasured.
-    #[test]
-    fn the_metal_sampler_s_read_bits_fold_the_measured_families() {
-        let folded = [
-            PixelFormat::RGBA8Unorm,
-            PixelFormat::BGRA8Unorm,
-            PixelFormat::R8Unorm,
-            PixelFormat::RG8Unorm,
-            PixelFormat::A8Unorm,
-            PixelFormat::RGBA8UnormSRGB,
-            PixelFormat::R16Float,
-            PixelFormat::RGBA16Float,
-            PixelFormat::B5G6R5Unorm,
-            PixelFormat::RGB10A2Unorm,
-            PixelFormat::RG11B10Float,
-            PixelFormat::RGB9E5Float,
-        ];
-        for pf in folded {
-            let c = texel_format(pf);
-            assert_eq!(c.0 & READ_ON_METAL_SAMPLER, 0, "{pf:?}");
-            assert!(!c.unmeasured_on_metal_sampler(), "{pf:?}");
-            assert_eq!(c.swizzled().0 & READ_ON_METAL_SAMPLER, 0, "{pf:?}");
-        }
-        for pf in [
-            PixelFormat::RGBA8Snorm,
-            PixelFormat::R16Unorm,
-            PixelFormat::RGBA16Snorm,
-            PixelFormat::RGBA32Float,
-        ] {
-            let c = texel_format(pf);
-            assert_ne!(c.0 & READ_ON_METAL_SAMPLER, 0, "{pf:?}");
-            assert!(!c.unmeasured_on_metal_sampler(), "{pf:?}");
-        }
-        for p in [PackedTexels::YCbCr8192, PackedTexels::YCbCrExtended8192] {
-            let c = TexelFormat((p as u32) << TexelFormat::PACKED);
-            assert_ne!(c.0 & READ_ON_METAL_SAMPLER, 0, "{p:?}");
-            assert!(!c.unmeasured_on_metal_sampler(), "{p:?}");
-        }
-        let ycbcr = TexelFormat((PackedTexels::YCbCr2048 as u32) << TexelFormat::PACKED);
-        assert_eq!(ycbcr.0 & READ_ON_METAL_SAMPLER, 0);
-        assert!(!ycbcr.unmeasured_on_metal_sampler());
-        assert!(texel_format(PixelFormat::BC7RGBAUnorm).unmeasured_on_metal_sampler());
-        assert!(!texel_format(PixelFormat::BC1RGBA).unmeasured_on_metal_sampler());
-        assert!(TexelFormat(0).unmeasured_on_metal_sampler());
     }
 }

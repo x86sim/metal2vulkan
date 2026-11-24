@@ -5,14 +5,18 @@ use crate::executor_contract::out_of_bounds::OutOfBoundsRun;
 use crate::hash::sha256_bytes;
 use crate::observation_contract::ComparisonClass;
 use base64::Engine as _;
-use metal2vulkan_runtime::Degradation;
 use serde::{Deserialize, Serialize};
 
 /// The product's source fingerprint (`validation/product_fingerprint.rs`: the translator's sources,
-/// then the runtime crate's, and the dev-tools crate's, which assemble the public cases' bitcode).
+/// then the dev-tools crate's, which assemble the public cases' bitcode).
 /// Every candidate row's translator fingerprint is derived from it
 /// (`candidate::engine::engine_fingerprint`), so a row is current only for this product.
 pub const TRANSLATOR_FINGERPRINT: &str = env!("METAL2VULKAN_PRODUCT_FINGERPRINT");
+
+/// The runtime crate's source fingerprint (`metal2vulkan-runtime`'s manifest and the files its
+/// module tree compiles, `build.rs`): with [`TRANSLATOR_FINGERPRINT`], what a row the runtime ran
+/// is current for (`candidate::engine::runtime_fingerprint`).
+pub const RUNTIME_CRATE_FINGERPRINT: &str = env!("METAL2VULKAN_RUNTIME_CRATE_FINGERPRINT");
 
 /// `VK_LAYER_KHRONOS_profiles`, as an active tool's `layer` names it in a candidate environment's
 /// `tools`.
@@ -177,10 +181,6 @@ impl ReferenceGap {
     }
 }
 
-/// The member of a candidate row's `environment` that holds the codes of the degrade notices its
-/// runtime device delivered ([`Degradation::code`]): a run through `metal2vulkan_runtime`.
-pub const RUNTIME_DEGRADES: &str = "runtime_degrades";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateObservation {
@@ -188,11 +188,13 @@ pub struct CandidateObservation {
     pub air_sha256: String,
     pub input_sha256: String,
     pub golden_output_sha256: String,
-    pub spv_sha256: String,
+    /// SHA-256 of the executed SPIR-V, where the executor compiled it itself: `None` for a row
+    /// the runtime ran, which keeps its modules to itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spv_sha256: Option<String>,
     pub translator_fingerprint: String,
     pub candidate_output_sha256: String,
     pub output_b64: String,
-    pub backend: Backend,
     pub environment_id: String,
     pub environment: serde_json::Value,
     pub executor_abi: String,
@@ -210,29 +212,35 @@ pub struct CandidateObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<CaseTiming>,
     pub status: CandidateStatus,
+    /// The C3 answer gap that keeps a difference its notes could explain a mismatch: the C3
+    /// reviewed list holds the case under it and the case's structure meets it
+    /// (`candidate::engine::difference_status`). `None` for every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_open_by: Option<crate::c3::AnswerGap>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Backend {
-    Moltenvk,
-    Vulkan,
-}
-
-impl Backend {
-    pub fn directory(self) -> &'static str {
-        match self {
-            Self::Moltenvk => "moltenvk",
-            Self::Vulkan => "vulkan",
-        }
-    }
-}
-
+/// How a candidate's output compares with Metal's: a difference is never a match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
     Match,
+    /// A difference no recorded note can explain (an exact class, or one past a bounded table),
+    /// an out-of-bounds target that escaped, or the difference of a case an answer gap holds open
+    /// ([`CandidateObservation::held_open_by`]): the user's decision of 2026-10-06 keeps an answer
+    /// gap's difference an open mismatch until an exact emulation exists.
     Mismatch,
+    /// The bytes differ under a class unbounded by precision notes
+    /// ([`ComparisonClass::Unbounded`]): the row's notes can explain a difference, which says
+    /// nothing of whether they explain this one. Never a match, and never accepted.
+    NotedDifference,
+}
+
+/// Whether a row whose output does not match Metal's may be a noted difference: its bytes differ,
+/// its class is unbounded by notes, and no out-of-bounds target escaped, which no note explains.
+pub fn may_be_noted(differs: bool, class: &ComparisonClass, run: Option<&OutOfBoundsRun>) -> bool {
+    differs
+        && matches!(class, ComparisonClass::Unbounded(_))
+        && !run.is_some_and(OutOfBoundsRun::escapes)
 }
 
 impl MetalObservation {
@@ -345,9 +353,8 @@ impl MetalObservation {
 pub struct CandidateDependencies<'a> {
     pub case: &'a AuthoredCase,
     pub metal: &'a MetalObservation,
-    pub spv_sha256: &'a str,
+    pub spv_sha256: Option<&'a str>,
     pub translator_fingerprint: &'a str,
-    pub backend: Backend,
     pub environment_id: &'a str,
     pub executor_abi: &'a str,
 }
@@ -359,7 +366,6 @@ impl CandidateObservation {
             ("air_sha256", self.air_sha256.as_str()),
             ("input_sha256", self.input_sha256.as_str()),
             ("golden_output_sha256", self.golden_output_sha256.as_str()),
-            ("spv_sha256", self.spv_sha256.as_str()),
             (
                 "candidate_output_sha256",
                 self.candidate_output_sha256.as_str(),
@@ -367,13 +373,16 @@ impl CandidateObservation {
         ] {
             validate_hash(field, value)?;
         }
+        if let Some(spv_sha256) = &self.spv_sha256 {
+            validate_hash("spv_sha256", spv_sha256)?;
+        }
         validate_hash("translator_fingerprint", &self.translator_fingerprint)?;
         validate_slot_fields(&self.environment_id, &self.executor_abi)?;
         if !self.environment.is_object() {
             return Err("candidate environment must be a JSON object".into());
         }
         self.validate_restriction()?;
-        self.validate_leg()?;
+        self.validate_census_artifact()?;
         let output = base64::engine::general_purpose::STANDARD
             .decode(&self.output_b64)
             .map_err(|error| format!("invalid candidate output_b64: {error}"))?;
@@ -395,9 +404,17 @@ impl CandidateObservation {
         // target's guard. `dependency_matches` re-decides each from the Metal bytes.
         let tolerated = self.comparison.tolerates_differences()
             || run.is_some_and(OutOfBoundsRun::tolerates_differences);
+        // A noted difference is one that may be noted, and only such a difference is held open by
+        // an answer gap. A mismatch under notes without a gap is a row of an executor before the
+        // noted status, stale by its executor ABI.
+        let noted = may_be_noted(!hashes_match, &self.comparison, run);
         let contradicts = match self.status {
-            CandidateStatus::Match => !hashes_match && !tolerated,
-            CandidateStatus::Mismatch => hashes_match && !run.is_some_and(OutOfBoundsRun::escapes),
+            CandidateStatus::Match => (!hashes_match && !tolerated) || self.held_open_by.is_some(),
+            CandidateStatus::Mismatch => {
+                (hashes_match && !run.is_some_and(OutOfBoundsRun::escapes))
+                    || (self.held_open_by.is_some() && !noted)
+            }
+            CandidateStatus::NotedDifference => !noted || self.held_open_by.is_some(),
         };
         if contradicts {
             return Err(format!(
@@ -461,55 +478,11 @@ impl CandidateObservation {
         }
     }
 
-    /// The row's robustness leg is the one its environment records and the one its slot names,
-    /// and its modules' containment agrees with it: a run that enabled no robustness feature
-    /// compiled no robust encoding, and is stored in a robustness-off slot
-    /// (`ENV@engine+robustness-off`), which holds no other row. Rows from before executors ran
-    /// a leg record none, in the census or the environment, and are in no robustness-off slot.
-    fn validate_leg(&self) -> Result<(), String> {
-        let off_slot = crate::candidate::engine::is_robustness_off_slot(&self.environment_id);
-        let recorded = self
-            .environment
-            .get("robustness")
-            .filter(|robustness| !robustness.is_null())
-            .map(|robustness| {
-                robustness
-                    .get("leg")
-                    .cloned()
-                    .and_then(|leg| serde_json::from_value::<crate::coverage::Leg>(leg).ok())
-                    .ok_or("the candidate environment's robustness names no leg")
-            })
-            .transpose()?;
+    /// The census's artifact, where the row records one, is well formed.
+    fn validate_census_artifact(&self) -> Result<(), String> {
         let Some(census) = &self.census else {
-            if off_slot {
-                return Err(format!(
-                    "the row is stored in robustness-off slot {:?}, but records no census, so no \
-                     robustness leg",
-                    self.environment_id
-                ));
-            }
             return Ok(());
         };
-        if census.leg != recorded {
-            return Err(format!(
-                "the candidate census ran in robustness leg {:?}, but the environment records {:?}",
-                census.leg, recorded
-            ));
-        }
-        if off_slot != (census.leg == Some(crate::coverage::Leg::RobustnessOff)) {
-            return Err(format!(
-                "the candidate census ran in robustness leg {:?}, but the row is stored in slot \
-                 {:?}",
-                census.leg, self.environment_id
-            ));
-        }
-        if !census.leg_holds() {
-            return Err(
-                "the candidate census ran with no robustness feature enabled, but records a \
-                 module compiled under a robust encoding"
-                    .into(),
-            );
-        }
         if let Some(artifact) = &census.artifact {
             artifact.validate()?;
         }
@@ -553,26 +526,13 @@ impl CandidateObservation {
             && self.air_sha256 == dependencies.case.air_sha256
             && self.input_sha256 == dependencies.metal.input_sha256
             && self.golden_output_sha256 == dependencies.metal.metal_output_sha256
-            && self.spv_sha256 == dependencies.spv_sha256
+            && self.spv_sha256.as_deref() == dependencies.spv_sha256
             && self.translator_fingerprint == dependencies.translator_fingerprint
-            && self.backend == dependencies.backend
             && self.environment_id == dependencies.environment_id
             && self.executor_abi == dependencies.executor_abi
             && base64::engine::general_purpose::STANDARD
                 .decode(&dependencies.metal.output_b64)
                 .is_ok_and(|golden| self.status_holds(dependencies.case, &golden))
-    }
-
-    /// The degradations the row's run announced ([`RUNTIME_DEGRADES`]), read through the
-    /// runtime's closed vocabulary ([`Degradation::from_code`]): a code it does not know (a
-    /// retired kind's) is none of them.
-    pub fn announced_degradations(&self) -> impl Iterator<Item = Degradation> + '_ {
-        self.environment
-            .get(RUNTIME_DEGRADES)
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|code| Degradation::from_code(code.as_str()?))
     }
 }
 
@@ -845,17 +805,17 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256,
             golden_output_sha256: metal.metal_output_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: "55".repeat(32),
             candidate_output_sha256: output_sha256,
             output_b64: metal.output_b64.clone(),
-            backend: Backend::Vulkan,
             environment_id: "vk-env".into(),
             environment: serde_json::json!({"driver": "test"}),
             executor_abi: "executor-v1".into(),
             comparison: ComparisonClass::Exact,
             census: None,
             status: CandidateStatus::Match,
+            held_open_by: None,
         };
         let mut missing = serde_json::to_value(&candidate).unwrap();
         missing
@@ -873,9 +833,8 @@ mod tests {
         let dependencies = CandidateDependencies {
             case: &case,
             metal: &metal,
-            spv_sha256: &spv_sha256,
+            spv_sha256: Some(&spv_sha256),
             translator_fingerprint: &candidate.translator_fingerprint,
-            backend: Backend::Vulkan,
             environment_id: "vk-env",
             executor_abi: "executor-v1",
         };
@@ -883,18 +842,13 @@ mod tests {
 
         let changed_spv = "44".repeat(32);
         let changed = CandidateDependencies {
-            spv_sha256: &changed_spv,
+            spv_sha256: Some(&changed_spv),
             ..dependencies
         };
         assert!(!candidate.dependency_matches(&changed));
         let changed_fingerprint = "66".repeat(32);
         let changed = CandidateDependencies {
             translator_fingerprint: &changed_fingerprint,
-            ..dependencies
-        };
-        assert!(!candidate.dependency_matches(&changed));
-        let changed = CandidateDependencies {
-            backend: Backend::Moltenvk,
             ..dependencies
         };
         assert!(!candidate.dependency_matches(&changed));
@@ -938,17 +892,17 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256: case.computed_input_sha256().unwrap(),
             golden_output_sha256: output_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: "55".repeat(32),
             candidate_output_sha256: output_sha256,
             output_b64: "AQAAAA==".into(),
-            backend: Backend::Vulkan,
             environment_id: "vk-env".into(),
             environment: serde_json::json!({}),
             executor_abi: "executor-v1".into(),
             comparison: ComparisonClass::Exact,
             census: None,
             status: CandidateStatus::Match,
+            held_open_by: None,
         };
         assert!(row.validate_content().is_ok());
         row.output_b64 = "AgAAAA==".into();
@@ -972,11 +926,10 @@ mod tests {
                 air_sha256: case.air_sha256.clone(),
                 input_sha256: case.computed_input_sha256().unwrap(),
                 golden_output_sha256: output_sha256.clone(),
-                spv_sha256: "33".repeat(32),
+                spv_sha256: Some("33".repeat(32)),
                 translator_fingerprint: "55".repeat(32),
                 candidate_output_sha256: output_sha256.clone(),
                 output_b64: "AQAAAA==".into(),
-                backend: Backend::Vulkan,
                 environment_id: "vk-env".into(),
                 environment,
                 executor_abi: "executor-v1".into(),
@@ -987,15 +940,15 @@ mod tests {
                     device: Some(crate::coverage::ExecutionClass::CpuIcd),
                     product: "77".repeat(32),
                     restricted_to: restricted_to.map(str::to_owned),
-                    leg: None,
                     modules: Vec::new(),
                     artifact: None,
                 }),
                 status: CandidateStatus::Match,
+                held_open_by: None,
             };
         let validation = serde_json::json!({"layer": "VK_LAYER_KHRONOS_validation"});
         let profiles = serde_json::json!({"layer": "VK_LAYER_KHRONOS_profiles"});
-        let restriction = serde_json::json!({"profile": "vk12-floor"});
+        let restriction = serde_json::json!({"profile": "runtime-floor"});
 
         // Native rows, with and without recorded tools.
         assert_eq!(row(serde_json::json!({}), None).validate_content(), Ok(()));
@@ -1015,134 +968,18 @@ mod tests {
             "profiles_layer": restriction,
         });
         assert_eq!(
-            row(restricted.clone(), Some("vk12-floor")).validate_content(),
+            row(restricted.clone(), Some("runtime-floor")).validate_content(),
             Ok(())
         );
         assert!(row(restricted.clone(), None).validate_content().is_err());
-        assert!(row(restricted, Some("roadmap-2022"))
+        assert!(row(restricted, Some("lavapipe"))
             .validate_content()
             .is_err());
         let inactive = serde_json::json!({"tools": [validation], "profiles_layer": restriction});
-        assert!(row(inactive, Some("vk12-floor"))
+        assert!(row(inactive, Some("runtime-floor"))
             .validate_content()
             .unwrap_err()
             .contains("not active"));
-    }
-
-    /// A row's robustness leg is the one its environment records, and a robustness-off row
-    /// records no module compiled under a robust encoding, so the store never accepts a row whose
-    /// census would close a requirement of the other leg.
-    #[test]
-    fn a_row_records_the_leg_its_environment_ran() {
-        use crate::coverage::{BufferEncoding, Containment, ImageEncoding, Leg, ModuleCensus};
-        let case = case();
-        let output_sha256 = sha256_bytes(&[1, 0, 0, 0]);
-        let module = |buffers| ModuleCensus {
-            stage: Stage::Kernel,
-            subgroup: Default::default(),
-            strategies: Default::default(),
-            precision: Default::default(),
-            containment: Some(Containment {
-                buffers,
-                images: ImageEncoding::Unused,
-            }),
-        };
-        // A row in `slot`, its environment recording `environment` and its census `leg`.
-        let in_slot = |slot: &str, environment: serde_json::Value, leg: Option<Leg>, buffers| {
-            CandidateObservation {
-                timing: Some(crate::observation::test_timing()),
-                case_id: case.case_id.clone(),
-                air_sha256: case.air_sha256.clone(),
-                input_sha256: case.computed_input_sha256().unwrap(),
-                golden_output_sha256: output_sha256.clone(),
-                spv_sha256: "33".repeat(32),
-                translator_fingerprint: "55".repeat(32),
-                candidate_output_sha256: output_sha256.clone(),
-                output_b64: "AQAAAA==".into(),
-                backend: Backend::Vulkan,
-                environment_id: slot.into(),
-                environment,
-                executor_abi: "executor-v1".into(),
-                comparison: ComparisonClass::Exact,
-                census: Some(ExecutedCensus {
-                    out_of_bounds: None,
-                    rate_map_pass: None,
-                    device: Some(crate::coverage::ExecutionClass::CpuIcd),
-                    product: "77".repeat(32),
-                    restricted_to: None,
-                    leg,
-                    modules: vec![module(buffers)],
-                    artifact: None,
-                }),
-                status: CandidateStatus::Match,
-            }
-        };
-        let stated_slot = "vk-env@engine";
-        let off_slot = "vk-env@engine+robustness-off";
-        // A row in the slot its census leg names.
-        let row = |environment: serde_json::Value, leg: Option<Leg>, buffers| {
-            let slot = match leg {
-                Some(Leg::RobustnessOff) => off_slot,
-                _ => stated_slot,
-            };
-            in_slot(slot, environment, leg, buffers)
-        };
-        let ran = |leg: &str| serde_json::json!({"robustness": {"leg": leg}});
-        let robust = BufferEncoding::Robust;
-        let checked = BufferEncoding::Checked;
-        assert_eq!(
-            row(ran("stated"), Some(Leg::Stated), robust).validate_content(),
-            Ok(())
-        );
-        assert_eq!(
-            row(ran("robustness_off"), Some(Leg::RobustnessOff), checked).validate_content(),
-            Ok(())
-        );
-        // A row from before executors ran a leg records none anywhere.
-        assert_eq!(
-            row(serde_json::json!({}), None, robust).validate_content(),
-            Ok(())
-        );
-        for (environment, leg) in [
-            (ran("stated"), Some(Leg::RobustnessOff)),
-            (ran("robustness_off"), Some(Leg::Stated)),
-            (ran("robustness_off"), None),
-            (serde_json::json!({}), Some(Leg::Stated)),
-        ] {
-            let refused = row(environment, leg, checked)
-                .validate_content()
-                .unwrap_err();
-            assert!(refused.contains("robustness leg"), "{refused}");
-        }
-        assert!(row(serde_json::json!({"robustness": {}}), None, checked)
-            .validate_content()
-            .unwrap_err()
-            .contains("names no leg"));
-        assert!(row(ran("robustness_off"), Some(Leg::RobustnessOff), robust)
-            .validate_content()
-            .unwrap_err()
-            .contains("robust encoding"));
-        // The slot names the leg: a robustness-off run is never stored as a stated row (where
-        // the coverage report would take it for one), nor any other row as a robustness-off one.
-        for (slot, environment, leg) in [
-            (stated_slot, ran("robustness_off"), Some(Leg::RobustnessOff)),
-            ("vk-env", ran("robustness_off"), Some(Leg::RobustnessOff)),
-            (off_slot, ran("stated"), Some(Leg::Stated)),
-            (off_slot, serde_json::json!({}), None),
-        ] {
-            let refused = in_slot(slot, environment, leg, checked)
-                .validate_content()
-                .unwrap_err();
-            assert!(refused.contains("is stored in slot"), "{refused}");
-        }
-        let mut no_census = row(serde_json::json!({}), None, checked);
-        no_census.census = None;
-        assert_eq!(no_census.validate_content(), Ok(()));
-        no_census.environment_id = off_slot.into();
-        assert!(no_census
-            .validate_content()
-            .unwrap_err()
-            .contains("records no census"));
     }
 
     #[test]
@@ -1170,17 +1007,17 @@ mod tests {
             air_sha256: case.air_sha256,
             input_sha256,
             golden_output_sha256: empty_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: "55".repeat(32),
             candidate_output_sha256: empty_sha256,
             output_b64: String::new(),
-            backend: Backend::Vulkan,
             environment_id: "vk-env".into(),
             environment: serde_json::json!({}),
             executor_abi: "executor-v1".into(),
             comparison: ComparisonClass::Exact,
             census: None,
             status: CandidateStatus::Match,
+            held_open_by: None,
         };
         assert!(candidate.validate_content().is_ok());
         candidate.candidate_output_sha256 = "00".repeat(32);
@@ -1235,7 +1072,6 @@ mod tests {
             device: None,
             product: "p".into(),
             restricted_to: None,
-            leg: None,
             modules: vec![crate::coverage::ModuleCensus {
                 stage: Stage::Fragment,
                 subgroup: Default::default(),
@@ -1256,26 +1092,25 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256: metal.input_sha256.clone(),
             golden_output_sha256: metal.metal_output_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: "55".repeat(32),
             candidate_output_sha256: sha256_bytes(output),
             output_b64: b64(output),
-            backend: Backend::Vulkan,
             environment_id: "vk-env".into(),
             environment: serde_json::json!({}),
             executor_abi: "executor-v1".into(),
             census: (comparison != ComparisonClass::Exact).then(|| census.clone()),
             comparison,
             status,
+            held_open_by: None,
         };
         let spv_sha256 = "33".repeat(32);
         let translator_fingerprint = "55".repeat(32);
         let dependencies = CandidateDependencies {
             case: &case,
             metal: &metal,
-            spv_sha256: &spv_sha256,
+            spv_sha256: Some(&spv_sha256),
             translator_fingerprint: &translator_fingerprint,
-            backend: Backend::Vulkan,
             environment_id: "vk-env",
             executor_abi: "executor-v1",
         };
@@ -1315,6 +1150,52 @@ mod tests {
         // A mismatch never has equal bytes.
         let equal = row(&golden, ComparisonClass::Exact, CandidateStatus::Mismatch);
         assert!(equal.validate_content().is_err());
+
+        // Under an unbounded class a difference is a noted difference, never a match, and a
+        // mismatch where an answer gap holds it open (or in a row of an executor before the noted
+        // status); no other class or status is noted.
+        let unbounded = ComparisonClass::Unbounded([PrecisionNote::DeviceSampling].into());
+        let valid = |output: &[u8], comparison: &ComparisonClass, status, held| {
+            let mut row = row(output, comparison.clone(), status);
+            row.held_open_by = held;
+            row.validate_content().is_ok()
+        };
+        let gap = Some(crate::c3::AnswerGap::ClippedPrimitiveSplit);
+        assert!(valid(
+            &far,
+            &unbounded,
+            CandidateStatus::NotedDifference,
+            None
+        ));
+        assert!(valid(&far, &unbounded, CandidateStatus::Mismatch, gap));
+        assert!(!valid(&far, &unbounded, CandidateStatus::Match, None));
+        assert!(valid(&far, &unbounded, CandidateStatus::Mismatch, None));
+        assert!(!valid(
+            &far,
+            &unbounded,
+            CandidateStatus::NotedDifference,
+            gap
+        ));
+        assert!(!valid(
+            &golden,
+            &unbounded,
+            CandidateStatus::NotedDifference,
+            None
+        ));
+        assert!(!valid(&golden, &unbounded, CandidateStatus::Match, gap));
+        let bounded = ComparisonClass::derive([PrecisionNote::F16FmaDoubleRounding], []);
+        assert!(!valid(
+            &far,
+            &bounded,
+            CandidateStatus::NotedDifference,
+            None
+        ));
+        assert!(!valid(
+            &far,
+            &ComparisonClass::Exact,
+            CandidateStatus::Mismatch,
+            gap
+        ));
     }
 
     /// A recorded timing reaches no digest, no fingerprint and no verdict.
@@ -1417,11 +1298,10 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256: input_sha256.clone(),
             golden_output_sha256: output_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: "55".repeat(32),
             candidate_output_sha256: output_sha256.clone(),
             output_b64: "AQAAAA==".into(),
-            backend: Backend::Vulkan,
             environment_id: "vk-env".into(),
             environment: serde_json::json!({"driver": "test"}),
             executor_abi: "executor-v1".into(),
@@ -1429,14 +1309,14 @@ mod tests {
             census: None,
             timing,
             status: CandidateStatus::Match,
+            held_open_by: None,
         };
         let golden = metal(Some(fast));
         let dependencies = CandidateDependencies {
             case: &case,
             metal: &golden,
-            spv_sha256: &"33".repeat(32),
+            spv_sha256: Some(&"33".repeat(32)),
             translator_fingerprint: &"55".repeat(32),
-            backend: Backend::Vulkan,
             environment_id: "vk-env",
             executor_abi: "executor-v1",
         };

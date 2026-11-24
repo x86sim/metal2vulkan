@@ -1,14 +1,13 @@
 //! Batched engine runs of the Metal-qualified authored cases on a Vulkan device
-//! (`corpus-vulkan --batch`), or on MoltenVK (`corpus-moltenvk --batch`); and, on the same driver,
-//! the Metal oracle's qualifications (`corpus-metal --batch`, [`metal`]): one [`Pass::Metal`] run
+//! (`corpus-vulkan --batch`); and, on the same driver, the Metal oracle's qualifications (`corpus-metal --batch`, [`metal`]): one [`Pass::Metal`] run
 //! per case, which records the case's Metal row, on the GPU only, with the same job stores,
 //! done-list, build record, tripwire, and stops.
 //!
 //! The batch selects every committed case with a current Metal observation in one Metal
 //! environment ([`qualified_cases`]: the row the executor compares against, by
-//! [`MetalObservation::dependency_matches`] under the current oracle) and runs it, in each
-//! requested robustness leg, through its backend's executor (`corpus-vulkan` or
-//! `corpus-moltenvk`, the engine) with `--device-type TYPE`: one process per (case, leg), exactly
+//! [`MetalObservation::dependency_matches`] under the current oracle) and runs it through its
+//! backend's executor (`corpus-vulkan`, the engine) with
+//! `--device-type TYPE`: one process per case, exactly
 //! the run a single-case invocation makes, so a row or a refusal it records is the executor's own.
 //! The batch never runs Metal: it reads the committed Metal rows. With a profile to restrict to,
 //! every run is the executor's `--profiles-layer P` run, stored in the `ID@engine@P` slots.
@@ -31,7 +30,7 @@
 //!   compile and device workers included, is killed, and the scratch directory it was given
 //!   (`TMPDIR`) is removed.
 //! - **Resumable, by one build.** Every finished run appends one line to the out directory's
-//!   done-list ([`DONE_LIST`]); a later invocation skips each (case, leg) listed there, so a rerun
+//!   done-list ([`DONE_LIST`]); a later invocation skips each (case, pass) listed there, so a rerun
 //!   continues where an interrupted one stopped. Delete a line to run it again. A last line without
 //!   its newline (an append cut short) is not a finished run: the readers drop it and
 //!   [`open_lines`] truncates it before the next append. The out directory records the build and
@@ -39,32 +38,30 @@
 //!   build or venue started, or one whose runs predate that record, so no done-list of an older
 //!   build passes for this build's finished runs.
 //! - **Scratch only.** Each job runs in its own store under the temporary directory: links to the
-//!   corpus's cases, reviews, Metal rows, the other backend's rows, and private sources, and its
+//!   corpus's cases, reviews, Metal rows, and private sources, and its
 //!   own empty candidate and refusal shards of its backend, so concurrent runs never share a shard
 //!   and the corpus is never written. A row a run recorded is appended verbatim to [`ROWS`], and a refusal it recorded
 //!   (`crate::refusal`) to [`REFUSALS`]. [`install`] writes the evidence of each slot's last run
 //!   into a store through [`CorpusStore::upsert_candidate`] and [`CorpusStore::upsert_refusal`],
 //!   the executor's own writes.
 //! - **Report.** [`report`] reads the done-list, rows, and refusals back beside the committed cases
-//!   and Metal rows: per leg, [`family`], and [`scope`], the runs by [`Class`], and every run that
-//!   did not match with its detail (for a mismatch, the 32-bit words that differ from Metal's
-//!   output; for a refusal, the class of its recorded refusal).
+//!   and Metal rows: [`family`] and [`scope`], the runs by [`Class`], and every run that
+//!   did not match with its detail (for a mismatch or a noted difference, the 32-bit words that
+//!   differ from Metal's output; for a refusal, the class of its recorded refusal).
 
-use crate::candidate::engine::{engine_slot, is_robustness_off_slot, ENGINE_EXECUTOR_ABI};
+use crate::candidate::engine::{engine_slot, ENGINE_EXECUTOR_ABI};
 use crate::candidate::exit_status;
 use crate::case::{AuthoredCase, Stage};
-use crate::coverage::Leg;
 use crate::gpu::tripwire::{write_record, HangKind, HangRecord, TripwirePaths};
 use crate::gpu::wait::{SubmissionBackend, HANG_EXIT_CODE};
 use crate::gpu::DeviceType;
 use crate::metal::{ORACLE_ABI, REFERENCE_GAP_EXIT};
 use crate::observation::{
-    Backend, CandidateObservation, CandidateStatus, MetalObservation, MetalStatus,
-    TRANSLATOR_FINGERPRINT,
+    CandidateObservation, CandidateStatus, MetalObservation, MetalStatus, TRANSLATOR_FINGERPRINT,
 };
 use crate::refusal::RefusalObservation;
 use crate::source::shard_name_for_hash;
-use crate::store::{refusal_directory, CorpusStore};
+use crate::store::{CorpusStore, CANDIDATE_DIRECTORY, REFUSAL_DIRECTORY};
 use crate::worker::device::VALIDATION_FINGERPRINT;
 use crate::ScratchDir;
 use base64::Engine as _;
@@ -80,7 +77,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The out directory's done-list: one tab-separated line per finished run
-/// (`case_id leg outcome ended seconds detail`), appended as each run ends.
+/// (`case_id pass outcome ended seconds detail`), appended as each run ends.
 pub const DONE_LIST: &str = "done.tsv";
 /// The out directory's rows: each row a run recorded, its store line verbatim, appended before
 /// the run's done-list line.
@@ -110,6 +107,9 @@ pub enum Outcome {
     ReferenceGap,
     /// Exit 1 with a mismatching row.
     Mismatch,
+    /// Exit 1 with a noted-difference row: its bytes differ under precision notes that can explain
+    /// a difference (`CandidateStatus::NotedDifference`). Never a match.
+    NotedDifference,
     /// `not_supported{...}`: the product refused the case, the device does not enable what it
     /// needs, or the executor does not implement it.
     NotSupported,
@@ -131,11 +131,12 @@ pub enum Outcome {
     Failed,
 }
 
-const OUTCOMES: [Outcome; 12] = [
+const OUTCOMES: [Outcome; 13] = [
     Outcome::Match,
     Outcome::Qualified,
     Outcome::ReferenceGap,
     Outcome::Mismatch,
+    Outcome::NotedDifference,
     Outcome::NotSupported,
     Outcome::Refused,
     Outcome::DeviceCrash,
@@ -146,21 +147,24 @@ const OUTCOMES: [Outcome; 12] = [
     Outcome::Failed,
 ];
 
-/// The report's four classes of [`Outcome`].
+/// The report's five classes of [`Outcome`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     /// A match, or a Metal run that qualified.
     Match,
     Mismatch,
+    /// A noted difference, counted apart from a mismatch and never a match.
+    NotedDifference,
     /// The case did not run: a typed refusal.
     Refusal,
     /// The run did not finish as evidence: a crash, a timeout, or a tooling failure.
     Failure,
 }
 
-const CLASSES: [Class; 4] = [
+const CLASSES: [Class; 5] = [
     Class::Match,
     Class::Mismatch,
+    Class::NotedDifference,
     Class::Refusal,
     Class::Failure,
 ];
@@ -172,6 +176,7 @@ impl Outcome {
             Self::Qualified => "qualified",
             Self::ReferenceGap => "reference_gap",
             Self::Mismatch => "mismatch",
+            Self::NotedDifference => "noted_difference",
             Self::NotSupported => "not_supported",
             Self::Refused => "refused",
             Self::DeviceCrash => "device_crash",
@@ -193,6 +198,7 @@ impl Outcome {
         match self {
             Self::Match | Self::Qualified => Class::Match,
             Self::Mismatch => Class::Mismatch,
+            Self::NotedDifference => Class::NotedDifference,
             Self::NotSupported | Self::Refused | Self::ReferenceGap => Class::Refusal,
             Self::DeviceCrash
             | Self::NeedsMetal
@@ -209,50 +215,36 @@ impl Class {
         match self {
             Self::Match => "match",
             Self::Mismatch => "mismatch",
+            Self::NotedDifference => "noted_difference",
             Self::Refusal => "refusal",
             Self::Failure => "failure",
         }
     }
 }
 
-/// What one run of a case is: a robustness leg of a candidate backend's executor, or the Metal
-/// oracle's qualification, which has no legs.
+/// What one run of a case is: a candidate backend's executor, or the Metal oracle's
+/// qualification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Pass {
-    Leg(Leg),
+    Engine,
     Metal,
 }
 
 impl Pass {
-    /// The done-list's spelling: the leg's ([`leg_label`]), or `metal`.
+    /// The done-list's spelling.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Leg(leg) => leg_label(leg),
+            Self::Engine => "engine",
             Self::Metal => "metal",
         }
     }
 
     pub fn parse(label: &str) -> Result<Self, String> {
         match label {
+            "engine" => Ok(Self::Engine),
             "metal" => Ok(Self::Metal),
-            _ => parse_leg(label).map(Self::Leg),
+            _ => Err(format!("unknown pass {label:?} (engine or metal)")),
         }
-    }
-}
-
-/// The command-line spelling of a robustness leg.
-pub fn leg_label(leg: Leg) -> &'static str {
-    match leg {
-        Leg::Stated => "stated",
-        Leg::RobustnessOff => "robustness-off",
-    }
-}
-
-pub fn parse_leg(label: &str) -> Result<Leg, String> {
-    match label {
-        "stated" => Ok(Leg::Stated),
-        "robustness-off" => Ok(Leg::RobustnessOff),
-        _ => Err(format!("unknown leg {label:?} (stated or robustness-off)")),
     }
 }
 
@@ -290,15 +282,16 @@ impl Ended {
 }
 
 /// The outcome of a run that ended as `ended` with `row` (the status of the row it recorded in
-/// its slot, if any) and `refused` (whether it recorded a refusal there). Only a match or a
-/// mismatch records a row, and only one whose status agrees with the exit; only a typed refusal
-/// (`not_supported`) records a refusal, and it may not (one before a device opened records
-/// none): anything else is [`Outcome::Failed`].
+/// its slot, if any) and `refused` (whether it recorded a refusal there). Only a match, a mismatch
+/// or a noted difference records a row, and only one whose status agrees with the exit; only a
+/// typed refusal (`not_supported`) records a refusal, and it may not (one before a device opened
+/// records none): anything else is [`Outcome::Failed`].
 pub fn classify(ended: Ended, row: Option<CandidateStatus>, refused: bool) -> Outcome {
     match (ended, row, refused) {
         (Ended::TimedOut, _, _) => Outcome::Timeout,
         (Ended::Code(0), Some(CandidateStatus::Match), false) => Outcome::Match,
         (Ended::Code(1), Some(CandidateStatus::Mismatch), false) => Outcome::Mismatch,
+        (Ended::Code(1), Some(CandidateStatus::NotedDifference), false) => Outcome::NotedDifference,
         (Ended::Code(exit_status::NOT_SUPPORTED), None, _) => Outcome::NotSupported,
         (Ended::Code(exit_status::REFUSED), None, false) => Outcome::Refused,
         (Ended::Code(exit_status::DEVICE_CRASH), None, false) => Outcome::DeviceCrash,
@@ -605,40 +598,21 @@ impl BatchDevice {
     }
 }
 
-/// Whose rows a batch records: a candidate backend's (its executor's engine runs), or Metal's
+/// Whose rows a batch records: the Vulkan candidate's (its executor's engine runs), or Metal's
 /// (the oracle's qualifications).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchBackend {
-    Moltenvk,
     Vulkan,
     Metal,
 }
 
 impl BatchBackend {
-    /// The candidate backend, for a candidate batch.
-    pub fn candidate(self) -> Option<Backend> {
-        match self {
-            Self::Moltenvk => Some(Backend::Moltenvk),
-            Self::Vulkan => Some(Backend::Vulkan),
-            Self::Metal => None,
-        }
-    }
-
-    /// Its rows' directory under `observations/` (`moltenvk`, `vulkan`, `metal`).
+    /// Its rows' directory under `observations/` (`vulkan`, `metal`).
     pub fn directory(self) -> &'static str {
-        match self.candidate() {
-            Some(backend) => backend.directory(),
-            None => "metal",
-        }
-    }
-}
-
-impl From<Backend> for BatchBackend {
-    fn from(backend: Backend) -> Self {
-        match backend {
-            Backend::Moltenvk => Self::Moltenvk,
-            Backend::Vulkan => Self::Vulkan,
+        match self {
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
         }
     }
 }
@@ -646,7 +620,7 @@ impl From<Backend> for BatchBackend {
 /// What a batch runs and where.
 #[derive(Clone, Debug)]
 pub struct BatchConfig {
-    /// The executor of `backend` (`corpus-vulkan`, `corpus-moltenvk`, or `corpus-metal`).
+    /// The executor of `backend` (`corpus-vulkan` or `corpus-metal`).
     pub executor: PathBuf,
     /// Whose rows the runs record: the slots, shards, and record are this backend's.
     pub backend: BatchBackend,
@@ -694,7 +668,7 @@ pub struct BatchBuild {
     /// before it was recorded, which is no build's.
     #[serde(default)]
     pub validation: String,
-    /// Absent in a record of a batch before MoltenVK had one: those were Vulkan.
+    /// Absent in a record of a batch before the backend was recorded: those were Vulkan.
     #[serde(default = "vulkan")]
     pub backend: BatchBackend,
     pub metal_environment_id: String,
@@ -836,7 +810,7 @@ pub fn run_batch(
         }
     } else if runs.iter().any(|run| run.pass == Pass::Metal) {
         return Err(format!(
-            "a {} batch runs robustness legs, never a Metal qualification",
+            "a {} batch runs the engine, never a Metal qualification",
             config.backend.directory()
         ));
     }
@@ -1008,7 +982,7 @@ fn hang(
     };
     let submissions = match backend {
         BatchBackend::Metal => SubmissionBackend::Metal,
-        BatchBackend::Moltenvk | BatchBackend::Vulkan => SubmissionBackend::VulkanGpu,
+        BatchBackend::Vulkan => SubmissionBackend::VulkanGpu,
     };
     let record = HangRecord::now(
         kind,
@@ -1043,27 +1017,18 @@ fn hang(
 
 /// A job's store at `store`: links to `corpus`'s cases, reviews, private sources, and library
 /// modules (each that exists), and the rows `backend`'s runs read; and empty shard directories of
-/// its own for the rows they write. A candidate run reads the Metal rows and the other backend's,
-/// and writes `backend`'s rows and refusals; a Metal run reads no rows and writes Metal's.
+/// its own for the rows they write. A candidate run reads the Metal rows and writes the candidate
+/// rows and refusals; a Metal run reads no rows and writes Metal's.
 fn worker_store(corpus: &Path, store: &Path, backend: BatchBackend) -> Result<(), String> {
-    let (own, read) = match backend.candidate() {
-        Some(backend) => {
-            let other = match backend {
-                Backend::Vulkan => Backend::Moltenvk,
-                Backend::Moltenvk => Backend::Vulkan,
-            };
-            (
-                vec![
-                    Path::new("observations").join(backend.directory()),
-                    refusal_directory(backend),
-                ],
-                vec![
-                    PathBuf::from("observations/metal"),
-                    Path::new("observations").join(other.directory()),
-                ],
-            )
-        }
-        None => (vec![PathBuf::from("observations/metal")], Vec::new()),
+    let (own, read) = match backend {
+        BatchBackend::Vulkan => (
+            vec![
+                PathBuf::from(CANDIDATE_DIRECTORY),
+                PathBuf::from(REFUSAL_DIRECTORY),
+            ],
+            vec![PathBuf::from("observations/metal")],
+        ),
+        BatchBackend::Metal => (vec![PathBuf::from("observations/metal")], Vec::new()),
     };
     for own in own {
         let own = store.join(own);
@@ -1131,11 +1096,8 @@ fn execute_run(config: &BatchConfig, store: &Path, run: &Run) -> Result<Executed
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
-    if let Pass::Leg(leg) = run.pass {
+    if run.pass == Pass::Engine {
         command.args(["--metal-environment-id", &config.metal_environment_id]);
-        if leg == Leg::RobustnessOff {
-            command.arg("--robustness-off");
-        }
         if let Some(profile) = &config.restricted_to {
             command.args(["--profiles-layer", profile]);
         }
@@ -1157,14 +1119,13 @@ fn execute_run(config: &BatchConfig, store: &Path, run: &Run) -> Result<Executed
         .map(|error| format!("remove {}: {error}", tmp.display()));
 
     let recorded = match run.pass {
-        Pass::Leg(leg) => {
-            let backend = config
-                .backend
-                .candidate()
-                .ok_or("a Metal batch has no robustness legs")?;
-            let slot = engine_slot(&config.environment_id, config.restricted_to.as_deref(), leg);
-            let row = find_row(store, backend, run, &slot)?;
-            let refusal = find_refusal(store, backend, run, &slot)?;
+        Pass::Engine => {
+            if config.backend == BatchBackend::Metal {
+                return Err("a Metal batch runs no engine".into());
+            }
+            let slot = engine_slot(&config.environment_id, config.restricted_to.as_deref());
+            let row = find_row(store, run, &slot)?;
+            let refusal = find_refusal(store, run, &slot)?;
             Recorded {
                 outcome: classify(
                     ended,
@@ -1206,6 +1167,7 @@ fn execute_run(config: &BatchConfig, store: &Path, run: &Run) -> Result<Executed
             format!("{}: {}", ended.label(), last_error())
         }
         Outcome::Mismatch
+        | Outcome::NotedDifference
         | Outcome::ReferenceGap
         | Outcome::NotSupported
         | Outcome::Refused
@@ -1244,7 +1206,11 @@ fn execute_run(config: &BatchConfig, store: &Path, run: &Run) -> Result<Executed
         .filter(|_| {
             matches!(
                 outcome,
-                Outcome::Match | Outcome::Mismatch | Outcome::Qualified | Outcome::ReferenceGap
+                Outcome::Match
+                    | Outcome::Mismatch
+                    | Outcome::NotedDifference
+                    | Outcome::Qualified
+                    | Outcome::ReferenceGap
             )
         })
         .map(|(line, _)| line);
@@ -1285,10 +1251,9 @@ fn wait_until(child: &mut Child, deadline: Instant) -> Result<Ended, String> {
     }
 }
 
-/// The store line and status of `run`'s row of `backend` in `slot`, if the job store holds one.
+/// The store line and status of `run`'s candidate row in `slot`, if the job store holds one.
 fn find_row(
     store: &Path,
-    backend: Backend,
     run: &Run,
     slot: &str,
 ) -> Result<Option<(String, CandidateStatus)>, String> {
@@ -1298,26 +1263,21 @@ fn find_row(
         environment_id: String,
         status: CandidateStatus,
     }
-    let directory = store.join("observations").join(backend.directory());
+    let directory = store.join(CANDIDATE_DIRECTORY);
     Ok(find_line::<Key>(&directory, run, |key| {
         key.case_id == run.case_id && key.environment_id == slot
     })?
     .map(|(line, key)| (line, key.status)))
 }
 
-/// The store line of `run`'s refusal of `backend` in `slot`, if the job store holds one.
-fn find_refusal(
-    store: &Path,
-    backend: Backend,
-    run: &Run,
-    slot: &str,
-) -> Result<Option<String>, String> {
+/// The store line of `run`'s refusal in `slot`, if the job store holds one.
+fn find_refusal(store: &Path, run: &Run, slot: &str) -> Result<Option<String>, String> {
     #[derive(serde::Deserialize)]
     struct Key {
         case_id: String,
         environment_id: String,
     }
-    let directory = store.join(refusal_directory(backend));
+    let directory = store.join(REFUSAL_DIRECTORY);
     Ok(find_line::<Key>(&directory, run, |key| {
         key.case_id == run.case_id && key.environment_id == slot
     })?
@@ -1409,17 +1369,15 @@ pub struct Installed {
 }
 
 /// Write the evidence of each slot's last run in the out directory `out` into `store` (rows, then
-/// refusals, each in (case, slot) order) through the store's own validated writes: for each
-/// (case, leg), the last
-/// done-list run that recorded evidence decides. A match or a mismatch installs the slot's last
+/// refusals, each in (case, slot) order) through the store's own validated writes: for each case,
+/// the last done-list run that recorded evidence decides. A match or a mismatch installs the slot's last
 /// row ([`ROWS`]), a typed refusal its last refusal ([`REFUSALS`]; a refusal before a device
 /// opened recorded none, and installs nothing). Evidence no finished run lists (an append cut
 /// before its done-list line) is not installed. The store keeps a slot's row or its refusal,
-/// never both, so the installed one replaces the other. Every row and refusal must be of
-/// `backend`, and so must the out directory's record (one without a record is Vulkan's). The
-/// record is returned: only rows of this build ([`BatchBuild::is_this_build`]) are current once
+/// never both, so the installed one replaces the other. The out directory's record must be a
+/// Vulkan batch's (one without a record is). The record is returned: only rows of this build ([`BatchBuild::is_this_build`]) are current once
 /// installed, which the caller checks before it commits them.
-pub fn install(out: &Path, store: &CorpusStore, backend: Backend) -> Result<Installed, String> {
+pub fn install(out: &Path, store: &CorpusStore) -> Result<Installed, String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Evidence {
         Row,
@@ -1429,60 +1387,36 @@ pub fn install(out: &Path, store: &CorpusStore, backend: Backend) -> Result<Inst
     let recorded = build
         .as_ref()
         .map_or(BatchBackend::Vulkan, |build| build.backend);
-    if recorded != BatchBackend::from(backend) {
+    if recorded != BatchBackend::Vulkan {
         return Err(format!(
-            "{} holds runs of the {} backend, not {}",
+            "{} holds runs of the {} backend, not vulkan",
             out.display(),
-            recorded.directory(),
-            backend.directory()
+            recorded.directory()
         ));
     }
     let output = BatchOutput::read(out)?;
     let mut last = HashMap::<(String, Pass), Evidence>::new();
     for run in output.done {
         let evidence = match run.outcome {
-            Outcome::Match | Outcome::Mismatch => Evidence::Row,
+            Outcome::Match | Outcome::Mismatch | Outcome::NotedDifference => Evidence::Row,
             Outcome::NotSupported => Evidence::Refusal,
             _ => continue,
         };
         last.insert((run.case_id, run.pass), evidence);
     }
-    let leg_of = |slot: &str| {
-        Pass::Leg(if is_robustness_off_slot(slot) {
-            Leg::RobustnessOff
-        } else {
-            Leg::Stated
-        })
-    };
     let mut rows = BTreeMap::new();
     for row in output.rows {
-        if row.backend != backend {
-            return Err(format!(
-                "row {} {} is not a {} row",
-                row.case_id,
-                row.environment_id,
-                backend.directory()
-            ));
-        }
         rows.insert((row.case_id.clone(), row.environment_id.clone()), row);
     }
     let mut refusals = BTreeMap::new();
     for refusal in output.refusals {
-        if refusal.backend != backend {
-            return Err(format!(
-                "refusal {} {} is not a {} refusal",
-                refusal.case_id,
-                refusal.environment_id,
-                backend.directory()
-            ));
-        }
         refusals.insert(
             (refusal.case_id.clone(), refusal.environment_id.clone()),
             refusal,
         );
     }
-    let decides = |(case_id, slot): &(String, String), evidence: Evidence| {
-        last.get(&(case_id.clone(), leg_of(slot))) == Some(&evidence)
+    let decides = |(case_id, _): &(String, String), evidence: Evidence| {
+        last.get(&(case_id.clone(), Pass::Engine)) == Some(&evidence)
     };
     let mut installed = Installed {
         build,
@@ -1556,29 +1490,31 @@ pub fn family(case: &AuthoredCase) -> String {
     format!("{stage}.{shape}")
 }
 
-/// The batch's report over `output` (the last run of each (case, leg) wins), against the
+/// The batch's report over `output` (the last engine run of each case wins), against the
 /// `selected` cases (what [`qualified_cases`] selects in `metal_environment_id`, narrowed by
-/// [`requested_cases`]: a run of any other case is not counted), for `legs` and the operator's
+/// [`requested_cases`]: a run of any other case is not counted), for the operator's
 /// `environment_id` (restricted to the profile `restricted_to`, if any: its rows and refusals are
 /// in that profile's slots). Lines:
 ///
-/// - `batch-report leg=L selected=N ran=N pending=N match=N mismatch=N refusal=N failure=N`, then
-///   the count of each refusal and failure [`Outcome`] (`not_supported=N ... failed=N`);
-/// - `batch-family leg=L family=F cases=N match=N mismatch=N refusal=N failure=N` per [`family`],
-///   and `batch-scope leg=L scope=S ...` the same per [`scope`];
-/// - `batch-run case=ID leg=L scope=S family=F outcome=O seconds=S name=NAME detail=D` for every
-///   run that did not match; a mismatch adds `comparison=C words=DIFFERING/TOTAL
-///   first=I:METAL/CANDIDATE` from its row and the case's current Metal row, and a typed refusal
+/// - `batch-report selected=N ran=N pending=N match=N mismatch=N noted_difference=N refusal=N
+///   failure=N`, then the count of each refusal and failure [`Outcome`] (`not_supported=N ...
+///   failed=N`);
+/// - `batch-family family=F cases=N match=N mismatch=N noted_difference=N refusal=N failure=N`
+///   per [`family`], and `batch-scope scope=S ...` the same per [`scope`];
+/// - `batch-run case=ID scope=S family=F outcome=O seconds=S name=NAME detail=D` for every
+///   run that did not match; a mismatch or a noted difference adds `comparison=C` (the class, and
+///   for a noted difference its notes), `held_open_by=GAP` for a mismatch an answer gap holds
+///   open, and `words=DIFFERING/TOTAL first=I:METAL/CANDIDATE` from its row and the case's current
+///   Metal row, and a typed refusal
 ///   `refusal=CLASS` from its recorded refusal (`device`, `product`, `executor`), or
 ///   `refusal=unrecorded` for one before a device opened;
-/// - `batch-slowest case=ID leg=L seconds=S outcome=O` for the slowest run.
+/// - `batch-slowest case=ID pass=P seconds=S outcome=O` for the slowest run.
 pub fn report(
     selected: &[AuthoredCase],
     metals: &[MetalObservation],
     metal_environment_id: &str,
     environment_id: &str,
     restricted_to: Option<&str>,
-    legs: &[Leg],
     output: &BatchOutput,
 ) -> Vec<String> {
     let BatchOutput {
@@ -1613,10 +1549,10 @@ pub fn report(
         .map(|metal| (metal.case_id.as_str(), metal))
         .collect::<HashMap<_, _>>();
     let mut lines = Vec::new();
-    for &leg in legs {
+    {
         let runs = latest
             .iter()
-            .filter(|((case_id, pass), _)| *pass == Pass::Leg(leg) && by_id.contains_key(case_id))
+            .filter(|((case_id, pass), _)| *pass == Pass::Engine && by_id.contains_key(case_id))
             .map(|(_, run)| *run)
             .collect::<Vec<_>>();
         let mut outcomes = BTreeMap::<Outcome, usize>::new();
@@ -1640,8 +1576,7 @@ pub fn report(
                 .sum::<usize>()
         };
         let mut line = format!(
-            "batch-report leg={} selected={} ran={} pending={}",
-            leg_label(leg),
+            "batch-report selected={} ran={} pending={}",
             selected.len(),
             runs.len(),
             selected.len() - runs.len()
@@ -1649,12 +1584,16 @@ pub fn report(
         for class in CLASSES {
             line.push_str(&format!(" {}={}", class.label(), class_count(class)));
         }
-        // A match and a mismatch are their own classes; the other classes' outcomes follow (a
-        // Metal run's outcomes are no candidate run's).
+        // A match, a mismatch and a noted difference are their own classes; the other classes'
+        // outcomes follow (a Metal run's outcomes are no candidate run's).
         for outcome in OUTCOMES.into_iter().filter(|outcome| {
             !matches!(
                 outcome,
-                Outcome::Match | Outcome::Mismatch | Outcome::Qualified | Outcome::ReferenceGap
+                Outcome::Match
+                    | Outcome::Mismatch
+                    | Outcome::NotedDifference
+                    | Outcome::Qualified
+                    | Outcome::ReferenceGap
             )
         }) {
             line.push_str(&format!(
@@ -1666,8 +1605,7 @@ pub fn report(
         lines.push(line);
         for ((kind, name), classes) in &groups {
             let mut line = format!(
-                "batch-{kind} leg={} {kind}={name} cases={}",
-                leg_label(leg),
+                "batch-{kind} {kind}={name} cases={}",
                 classes.values().sum::<usize>()
             );
             for class in CLASSES {
@@ -1679,14 +1617,12 @@ pub fn report(
             }
             lines.push(line);
         }
-        let slot = engine_slot(environment_id, restricted_to, leg);
+        let slot = engine_slot(environment_id, restricted_to);
         for run in runs.iter().filter(|run| run.outcome != Outcome::Match) {
             let case = by_id[run.case_id.as_str()];
             let mut line = format!(
-                "batch-run case={} leg={} scope={} family={} outcome={} seconds={:.3} name={} \
-                 detail={}",
+                "batch-run case={} scope={} family={} outcome={} seconds={:.3} name={} detail={}",
                 run.case_id,
-                leg_label(leg),
                 scope(case),
                 family(case),
                 run.outcome.label(),
@@ -1694,12 +1630,15 @@ pub fn report(
                 case.name,
                 run.detail
             );
-            if run.outcome == Outcome::Mismatch {
+            if matches!(run.outcome, Outcome::Mismatch | Outcome::NotedDifference) {
                 match row_of.get(&(run.case_id.as_str(), slot.as_str())) {
                     Some(row) => {
                         let comparison = serde_json::to_string(&row.comparison)
                             .unwrap_or_else(|error| format!("?{error}"));
                         line.push_str(&format!(" comparison={comparison}"));
+                        if let Some(gap) = row.held_open_by {
+                            line.push_str(&format!(" held_open_by={}", gap.as_str()));
+                        }
                         if let Some(metal) = metal_of.get(run.case_id.as_str()) {
                             line.push_str(&format!(
                                 " {}",
@@ -1725,7 +1664,7 @@ pub fn report(
         .max_by(|left, right| left.seconds.total_cmp(&right.seconds))
     {
         lines.push(format!(
-            "batch-slowest case={} leg={} seconds={:.3} outcome={}",
+            "batch-slowest case={} pass={} seconds={:.3} outcome={}",
             slowest.case_id,
             slowest.pass.label(),
             slowest.seconds,

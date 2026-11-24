@@ -747,7 +747,7 @@ fn the_subgroup_facts_stand_only_with_their_requirement() {
         size: Some(32),
         full_subgroups: true,
         local_size_multiple: 32,
-        metal_vertex_simdgroups: false,
+        varying: false,
     };
     let k = kernel_with(Some(pinned));
     let r = &k.m.requirements;
@@ -955,7 +955,13 @@ fn workgroup_initialized() -> TypedModule {
 fn workgroup_initializers_need_zero_initialize_workgroup_memory() {
     let m = workgroup_initialized();
     structure(&m).expect("structurally valid");
-    let floor = profile("vk12-floor");
+    // The runtime's floor without the feature, which the floor requires: a device below it.
+    let floor = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::ShaderZeroInitializeWorkgroupMemory],
+        crate::device::DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
     assert!(!floor
         .fields()
         .enabled
@@ -982,6 +988,48 @@ fn workgroup_initializers_need_zero_initialize_workgroup_memory() {
     for (stem, p) in with {
         assert_eq!(check(&m, &p, &mut meter()).map(|_| ()), Ok(()), "{stem}");
         assert_valid(workgroup_initialized(), &p);
+    }
+}
+
+/// A `Workgroup` initializer other than `OpConstantNull` breaks a rule on every profile, one with
+/// `shaderZeroInitializeWorkgroupMemory` too (`VUID-StandaloneSpirv-OpVariable-04734`).
+#[test]
+fn a_workgroup_initializer_is_only_a_null() {
+    let m = compute(|f, t| {
+        let one = f
+            .module()
+            .constant(Constant::Scalar {
+                ty: t.u32_,
+                bits: ConstBits(1),
+            })
+            .expect("one");
+        let g = f
+            .module()
+            .plain_global(StorageClass::Workgroup, t.u32_, Some(one))
+            .expect("workgroup");
+        let p = f.module().global_value(g).expect("global");
+        f.load(p, MemAccess::default()).expect("load")
+    });
+    structure(&m).expect("structurally valid");
+    let with: Vec<_> = committed_profiles()
+        .expect("profiles")
+        .into_iter()
+        .filter(|(_, p)| {
+            p.fields()
+                .enabled
+                .features
+                .contains(&VkFeature::ShaderZeroInitializeWorkgroupMemory)
+        })
+        .collect();
+    assert!(!with.is_empty());
+    for (stem, p) in with {
+        assert_eq!(
+            check(&m, &p, &mut meter()),
+            Err(VerifyError::Rule(Violation::WorkgroupInitializer(
+                GlobalId::new(1)
+            ))),
+            "{stem}"
+        );
     }
 }
 

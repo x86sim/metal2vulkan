@@ -1,7 +1,6 @@
 //! A refusal's class from the executor's typed refusal, and a refusal record's own checks.
 
 use super::*;
-use crate::coverage::{Leg, RobustBufferForm};
 use crate::engine::{LimitKind, Outcome, UnsupportedReason};
 use crate::requirement::ToolingRequirement;
 
@@ -36,7 +35,10 @@ fn a_refusal_is_classed_by_its_type() {
             RefusalClass::Device,
         ),
         (
-            NotSupported::Uncontained([RobustBufferForm::LoadStore].into()),
+            NotSupported::Uncontained {
+                unchecked: [crate::case::out_of_bounds::ContainmentForm::LoadedPointer].into(),
+                variant: None,
+            },
             RefusalClass::Device,
         ),
         (
@@ -106,25 +108,20 @@ fn a_refusal_is_classed_by_its_type() {
     );
 }
 
-/// A product refusal records whether the binder refused what the case binds (`at_bind`), from the
-/// executor's own path: the binder's typed `Unsupported` is at bind, a compile's is not. A record
-/// of a build before the field reads `None`, its phase unknown, and a record of this build keeps
-/// `false` explicitly, so the two are never confused.
+/// A product refusal records whether the binder refused what the case binds (`at_bind`): a
+/// compile's refusal is not at bind. A record of a build before the field reads `None`, its phase
+/// unknown, and a record of this build keeps `false` explicitly, so the two are never confused.
 #[test]
 fn a_product_refusal_records_whether_the_binder_refused() {
-    use crate::candidate::engine::{bind_refusal, product_refusal};
+    use crate::candidate::engine::product_refusal;
     use crate::check::admission::ExecutorError;
-    use metal2vulkan::error::{BindError, Error, Feature, Unsupported};
+    use metal2vulkan::error::{Error, Feature, Unsupported};
     let unsupported = Unsupported::not_implemented(Feature::Imageblocks);
-    let refused = |error: ExecutorError| match error {
+    let compiled = match product_refusal(&Error::Unsupported(unsupported)) {
         ExecutorError::NotSupported(not_supported) => Refusal::of(&not_supported),
         other => panic!("{other}"),
     };
-    let bound = refused(bind_refusal(&BindError::Unsupported(unsupported.clone())));
-    let compiled = refused(product_refusal(&Error::Unsupported(unsupported)));
-    assert_eq!(bound.class, RefusalClass::Product);
-    assert_eq!(bound.outcome, compiled.outcome);
-    assert_eq!(bound.product.as_ref().unwrap().at_bind, Some(true));
+    assert_eq!(compiled.class, RefusalClass::Product);
     assert_eq!(compiled.product.as_ref().unwrap().at_bind, Some(false));
     let written = serde_json::to_value(&compiled).unwrap();
     assert_eq!(written["product"]["at_bind"], false);
@@ -138,16 +135,15 @@ fn a_product_refusal_records_whether_the_binder_refused() {
     assert_eq!(earlier.validate(), Ok(()));
 }
 
-fn record(slot: &str, leg: &str) -> RefusalObservation {
+fn record(slot: &str) -> RefusalObservation {
     RefusalObservation {
         timing: Some(crate::observation::test_timing()),
         case_id: "aa".repeat(32),
         air_sha256: "11".repeat(32),
         input_sha256: "22".repeat(32),
         translator_fingerprint: "33".repeat(32),
-        backend: Backend::Vulkan,
         environment_id: slot.into(),
-        environment: serde_json::json!({"robustness": {"leg": leg}}),
+        environment: serde_json::json!({"robustness": {"enabled": [], "unmet": []}}),
         executor_abi: "vulkan-engine-v1".into(),
         refusal: Refusal::of(&device_capability_missing()),
         artifact: None,
@@ -161,7 +157,7 @@ fn record(slot: &str, leg: &str) -> RefusalObservation {
 #[test]
 fn a_refusals_timing_reaches_no_digest_no_fingerprint_and_no_verdict() {
     let timed = |timing| {
-        let mut row = record("env@engine", "stated");
+        let mut row = record("env@engine");
         row.timing = timing;
         row
     };
@@ -212,28 +208,23 @@ fn a_refusals_timing_reaches_no_digest_no_fingerprint_and_no_verdict() {
     );
 }
 
-/// A record is an engine slot's, in the leg its environment ran, with a refusal whose class
-/// agrees with the product's outcome.
+/// A record is an engine slot's, with a refusal whose class agrees with the product's outcome.
 #[test]
 fn a_refusal_record_is_checked() {
-    assert_eq!(record("env@engine", "stated").validate_content(), Ok(()));
+    assert_eq!(record("env@engine").validate_content(), Ok(()));
     assert_eq!(
-        record("env@engine+robustness-off", "robustness_off").validate_content(),
+        record("env@engine@runtime-floor").validate_content(),
         Ok(())
     );
     type Edit = fn(&mut RefusalObservation);
-    let edits: [(Edit, &str); 8] = [
+    let edits: [(Edit, &str); 7] = [
         (
             |record| record.environment_id = "env".into(),
             "not an engine slot",
         ),
         (
-            |record| record.environment_id = "env@engine+robustness-off".into(),
-            "but is stored in slot",
-        ),
-        (
-            |record| record.environment = serde_json::json!({}),
-            "names no leg",
+            |record| record.environment = serde_json::json!([]),
+            "must be a JSON object",
         ),
         (
             |record| record.translator_fingerprint = "fingerprint".into(),
@@ -248,7 +239,7 @@ fn a_refusal_record_is_checked() {
         (|record| record.refusal.detail.clear(), "its detail"),
     ];
     for (edit, why) in edits {
-        let mut record = record("env@engine", "stated");
+        let mut record = record("env@engine");
         edit(&mut record);
         if why.is_empty() {
             // A device refusal need not name a product outcome (the binder's, the device's).
@@ -261,8 +252,4 @@ fn a_refusal_record_is_checked() {
         let error = record.validate_content().unwrap_err();
         assert!(error.contains(why), "{why}: {error}");
     }
-    let leg = |record: &RefusalObservation| {
-        serde_json::from_value::<Leg>(record.environment["robustness"]["leg"].clone()).unwrap()
-    };
-    assert_eq!(leg(&record("env@engine", "stated")), Leg::Stated);
 }

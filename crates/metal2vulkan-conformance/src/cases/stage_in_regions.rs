@@ -20,16 +20,14 @@
 //! Nothing here can fault a GPU: one compute pass a row, four buffers, no texture, no loop, and
 //! every fetch inside its buffer.
 
-use crate::allowance::Allowance;
 use crate::case::{
-    call, made, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, Side, StageInAttribute,
-    StageInLayout, StageInRegion, StageInput,
+    call, made, probe, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, Side,
+    StageInAttribute, StageInLayout, StageInRegion, StageInput,
 };
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::transcript::{ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value};
 use metal2vulkan::metal::{AttributeFormat, StepFunction};
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture both entry points live in.
 const FIXTURE: &str = "stage_in_regions";
@@ -188,7 +186,7 @@ impl Row {
     }
 }
 
-/// Every row the lane measured: its steps, region, grid, threadgroup and how the region is set.
+/// Every row measured: its steps, region, grid, threadgroup and how the region is set.
 ///
 /// The family is exhaustive in the directions that matter and small in every other: a step on x
 /// and on y, a step rate of 1, 2 and 3, an origin inside and past the buffer's elements, a size of
@@ -500,22 +498,6 @@ impl Case for StageInRegions {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // The one row that sets its region indirectly reads that region on the host, because it is
-        // GPU memory the work before the dispatch may write, and the runtime announces that. The
-        // notice is a performance one: the words the row writes still compare exactly, and the
-        // only site loosened is the set of notices, which Metal holds empty. The allowance fails
-        // the case if the notice did not fire, so a row that stops reading the region on the host
-        // has to drop this line rather than carry a stale excuse.
-        // The second is the venue's own: the buffers this dispatch reads its arguments and writes
-        // its answer through are `Shared`, which a device with no unified memory keeps in system
-        // memory because that is the only memory both sides can reach.
-        vec![
-            crate::replay::notice_allowance(Degradation::HostReadDispatchArguments.code()),
-            crate::replay::shared_memory_notice(),
-        ]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let mut shaders = Vec::new();
         for entry in [WORD, PAIR] {
@@ -577,11 +559,18 @@ impl Case for StageInRegions {
 
         for row in ROWS {
             let at = |site: &str| format!("{}/{site}", row.name);
-            let pipeline = made(
+            // A pipeline or a dispatch either side refuses is recorded at its own site and the
+            // sweep carries on, so one refused row compares as a refusal there while every other
+            // row still compares. The row stops at its refusal: the sites after it are the other
+            // side's alone, which the comparison folds under the refusal (`compare`'s walk).
+            let Some(pipeline) = probe(
                 sites,
                 &at("pipeline"),
                 side.compute_pipeline_with_stage_input(library, row.entry(), &row.stage_input()),
-            )?;
+                |_| Value::Absent,
+            ) else {
+                continue;
+            };
             let output = made(
                 sites,
                 &at("buffer/0"),
@@ -594,7 +583,7 @@ impl Case for StageInRegions {
             )?;
             let mut bound = vec![output];
             bound.extend(&sources);
-            let command_buffer = made(
+            let Some(command_buffer) = probe(
                 sites,
                 &at("dispatch"),
                 side.dispatch_threads(
@@ -604,7 +593,10 @@ impl Case for StageInRegions {
                     [row.grid[0], row.grid[1], 1],
                     [row.group[0], row.group[1], 1],
                 ),
-            )?;
+                |_| Value::Absent,
+            ) else {
+                continue;
+            };
             call(
                 sites,
                 &at("status"),

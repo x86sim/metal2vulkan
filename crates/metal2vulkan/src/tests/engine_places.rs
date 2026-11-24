@@ -5,9 +5,8 @@
 //! address of an rvalue", Q1's three atomic-subtraction cases). Every device-address pointer is
 //! therefore the member of a one-member `Block` at the address (`FunctionBuilder::device_place`).
 //!
-//! - The committed `kernel_atomic_xor_and_subtract` fixture (a native float add through a device
-//!   address on `moltenvk-m3`) has every atomic of its final words on a place, on every committed
-//!   profile.
+//! - The committed `kernel_atomic_xor_and_subtract` fixture has every atomic of its final words on
+//!   a place, on every committed profile.
 //! - Its `moltenvk-m3` module, a PSB leaf's word atomics and sub-word store, and a dynamic root's
 //!   store with its resident-miss count convert to MSL as MoltenVK converts them and compile with
 //!   `xcrun metal` (compile only; nothing runs on a GPU).
@@ -31,7 +30,7 @@ use crate::pipeline::testing::{
     atomic_place_scan_steps, atomics_on_places, fixtures_dir, link_and_validate, llvm_assemble,
     meter, moltenvk_msl_compile, profile, AssembleError,
 };
-use crate::spirv::testing::committed_profiles;
+use crate::spirv::testing::threadgroup_profiles;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -127,7 +126,7 @@ fn the_atomic_fixture_has_every_atomic_on_a_place_on_every_profile() {
     let Some(bc) = fixture() else {
         return;
     };
-    let profiles = committed_profiles().expect("profiles");
+    let profiles = threadgroup_profiles().expect("profiles");
     assert!(profiles.iter().any(|(stem, _)| stem == "moltenvk-m3"));
     for (stem, p) in profiles {
         let words = final_words(
@@ -142,14 +141,14 @@ fn the_atomic_fixture_has_every_atomic_on_a_place_on_every_profile() {
     }
 }
 
-/// Q1's failure: on `moltenvk-m3` the fixture's `air.atomic.global.sub.f32` is a native float add
-/// through a device address, and MoltenVK's MSL of the module compiles.
+/// Q1's failure: on `moltenvk-m3` the fixture's `air.atomic.global.sub.f32` is a compare-and-swap
+/// loop, and MoltenVK's MSL of the module compiles.
 #[test]
 fn the_atomic_fixture_compiles_as_moltenvk_msl() {
     let Some(bc) = fixture() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let words = final_words(
         &bc,
         "kernel_atomic_xor_and_subtract",
@@ -157,8 +156,9 @@ fn the_atomic_fixture_compiles_as_moltenvk_msl() {
         &LowerInputs::new(),
     );
     assert!(
-        has_opcode(&words, crate::spv::Op::AtomicFAddEXT),
-        "the float subtraction is a native float add on moltenvk-m3"
+        has_opcode(&words, crate::spv::Op::AtomicCompareExchange)
+            && !has_opcode(&words, crate::spv::Op::AtomicFAddEXT),
+        "the float subtraction is a compare-and-swap loop on moltenvk-m3"
     );
     compiles_as_moltenvk_msl(&words, "kernel_atomic_xor_and_subtract", 6);
 }
@@ -190,7 +190,7 @@ fn a_psb_leaf_compiles_as_moltenvk_msl() {
     let Some(bc) = assemble("psb_leaf", &format!("{HEADER}{PSB_LEAF}")) else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let mut inputs = LowerInputs::new();
     inputs.psb_slots.insert(SlotRef {
         stage: Stage::Kernel,
@@ -230,7 +230,7 @@ fn a_dynamic_root_compiles_as_moltenvk_msl() {
     let Some(bc) = assemble("dynamic_store", &format!("{HEADER}{DYNAMIC_STORE}")) else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let words = final_words(&bc, "dynamic_store", &p, &LowerInputs::new());
     // The miss count and bit, and the halfword store's clear and set (of one or two words).
     compiles_as_moltenvk_msl(&words, "dynamic_store", 4);

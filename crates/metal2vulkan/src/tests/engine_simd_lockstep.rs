@@ -20,9 +20,7 @@
 //!   loop's header takes a simdgroup barrier there;
 //! - a conflict no barrier position orders on a subgroup (an arm then a divergent loop) takes a
 //!   simdgroup barrier that only emulated simdgroups make exact, and the kernel takes the
-//!   `Emulated` tier (`barrier.lockstep.emulated.simdgroup`), except on a device that runs a
-//!   simdgroup's 32 threads in lockstep itself (moltenvk-m3), where the kernel keeps its tier
-//!   and requires that fact (`barrier.lockstep.device`).
+//!   `Emulated` tier (`barrier.lockstep.emulated.simdgroup`).
 //!
 //! Accesses the IR proves disjoint between the threads of a simdgroup (each thread's own word,
 //! two objects, two constant words, words further apart than a simdgroup spans, words a loop
@@ -37,7 +35,6 @@
 use std::collections::BTreeMap;
 
 use crate::budget::{Budget, Meter, SPIRV_WORDS};
-use crate::device::requirements::VkProperty;
 use crate::device::subgroup::{OpBits, SimdClass, SubgroupRequirement, Tier};
 use crate::device::DevicePolicy;
 use crate::error::Error;
@@ -45,9 +42,9 @@ use crate::library::FunctionConstantValues;
 use crate::lower::select::{LowerInputs, Plan};
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
-    compile, llvm_assemble, profile, typed_module, typed_module_with, AssembleError, Scratch,
+    llvm_assemble, profile, typed_module, typed_module_with, AssembleError, Scratch,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
@@ -1447,11 +1444,7 @@ fn run_words(plan: &Plan, m: &TypedModule, threads: u32, lanes: SubgroupSize) ->
 fn run_shape(plan: &Plan, m: &TypedModule, local: [u32; 3], lanes: SubgroupSize) -> Vec<u32> {
     let threads = local.iter().product::<u32>();
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    // The flattened tiers' Vulkan workgroup width.
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants(local));
     let res = Resources {
         buffers: vec![Buffer {
             slot: Some(ResourceSlot {
@@ -1503,7 +1496,7 @@ fn check(
     expect: impl Fn(u32) -> u32,
 ) -> Option<Plan> {
     let bc = assemble(name, body)?;
-    let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+    let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (plan, m) = typed_module(&bc, name, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
     let want: Vec<u32> = (0..threads).map(&expect).collect();
     for &w in lanes {
@@ -1520,7 +1513,7 @@ const CHUNKED: [SubgroupSize; 3] = [SubgroupSize::W8, SubgroupSize::W16, Subgrou
 
 #[test]
 fn a_uniform_conflict_takes_a_threadgroup_barrier() {
-    for profile_name in ["lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for profile_name in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let Some(plan) = check("neighbor", NEIGHBOR, profile_name, 32, &CHUNKED, |t| t ^ 8) else {
             return;
         };
@@ -1551,7 +1544,7 @@ fn a_conflict_in_one_simdgroup_takes_a_simdgroup_barrier() {
         ("carry", CARRY, &carry, 2),
     ] {
         // Emulated simdgroups: a predicated workgroup barrier, exact at every width.
-        for profile_name in ["lavapipe", "vk12-floor"] {
+        for profile_name in ["lavapipe", "runtime-floor"] {
             let Some(plan) = check(name, body, profile_name, 64, &CHUNKED, expect) else {
                 return;
             };
@@ -1575,12 +1568,9 @@ fn a_conflict_in_one_simdgroup_takes_a_simdgroup_barrier() {
 }
 
 /// The arm's read, then the loop's writes: no subgroup barrier may stand between them. Emulated
-/// simdgroups order the pair on lavapipe and vk12-floor; moltenvk-m3's device runs a simdgroup's
-/// 32 threads in lockstep itself (`VkProperty::SimdgroupLockstep`), so there the kernel keeps its
-/// own tier, no barrier stands, and the module requires the property. The CPU interpreter's 32-lane
-/// subgroups run in lockstep as that device does.
+/// simdgroups order the pair, on lavapipe and roadmap-2022 alike.
 #[test]
-fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups_or_the_devices_lockstep() {
+fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups() {
     let expect = |t: u32| {
         if t < 32 && t.is_multiple_of(2) {
             (t + 2) & 31
@@ -1588,16 +1578,7 @@ fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups_or_the_device
             0
         }
     };
-    let requires = |profile_name: &str| {
-        let bc = assemble("arm_then_loop", ARM_THEN_LOOP).expect("assembled once already");
-        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
-        compile(&bc, "arm_then_loop", &p)
-            .unwrap_or_else(|e| panic!("{profile_name}: {e}"))
-            .requirements
-            .properties
-            .contains(&VkProperty::SimdgroupLockstep)
-    };
-    for profile_name in ["lavapipe", "vk12-floor"] {
+    for profile_name in ["lavapipe", "runtime-floor"] {
         let Some(plan) = check(
             "arm_then_loop",
             ARM_THEN_LOOP,
@@ -1619,28 +1600,8 @@ fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups_or_the_device
             0,
             "{profile_name}"
         );
-        assert_eq!(uses(&plan, "barrier.lockstep.device"), 0, "{profile_name}");
         assert_eq!(plan.simd.1, Tier::Emulated, "{profile_name}");
-        assert!(!requires(profile_name), "{profile_name}");
     }
-    let Some(plan) = check(
-        "arm_then_loop",
-        ARM_THEN_LOOP,
-        "moltenvk-m3",
-        64,
-        &[SubgroupSize::W32],
-        expect,
-    ) else {
-        return;
-    };
-    assert_eq!(uses(&plan, "barrier.lockstep.device"), 1);
-    assert!(!plan
-        .census()
-        .keys()
-        .any(|k| k.starts_with("barrier.lockstep.") && k != "barrier.lockstep.device"));
-    // The kernel's own tier: it holds no simdgroup operation.
-    assert_eq!(plan.simd.1, Tier::NoSubgroup);
-    assert!(requires("moltenvk-m3"));
 }
 
 /// The `Emulated` tier a lockstep barrier forces (item 4's last kind) walks the kernel
@@ -1649,8 +1610,7 @@ fn a_conflict_no_subgroup_barrier_orders_takes_emulated_simdgroups_or_the_device
 /// splits at a synchronization (`forward_cross`) and across the synchronization within its block
 /// (`forward_sync`), and the members a member-wise phi's copy reads across it (`member_sync`).
 /// Each failed to emit (`Invariant: ValueId(n) has no value in this block`) while
-/// the walk reloaded and demoted an instruction's literal operands. On moltenvk-m3 the device's
-/// lockstep orders the pair, so the kernels keep their tier and no walk is predicated.
+/// the walk reloaded and demoted an instruction's literal operands.
 #[test]
 fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
     let arm = |t: u32| {
@@ -1682,7 +1642,7 @@ fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
             "arith.aggregate.member",
         ),
     ] {
-        for profile_name in ["lavapipe", "vk12-floor"] {
+        for profile_name in ["lavapipe", "runtime-floor"] {
             let Some(plan) = check(name, body, profile_name, 64, &CHUNKED, expect) else {
                 return;
             };
@@ -1697,11 +1657,6 @@ fn a_forced_predicated_walk_carries_what_each_instruction_reads() {
             // The struct's pointer is read through the extract, not folded away.
             assert_eq!(uses(&plan, extracts), 1, "{at}");
         }
-        let Some(plan) = check(name, body, "moltenvk-m3", 64, &[SubgroupSize::W32], expect) else {
-            return;
-        };
-        assert_eq!(uses(&plan, "barrier.lockstep.device"), 1, "{name}");
-        assert!(plan.families.simd.predication.is_none(), "{name}");
     }
 }
 
@@ -1847,8 +1802,8 @@ fn tile_rows_apart_by_more_than_their_columns_take_no_barrier() {
 /// Pairs whose indices look apart but whose addresses meet: a tree reduction's guard from a base
 /// that differs between threads, a row from such a base, two rows of one size and different
 /// strides, and a simdgroup sum read after a loop its lanes leave at different iterations. Each
-/// keeps a barrier, so every schedule reads what lockstep reads; on moltenvk-m3 the device's own
-/// lockstep, at 32 lanes, orders what no subgroup barrier may.
+/// keeps a barrier, so every schedule reads what lockstep reads; on moltenvk-m3's 32-lane
+/// subgroups a subgroup barrier orders `group_base`'s place.
 #[test]
 fn indices_apart_from_a_shared_place_only_clear_their_pairs() {
     let group_base = |l: u32| {
@@ -1863,10 +1818,10 @@ fn indices_apart_from_a_shared_place_only_clear_their_pairs() {
     let row_base = |l: u32| l + 1;
     let row_stride = |_: u32| 0;
     let temporal = |l: u32| 33 - l;
-    // The one lockstep barrier each kernel takes on lavapipe and vk12-floor, then on moltenvk-m3.
+    // The one lockstep barrier each kernel takes on lavapipe and roadmap-2022, then on moltenvk-m3.
     // At 32 threads the interpreter's 32-lane schedule is lockstep and gives the answer either
     // way, so on moltenvk-m3 the barrier is what shows the pair is kept: `group_base`'s place
-    // is ordered only within its simdgroup, which that device does itself.
+    // is ordered only within its simdgroup, by a subgroup barrier there.
     let tg = "barrier.lockstep.threadgroup";
     for (name, body, expect, elsewhere, on_m3) in [
         (
@@ -1874,7 +1829,7 @@ fn indices_apart_from_a_shared_place_only_clear_their_pairs() {
             GROUP_BASE,
             &group_base as &dyn Fn(u32) -> u32,
             "barrier.lockstep.emulated.simdgroup",
-            "barrier.lockstep.device",
+            "barrier.lockstep.simdgroup",
         ),
         ("row_base", ROW_BASE, &row_base, tg, tg),
         ("row_stride", ROW_STRIDE, &row_stride, tg, tg),
@@ -1883,7 +1838,7 @@ fn indices_apart_from_a_shared_place_only_clear_their_pairs() {
         for (profile_name, lanes, want) in [
             ("moltenvk-m3", &[SubgroupSize::W32][..], on_m3),
             ("lavapipe", &CHUNKED[..], elsewhere),
-            ("vk12-floor", &CHUNKED[..], elsewhere),
+            ("runtime-floor", &CHUNKED[..], elsewhere),
         ] {
             let Some(plan) = check(name, body, profile_name, 32, lanes, expect) else {
                 return;
@@ -1932,10 +1887,7 @@ fn a_conflict_across_iterations_takes_a_barrier_at_the_loop_header() {
 fn run_over(plan: &Plan, m: &TypedModule, input: &[u32], lanes: SubgroupSize) -> Vec<u32> {
     let threads = input.len() as u32;
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([threads, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     let slot = |index| {
         Some(ResourceSlot {
             stage: Stage::Kernel,
@@ -2001,17 +1953,14 @@ fn in_lockstep(words: &mut [u32], mut step: impl FnMut(usize, u32, &[u32]) -> Op
     }
 }
 
-/// The owned fixture `rtl_lockstep`, the runtime lane `driver_deviations`' lockstep gate: Apple's
-/// compiler keeps each kernel's read of another thread's word and its write of its own in one loop
-/// each thread leaves after its own count, so no barrier position is uniform in the simdgroup.
-/// moltenvk-m3 relies on its device's lockstep there (a `barrier.lockstep.device` place,
-/// `VkProperty::SimdgroupLockstep` required, its tier kept); lavapipe and vk12-floor take emulated
-/// simdgroups. Each reads what lockstep reads, which the lane checks on the device
-/// (`rtl_lockstep_divergent_loop`'s 64 threads run 1 to 5 iterations of `words[t] = words[t ^ 16] *
-/// 3 + i + 1`; `rtl_lockstep_until`'s add the word 8 lanes on to their own while it is below a
-/// limit, at most 8 times).
+/// The owned fixture `rtl_lockstep`: Apple's compiler keeps each kernel's read of another thread's
+/// word and its write of its own in one loop each thread leaves after its own count, so no barrier
+/// position is uniform in the simdgroup. lavapipe and roadmap-2022 take emulated simdgroups. Each
+/// reads what lockstep reads (`rtl_lockstep_divergent_loop`'s 64 threads run 1 to 5 iterations of
+/// `words[t] = words[t ^ 16] * 3 + i + 1`; `rtl_lockstep_until`'s add the word 8 lanes on to their
+/// own while it is below a limit, at most 8 times).
 #[test]
-fn the_lockstep_gate_fixture_needs_the_devices_lockstep_or_emulated_simdgroups() {
+fn the_lockstep_gate_fixture_takes_emulated_simdgroups() {
     let path = crate::pipeline::testing::engine_dir().join("rtl_lockstep.ll");
     let bc = match llvm_assemble(&path) {
         Ok(b) => b,
@@ -2048,31 +1997,17 @@ fn the_lockstep_gate_fixture_needs_the_devices_lockstep_or_emulated_simdgroups()
         ("rtl_lockstep_divergent_loop", &counts, divergent),
         ("rtl_lockstep_until", &limits, until),
     ] {
-        for (profile_name, lanes) in [
-            ("moltenvk-m3", &[SubgroupSize::W32][..]),
-            ("lavapipe", &CHUNKED[..]),
-            ("vk12-floor", &CHUNKED[..]),
-        ] {
-            let device = profile_name == "moltenvk-m3";
-            let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        for profile_name in ["lavapipe", "runtime-floor"] {
+            let lanes = &CHUNKED[..];
+            let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
             let (plan, m) = typed_module(&bc, kernel, &p)
                 .unwrap_or_else(|e| panic!("{kernel} on {profile_name}: {e}"));
             let at = format!("{kernel} on {profile_name}");
-            assert_eq!(uses(&plan, "barrier.lockstep.device") > 0, device, "{at}");
-            assert_eq!(
+            assert!(
                 uses(&plan, "barrier.lockstep.emulated.simdgroup") > 0,
-                !device,
                 "{at}"
             );
-            if !device {
-                assert_eq!(plan.simd.1, Tier::Emulated, "{at}");
-            }
-            let requires = compile(&bc, kernel, &p)
-                .unwrap_or_else(|e| panic!("{at}: {e}"))
-                .requirements
-                .properties
-                .contains(&VkProperty::SimdgroupLockstep);
-            assert_eq!(requires, device, "{at}");
+            assert_eq!(plan.simd.1, Tier::Emulated, "{at}");
             for &w in lanes {
                 assert_eq!(run_over(&plan, &m, input, w), want, "{at} at {w:?}");
             }
@@ -2086,7 +2021,7 @@ fn the_lockstep_gate_fixture_needs_the_devices_lockstep_or_emulated_simdgroups()
 /// Without it the chunked schedule reads a word another chunk already overwrote.
 #[test]
 fn a_device_memory_conflict_takes_the_barrier_lockstep_stood_for() {
-    for profile_name in ["lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for profile_name in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let Some(plan) = check(
             "device_neighbor",
             DEVICE_NEIGHBOR,
@@ -2105,7 +2040,7 @@ fn a_device_memory_conflict_takes_the_barrier_lockstep_stood_for() {
         assert_eq!(plan.simd.1, Tier::NoSubgroup, "{profile_name}");
     }
     let rotate = |t: u32| if t < 32 { 2 * ((t + 1) & 31) } else { t };
-    for profile_name in ["lavapipe", "vk12-floor"] {
+    for profile_name in ["lavapipe", "runtime-floor"] {
         let Some(plan) = check(
             "device_rotate",
             DEVICE_ROTATE,
@@ -2143,7 +2078,7 @@ fn a_device_memory_conflict_takes_the_barrier_lockstep_stood_for() {
 /// word another chunk already overwrote.
 #[test]
 fn a_buffer_through_two_thread_slots_is_one_object() {
-    for profile_name in ["lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for profile_name in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let Some(plan) = check(
             "device_slots",
             DEVICE_SLOTS,
@@ -2165,7 +2100,7 @@ fn a_buffer_through_two_thread_slots_is_one_object() {
 /// Each thread's own device word takes no barrier.
 #[test]
 fn a_threads_own_device_word_takes_no_barrier() {
-    for profile_name in ["lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for profile_name in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let Some(plan) = check("device_own", DEVICE_OWN, profile_name, 32, &CHUNKED, |t| {
             t + 1
         }) else {
@@ -2175,7 +2110,6 @@ fn a_threads_own_device_word_takes_no_barrier() {
             "barrier.lockstep.threadgroup",
             "barrier.lockstep.simdgroup",
             "barrier.lockstep.emulated.simdgroup",
-            "barrier.lockstep.device",
         ] {
             assert_eq!(uses(&plan, name), 0, "{name} on {profile_name}");
         }
@@ -2186,18 +2120,17 @@ fn a_threads_own_device_word_takes_no_barrier() {
 /// Metal's own answer is the arm order its GPU chose, not lockstep's program order.
 #[test]
 fn a_branchs_two_arms_take_no_device_barrier() {
-    for profile_name in ["lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for profile_name in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let Some(bc) = assemble("device_arms", DEVICE_ARMS) else {
             return;
         };
-        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) = typed_module(&bc, "device_arms", &p)
             .unwrap_or_else(|e| panic!("device_arms on {profile_name}: {e}"));
         for name in [
             "barrier.lockstep.threadgroup",
             "barrier.lockstep.simdgroup",
             "barrier.lockstep.emulated.simdgroup",
-            "barrier.lockstep.device",
         ] {
             assert_eq!(uses(&plan, name), 0, "{name} on {profile_name}");
         }
@@ -2205,51 +2138,49 @@ fn a_branchs_two_arms_take_no_device_barrier() {
 }
 
 /// The lockstep census names of the inserted barriers.
-const LOCKSTEP_NAMES: [&str; 5] = [
+const LOCKSTEP_NAMES: [&str; 4] = [
     "barrier.lockstep.threadgroup",
     "barrier.lockstep.threadgroup.rows",
     "barrier.lockstep.simdgroup",
     "barrier.lockstep.emulated.simdgroup",
-    "barrier.lockstep.device",
 ];
 
 /// A pair in a block only some threads of each simdgroup run takes a subgroup barrier, and the
 /// kernel keeps the `Direct` tier, where the entry reconverges maximally on 32-lane subgroups
-/// (the RTX 5080's profile): the barrier orders the threads that run it together, those
-/// Apple's simdgroup runs it for. On lavapipe's 8-lane subgroups it stays on emulated simdgroups,
-/// and on MoltenVK the device's lockstep orders it.
+/// (the RTX 5080's and MoltenVK's profiles): the barrier orders the threads that run it together,
+/// those Apple's simdgroup runs it for. On lavapipe's 8-lane subgroups it stays on emulated
+/// simdgroups.
 #[test]
 fn a_divergent_device_pair_takes_a_tangle_barrier_where_the_entry_reconverges_maximally() {
     let half = |t: u32| if t & 31 < 16 { t ^ 1 } else { t };
-    let Some(plan) = check(
-        "device_half",
-        DEVICE_HALF,
-        "nvidia-rtx5080-laptop",
-        64,
-        &[SubgroupSize::W32],
-        half,
-    ) else {
-        return;
-    };
-    assert_eq!(uses(&plan, "barrier.lockstep.simdgroup"), 1);
-    assert_eq!(uses(&plan, "barrier.lockstep.emulated.simdgroup"), 0);
-    assert_eq!(plan.simd.1, Tier::Direct);
+    for profile_name in ["nvidia-rtx5080-laptop", "moltenvk-m3"] {
+        let Some(plan) = check(
+            "device_half",
+            DEVICE_HALF,
+            profile_name,
+            64,
+            &[SubgroupSize::W32],
+            half,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            uses(&plan, "barrier.lockstep.simdgroup"),
+            1,
+            "{profile_name}"
+        );
+        assert_eq!(
+            uses(&plan, "barrier.lockstep.emulated.simdgroup"),
+            0,
+            "{profile_name}"
+        );
+        assert_eq!(plan.simd.1, Tier::Direct, "{profile_name}");
+    }
     let Some(plan) = check("device_half", DEVICE_HALF, "lavapipe", 64, &CHUNKED, half) else {
         return;
     };
     assert_eq!(uses(&plan, "barrier.lockstep.emulated.simdgroup"), 1);
     assert_eq!(plan.simd.1, Tier::Emulated);
-    let Some(plan) = check(
-        "device_half",
-        DEVICE_HALF,
-        "moltenvk-m3",
-        64,
-        &[SubgroupSize::W32],
-        half,
-    ) else {
-        return;
-    };
-    assert_eq!(uses(&plan, "barrier.lockstep.device"), 1);
 }
 
 /// How [`device_half_padded`] computes `DEVICE_HALF`'s first stored value, `t`.
@@ -2376,7 +2307,7 @@ fn a_pressured_kernel_takes_the_emulated_tier_in_place_of_the_widest_mode() {
     assert_eq!(plan.subgroup.size, None, "pressured");
     assert!(!plan.subgroup.full_subgroups, "pressured");
     assert!(plan.families.simd.predication.is_some(), "pressured");
-    for other in ["nvidia-rtx5080-laptop", "amd-rdna3-radv"] {
+    for other in ["nvidia-rtx5080-laptop", "amd-780m-radv"] {
         direct("pressured", &pressured, other);
     }
     // 48 KiB, the profile's `maxComputeSharedMemorySize`: no room for a simdgroup's 128 bytes.
@@ -2387,115 +2318,56 @@ fn a_pressured_kernel_takes_the_emulated_tier_in_place_of_the_widest_mode() {
     );
 }
 
-/// On a driver with a stage bound's defect (`DriverWorkaround::SerializedStageWrapsLargeModules`,
-/// a stage corrupted past the size it compiles intact, and
-/// `DriverWorkaround::CompilerMemoryGrowsWithStageSize`, a compile past the size measured within
-/// host-sized memory; ANV: the Iris Xe of RPL-P), a module whose entry weighs more than either
-/// bound (`pipeline::compile`'s `stage_bound`, here bounds the test sets) is never emitted: the
-/// pressured kernel of `a_pressured_kernel_takes_the_emulated_tier_in_place_of_the_widest_mode`,
-/// whose emulated module passes a bound, is planned again keeping the `Direct` tier's pin to 32
-/// lanes, its answers Metal's; under a bound its `Direct` module passes too, it is refused
-/// (`Feature::StageSize`, that bound's defect named, and as its symbol, which its Display prints,
-/// the module's entry weight and the bound it passed), and past both, the serialized stage's
-/// defect, which faults the driver, is named. The same description under another driver, which
-/// has neither defect, emits the emulated module under every bound.
+/// Every stage is weighed against the compiled bound (here bounds the test sets), whatever the
+/// driver, by the stage weight (`spirv::roll::bound_weight`): the pressured kernel of
+/// `a_pressured_kernel_takes_the_emulated_tier_in_place_of_the_widest_mode`, whose emulated module
+/// passes the bound, is planned again, and its module keeping the `Direct` tier's pin to 32 lanes,
+/// which weighs less, is taken, its answers Metal's; under a bound its `Direct` module passes too,
+/// it is made as it weighs, its stats naming its weight (`ModuleStats::entry_weight`), for the
+/// runtime to compile apart.
 #[test]
-fn a_kernel_past_the_stage_bound_keeps_the_widest_pin_or_is_refused() {
-    use crate::device::profile::DriverWorkaround;
+fn every_stage_from_queries_keeps_the_widest_pin_or_states_its_weight() {
     use crate::device::Device;
-    use crate::error::{DiagName, Feature, Needs};
     use crate::lower::simd::{WIDEST_PIN, WIDEST_PIN_FLOOR, WIDEST_PIN_WORDS};
     use crate::pipeline::compile::{compile_bitcode_bounded, StageBounds};
     use crate::pipeline::testing::meter;
-    use crate::spirv::roll::entry_weight;
+    use crate::spirv::roll::bound_weight;
     let half = |t: u32| if t & 31 < 16 { t ^ 1 } else { t };
     let fan = Padding::Fan((WIDEST_PIN_FLOOR / 2 + 16).max(WIDEST_PIN_WORDS as usize + 8));
     let Some(bc) = assemble("device_half", &device_half_padded(fan, None)) else {
         return;
     };
     let entry = EntryRef::Name("device_half");
-    let weight = |module: &TypedModule| entry_weight(module, &mut meter()).expect("weight");
-    let serialized = DriverWorkaround::SerializedStageWrapsLargeModules;
-    let memory = DriverWorkaround::CompilerMemoryGrowsWithStageSize;
-    let iris_desc = crate::pipeline::testing::description("intel-irisxe-rplp-anv").unwrap();
-    let iris = Device::new(iris_desc.clone(), DevicePolicy::default()).unwrap();
-    let iris = iris.profile();
-    assert!(iris.workarounds().contains(&serialized));
-    assert!(iris.workarounds().contains(&memory));
-    let mut other_desc = iris_desc;
-    other_desc.driver_id = Some(crate::vk::DriverId::MESA_RADV);
-    let other = Device::new(other_desc, DevicePolicy::default()).unwrap();
-    let other = other.profile();
-    assert!(!other.workarounds().contains(&serialized));
-    assert!(!other.workarounds().contains(&memory));
-    // One defect's bound at `cap`, the other's past every module.
-    let at = |defect, cap| match defect == serialized {
-        true => StageBounds {
-            serialized: cap,
-            compiled: u64::MAX,
-        },
-        false => StageBounds {
-            serialized: u64::MAX,
-            compiled: cap,
-        },
-    };
-    // The defect a refusal names, checking it names the module's entry weight `weight` and the
-    // bound `bound` it passed.
-    let refused_for = |refused: Error, weight: u64, bound: u64| match refused {
-        Error::Unsupported(u) if u.feature == Feature::StageSize => {
-            let named = format!("entry weight {weight}, past the bound {bound}");
-            assert_eq!(u.symbol, Some(DiagName::new(named.as_str())), "{u}");
-            assert!(u.to_string().contains(&named), "{u}");
-            match u.needs {
-                Needs::DriverDefect(defect) => defect,
-                needs => panic!("{needs:?}"),
-            }
-        }
-        refused => panic!("{refused:?}"),
-    };
-    // Unbounded, the kernel emulates its simdgroups in place of the widest mode on both.
+    let weight = |module: &TypedModule| bound_weight(module, &mut meter()).expect("weight");
+    let want: Vec<u32> = (0..64).map(half).collect();
+    let desc = crate::pipeline::testing::description("intel-irisxe-rplp-anv").unwrap();
+    let queries = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).unwrap();
+    let queries = queries.profile();
     let compile = |p, bounds| compile_bitcode_bounded(&bc, entry, p, &mut meter(), bounds);
-    let (_, plan, emulated) = compile(iris, at(serialized, u64::MAX)).expect("emulated");
+    let compiled = |cap| StageBounds { compiled: cap };
+    // Unbounded, the kernel emulates its simdgroups in place of the widest mode.
+    let (_, plan, emulated) = compile(queries, compiled(u64::MAX)).expect("emulated");
     assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 1));
     let emulated = weight(&emulated);
-    let want: Vec<u32> = (0..64).map(half).collect();
-    let mut pinned = 0;
-    for defect in [serialized, memory] {
-        // Under a bound the emulated module passes: planned again keeping the pin, exact at 32
-        // lanes.
-        let (_, plan, module) = compile(iris, at(defect, emulated - 1)).expect("planned again");
-        assert_eq!(plan.simd.1, Tier::Direct, "{defect:?}");
-        assert_eq!(uses(&plan, WIDEST_PIN), 0);
-        assert_eq!(plan.subgroup.size, Some(32));
-        pinned = weight(&module);
-        assert!(pinned < emulated, "pinned {pinned}, emulated {emulated}");
-        assert_eq!(run_words(&plan, &module, 64, SubgroupSize::W32), want);
-        // Under a bound the pinned module passes too: refused, the bound's defect named.
-        let refused = compile(iris, at(defect, pinned - 1)).expect_err("past the bound");
-        assert_eq!(refused_for(refused, pinned, pinned - 1), defect);
-        // Without the defect, the emulated module is emitted under either bound.
-        for cap in [emulated - 1, pinned - 1] {
-            let (_, plan, module) = compile(other, at(defect, cap)).expect("emitted");
-            assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 1));
-            assert!(weight(&module) > cap, "{cap}");
-            for lanes in CHUNKED {
-                assert_eq!(run_words(&plan, &module, 64, lanes), want, "{lanes:?}");
-            }
-        }
-    }
-    // Past both bounds, the serialized stage's defect is named.
-    let both = StageBounds {
-        serialized: pinned - 1,
-        compiled: pinned - 1,
-    };
-    let refused = compile(iris, both).expect_err("past both bounds");
-    assert_eq!(refused_for(refused, pinned, pinned - 1), serialized);
+    // Under a bound the emulated module passes: planned again keeping the pin, exact at 32 lanes.
+    let (function, plan, module) = compile(queries, compiled(emulated - 1)).expect("planned again");
+    assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Direct, 0));
+    assert_eq!(plan.subgroup.size, Some(32));
+    let pinned = weight(&module);
+    assert!(pinned < emulated, "pinned {pinned}, emulated {emulated}");
+    assert_eq!(function.module_stats().entry_weight, pinned);
+    assert_eq!(run_words(&plan, &module, 64, SubgroupSize::W32), want);
+    // Under a bound the pinned module passes too: made as it weighs, pinned, its weight stated.
+    let (function, plan, module) = compile(queries, compiled(pinned - 1)).expect("past the bound");
+    assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Direct, 0));
+    assert_eq!(weight(&module), pinned);
+    assert_eq!(function.module_stats().entry_weight, pinned);
 }
 
 /// One input, one answer, whichever path compiles it: on the Iris Xe, the pressured kernel of
-/// `a_kernel_past_the_stage_bound_keeps_the_widest_pin_or_is_refused`, past a bound its emulated
-/// module passes (planned again keeping the pin) and past one its pinned module passes too
-/// (refused, `Feature::StageSize`), is charged the same work units compiled alone
+/// `every_stage_from_queries_keeps_the_widest_pin_or_states_its_weight`, past a bound its emulated
+/// module passes and past one its pinned module passes too (planned again keeping the pin, its
+/// weight stated, both times), is charged the same work units compiled alone
 /// (`Device::compile_function`) and compiled from a creation's entries
 /// (`Device::compile_function_from_entries`), whether the entry there was made or found. So at
 /// exactly that many work units both paths give the bound's answer, and at one fewer both are
@@ -2505,7 +2377,7 @@ fn a_kernel_past_the_stage_bound_keeps_the_widest_pin_or_is_refused() {
 #[test]
 fn a_kernel_past_the_stage_bound_gets_one_answer_through_either_path() {
     use crate::device::Device;
-    use crate::error::{Feature, Limit, Unsupported};
+    use crate::error::Limit;
     use crate::library::Library;
     use crate::lower::simd::{WIDEST_PIN_FLOOR, WIDEST_PIN_WORDS};
     use crate::pipeline::compile::{
@@ -2513,21 +2385,18 @@ fn a_kernel_past_the_stage_bound_gets_one_answer_through_either_path() {
     };
     use crate::pipeline::testing::meter;
     use crate::pipeline::FunctionDescriptor;
-    use crate::spirv::roll::entry_weight;
+    use crate::spirv::roll::bound_weight;
     let fan = Padding::Fan((WIDEST_PIN_FLOOR / 2 + 16).max(WIDEST_PIN_WORDS as usize + 8));
     let Some(bc) = assemble("device_half", &device_half_padded(fan, None)) else {
         return;
     };
     let iris_desc = crate::pipeline::testing::description("intel-irisxe-rplp-anv").unwrap();
-    let iris = Device::new(iris_desc, DevicePolicy::default()).unwrap();
+    let iris = Device::from_queries(iris_desc, DevicePolicy::RESIDENT_TABLES).unwrap();
     let iris = iris.profile();
     let library = Library::from_air(&bc).expect("library");
     let fd = FunctionDescriptor::new(library.function("device_half").expect("the kernel"));
-    // The serialized stage's bound at `cap`; the compiled one past every module.
-    let at = |cap| StageBounds {
-        serialized: cap,
-        compiled: u64::MAX,
-    };
+    // The stage bound at `cap`.
+    let at = |cap| StageBounds { compiled: cap };
     let weight = |cap| {
         let compiled = compile_bitcode_bounded(
             &bc,
@@ -2537,20 +2406,22 @@ fn a_kernel_past_the_stage_bound_gets_one_answer_through_either_path() {
             at(cap),
         );
         let (_, _, module) = compiled.expect("compiled");
-        entry_weight(&module, &mut meter()).expect("weight")
+        bound_weight(&module, &mut meter()).expect("weight")
     };
     let emulated = weight(u64::MAX);
     let pinned = weight(emulated - 1);
     assert!(pinned < emulated, "pinned {pinned}, emulated {emulated}");
-    // Its answer, as a planned-again `Direct` module's word count or the refusal's feature.
+    // Its answer, as a planned-again `Direct` module's word count and entry weight, or the limit.
     let answer = |compiled: Result<crate::library::CompiledFunction, Error>| match compiled {
-        Ok(c) => Ok(c.artifact().module.words.len()),
-        Err(Error::Unsupported(Unsupported { feature, .. })) => Err(Ok(feature)),
-        Err(Error::LimitExceeded(limit)) => Err(Err(limit)),
+        Ok(c) => Ok((
+            c.artifact().module.words.len(),
+            c.module_stats().entry_weight,
+        )),
+        Err(Error::LimitExceeded(limit)) => Err(limit),
         Err(e) => panic!("{e:?}"),
     };
     let capped = |work| Meter::with_caps(&Budget::default(), work, crate::budget::LEDGER_BYTES);
-    for (cap, planned_again) in [(emulated - 1, true), (pinned - 1, false)] {
+    for cap in [emulated - 1, pinned - 1] {
         // The work units each path is charged: alone, from entries that make the entry, and from
         // the same entries again, which find it.
         let entries = StageEntries::new();
@@ -2561,19 +2432,12 @@ fn a_kernel_past_the_stage_bound_gets_one_answer_through_either_path() {
         };
         let (alone, made, found) = (work(None), work(Some(&entries)), work(Some(&entries)));
         assert_eq!(entries.counts(), (1, 1), "made once, then found");
-        let (want, w) = alone.clone();
-        match &want {
-            Ok(_) => assert!(planned_again, "{want:?}"),
-            Err(refused) => assert_eq!(*refused, Ok(Feature::StageSize)),
-        }
-        assert_eq!(
-            (made, found),
-            ((want.clone(), w), (want.clone(), w)),
-            "bound {cap}"
-        );
+        let (want, w) = alone;
+        assert_eq!(want.map(|(_, weight)| weight), Ok(pinned), "bound {cap}");
+        assert_eq!((made, found), ((want, w), (want, w)), "bound {cap}");
         // At exactly that many work units, the bound's answer through both paths; at one fewer,
         // the work cap's through both.
-        for (budget, expected) in [(w, want.clone()), (w - 1, Err(Err(Limit::WorkUnits)))] {
+        for (budget, expected) in [(w, want), (w - 1, Err(Limit::WorkUnits))] {
             for via in [None, Some(&entries)] {
                 let mut m = capped(budget);
                 let got = answer(compile_stage_bounded(&fd, iris, via, &mut m, at(cap)));
@@ -2591,11 +2455,122 @@ fn a_kernel_past_the_stage_bound_gets_one_answer_through_either_path() {
         let entry = EntryRef::Name("device_half");
         plan_bitcode(&bc, entry, &consts, iris, &LowerInputs::new(), &mut m).expect("planned");
         let got = answer(compile_stage_bounded(&fd, iris, None, &mut m, at(cap)));
-        assert_eq!(
-            got,
-            Err(Err(Limit::WorkUnits)),
-            "bound {cap}, charged twice"
+        assert_eq!(got, Err(Limit::WorkUnits), "bound {cap}, charged twice");
+    }
+}
+
+/// The owned stage-bound fixture (`validation/fixtures/public/stage_bound/stage_bound_matrix`: 512
+/// simdgroup matrix multiply-accumulates beside a lockstep pair in divergent flow) under the
+/// measured stage bounds (`StageBounds::MEASURED`). On the Iris Xe under the identity domains,
+/// whose subgroup size range offers the widest mode's pin and which has maximal reconvergence, the
+/// kernel emulates its simdgroups, a module past the compiled bound, and is planned again keeping
+/// the pin. The pinned module weighs less by the entry weight (`spirv::roll::entry_weight`), under
+/// the bound, and more by the stage weight (`spirv::roll::bound_weight`), its multiply-adds'
+/// subgroup instructions counted as `spirv::roll::SUBGROUP_WEIGHT` each: the re-plan takes the
+/// lighter by the stage weight, the emulated module, made as it weighs, its stats naming its
+/// weight (where the pin was taken whatever it weighed, this fails). The same description without
+/// maximal reconvergence emulates its simdgroups for the lockstep pair, so it has no pin to keep:
+/// it is made as it weighs, past the bound, its stats naming the emulated module's weight, under
+/// any driver (Intel's Windows driver too).
+#[test]
+fn the_stage_bound_fixture_takes_the_lighter_module_or_states_its_weight() {
+    use crate::device::profile::DeviceProfile;
+    use crate::device::{Device, DeviceDescription};
+    use crate::lower::simd::{WidestPin, WIDEST_PIN};
+    use crate::pipeline::compile::{
+        compile_bitcode_bounded, compile_bitcode_kept, emit_bitcode_as, StageBounds,
+    };
+    use crate::pipeline::testing::meter;
+    use crate::spirv::roll::{bound_weight, entry_weight};
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/fixtures/public/stage_bound");
+    let bc = match llvm_assemble(&dir.join("stage_bound_matrix.ll")) {
+        Ok(b) => b,
+        Err(AssembleError::Missing(t)) => {
+            eprintln!("SKIPPED: {t}");
+            return;
+        }
+        Err(AssembleError::Rejected(e)) => panic!("llvm-as rejected the fixture: {e}"),
+    };
+    let entry = EntryRef::Name("stage_bound_matrix");
+    let weight = |module: &TypedModule| bound_weight(module, &mut meter()).expect("weight");
+    let entry_only = |module: &TypedModule| entry_weight(module, &mut meter()).expect("weight");
+    let bound = StageBounds::MEASURED.compiled;
+    let unbounded = StageBounds { compiled: u64::MAX };
+    let inputs = LowerInputs::new();
+    let kept =
+        |p: &DeviceProfile| compile_bitcode_kept(&bc, entry, p, &inputs, &mut meter(), SPIRV_WORDS);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/profiles/intel-irisxe-rplp-anv.json");
+    let text = std::fs::read_to_string(path).expect("profile");
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    // The runtime's domains, whose kernels the bound keeps in the process: on the resident tables
+    // the in-shader containment of every access weighs the pinned plan past the bound.
+    let queries = Device::from_queries(desc, DevicePolicy::default()).unwrap();
+    {
+        let p = queries.profile();
+        assert!(p.fields().subgroup.maximal_reconvergence);
+        // Unbounded, the kernel emulates its simdgroups in place of the widest mode, past the
+        // bound.
+        let compiled = compile_bitcode_bounded(&bc, entry, p, &mut meter(), unbounded);
+        let (_, plan, module) = compiled.expect("emulated");
+        assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 1));
+        let emulated = (entry_only(&module), weight(&module));
+        assert!(emulated.1 > bound, "emulated {emulated:?}");
+        // The plan keeping the pin: under the bound by the entry weight, heavier than the
+        // emulated module by the stage weight.
+        let pinned = emit_bitcode_as(&bc, entry, p, WidestPin::Kept, &mut meter());
+        let (plan, module, stated) = pinned.expect("pinned");
+        assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Direct, 0));
+        assert_eq!(plan.subgroup.size, Some(32));
+        let pinned = (entry_only(&module), weight(&module));
+        assert_eq!(stated, pinned.1);
+        assert!(
+            pinned.0 <= bound,
+            "pinned {pinned:?}, emulated {emulated:?}"
         );
+        assert!(
+            pinned.1 > emulated.1,
+            "pinned {pinned:?}, emulated {emulated:?}"
+        );
+        // Under the measured bounds: planned again, and the lighter, the emulated module, made as
+        // it weighs.
+        let (function, plan, module) = kept(p).expect("planned again");
+        assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 1));
+        assert_eq!((entry_only(&module), weight(&module)), emulated);
+        assert_eq!(function.module_stats().entry_weight, emulated.1);
+    }
+    // Without maximal reconvergence (and so without quad control, which no device offers without
+    // it): emulated for the lockstep pair, with no pin to keep.
+    let cleared = text
+        .replace(
+            "\"shaderMaximalReconvergence\": true",
+            "\"shaderMaximalReconvergence\": false",
+        )
+        .replace(
+            "\"shaderQuadControl\": true",
+            "\"shaderQuadControl\": false",
+        );
+    assert_ne!(
+        cleared, text,
+        "the description names shaderMaximalReconvergence"
+    );
+    let desc = DeviceDescription::from_khronos_json(&cleared, None).expect("description");
+    let queries = Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES).unwrap();
+    let mut windows = desc;
+    windows.driver_id = Some(crate::vk::DriverId::INTEL_PROPRIETARY_WINDOWS);
+    let windows = Device::from_queries(windows, DevicePolicy::RESIDENT_TABLES).unwrap();
+    for p in [queries.profile(), windows.profile()] {
+        assert!(!p.fields().subgroup.maximal_reconvergence);
+        let compiled = compile_bitcode_bounded(&bc, entry, p, &mut meter(), unbounded);
+        let (_, plan, module) = compiled.expect("emulated");
+        assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 0));
+        let alone = weight(&module);
+        assert!(alone > bound, "emulated {alone}");
+        let (function, plan, module) = kept(p).expect("made as it weighs");
+        assert_eq!((plan.simd.1, uses(&plan, WIDEST_PIN)), (Tier::Emulated, 0));
+        assert_eq!(weight(&module), alone);
+        assert_eq!(function.module_stats().entry_weight, alone);
     }
 }
 
@@ -2607,7 +2582,7 @@ fn texture_calls_take_no_device_barrier() {
         return;
     };
     for profile_name in ["lavapipe", "moltenvk-m3", "nvidia-rtx5080-laptop"] {
-        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) = typed_module(&bc, "device_texture", &p)
             .unwrap_or_else(|e| panic!("device_texture on {profile_name}: {e}"));
         for name in LOCKSTEP_NAMES {
@@ -2617,17 +2592,17 @@ fn texture_calls_take_no_device_barrier() {
 }
 
 /// The profiles the one-thread guard is checked on: emulated simdgroups (lavapipe's 8-lane
-/// subgroups, the floor), the tangle barrier (the RTX 5080's maximal reconvergence), and the
-/// device's lockstep (MoltenVK).
+/// subgroups, the floor), the tangle barrier (the RTX 5080's maximal reconvergence), and MoltenVK's
+/// 32-lane subgroups.
 const LONE_PROFILES: [&str; 4] = [
     "lavapipe",
-    "vk12-floor",
+    "runtime-floor",
     "nvidia-rtx5080-laptop",
     "moltenvk-m3",
 ];
 
-/// The lanes `profile_name`'s kernels run on here: 32 where its subgroups are pinned 32 wide
-/// or it runs a simdgroup in lockstep itself, else the chunked widths.
+/// The lanes `profile_name`'s kernels run on here: 32 where its subgroups are 32 wide, else the
+/// chunked widths.
 fn lanes_of(profile_name: &str) -> &'static [SubgroupSize] {
     match profile_name {
         "nvidia-rtx5080-laptop" | "moltenvk-m3" => &[SubgroupSize::W32],
@@ -2699,7 +2674,7 @@ fn the_busy_kernel_takes_no_lockstep_barrier() {
         Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected rfs_agx_yield: {why}"),
     };
     for profile_name in LONE_PROFILES {
-        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) = typed_module(&bc, "agx_yield_lookback", &p)
             .unwrap_or_else(|e| panic!("agx_yield_lookback on {profile_name}: {e}"));
         for name in LOCKSTEP_NAMES {
@@ -2746,7 +2721,7 @@ fn a_store_loop_another_thread_reads_moves_or_leaves_early_keeps_its_barrier() {
             return;
         };
         for profile_name in LONE_PROFILES {
-            let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+            let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
             let (plan, _) = typed_module(&bc, name, &p)
                 .unwrap_or_else(|e| panic!("{name} on {profile_name}: {e}"));
             let barriers: u32 = LOCKSTEP_NAMES.iter().map(|n| uses(&plan, n)).sum();
@@ -2768,7 +2743,7 @@ fn grid_barriers(name: &str, body: &str) -> Option<Vec<(&'static str, u32)>> {
     let bc = assemble_text(name, &text)?;
     let mut out = Vec::new();
     for profile_name in LONE_PROFILES {
-        let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+        let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) =
             typed_module(&bc, name, &p).unwrap_or_else(|e| panic!("{name} on {profile_name}: {e}"));
         out.push((
@@ -2905,12 +2880,14 @@ target triple = "air64_v28-apple-macosx26.0.0"
 }
 
 /// What compiling `grow` of [`barrier_free_steps`] for the RTX 5080 laptop profile spent under
-/// the standard budget: its work units and ledger peak, and whether it compiled. `None` where
-/// `llvm-as` is missing.
+/// the standard work and ledger caps: its work units and ledger peak, and whether it compiled.
+/// `None` where `llvm-as` is missing. The meter has no deadline: these tests judge the work and
+/// the ledger, which stand for the 20 s and 500 MiB ceilings, and the clock of a suite that runs
+/// beside other jobs says nothing of the first (a loaded debug run took more than 20 s).
 fn steps_cost(steps: usize, accs: usize, pointers: bool) -> Option<(u64, u64, Result<(), Error>)> {
     let bc = assemble_text("grow", &barrier_free_steps(steps, accs, pointers))?;
-    let p = profile("nvidia-rtx5080-laptop", DevicePolicy::default()).expect("profile");
-    let mut m = Meter::new(&Budget::standard());
+    let p = profile("nvidia-rtx5080-laptop", DevicePolicy::RESIDENT_TABLES).expect("profile");
+    let mut m = Meter::new(&Budget::default());
     let compiled = compile_bitcode(
         &bc,
         EntryRef::Name("grow"),
@@ -2959,7 +2936,7 @@ fn a_long_barrier_free_kernel_s_work_grows_with_its_blocks() {
     let Some((long, _, compiled)) = steps_cost(4096, 1, false) else {
         return;
     };
-    compiled.expect("4096 steps inside the standard budget");
+    compiled.expect("4096 steps inside the standard caps");
     eprintln!("BARRIER-FREE-STEPS: work {short} at 1024 steps, {long} at 4096");
     assert!(
         long <= 6 * short,
@@ -2968,16 +2945,24 @@ fn a_long_barrier_free_kernel_s_work_grows_with_its_blocks() {
 }
 
 /// The authored kernel of 4,096 steps through loaded pointers, 16 accumulators (about 258,000
-/// instructions and 12,000 blocks), compiles inside the standard budget's work and ledger bounds,
-/// which stand for the 20 s and 500 MiB ceilings. The search that tried every reached pair
+/// instructions and 12,000 blocks), compiles inside the standard work and ledger caps, which
+/// stand for the 20 s and 500 MiB ceilings. The search that tried every reached pair
 /// refused it past the work cap, and the one before refused 2,048 steps past the ledger's bound.
+///
+/// Its work stands for its time: it takes 2.4 s in a release build on the slowest CPU measured,
+/// where the cap stands for about 16 s (`pipeline::compile::weights`), so it counts at most a
+/// fifth of the cap. Counted a whole unit a tick in every stage, it took 28% of the cap.
 #[test]
 fn the_authored_4096_step_kernel_compiles_inside_the_budget() {
     let Some((work, peak, compiled)) = steps_cost(4096, 16, true) else {
         return;
     };
     eprintln!("BARRIER-FREE-STEPS: 4096 steps: {work} work units, ledger peak {peak}");
-    compiled.expect("4096 steps inside the standard budget");
+    compiled.expect("4096 steps inside the standard caps");
+    assert!(
+        work.saturating_mul(5) <= crate::budget::WORK_UNITS,
+        "{work} work units for 2.4 s of the slowest CPU's lowering"
+    );
 }
 
 /// The metadata of kernel `name(device uint *out [[buffer(0)]], uint3 pos
@@ -3018,7 +3003,7 @@ fn check_shapes(
     expect: impl Fn(u32, u32) -> u32,
 ) -> Option<Plan> {
     let bc = assemble_text(name, &format!("{HEADER}\n{body}\n{}", footer_pos(name)))?;
-    let p = profile(profile_name, DevicePolicy::default()).expect("profile");
+    let p = profile(profile_name, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (plan, m) = typed_module(&bc, name, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
     for &local in shapes {
         let threads = local.iter().product::<u32>();
@@ -3368,7 +3353,7 @@ done:
 /// nothing: its one-row variant keeps the barrier and the pin.
 #[test]
 fn a_guard_on_its_index_widened_once_clears_a_tree_reduction_in_one_row() {
-    let p = profile("amd-780m-radv", DevicePolicy::default()).expect("profile");
+    let p = profile("amd-780m-radv", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let mut one_row = LowerInputs::new();
     one_row.one_row = true;
     let sum: u32 = (0..16).sum();

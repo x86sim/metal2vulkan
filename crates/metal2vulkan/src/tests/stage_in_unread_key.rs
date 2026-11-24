@@ -50,7 +50,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::budget::{Budget, Meter};
-use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::library::Library;
 use crate::metal::{AttributeFormat, IndexType, StepFunction};
@@ -85,9 +84,8 @@ fn device() -> Device {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.features.insert(VkFeature::RobustBufferAccess);
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 fn fixture() -> Option<Vec<u8>> {
@@ -558,7 +556,7 @@ fn an_unread_attribute_changes_no_word_of_the_module() {
 ///
 /// This is the measurement of the fix. `Device::kernel_inputs_read` narrows a creation's lowering
 /// inputs to the attributes the kernel's entry reads, and a creation keys its kernel and compiles
-/// it under those (`metal2vulkan-runtime`'s `Variant::compiled`), so the 36 rows ask for one
+/// it under those, so the 36 rows ask for one
 /// compiled function and the memo of compiled functions answers 35 of them. Before the narrowing
 /// each row was a key of its own and each bought a translation of bytes the first already
 /// produced; [`an_unread_attribute_changes_no_word_of_the_module`] is what says those were the

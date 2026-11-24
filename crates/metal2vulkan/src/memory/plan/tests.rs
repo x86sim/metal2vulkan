@@ -21,11 +21,13 @@ use crate::pipeline::testing::{meter, profile};
 const AIR_DL: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
 fn addressed() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("moltenvk-m3")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("moltenvk-m3")
 }
 
+/// Profile F: a device without device addresses, below the runtime's floor.
 fn floor() -> DeviceProfile {
-    profile("vk12-floor", DevicePolicy::default()).expect("vk12-floor")
+    let dev = crate::pipeline::testing::device_f(DevicePolicy::RESIDENT_TABLES).expect("Profile F");
+    dev.profile().clone()
 }
 
 fn slot(index: u32) -> Slot {
@@ -160,6 +162,7 @@ fn entry(
         lockstep: Default::default(),
         call_stack: None,
         unmeasured_speculation: false,
+        open_cl_1d_images: Default::default(),
         module,
     }
 }
@@ -497,8 +500,9 @@ fn a_loaded_pointer_is_dynamic_wide_and_makes_every_window_whole() {
     assert_eq!(window_of(&plan, 1), Some(Window::Whole));
 }
 
-/// Profile F refuses the dereference of a dynamic root, naming `bufferDeviceAddress` and
-/// `shaderInt64` (both missing on `vk12-floor`), at the dereferencing instruction.
+/// Profile F refuses the dereference of a dynamic root, naming what it lacks of
+/// `bufferDeviceAddress` and `shaderInt64` (the first, on [`floor`]), at the dereferencing
+/// instruction.
 #[test]
 fn profile_f_refuses_a_dynamic_dereference_naming_buffer_device_address() {
     let (e, _) = loaded_pointer_kernel();
@@ -509,10 +513,9 @@ fn profile_f_refuses_a_dynamic_dereference_naming_buffer_device_address() {
             assert_eq!(u.feature, Feature::DereferenceLoadedPointer);
             assert_eq!(
                 u.needs,
-                Needs::AnyOf(vec![vec![
-                    Capability::Feature(VkFeature::BufferDeviceAddress),
-                    Capability::Feature(VkFeature::ShaderInt64),
-                ]])
+                Needs::AnyOf(vec![vec![Capability::Feature(
+                    VkFeature::BufferDeviceAddress
+                )]])
             );
             assert!(u.location.is_some());
         }
@@ -690,6 +693,7 @@ fn pooled_cells(stem: &str) -> Option<Entry> {
     let req = crate::air::SpecRequest {
         call_stack_depth: 1,
         open_cl_mode: false,
+        open_cl_lines: Default::default(),
         entry: stem.to_owned(),
         constants: Default::default(),
     };
@@ -1463,7 +1467,7 @@ fn verifying_the_cells_returns_its_tables_to_the_ledger() {
         let mut m = meter();
         let layouts = TypeLayouts::new(&e.layout, e.module.types(), &mut m).expect("layouts");
         let before = m.ledger();
-        let prov = provenance::analyze(&e, &layouts, &mut m).expect("provenance");
+        let prov = provenance::analyze(&e, &layouts, true, &mut m).expect("provenance");
         assert!(
             prov.dynamic_deref.is_none(),
             "the cell forwards its pointer"
@@ -1574,6 +1578,7 @@ fn every_public_fixture_analyzes_without_an_internal_error() {
             let req = crate::air::SpecRequest {
                 call_stack_depth: 1,
                 open_cl_mode: false,
+                open_cl_lines: Default::default(),
                 entry: name.clone(),
                 constants: Default::default(),
             };
@@ -1627,6 +1632,7 @@ fn hand_checked_fixtures() {
         let req = crate::air::SpecRequest {
             call_stack_depth: 1,
             open_cl_mode: false,
+            open_cl_lines: Default::default(),
             entry: stem.to_owned(),
             constants: Default::default(),
         };

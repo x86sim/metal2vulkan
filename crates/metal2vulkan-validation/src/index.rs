@@ -1,6 +1,6 @@
 use crate::candidate::engine::{engine_fingerprint_of, is_engine_slot, ENGINE_EXECUTOR_ABI};
 use crate::metal::ORACLE_ABI;
-use crate::observation::{Backend, CandidateDependencies, MetalStatus};
+use crate::observation::{CandidateDependencies, MetalStatus};
 use crate::source::{
     private_store_present, public_source_set, shard_index_from_path, source_shards_dir,
     PublicSources, SourceIndexLocation, SourceRow,
@@ -34,6 +34,9 @@ pub enum QueueState {
 pub enum EvidenceState {
     Current,
     Failed,
+    /// A current candidate row that differs from Metal under notes that can explain a difference
+    /// (`CandidateStatus::NotedDifference`): never current, and counted apart from a failure.
+    NotedDifference,
     Missing,
     Stale,
     /// A Metal slot whose row is a current reference gap: the reference device cannot run the case,
@@ -178,6 +181,7 @@ impl EvidenceState {
         match self {
             Self::Current => "current",
             Self::Failed => "failed",
+            Self::NotedDifference => "noted_difference",
             Self::Missing => "missing",
             Self::Stale => "stale",
             Self::ReferenceGap => "reference_gap",
@@ -185,15 +189,14 @@ impl EvidenceState {
     }
 }
 
-/// One authored case's evidence. `moltenvk` and `vulkan` summarize the case's engine slots
-/// (`ENV@engine`) in each backend, judged by the one currency rule. The old engine's slots are
+/// One authored case's evidence. `vulkan` summarizes the case's engine slots (`ENV@engine`),
+/// judged by the one currency rule. The old engine's slots are
 /// not evidence: its executor is deleted, and the census omits them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceRow {
     pub case_id: String,
     pub name: String,
     pub metal: EvidenceState,
-    pub moltenvk: EvidenceState,
     pub vulkan: EvidenceState,
     pub translation_error: Option<String>,
     pub slots: Vec<EvidenceSlot>,
@@ -406,18 +409,6 @@ fn rebuild_index_counting(
                oracle_abi TEXT NOT NULL,
                PRIMARY KEY(case_id, environment_id)
              );
-             CREATE TABLE candidate_observations (
-               case_id TEXT NOT NULL REFERENCES cases(case_id),
-               backend TEXT NOT NULL,
-               environment_id TEXT NOT NULL,
-               input_sha256 TEXT NOT NULL,
-               golden_output_sha256 TEXT NOT NULL,
-               spv_sha256 TEXT NOT NULL,
-               translator_fingerprint TEXT NOT NULL,
-               executor_abi TEXT NOT NULL,
-               status TEXT NOT NULL,
-               PRIMARY KEY(case_id, backend, environment_id)
-             );
              CREATE TABLE indexed_source_shards (
                shard INTEGER PRIMARY KEY,
                size INTEGER NOT NULL,
@@ -439,6 +430,9 @@ fn rebuild_index_counting(
              CREATE INDEX metal_case_dependencies ON metal_observations(case_id, input_sha256, oracle_abi);",
         )
         .map_err(|error| format!("create index schema: {error}"))?;
+    connection
+        .execute_batch(CANDIDATE_TABLE)
+        .map_err(|error| format!("create candidate index table: {error}"))?;
     ensure_reference_gap_table(&connection)?;
     let transaction = connection
         .transaction()
@@ -561,7 +555,7 @@ pub fn sync_index_with(
         .map_err(|error| format!("open index {}: {error}", destination.display()))?;
     keep_write_ahead_log(&connection, destination)?;
     ensure_source_location_columns(&connection)?;
-    ensure_candidate_fingerprint_column(&connection)?;
+    ensure_candidate_columns(&connection)?;
     ensure_case_tracking(&connection)?;
     ensure_reference_gap_table(&connection)?;
     connection
@@ -1615,7 +1609,23 @@ fn ensure_source_membership_table(connection: &Connection) -> Result<(), String>
         .map_err(|error| format!("upgrade source-membership index: {error}"))
 }
 
-fn ensure_candidate_fingerprint_column(connection: &Connection) -> Result<(), String> {
+/// The candidate rows' table: one row per candidate observation, keyed by its slot.
+const CANDIDATE_TABLE: &str = "CREATE TABLE candidate_observations (
+               case_id TEXT NOT NULL REFERENCES cases(case_id),
+               environment_id TEXT NOT NULL,
+               input_sha256 TEXT NOT NULL,
+               golden_output_sha256 TEXT NOT NULL,
+               spv_sha256 TEXT NOT NULL,
+               translator_fingerprint TEXT NOT NULL,
+               executor_abi TEXT NOT NULL,
+               status TEXT NOT NULL,
+               PRIMARY KEY(case_id, environment_id)
+             );";
+
+/// Give an older index's candidate table this build's columns ([`CANDIDATE_TABLE`]). The table
+/// keeps nothing across syncs (each sync clears it and refills it from the shards), so a table
+/// without `translator_fingerprint`, or with the former `backend` column, is made again.
+fn ensure_candidate_columns(connection: &Connection) -> Result<(), String> {
     let mut statement = connection
         .prepare("PRAGMA table_info(candidate_observations)")
         .map_err(|error| format!("inspect candidate index columns: {error}"))?;
@@ -1625,15 +1635,14 @@ fn ensure_candidate_fingerprint_column(connection: &Connection) -> Result<(), St
         .collect::<Result<HashSet<_>, _>>()
         .map_err(|error| format!("read candidate index columns: {error}"))?;
     drop(statement);
-    if !columns.contains("translator_fingerprint") {
-        connection
-            .execute(
-                "ALTER TABLE candidate_observations ADD COLUMN translator_fingerprint TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|error| format!("add translator_fingerprint index column: {error}"))?;
+    if columns.contains("translator_fingerprint") && !columns.contains("backend") {
+        return Ok(());
     }
-    Ok(())
+    connection
+        .execute_batch(&format!(
+            "DROP TABLE IF EXISTS candidate_observations; {CANDIDATE_TABLE}"
+        ))
+        .map_err(|error| format!("remake candidate index table: {error}"))
 }
 
 /// Lazily backfill byte locations for one private source shard.
@@ -1752,19 +1761,17 @@ fn insert_compact_rows(
             )
             .map_err(|error| format!("index Metal observation: {error}"))?;
     }
-    for backend in [Backend::Moltenvk, Backend::Vulkan] {
-        for observation in store.read_candidates(backend)? {
-            if unavailable_cases.contains(&observation.case_id) {
-                unavailable.candidate_observations += 1;
-                continue;
-            }
-            transaction
-                .execute(
-                    "INSERT INTO candidate_observations (case_id, backend, environment_id, input_sha256, golden_output_sha256, spv_sha256, translator_fingerprint, executor_abi, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![observation.case_id, backend.directory(), observation.environment_id, observation.input_sha256, observation.golden_output_sha256, observation.spv_sha256, observation.translator_fingerprint, observation.executor_abi, format!("{:?}", observation.status).to_ascii_lowercase()],
-                )
-                .map_err(|error| format!("index {} observation: {error}", backend.directory()))?;
+    for observation in store.read_candidates()? {
+        if unavailable_cases.contains(&observation.case_id) {
+            unavailable.candidate_observations += 1;
+            continue;
         }
+        transaction
+            .execute(
+                "INSERT INTO candidate_observations (case_id, environment_id, input_sha256, golden_output_sha256, spv_sha256, translator_fingerprint, executor_abi, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![observation.case_id, observation.environment_id, observation.input_sha256, observation.golden_output_sha256, observation.spv_sha256.as_deref().unwrap_or_default(), observation.translator_fingerprint, observation.executor_abi, format!("{:?}", observation.status).to_ascii_lowercase()],
+            )
+            .map_err(|error| format!("index candidate observation: {error}"))?;
     }
     Ok(match public_keys {
         None => IndexScope::Complete,
@@ -1886,7 +1893,7 @@ fn logical_snapshot(index: &Path) -> Result<Vec<String>, String> {
         "SELECT 'case|' || quote(case_id) || '|' || quote(air_sha256) || '|' || quote(name) || '|' || quote(input_sha256) FROM cases ORDER BY case_id",
         "SELECT 'metal|' || quote(case_id) || '|' || quote(environment_id) || '|' || quote(input_sha256) || '|' || quote(output_sha256) || '|' || quote(oracle_abi) FROM metal_observations ORDER BY case_id, environment_id",
         "SELECT 'metal-gap|' || quote(case_id) || '|' || quote(environment_id) || '|' || quote(input_sha256) || '|' || quote(apple_family) || '|' || quote(oracle_abi) FROM metal_reference_gaps ORDER BY case_id, environment_id",
-        "SELECT 'candidate|' || quote(case_id) || '|' || quote(backend) || '|' || quote(environment_id) || '|' || quote(input_sha256) || '|' || quote(golden_output_sha256) || '|' || quote(spv_sha256) || '|' || quote(translator_fingerprint) || '|' || quote(executor_abi) || '|' || quote(status) FROM candidate_observations ORDER BY case_id, backend, environment_id",
+        "SELECT 'candidate|' || quote(case_id) || '|' || quote(environment_id) || '|' || quote(input_sha256) || '|' || quote(golden_output_sha256) || '|' || quote(spv_sha256) || '|' || quote(translator_fingerprint) || '|' || quote(executor_abi) || '|' || quote(status) FROM candidate_observations ORDER BY case_id, environment_id",
         "SELECT 'source-shard|' || quote(shard) || '|' || quote(size) || '|' || quote(modified_ns) FROM indexed_source_shards ORDER BY shard",
     ];
     let mut snapshot = Vec::new();
@@ -1997,15 +2004,11 @@ pub fn evidence_status(
     });
     let metals = store.read_metal()?;
     // The engine slots only: the old engine's rows are no evidence (cutover X2b).
-    let engine_rows = |backend| {
-        store.read_candidates(backend).map(|rows| {
-            rows.into_iter()
-                .filter(|row| is_engine_slot(&row.environment_id))
-                .collect::<Vec<_>>()
-        })
-    };
-    let moltenvk = engine_rows(Backend::Moltenvk)?;
-    let vulkan = engine_rows(Backend::Vulkan)?;
+    let vulkan = store
+        .read_candidates()?
+        .into_iter()
+        .filter(|row| is_engine_slot(&row.environment_id))
+        .collect::<Vec<_>>();
     let (judge, _) = crate::c3::reference::Judge::new(references, &cases, &metals);
     let mut rows = Vec::new();
     for case in cases {
@@ -2050,11 +2053,7 @@ pub fn evidence_status(
         } else {
             EvidenceState::Stale
         };
-        let state = |backend, observations| {
-            candidate_state(&case, backend, &current_metals, observations, venues)
-        };
-        let moltenvk_state = state(Backend::Moltenvk, &moltenvk);
-        let vulkan_state = state(Backend::Vulkan, &vulkan);
+        let vulkan_state = candidate_state(&case, &current_metals, &vulkan, venues);
         let mut slots = case_metals
             .iter()
             .map(|observation| EvidenceSlot {
@@ -2063,27 +2062,16 @@ pub fn evidence_status(
                 state: metal_state(observation),
             })
             .collect::<Vec<_>>();
-        for (backend, observations) in [
-            (Backend::Moltenvk, moltenvk.as_slice()),
-            (Backend::Vulkan, vulkan.as_slice()),
-        ] {
-            slots.extend(
-                observations
-                    .iter()
-                    .filter(|observation| observation.case_id == case.case_id)
-                    .map(|observation| EvidenceSlot {
-                        backend: backend.directory(),
-                        environment_id: observation.environment_id.clone(),
-                        state: candidate_slot_state(
-                            &case,
-                            backend,
-                            &current_metals,
-                            observation,
-                            venues,
-                        ),
-                    }),
-            );
-        }
+        slots.extend(
+            vulkan
+                .iter()
+                .filter(|observation| observation.case_id == case.case_id)
+                .map(|observation| EvidenceSlot {
+                    backend: "vulkan",
+                    environment_id: observation.environment_id.clone(),
+                    state: candidate_slot_state(&case, &current_metals, observation, venues),
+                }),
+        );
         slots.sort_by(|left, right| {
             left.backend
                 .cmp(right.backend)
@@ -2093,7 +2081,6 @@ pub fn evidence_status(
             case_id: case.case_id,
             name: case.name,
             metal,
-            moltenvk: moltenvk_state,
             vulkan: vulkan_state,
             translation_error: None,
             slots,
@@ -2102,10 +2089,9 @@ pub fn evidence_status(
     Ok(rows)
 }
 
-/// The summary of `case`'s `backend` slots among `candidates`.
+/// The summary of `case`'s slots among `candidates`.
 fn candidate_state(
     case: &crate::case::AuthoredCase,
-    backend: Backend,
     metals: &[&crate::observation::MetalObservation],
     candidates: &[crate::observation::CandidateObservation],
     venues: &crate::c3::VenueKeys,
@@ -2119,7 +2105,7 @@ fn candidate_state(
     }
     let states = candidates
         .iter()
-        .map(|candidate| candidate_slot_state(case, backend, metals, candidate, venues))
+        .map(|candidate| candidate_slot_state(case, metals, candidate, venues))
         .collect::<Vec<_>>();
     summarize_existing_states(&states)
 }
@@ -2127,6 +2113,8 @@ fn candidate_state(
 fn summarize_existing_states(states: &[EvidenceState]) -> EvidenceState {
     if states.contains(&EvidenceState::Failed) {
         EvidenceState::Failed
+    } else if states.contains(&EvidenceState::NotedDifference) {
+        EvidenceState::NotedDifference
     } else if states.contains(&EvidenceState::Stale) {
         EvidenceState::Stale
     } else if states.is_empty() {
@@ -2142,6 +2130,15 @@ fn summarize_existing_states(states: &[EvidenceState]) -> EvidenceState {
 fn engine_translator_fingerprint(environment: &serde_json::Value) -> Option<String> {
     let hex = environment.get("profile_fingerprint")?.as_str()?;
     Some(engine_fingerprint_of(&decode_hash256(hex)?))
+}
+
+/// Whether a row's or refusal's `translator_fingerprint`, with the `environment` it records, is
+/// this product's: the engine's fingerprint of the profile it records
+/// ([`engine_translator_fingerprint`]), or, for a run through the runtime, which records no
+/// profile, the runtime's ([`runtime_fingerprint`](crate::candidate::engine::runtime_fingerprint)).
+fn this_build(environment: &serde_json::Value, translator_fingerprint: &str) -> bool {
+    engine_translator_fingerprint(environment).as_deref() == Some(translator_fingerprint)
+        || translator_fingerprint == crate::candidate::engine::runtime_fingerprint()
 }
 
 /// The digest a lowercase 64-digit hexadecimal SHA-256 spells, or `None` for anything else.
@@ -2173,16 +2170,15 @@ pub enum Dependency {
     /// The product build: the translator fingerprint this product derives from the device facts
     /// the record holds (missing or malformed facts count as another), and the product its census
     /// names. A venue's engine record of another build holds it while what it executed is
-    /// this build's artifact of its case on its profile-leg, under this product's runtime version
+    /// this build's artifact of its case on its profile, under this product's runtime version
     /// ([`crate::c3::VenueKeys::artifact_is_current`]).
     Product,
     /// The venue profile: a record in a venue's native slot recorded the key of the committed
     /// profile its venue holds that slot to ([`crate::c3::VenueKeys::holds`]). A record in any
     /// other slot is no venue's, and holds it.
     Venue,
-    /// Every other dependency: its content or comparison class, its case's AIR or inputs, its
-    /// backend, or, for a row, a current Metal row it compared against with the status it
-    /// records.
+    /// Every other dependency: its content or comparison class, its case's AIR or inputs, or, for
+    /// a row, a current Metal row it compared against with the status it records.
     Other,
 }
 
@@ -2260,7 +2256,7 @@ impl std::fmt::Debug for Staleness {
     }
 }
 
-/// [`Staleness`] of one candidate row of `case` in `backend` under this build. `metals` are the
+/// [`Staleness`] of one candidate row of `case` under this build. `metals` are the
 /// case's current Metal rows (`MetalObservation::dependency_matches` under the current oracle):
 /// the row's Metal dependency holds when one of them is the row it compared against and the
 /// recorded status is the verdict of its class on that row's output. `venues` holds each venue's
@@ -2268,7 +2264,6 @@ impl std::fmt::Debug for Staleness {
 /// product while it executed this build's artifact.
 pub(crate) fn candidate_staleness(
     case: &crate::case::AuthoredCase,
-    backend: Backend,
     metals: &[&crate::observation::MetalObservation],
     candidate: &crate::observation::CandidateObservation,
     venues: &crate::c3::VenueKeys,
@@ -2277,9 +2272,8 @@ pub(crate) fn candidate_staleness(
         .census
         .as_ref()
         .is_none_or(|census| census.product == crate::observation::TRANSLATOR_FINGERPRINT);
-    let same_build = census_product
-        && engine_translator_fingerprint(&candidate.environment).as_deref()
-            == Some(candidate.translator_fingerprint.as_str());
+    let same_build =
+        census_product && this_build(&candidate.environment, &candidate.translator_fingerprint);
     let executed = candidate
         .census
         .as_ref()
@@ -2292,16 +2286,11 @@ pub(crate) fn candidate_staleness(
         (
             Dependency::Product,
             same_build
-                || venues.artifact_is_current(
-                    backend,
-                    &candidate.environment_id,
-                    &case.case_id,
-                    executed,
-                ),
+                || venues.artifact_is_current(&candidate.environment_id, &case.case_id, executed),
         ),
         (
             Dependency::Venue,
-            venues.holds(backend, &candidate.environment_id, &candidate.environment),
+            venues.holds(&candidate.environment_id, &candidate.environment),
         ),
         // Every other dependency, the build's own facts taken as the row records them.
         (
@@ -2310,9 +2299,8 @@ pub(crate) fn candidate_staleness(
                 candidate.dependency_matches(&CandidateDependencies {
                     case,
                     metal,
-                    spv_sha256: &candidate.spv_sha256,
+                    spv_sha256: candidate.spv_sha256.as_deref(),
                     translator_fingerprint: &candidate.translator_fingerprint,
-                    backend,
                     environment_id: &candidate.environment_id,
                     executor_abi: &candidate.executor_abi,
                 })
@@ -2322,33 +2310,33 @@ pub(crate) fn candidate_staleness(
 }
 
 /// The state of one candidate row of `case` under this build ([`candidate_staleness`]): `Current`
-/// when it matched and is current, `Failed` when it mismatched and is current, `Stale` otherwise.
+/// when it matched and is current, `Failed` when it mismatched and is current, `NotedDifference`
+/// when it is a current noted difference, `Stale` otherwise.
 /// `metals` are the case's current Metal rows.
 pub(crate) fn candidate_slot_state(
     case: &crate::case::AuthoredCase,
-    backend: Backend,
     metals: &[&crate::observation::MetalObservation],
     candidate: &crate::observation::CandidateObservation,
     venues: &crate::c3::VenueKeys,
 ) -> EvidenceState {
-    if !candidate_staleness(case, backend, metals, candidate, venues).is_current() {
+    if !candidate_staleness(case, metals, candidate, venues).is_current() {
         return EvidenceState::Stale;
     }
     match candidate.status {
         crate::observation::CandidateStatus::Match => EvidenceState::Current,
         crate::observation::CandidateStatus::Mismatch => EvidenceState::Failed,
+        crate::observation::CandidateStatus::NotedDifference => EvidenceState::NotedDifference,
     }
 }
 
-/// [`Staleness`] of a refusal record of `case` (`crate::refusal`) in `backend` under this build, by
+/// [`Staleness`] of a refusal record of `case` (`crate::refusal`) under this build, by
 /// the rule a row is held to: the new executor's ABI, the translator fingerprint this product
 /// derives from the profile fingerprint it recorded (or, for a venue's refusal made after it
 /// compiled, this build's artifact), for a venue's refusal the venue profile `venues` holds its
-/// slot to, and a well-formed record of this case's AIR and inputs in `backend`. A refusal compares
+/// slot to, and a well-formed record of this case's AIR and inputs. A refusal compares
 /// nothing with Metal, so no Metal row is a dependency.
 pub(crate) fn refusal_staleness(
     case: &crate::case::AuthoredCase,
-    backend: Backend,
     refusal: &crate::refusal::RefusalObservation,
     venues: &crate::c3::VenueKeys,
 ) -> Staleness {
@@ -2359,10 +2347,8 @@ pub(crate) fn refusal_staleness(
         ),
         (
             Dependency::Product,
-            engine_translator_fingerprint(&refusal.environment).as_deref()
-                == Some(refusal.translator_fingerprint.as_str())
+            this_build(&refusal.environment, &refusal.translator_fingerprint)
                 || venues.artifact_is_current(
-                    backend,
                     &refusal.environment_id,
                     &case.case_id,
                     refusal.artifact.as_ref(),
@@ -2370,7 +2356,7 @@ pub(crate) fn refusal_staleness(
         ),
         (
             Dependency::Venue,
-            venues.holds(backend, &refusal.environment_id, &refusal.environment),
+            venues.holds(&refusal.environment_id, &refusal.environment),
         ),
         (
             Dependency::Other,
@@ -2379,8 +2365,7 @@ pub(crate) fn refusal_staleness(
                 && refusal.air_sha256 == case.air_sha256
                 && case
                     .computed_input_sha256()
-                    .is_ok_and(|digest| digest == refusal.input_sha256)
-                && refusal.backend == backend,
+                    .is_ok_and(|digest| digest == refusal.input_sha256),
         ),
     ])
 }
@@ -2389,11 +2374,10 @@ pub(crate) fn refusal_staleness(
 /// report judges refusals by it (`c3`).
 pub(crate) fn refusal_is_current(
     case: &crate::case::AuthoredCase,
-    backend: Backend,
     refusal: &crate::refusal::RefusalObservation,
     venues: &crate::c3::VenueKeys,
 ) -> bool {
-    refusal_staleness(case, backend, refusal, venues).is_current()
+    refusal_staleness(case, refusal, venues).is_current()
 }
 
 #[cfg(test)]
@@ -2501,12 +2485,11 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256,
             golden_output_sha256: output_sha256.clone(),
-            spv_sha256: "33".repeat(32),
+            spv_sha256: Some("33".repeat(32)),
             translator_fingerprint: engine_fingerprint_of(&[7; 32]),
             candidate_output_sha256: output_sha256,
             output_b64: output_b64.into(),
-            backend: Backend::Moltenvk,
-            environment_id: engine_environment_id("moltenvk-env"),
+            environment_id: engine_environment_id("toy-env"),
             environment: serde_json::json!({
                 "profile_fingerprint": crate::hash::hex_encode([7; 32]),
             }),
@@ -2514,6 +2497,7 @@ mod tests {
             comparison: ComparisonClass::Exact,
             census: None,
             status: CandidateStatus::Match,
+            held_open_by: None,
         };
         (metal, candidate)
     }
@@ -2568,7 +2552,7 @@ mod tests {
     }
 
     /// A private checkout: a public case and a case over one private source,
-    /// each with a Metal and a MoltenVK row. Returns the root, the public case, and the private
+    /// each with a Metal and a Vulkan row. Returns the root, the public case, and the private
     /// case.
     fn private_checkout(name: &str) -> (ScratchDir, AuthoredCase, AuthoredCase) {
         let scratch = ScratchDir::new(name).unwrap();
@@ -3077,7 +3061,6 @@ mod tests {
         let state = |candidate: &CandidateObservation| {
             candidate_slot_state(
                 &case,
-                Backend::Moltenvk,
                 &[&metal],
                 candidate,
                 &crate::c3::VenueKeys::default(),
@@ -3091,7 +3074,7 @@ mod tests {
     /// target facts, in its environment's bare slot.
     fn old_engine_row(case: &AuthoredCase) -> CandidateObservation {
         let (_, mut row) = synthetic_observations(case);
-        row.environment_id = "moltenvk-env".into();
+        row.environment_id = "toy-env".into();
         row.executor_abi = "vulkan-executed-pipeline-v64".into();
         row.translator_fingerprint = "55".repeat(32);
         row.environment = serde_json::json!({"vulkan_target": {"version": [1, 2]}});
@@ -3099,21 +3082,25 @@ mod tests {
     }
 
     /// A synthetic `vulkaninfo` venue profile of a Vulkan 1.3 device, edited by `edit`: what
-    /// [`crate::c3::VenueProfile::parse`] reads, owned by the test.
+    /// [`crate::c3::VenueProfile::parse`] reads, owned by the test. It states the device addresses
+    /// and 64-bit integers the default policy's identity domains need.
     fn venue_profile(edit: impl FnOnce(&mut serde_json::Value)) -> crate::c3::VenueProfile {
         let mut document = serde_json::json!({
             "provenance": {"source": "vulkaninfo"},
             "capabilities": {"device": {
                 "extensions": {"VK_KHR_format_feature_flags2": 2},
                 "features": {
-                    "VkPhysicalDeviceFeatures": {"shaderInt16": true},
-                    "VkPhysicalDeviceVulkan12Features": {"bufferDeviceAddress": false},
+                    "VkPhysicalDeviceFeatures": {"shaderInt16": true, "shaderInt64": true},
+                    "VkPhysicalDeviceVulkan12Features": {"bufferDeviceAddress": true},
                 },
                 "properties": {
                     "VkPhysicalDeviceProperties": {
                         "deviceName": "Toy GPU", "vendorID": 4098, "deviceID": 5567,
                         "driverVersion": 109060100,
-                        "limits": {"maxComputeWorkGroupInvocations": 1024},
+                        "limits": {
+                            "maxComputeWorkGroupInvocations": 1024,
+                            "maxPushConstantsSize": 256,
+                        },
                     },
                     "VkPhysicalDeviceDriverProperties": {
                         "driverID": "VK_DRIVER_ID_MESA_RADV", "driverInfo": "Mesa 26.2.4",
@@ -3201,25 +3188,19 @@ mod tests {
         row.environment[crate::c3::VENUE_PROFILE] = base.record();
         let keys = |profile: &crate::c3::VenueProfile| {
             let mut keys = crate::c3::VenueKeys::default();
-            keys.insert(
-                "moltenvk-env",
-                Backend::Moltenvk,
-                &profile.fingerprint,
-                "toy",
-            );
+            keys.insert("toy-env", &profile.fingerprint, "toy");
             keys
         };
         let state = |row: &CandidateObservation, keys: &crate::c3::VenueKeys| {
-            candidate_slot_state(&case, Backend::Moltenvk, &[&metal], row, keys)
+            candidate_slot_state(&case, &[&metal], row, keys)
         };
         assert_eq!(state(&row, &keys(&base)), EvidenceState::Current);
-        let mut refusal = crate::refusal::RefusalObservation {
+        let refusal = crate::refusal::RefusalObservation {
             timing: Some(crate::observation::test_timing()),
             case_id: case.case_id.clone(),
             air_sha256: case.air_sha256.clone(),
             input_sha256: case.computed_input_sha256().unwrap(),
             translator_fingerprint: row.translator_fingerprint.clone(),
-            backend: Backend::Moltenvk,
             environment_id: row.environment_id.clone(),
             environment: row.environment.clone(),
             executor_abi: ENGINE_EXECUTOR_ABI.into(),
@@ -3228,13 +3209,7 @@ mod tests {
             ),
             artifact: None,
         };
-        refusal.environment["robustness"] = serde_json::json!({"leg": "stated"});
-        assert!(refusal_is_current(
-            &case,
-            Backend::Moltenvk,
-            &refusal,
-            &keys(&base)
-        ));
+        assert!(refusal_is_current(&case, &refusal, &keys(&base)));
         for (what, edit) in edits {
             let moved = venue_profile(edit);
             assert_ne!(moved.fingerprint, base.fingerprint, "{what} moves no key");
@@ -3244,7 +3219,7 @@ mod tests {
                 "a row of the profile before {what} changed"
             );
             assert!(
-                !refusal_is_current(&case, Backend::Moltenvk, &refusal, &keys(&moved)),
+                !refusal_is_current(&case, &refusal, &keys(&moved)),
                 "a refusal of the profile before {what} changed"
             );
         }
@@ -3269,7 +3244,7 @@ mod tests {
         };
         assert_eq!(without(|_| {}), without(edits[3].1));
         assert_ne!(without(|_| {}), without(edits[2].1));
-        // A venue's record without the key, or of another backend's slot.
+        // A venue's record without the key.
         let mut unkeyed = row.clone();
         unkeyed
             .environment
@@ -3277,9 +3252,6 @@ mod tests {
             .unwrap()
             .remove(crate::c3::VENUE_PROFILE);
         assert_eq!(state(&unkeyed, &keys(&base)), EvidenceState::Stale);
-        let mut elsewhere = crate::c3::VenueKeys::default();
-        elsewhere.insert("moltenvk-env", Backend::Vulkan, &base.fingerprint, "toy");
-        assert_eq!(state(&unkeyed, &elsewhere), EvidenceState::Current);
         assert_eq!(
             state(&unkeyed, &crate::c3::VenueKeys::default()),
             EvidenceState::Current
@@ -3293,7 +3265,6 @@ mod tests {
         let state = |candidate: &CandidateObservation| {
             candidate_slot_state(
                 &case,
-                Backend::Moltenvk,
                 &[&metal],
                 candidate,
                 &crate::c3::VenueKeys::default(),
@@ -3321,13 +3292,7 @@ mod tests {
         let old = old_engine_row(&case);
         assert_eq!(state(&old), EvidenceState::Stale);
         assert_eq!(
-            candidate_staleness(
-                &case,
-                Backend::Moltenvk,
-                &[&metal],
-                &old,
-                &crate::c3::VenueKeys::default()
-            ),
+            candidate_staleness(&case, &[&metal], &old, &crate::c3::VenueKeys::default()),
             Staleness::of([Dependency::Executor, Dependency::Product])
         );
         // A current row whose output differs from Metal's is a failure, not staleness.
@@ -3351,13 +3316,13 @@ mod tests {
         let none = crate::c3::VenueKeys::default();
         // The candidate's own slot held to a key it did not record.
         let mut keyed = crate::c3::VenueKeys::default();
-        keyed.insert("moltenvk-env", Backend::Moltenvk, &"77".repeat(32), "toy");
+        keyed.insert("toy-env", &"77".repeat(32), "toy");
         assert_eq!(
-            keyed.expected(Backend::Moltenvk, &candidate.environment_id),
+            keyed.expected(&candidate.environment_id),
             Some("77".repeat(32).as_str())
         );
         let staleness = |candidate: &CandidateObservation| {
-            candidate_staleness(&case, Backend::Moltenvk, &[&metal], candidate, &none)
+            candidate_staleness(&case, &[&metal], candidate, &none)
         };
         let only = |executor: bool, product: bool, venue: bool, other: bool| {
             Staleness::judge([
@@ -3369,11 +3334,11 @@ mod tests {
         };
         assert!(staleness(&candidate).is_current());
         assert_eq!(
-            candidate_slot_state(&case, Backend::Moltenvk, &[&metal], &candidate, &none),
+            candidate_slot_state(&case, &[&metal], &candidate, &none),
             EvidenceState::Current
         );
         assert_eq!(
-            candidate_staleness(&case, Backend::Moltenvk, &[&metal], &candidate, &keyed),
+            candidate_staleness(&case, &[&metal], &candidate, &keyed),
             only(false, false, true, false)
         );
         let mut executor = candidate.clone();
@@ -3387,7 +3352,7 @@ mod tests {
         assert_eq!(staleness(&both), only(true, true, false, false));
         for row in [&executor, &product, &both] {
             assert_eq!(
-                candidate_slot_state(&case, Backend::Moltenvk, &[&metal], row, &none),
+                candidate_slot_state(&case, &[&metal], row, &none),
                 EvidenceState::Stale
             );
         }
@@ -3396,7 +3361,6 @@ mod tests {
             device: Some(ExecutionClass::CpuIcd),
             product: product.into(),
             restricted_to: None,
-            leg: None,
             modules: Vec::new(),
             out_of_bounds: None,
             rate_map_pass: None,
@@ -3409,19 +3373,17 @@ mod tests {
         assert_eq!(staleness(&censused), only(false, true, false, false));
         // No current Metal row: another dependency.
         assert_eq!(
-            candidate_staleness(&case, Backend::Moltenvk, &[], &candidate, &none),
+            candidate_staleness(&case, &[], &candidate, &none),
             only(false, false, false, true)
         );
 
-        let mut environment = candidate.environment.clone();
-        environment["robustness"] = serde_json::json!({"leg": "stated"});
+        let environment = candidate.environment.clone();
         let refusal = crate::refusal::RefusalObservation {
             timing: Some(crate::observation::test_timing()),
             case_id: case.case_id.clone(),
             air_sha256: case.air_sha256.clone(),
             input_sha256: case.computed_input_sha256().unwrap(),
             translator_fingerprint: candidate.translator_fingerprint.clone(),
-            backend: Backend::Moltenvk,
             environment_id: candidate.environment_id.clone(),
             environment,
             executor_abi: ENGINE_EXECUTOR_ABI.into(),
@@ -3430,18 +3392,12 @@ mod tests {
             ),
             artifact: None,
         };
-        let judged = |refusal: &crate::refusal::RefusalObservation| {
-            refusal_staleness(&case, Backend::Moltenvk, refusal, &none)
-        };
+        let judged =
+            |refusal: &crate::refusal::RefusalObservation| refusal_staleness(&case, refusal, &none);
         assert!(judged(&refusal).is_current());
-        assert!(refusal_is_current(
-            &case,
-            Backend::Moltenvk,
-            &refusal,
-            &none
-        ));
+        assert!(refusal_is_current(&case, &refusal, &none));
         assert_eq!(
-            refusal_staleness(&case, Backend::Moltenvk, &refusal, &keyed),
+            refusal_staleness(&case, &refusal, &keyed),
             only(false, false, true, false)
         );
         let mut executor = refusal.clone();
@@ -3450,16 +3406,11 @@ mod tests {
         let mut product = refusal.clone();
         product.translator_fingerprint = "66".repeat(32);
         assert_eq!(judged(&product), only(false, true, false, false));
-        // A refusal recorded in another backend is another backend's record.
-        assert_eq!(
-            refusal_staleness(&case, Backend::Vulkan, &refusal, &none),
-            only(false, false, false, true)
-        );
     }
 
     /// Artifact-keyed currency, over a synthetic store and its census file at two builds. A venue's
     /// row and refusal recorded at another build hold the product while this build's file records
-    /// the digest they executed, on their slot's profile-leg, under this runtime version. A moved
+    /// the digest they executed, on their slot's profile, under this runtime version. A moved
     /// digest, another runtime version, no recorded digest, a file at another build (a branch's
     /// copy of master's), no file, and a slot no venue keys all leave the record to the build that
     /// recorded it: stale for its product, and current only there.
@@ -3467,11 +3418,10 @@ mod tests {
     fn a_venue_record_of_another_build_is_current_while_it_executed_this_builds_artifact() {
         use crate::authored_compile::{
             expectations_path, ArtifactBuild, Cell, CellOutcome, CurrentArtifacts, Expectations,
-            ProfileLeg,
+            ProfileStem,
         };
         use crate::candidate::engine::artifact::ExecutedArtifact;
-        use crate::candidate::engine::engine_slot;
-        use crate::coverage::{ExecutedCensus, ExecutionClass, Leg};
+        use crate::coverage::{ExecutedCensus, ExecutionClass};
         use metal2vulkan::cache::RUNTIME_VERSION;
         let scratch = ScratchDir::new("index-artifact-currency").unwrap();
         let root = scratch.path();
@@ -3501,7 +3451,6 @@ mod tests {
                 device: Some(ExecutionClass::CpuIcd),
                 product: "an older build".into(),
                 restricted_to: None,
-                leg: None,
                 modules: Vec::new(),
                 out_of_bounds: None,
                 rate_map_pass: None,
@@ -3515,31 +3464,23 @@ mod tests {
         store.upsert_metal(metal.clone()).unwrap();
         store.upsert_candidate(row.clone()).unwrap();
 
-        let stated = ProfileLeg {
-            stem: "toy".into(),
-            leg: Leg::Stated,
-        };
-        let off = ProfileLeg {
-            stem: "toy".into(),
-            leg: Leg::RobustnessOff,
-        };
+        let stated = ProfileStem { stem: "toy".into() };
         let another_build = ArtifactBuild {
             product: "77".repeat(32),
             executor: ENGINE_EXECUTOR_ABI.into(),
         };
-        // The corpus's census file at `build`, with `stated` and `off` the case's digests.
-        let bless = |build: &ArtifactBuild, stated_digest: &str, off_digest: &str| {
+        // The corpus's census file at `build`, with `stated` the case's digest.
+        let bless = |build: &ArtifactBuild, stated_digest: &str| {
             let cell = |digest: &str| Cell {
                 outcome: CellOutcome::Compiled,
-                uncovered: 0,
                 artifact: Some(digest.into()),
             };
             Expectations {
                 build: Some(build.clone()),
-                profiles: vec![stated.clone(), off.clone()],
+                profiles: vec![stated.clone()],
                 cases: std::collections::BTreeMap::from([(
                     case.case_id.clone(),
-                    vec![cell(stated_digest), cell(off_digest)],
+                    vec![cell(stated_digest)],
                 )]),
             }
             .write(&expectations_path(root))
@@ -3548,23 +3489,17 @@ mod tests {
         // What the binaries judge by: the venue's key, and the corpus's file at this build.
         let keys = || {
             let mut keys = crate::c3::VenueKeys::default();
-            keys.insert(
-                "moltenvk-env",
-                Backend::Moltenvk,
-                &profile.fingerprint,
-                "toy",
-            );
+            keys.insert("toy-env", &profile.fingerprint, "toy");
             keys.with_artifacts(CurrentArtifacts::load(root).unwrap())
         };
         let judged = || {
             evidence_status(root, &keys(), &references)
                 .unwrap()
                 .remove(0)
-                .moltenvk
+                .vulkan
         };
-        let staleness = |row: &CandidateObservation| {
-            candidate_staleness(&case, Backend::Moltenvk, &[&metal], row, &keys())
-        };
+        let staleness =
+            |row: &CandidateObservation| candidate_staleness(&case, &[&metal], row, &keys());
         let product = Staleness::of([Dependency::Product]);
 
         // No file: the build that recorded it.
@@ -3575,7 +3510,7 @@ mod tests {
         assert_eq!(judged(), EvidenceState::Stale);
         assert_eq!(staleness(&row), product);
         // This build's file records what it executed: current.
-        bless(&ArtifactBuild::this(), &digest, &moved);
+        bless(&ArtifactBuild::this(), &digest);
         assert_eq!(judged(), EvidenceState::Current);
         assert!(staleness(&row).is_current());
         // Under another runtime version, or without a digest: its build's.
@@ -3591,12 +3526,12 @@ mod tests {
         executor.executor_abi = "vulkan-engine-v1".into();
         assert_eq!(staleness(&executor), Staleness::of([Dependency::Executor]));
         // The digest moved: stale.
-        bless(&ArtifactBuild::this(), &moved, &digest);
+        bless(&ArtifactBuild::this(), &moved);
         assert_eq!(judged(), EvidenceState::Stale);
         assert_eq!(staleness(&row), product);
         // The file is at another build, with the very digest: its digests are not this build's,
         // and the row is its own build's.
-        bless(&another_build, &digest, &digest);
+        bless(&another_build, &digest);
         assert_eq!(
             CurrentArtifacts::load(root).unwrap(),
             CurrentArtifacts::default()
@@ -3605,27 +3540,22 @@ mod tests {
         // A row of this build is current whatever the file says.
         store.upsert_candidate(this_build.clone()).unwrap();
         assert_eq!(judged(), EvidenceState::Current);
-        bless(&ArtifactBuild::this(), &moved, &moved);
+        bless(&ArtifactBuild::this(), &moved);
         assert_eq!(judged(), EvidenceState::Current);
 
-        // Each slot is judged on its own leg's digest; a slot no venue keys, on its build alone.
-        bless(&ArtifactBuild::this(), &digest, &moved);
-        let off_slot = engine_slot("moltenvk-env", None, Leg::RobustnessOff);
-        let stated_slot = engine_environment_id("moltenvk-env");
-        let current = |slot: &str, backend: Backend, sha256: &str| {
+        // The slot is judged on its profile's digest; a slot no venue keys, on its build alone.
+        bless(&ArtifactBuild::this(), &digest);
+        let stated_slot = engine_environment_id("toy-env");
+        let current = |slot: &str, sha256: &str| {
             keys().artifact_is_current(
-                backend,
                 slot,
                 &case.case_id,
                 executed(Some(sha256), RUNTIME_VERSION).as_ref(),
             )
         };
-        assert!(current(&stated_slot, Backend::Moltenvk, &digest));
-        assert!(!current(&stated_slot, Backend::Moltenvk, &moved));
-        assert!(current(&off_slot, Backend::Moltenvk, &moved));
-        assert!(!current(&off_slot, Backend::Moltenvk, &digest));
-        assert!(!current(&stated_slot, Backend::Vulkan, &digest));
-        assert!(!current("another-env@engine", Backend::Moltenvk, &digest));
+        assert!(current(&stated_slot, &digest));
+        assert!(!current(&stated_slot, &moved));
+        assert!(!current("another-env@engine", &digest));
 
         // A refusal the venue's run made after it compiled is held to the same digest.
         let mut refusal = crate::refusal::RefusalObservation {
@@ -3634,7 +3564,6 @@ mod tests {
             air_sha256: case.air_sha256.clone(),
             input_sha256: case.computed_input_sha256().unwrap(),
             translator_fingerprint: "66".repeat(32),
-            backend: Backend::Moltenvk,
             environment_id: stated_slot.clone(),
             environment: this_build.environment.clone(),
             executor_abi: ENGINE_EXECUTOR_ABI.into(),
@@ -3643,25 +3572,11 @@ mod tests {
             ),
             artifact: executed(Some(&digest), RUNTIME_VERSION),
         };
-        refusal.environment["robustness"] = serde_json::json!({"leg": "stated"});
-        assert!(refusal_is_current(
-            &case,
-            Backend::Moltenvk,
-            &refusal,
-            &keys()
-        ));
+        assert!(refusal_is_current(&case, &refusal, &keys()));
         refusal.artifact = executed(Some(&moved), RUNTIME_VERSION);
-        assert_eq!(
-            refusal_staleness(&case, Backend::Moltenvk, &refusal, &keys()),
-            product
-        );
-        bless(&another_build, &moved, &moved);
-        assert!(!refusal_is_current(
-            &case,
-            Backend::Moltenvk,
-            &refusal,
-            &keys()
-        ));
+        assert_eq!(refusal_staleness(&case, &refusal, &keys()), product);
+        bless(&another_build, &moved);
+        assert!(!refusal_is_current(&case, &refusal, &keys()));
     }
 
     /// The currency rule's one decision: a record is stale in exactly the dependencies whose check
@@ -3712,8 +3627,7 @@ mod tests {
         .unwrap()
         .remove(0);
         assert_eq!(row.metal, EvidenceState::Current);
-        assert_eq!(row.moltenvk, EvidenceState::Current);
-        assert_eq!(row.vulkan, EvidenceState::Missing);
+        assert_eq!(row.vulkan, EvidenceState::Current);
         let slots = row
             .slots
             .iter()
@@ -3728,7 +3642,7 @@ mod tests {
                     EvidenceState::Current
                 ),
                 (
-                    "moltenvk",
+                    "vulkan",
                     new.environment_id.as_str(),
                     EvidenceState::Current
                 ),
@@ -3745,7 +3659,7 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        assert_eq!(row.moltenvk, EvidenceState::Stale);
+        assert_eq!(row.vulkan, EvidenceState::Stale);
     }
 
     /// A reference gap is indexed in its own table: its source counts as `reference-gap`, its case

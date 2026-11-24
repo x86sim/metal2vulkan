@@ -17,19 +17,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::LocalSizeLimits => Mechanism::PlanTimeCheck,
         // NumWorkgroups for single-region dispatches, push fields for multi-region ones.
         RuntimeFact::DispatchGrid => Mechanism::RegionSelected,
-        // GPU-written group counts need the clamp prepass only when some axis limit is below
-        // what an indirect argument can hold.
-        RuntimeFact::IndirectGroupCount => {
-            if f.limits
-                .max_compute_work_group_count
-                .iter()
-                .any(|&axis| axis < u32::MAX)
-            {
-                Mechanism::IndirectClamp
-            } else {
-                Mechanism::None
-            }
-        }
+        // GPU-written group counts are read where Metal wrote them.
+        RuntimeFact::IndirectGroupCount => Mechanism::None,
         RuntimeFact::ResourcePresence { .. } => Mechanism::Specialization,
         RuntimeFact::SampleCount => Mechanism::Specialization,
         // Keyed by a per-slot StorageImageChoice, a separate per-function compile.
@@ -40,8 +29,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::SamplerCoordinates { .. } => Mechanism::Specialization,
         RuntimeFact::SamplerReduction { .. } => Mechanism::PlanTimeCheck,
         RuntimeFact::ImageViewShape { .. } => Mechanism::BinderView,
-        // The binder views the slot's `RG32Uint` texture as `R64_UINT`.
-        RuntimeFact::UlongAtomicView { .. } => Mechanism::BinderView,
         RuntimeFact::VertexFetch { .. } => Mechanism::KeyProjection,
         RuntimeFact::VertexBufferStride { .. } => {
             if f.dynamic_vertex_stride {
@@ -92,13 +79,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::StageInRegion => Mechanism::PushConstant,
         // The binder writes the bound stride per dispatch.
         RuntimeFact::StageInStride { .. } => Mechanism::PushConstant,
-        // A shape that does not prove a uniform view's range fits asks for the variant that keeps
-        // the slot a storage view.
-        RuntimeFact::UniformViewRange { .. } => Mechanism::Variant,
-        // Instantiation compares the bound Metal addresses.
-        RuntimeFact::UniformViewAliasing { .. } => Mechanism::PlanTimeCheck,
-        // The pass's imageblock storage image, bound to every draw of the pass.
-        RuntimeFact::FragmentImageblock { .. } => Mechanism::RenderPassContract,
         // The render area is specialized; the planner refuses a layered pass.
         RuntimeFact::TileFunction => Mechanism::Specialization,
         // Compiled in under the function's key; the tile pipeline checks its descriptor.
@@ -128,22 +108,9 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         } => Mechanism::PlanTimeCheck,
         // The binder writes the bound structure's instance count per dispatch or draw.
         RuntimeFact::AccelerationStructureInstanceCount { .. } => Mechanism::PushConstant,
-        // The consumer binds the attachment as a storage image outside the subpass's color
-        // attachments (`GraphicsState::storage_attachments`).
-        RuntimeFact::InterlockedFramebufferFetch { .. } => Mechanism::RenderPassContract,
-        // The consumer keeps the stencil's shadow and binds it, with the encoder's stencil state
-        // as push data (`GraphicsState::shadow_stencil`).
-        RuntimeFact::ShadowStencil { .. } => Mechanism::RenderPassContract,
-        // The consumer keeps the depth attachment's stand-in and binds it, with the encoder's
-        // depth state as push data (`GraphicsState::shader_tests`).
-        RuntimeFact::ShaderTests { .. } => Mechanism::RenderPassContract,
-        // The consumer keeps the stencil attachment's stand-in and binds it, with the encoder's
-        // stencil state and references as push data (`ShaderTestsUse::stencil`).
-        RuntimeFact::ShaderStencilTest { .. } => Mechanism::RenderPassContract,
         // The vote word is fixed in the module; the planner counts it against the limit.
         RuntimeFact::PredicationVote => Mechanism::PlanTimeCheck,
         // The binder pushes the bound format's class, which selects its conversion.
-        RuntimeFact::TexelFormat { .. } => Mechanism::PushConstant,
         // The binder writes the encoder's viewport count per draw.
         RuntimeFact::ViewportCount => Mechanism::PushConstant,
         // A Metal query's answer: nothing on the device reads it.
@@ -154,6 +121,8 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The mode a kernel was compiled in: the compile layer checks it against the pipeline's;
         // nothing on the device reads it.
         RuntimeFact::OpenClMode => Mechanism::None,
+        // Keyed by the slots of a kernel's 1D images bound to a 1D texture, which it reads so.
+        RuntimeFact::OpenClLineTexture { .. } => Mechanism::Variant,
         // The binder's local-size rules read it: a one-row region of the planned pipeline.
         RuntimeFact::RowLockstep => Mechanism::PlanTimeCheck,
         // A pipeline compiled under the one-row variant; its plans state it.
@@ -181,9 +150,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // A separate compile of the pipeline, which an amplification multiview does not express
         // asks for; the binder writes each amplification's words before its draw.
         RuntimeFact::AmplificationDraws { .. } => Mechanism::Variant,
-        // A separate compile of the pipeline, which a viewport Vulkan's cannot be asks for; the
-        // binder writes the draw's compensation.
-        RuntimeFact::ViewportCompensation { .. } => Mechanism::Variant,
         // A pipeline compiled under the folded-groups variant; its plans state it.
         RuntimeFact::FoldedGroups => Mechanism::Variant,
         // A render pipeline compiled under the replay-bindings variant; its plans state it.
@@ -195,14 +161,15 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::RegionViewports => Mechanism::Variant,
         // A kernel compiled under the partial-threadgroups variant; its plans state it.
         RuntimeFact::PartialThreadgroups => Mechanism::Variant,
-        // Keyed by the slots bound to a texture whose planes are read in place, on a profile that
-        // reads them so (`ProfileFields::ycbcr_in_place`).
-        RuntimeFact::YCbCrInPlace { .. } => Mechanism::Variant,
-        // Keyed by the slots bound to a texture whose rows are read and written in place.
-        RuntimeFact::TexelRows { .. } => Mechanism::Variant,
-        // The function marks the `ExecutionStatus` buffer its `ExecutionStatus` fact binds; the
-        // consumer reads the bit after the command buffer.
-        RuntimeFact::AbsentArgumentRead { .. } => Mechanism::None,
+        // The binder's regions carry the tile as the nominal size, under `MultiRegion` 1.
+        RuntimeFact::GridTiles => Mechanism::RegionSelected,
+        // The runtime pushes its arena's address, and sizes and orders the arena's slots by the
+        // slot's bytes.
+        RuntimeFact::PrivateArena { .. } => Mechanism::PushConstant,
+        // Keyed by the slots bound to a texture buffer of more texels than one view holds.
+        RuntimeFact::TexelBufferParts { .. } => Mechanism::Variant,
+        // The runtime refuses a dispatch whose slot address is not a multiple of the alignment.
+        RuntimeFact::AddressAlignment { .. } => Mechanism::PlanTimeCheck,
         // A separate compile of the pipeline, which a pass with colors the pipeline lacks asks
         // for.
         RuntimeFact::ZeroedColor { .. } | RuntimeFact::DroppedColor { .. } => Mechanism::Variant,
@@ -211,7 +178,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::DepthClampRange => Mechanism::Variant,
         RuntimeFact::RotatedWeights => Mechanism::Variant,
         // A separate link of the mesh pipeline's synthesized vertex stage.
-        RuntimeFact::MeshLastFirst => Mechanism::Variant,
         // The binder's region flags a draw whose last object threadgroup along an axis is partial.
         RuntimeFact::PartialObjectThreadgroups => Mechanism::RegionSelected,
         // The binder specializes the lanes from the bound texture's pixel format and swizzle.
@@ -223,13 +189,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
             BufferAccess::Addressed => Mechanism::Variant,
             BufferAccess::Floor => Mechanism::PlanTimeCheck,
         },
-        // A separate compile that declares early tests, which a draw whose tests drop fragments
-        // but write and count nothing asks for; the planner refuses a draw whose tests may write
-        // or count.
-        RuntimeFact::TestedStorageWrites { .. } => Mechanism::Variant,
-        // The tests a draw that moves the function's color into the interlocked storage form
-        // selects: that variant's.
-        RuntimeFact::MovableStorageWrites { .. } => Mechanism::Variant,
         // The binder's regions carry the tile as Metal's threadgroup; the tile pipeline checks its
         // descriptor's flag.
         RuntimeFact::TileThreadgroup { .. } => Mechanism::RegionSelected,
@@ -244,15 +203,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The planner refuses a texture a heap holds by its raw texels alone that a plan names
         // beside the stage; a consumer's own heap announces one.
         RuntimeFact::HeapRawSamples { .. } => Mechanism::PlanTimeCheck,
-        // Link gives the attachment no Vulkan blend and its input attachment, which the consumer
-        // binds as `GraphicsState::input_attachments` states.
-        RuntimeFact::ExtendedRangeInputBlend { .. } => Mechanism::RenderPassContract,
-        // Link gives the rotated attachment no Vulkan blend and its input attachment, which the
-        // consumer binds as `GraphicsState::input_attachments` states.
-        RuntimeFact::RotatedInputBlend { .. } => Mechanism::RenderPassContract,
-        // Link writes the whole word and gives the attachment its input attachment, which the
-        // consumer binds as `GraphicsState::input_attachments` states.
-        RuntimeFact::WordInputMerge { .. } => Mechanism::RenderPassContract,
         // Keyed by the slots bound in a format of another numeric class than the declared one,
         // whose texels the function reads in that class.
         RuntimeFact::CrossClassReads { .. } => Mechanism::Variant,
@@ -272,8 +222,5 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // Keyed by the slots bound to a sampler whose word states anisotropy, where the
         // function's samples take Metal's anisotropic filter, emulated.
         RuntimeFact::AnisotropicSampler { .. } => Mechanism::Variant,
-        // The pipeline's own stages, which every draw of its class runs; the consumer announces
-        // them.
-        RuntimeFact::SynthesizedGeometry { .. } => Mechanism::None,
     }
 }

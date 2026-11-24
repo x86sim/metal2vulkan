@@ -84,6 +84,23 @@
 //! at `[[id(1)]]`: the kernel reads every texel of the read-write one into a buffer and writes
 //! both. The case records what the read gave and what the write left in the texture, per format.
 //!
+//! # A read-write view of an sRGB texture
+//!
+//! `read-write-srgb-unorm-views` writes an sRGB texture through a view of its unorm sibling, the
+//! view Metal makes of a texture of any usage. A 16 by 16 `RGBA8Unorm_sRGB` texture of read-write
+//! usage, made once plainly and once over a shared buffer at its texels' own pitch, starts as the
+//! family's fill; `scout_read_write_f` swizzles every texel through an `RGBA8Unorm` view of it, so
+//! it reads and writes the unorm codes, and `scout_read_f` then reads every texel through the same
+//! view. The case records that read, the texture's bytes by `getBytes:`, and, over the buffer, the
+//! buffer's bytes. On a device that stores no 8-bit sRGB format a side that made the texture's
+//! image without storage for its view refuses the swizzle at its own site.
+//!
+//! The read is the view's and not the texture's own, because the texture's own read decodes the
+//! codes, and the decode is the device's own answer (rule 1) rather than this case's subject:
+//! measured on this M3 Max, Metal decodes the code `0x22` to `0.016117217`, where the sRGB
+//! formula gives `0.015996293`, so an exact comparison of the decoded words would compare two
+//! devices' decodes. A view's unorm read is exact on both sides.
+//!
 //! # Why the reported tiers are a case of their own
 //!
 //! `device-read-write-tiers` holds the two numbers and nothing else, deliberately. They are a
@@ -114,11 +131,9 @@
 //!
 //! # Exactness
 //!
-//! Every value is a word or a byte and the family declares no tolerance beyond the one notice a
-//! venue without unified memory announces for the `Shared` buffer each case reads its answer back
-//! through. A format the runtime holds no read-write image of refuses its site with a typed error,
-//! which the comparison reads as [`Refused`](crate::verdict::Verdict::Refused) and never as a
-//! pass.
+//! Every value is a word or a byte and the family declares no tolerance. A format the runtime holds
+//! no read-write image of refuses its site with a typed error, which the comparison reads as
+//! [`Refused`](crate::verdict::Verdict::Refused) and never as a pass.
 
 use crate::allowance::Allowance;
 use crate::case::{
@@ -126,7 +141,7 @@ use crate::case::{
 };
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
-use crate::texture::{TextureRequest, Upload};
+use crate::texture::{Over, TextureRequest, Upload};
 use crate::texture_query::{HeapTextureQuery as Q, Storage};
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
@@ -444,12 +459,12 @@ impl Case for ReadWriteDescriptors {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // The tables name block-compressed formats, which a device with no Vulkan format for one
-        // makes through a decoded twin carried beside the blocks, and the runtime says so: a
-        // performance notice at the notices site alone, every answer of the tables still
-        // compared. Measured firing on llvmpipe (LLVM 21.1.8).
+        // The tables name block-compressed formats: a texture of such a format the device holds
+        // itself announces the device's decode of its blocks (`compressed-texel-decode`), at the
+        // notices site alone: the tables read no texel, and every answer of the tables is still
+        // compared.
         vec![crate::replay::notice_allowance(
-            metal2vulkan_runtime::Degradation::CarriedDecodedTwin.code(),
+            crate::degradation::Degradation::CompressedTexelDecode.code(),
         )]
     }
 
@@ -557,14 +572,6 @@ impl Case for ReadWriteRoundTrip {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer and a `Shared` texture, so on
-        // a device without unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notice's
-        // site alone, so every value still compares against Metal's exactly.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -881,26 +888,6 @@ impl Case for HeldReadWrite {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // The venue's memory model for the `Shared` read-back ([`crate::replay::shared_memory_notice`]),
-        // and the notice a device announces for a held texture whose format its heap array cannot
-        // view (`unnamed-texture-unviewable`): the array holds the class's neutral at the
-        // texture's ID. It fired on lavapipe and the RTX 5080 for the two sRGB formats and
-        // `BGR10A2Unorm` until the heap viewed them through their storage aliases
-        // (`bind::heap::storage_conversions`); it stays declared for a device whose alias for a
-        // swept format the heap's formatless declaration cannot serve. Both sit at the notices
-        // site alone: every texel is still compared. And the held textures' heap set,
-        // which MoltenVK's layout query refuses ([`crate::replay::set_past_layout_notice`]):
-        // announced on the M3 Max under MoltenVK 1.4.2, not on lavapipe.
-        vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::UnnamedTextureUnviewable.code(),
-            ),
-            crate::replay::set_past_layout_notice(),
-        ]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let mut shaders = Vec::new();
         for extension in [RUNTIME_TEXT, METAL_TEXT] {
@@ -971,6 +958,193 @@ impl Case for HeldReadWrite {
     }
 }
 
+/// A read-write view of an sRGB texture: an `RGBA8Unorm_sRGB` texture, made plainly and over a
+/// buffer, swizzled through an `RGBA8Unorm` view of it, then read through the view.
+pub struct SrgbViews;
+
+/// The row pitch of [`SrgbViews`]' texture, and of the buffer under it: its 16 texels of 4 bytes.
+const VIEW_PITCH: u32 = SCOUT_SIDE * 4;
+
+impl SrgbViews {
+    /// The fixture under the float class's read-write kernel.
+    fn fixture(&self) -> Fixture {
+        Fixture {
+            name: SCOUT,
+            entry: Class::Float.read_write_entry(),
+        }
+    }
+
+    /// The bytes of one texture: the family's fill at [`VIEW_PITCH`] a row.
+    fn bytes() -> Vec<u8> {
+        fill((VIEW_PITCH * SCOUT_SIDE) as usize)
+    }
+
+    /// One backing: the texture, its view, the swizzle through the view, the read of the whole
+    /// grid through the view, the texture's bytes, and the buffer's where it is over one.
+    fn sweep_one(
+        side: &mut dyn Side,
+        sites: &mut Sites,
+        over: bool,
+        swizzle: Handle,
+        read: Handle,
+    ) -> Option<()> {
+        let at = match over {
+            true => "over-a-buffer",
+            false => "plain",
+        };
+        let bytes = Self::bytes();
+        let uploads = [Upload::level_0(
+            [SCOUT_SIDE, SCOUT_SIDE],
+            VIEW_PITCH,
+            SCOUT_SIDE,
+            &bytes,
+        )];
+        let under = match over {
+            true => Some(probe(
+                sites,
+                &format!("{at}/buffer"),
+                side.buffer(&bytes),
+                |_| Value::Absent,
+            )?),
+            false => None,
+        };
+        let request = TextureRequest {
+            format: PixelFormat::RGBA8UnormSRGB.as_raw(),
+            texture_type: TextureType::Type2D,
+            size: [SCOUT_SIDE, SCOUT_SIDE, 1],
+            levels: 1,
+            slices: 1,
+            usage: READ_WRITE,
+            private: false,
+            gpu_optimized: true,
+            swizzle: TextureSwizzleChannels::DEFAULT,
+            over: under.map(|buffer| Over::Buffer {
+                buffer,
+                offset: 0,
+                bytes_per_row: u64::from(VIEW_PITCH),
+            }),
+            uploads: if over { &[] } else { &uploads },
+        };
+        let texture = side.texture(&request);
+        let texture = probe(sites, &format!("{at}/texture"), texture, |_| Value::Absent)?;
+        let view = TextureRequest {
+            format: PixelFormat::RGBA8Unorm.as_raw(),
+            uploads: &[],
+            ..request
+        };
+        let view = side.texture(&view.viewing(texture));
+        let view = probe(sites, &format!("{at}/view"), view, |_| Value::Absent)?;
+        let out = side.zeroed_buffer((SCOUT_SIDE * SCOUT_SIDE * WORDS_A_TEXEL * 4) as usize);
+        let out = probe(sites, &format!("{at}/out"), out, |_| Value::Absent)?;
+        let grid = [SCOUT_SIDE, SCOUT_SIDE, 1];
+        let viewed = [view];
+        let outs = [out];
+        let steps = [
+            ("read-write", swizzle, Bindings::textures(&viewed)),
+            ("read", read, Bindings::new(&viewed, &outs)),
+        ];
+        for (step, pipeline, bindings) in steps {
+            let ran = side.dispatch_threads(pipeline, &bindings, &[], grid, grid);
+            let ran = probe(sites, &format!("{at}/{step}"), ran, |_| Value::Absent)?;
+            let status = side.wait(ran);
+            let status = probe(sites, &format!("{at}/{step}/status"), status, Clone::clone)?;
+            if status != Value::unit_variant("Completed") {
+                return None;
+            }
+        }
+        let length = SCOUT_SIDE * SCOUT_SIDE * WORDS_A_TEXEL * 4;
+        let words = side.read_buffer(out, 0, length as usize);
+        let words = probe(sites, &format!("{at}/read-back"), words, |_| Value::Absent)?;
+        sites.push(Node::leaf(
+            format!("{at}/texels"),
+            Observed::bytes(words, ByteLayout::buffer(0, length.into(), Element::U32)),
+        ));
+        let texels = side.read_texture(texture, [SCOUT_SIDE, SCOUT_SIDE], VIEW_PITCH);
+        let texels = probe(sites, &format!("{at}/get-bytes"), texels, |_| Value::Absent)?;
+        let length = u64::from(VIEW_PITCH * SCOUT_SIDE);
+        sites.push(Node::leaf(
+            format!("{at}/bytes"),
+            Observed::bytes(texels, ByteLayout::buffer(0, length, Element::U8)),
+        ));
+        if let Some(under) = under {
+            let held = side.read_buffer(under, 0, length as usize);
+            let held = probe(sites, &format!("{at}/buffer-read"), held, |_| Value::Absent)?;
+            sites.push(Node::leaf(
+                format!("{at}/buffer-bytes"),
+                Observed::bytes(held, ByteLayout::buffer(0, length, Element::U8)),
+            ));
+        }
+        Some(())
+    }
+}
+
+impl Case for SrgbViews {
+    fn name(&self) -> &'static str {
+        "read-write-srgb-unorm-views"
+    }
+
+    fn metal_source(&self) -> MetalSource {
+        MetalSource::Run
+    }
+
+    fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
+        let mut shaders = Vec::new();
+        for entry in [Class::Float.read_write_entry(), Class::Float.read_entry()] {
+            for extension in [RUNTIME_TEXT, METAL_TEXT] {
+                shaders.push(ShaderRef {
+                    fixture: format!("{SCOUT}{extension}"),
+                    entry: entry.to_owned(),
+                    source_sha256: crate::sha256_hex(self.fixture().text(extension)?.as_bytes()),
+                });
+            }
+        }
+        Ok(shaders)
+    }
+
+    fn inputs(&self) -> Result<Vec<Input>, String> {
+        let fixture = self.fixture();
+        let mut words = Vec::new();
+        for format in [PixelFormat::RGBA8UnormSRGB, PixelFormat::RGBA8Unorm] {
+            words.extend(format.as_raw().to_le_bytes());
+        }
+        words.extend(VIEW_PITCH.to_le_bytes());
+        Ok(vec![
+            Input {
+                name: "air".to_owned(),
+                digest: Digest::sha256(fixture.text(RUNTIME_TEXT)?.as_bytes()),
+            },
+            Input {
+                name: "air-typed".to_owned(),
+                digest: Digest::sha256(fixture.text(METAL_TEXT)?.as_bytes()),
+            },
+            Input::bytes("formats", &words),
+            Input::bytes("texture:fill", &Self::bytes()),
+        ])
+    }
+
+    fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
+        let loaded = self.fixture().loaded().map_err(|why| Abort {
+            at: "library".to_owned(),
+            failure: Failure::named("FixtureNotRead", why),
+        })?;
+        let library = made(sites, "library", side.library(&loaded.source()))?;
+        let swizzle = made(
+            sites,
+            "pipeline/read-write",
+            side.compute_pipeline(library, Class::Float.read_write_entry()),
+        )?;
+        let read = made(
+            sites,
+            "pipeline/read",
+            side.compute_pipeline(library, Class::Float.read_entry()),
+        )?;
+        for over in [false, true] {
+            Self::sweep_one(side, sites, over, swizzle, read);
+        }
+        Ok(())
+    }
+}
+
 /// Every case of the family.
 pub fn all() -> Vec<Box<dyn Case>> {
     let mut cases: Vec<Box<dyn Case>> =
@@ -979,6 +1153,7 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     cases.push(Box::new(HeldReadWrite));
+    cases.push(Box::new(SrgbViews));
     cases
 }
 

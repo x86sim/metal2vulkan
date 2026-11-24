@@ -37,13 +37,10 @@
 //! `mapScreenToPhysicalCoordinates:forLayer:` over a map of a zero screen extent (verified: a
 //! SIGSEGV at the first such call on 0 by 64, 64 by 0 and 0 by 0 alike, where the
 //! physical-to-screen map of the same map answers) — which is why the runtime refuses all three.
-//! A pass over a mutable map is out of this round by the user's rule.
+//! A pass over a mutable map is not a case either.
 
-use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{made, Abort, Case, Input, MetalSource, RateMapLayer, RateMapRequest, Side};
-use crate::replay::NOTICES_SITE;
 use crate::transcript::{ByteLayout, Element, Gaps, Node, Observed, Region, Sites};
-use metal2vulkan_runtime::Degradation;
 
 /// The case of a descriptor Metal counts as having no layers.
 pub const NO_LAYERS: &str = "rate-map-no-layers";
@@ -85,10 +82,6 @@ pub struct RateMapCase {
     layers: Vec<RateMapLayer>,
     /// The descriptor's label, which the map keeps.
     label: &'static str,
-    /// Whether the compiled map is the identity inside its screen. A map that is not announces
-    /// the `rasterization-rate-map` degradation when it is made, because a pass over it would be
-    /// drawn region by region, so such a case keeps one notice allowance; Metal announces nothing.
-    identity: bool,
 }
 
 /// Every case of the family.
@@ -96,23 +89,20 @@ pub fn all() -> Vec<RateMapCase> {
     vec![
         // A descriptor holding no layer: Metal's `layerCount` is 0, its validation refuses the
         // descriptor, and plain Metal compiles a map of no layers. The screen size is the one the
-        // runtime lane's own table of this chip was taken at.
+        // measured table of this chip was taken at.
         RateMapCase {
             name: NO_LAYERS,
             screen: [256, 256],
             layers: Vec::new(),
             label: "conformance-no-layers",
-            identity: true,
         },
         // A descriptor of no screen width: its validation refuses it, and plain Metal compiles a
-        // map of one layer, which the runtime compiles too. Its vertical axis is not the
-        // identity, so making it announces the rate-map degradation.
+        // map of one layer.
         RateMapCase {
             name: ZERO_SCREEN_WIDTH,
             screen: [0, 64],
             layers: vec![RateMapLayer::uniform(0.5, 0.5)],
             label: "conformance-zero-width",
-            identity: false,
         },
     ]
 }
@@ -161,33 +151,6 @@ impl Case for RateMapCase {
             Input::bytes("label", self.label.as_bytes()),
             Input::bytes("parameter-copy-offset", &0u64.to_le_bytes()),
         ])
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Exact is the default and every answer of these cases keeps it. A map of the identity
-        // announces nothing, on either venue (verified on MoltenVK and on lavapipe), so its case
-        // carries no allowance at all: a tolerance that never fires is one nobody is checking, and
-        // a device that does announce something there should fail the case until somebody names
-        // why.
-        // Either way the case declares the notice its `Shared` read-back buffer provokes
-        // ([`crate::replay::shared_memory_notice`]), which the RTX 5080 announced for both rows.
-        let shared = crate::replay::shared_memory_notice();
-        if self.identity {
-            return vec![shared];
-        }
-        // A map that is not the identity announces the rate-map degradation when it is made, a
-        // near-equivalent the runtime declares (`docs/API.md`'s degrade catalogue): a pass over
-        // such a map is drawn region by region, on this crate's tile lines. Metal announces
-        // nothing, so the notices set is the one field that may differ, and the allowance is held
-        // to its evidence — the notice must actually have been announced on the run compared.
-        vec![
-            shared,
-            Allowance::new(
-                format!("case/{NOTICES_SITE}/*"),
-                Loosening::Unchecked,
-                Justification::notice(Degradation::RasterizationRateMap),
-            ),
-        ]
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {

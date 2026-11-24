@@ -29,6 +29,7 @@
 //! decides that from the request's own shape and the parent's, a case's guard reaches it with no
 //! device at all, and the Metal side calls it before it makes the call.
 
+use crate::case::Answer;
 use crate::transcript::{Node, NodeName, Observed, Value};
 use metal2vulkan::metal::{PixelFormat, TextureSwizzle, TextureSwizzleChannels, TextureType};
 
@@ -242,13 +243,19 @@ impl ViewRequest {
                 parent.format.name()
             ));
         }
-        let array = matches!(
-            self.texture_type,
-            TextureType::Type2DArray | TextureType::CubeArray | TextureType::Type1DArray
-        );
-        if !array && self.slice_count != 1 {
+        // Apple's `makeTextureView(pixelFormat:textureType:levels:slices:)`: "The length value of
+        // the sliceRange parameter needs to be 6 if the new texture type value is
+        // MTLTextureType.typeCube, or a multiple of 6 if the new texture type value is
+        // MTLTextureType.typeCubeArray"; a type that is not an array holds one.
+        let fits = match self.texture_type {
+            TextureType::Type2DArray | TextureType::Type1DArray => true,
+            TextureType::Cube => self.slice_count == 6,
+            TextureType::CubeArray => self.slice_count.is_multiple_of(6),
+            _ => self.slice_count == 1,
+        };
+        if !fits {
             return Some(format!(
-                "{:?} holds one slice, not {}",
+                "{:?} holds no view of {} slices",
                 self.texture_type, self.slice_count
             ));
         }
@@ -345,9 +352,34 @@ pub fn swizzle_value(swizzle: [u32; 4]) -> Value {
     ])
 }
 
-/// What a texture or a view answers about its place in a view chain, and about sharing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a texture or a view answers about its place in a view chain, and about sharing: the
+/// parent's facts, which a runtime may leave to its consumer, and the view's own shape and
+/// swizzle, each recorded at a site of its own so that either can be compared without the other.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ViewFacts {
+    /// `parentTexture`, `parentRelativeLevel`, `parentRelativeSlice` and `shareable`, or why the
+    /// side has none of them: a runtime whose consumer keeps a view's parent and what it shared
+    /// answers the consumer's own failure at each of their four sites.
+    pub parent: Answer<ViewParent>,
+    /// `swizzle`, by its four raw `MTLTextureSwizzle` ordinals in Metal's order.
+    ///
+    /// Raw and not the translator's own enumeration, deliberately: that type is
+    /// `#[non_exhaustive]` and has no constructor from a raw value, so a side mapping Metal's
+    /// answer into it would have to **coerce** a channel Metal has a name for and the enumeration
+    /// does not. The ordinals are Metal's own, which is the suite's convention everywhere else.
+    pub swizzle: [u32; 4],
+    /// `textureType`, `pixelFormat`, `mipmapLevelCount` and `arrayLength` of the view, so a
+    /// recording states the shape the relative getters are relative to rather than leaving a
+    /// reader to find this module.
+    pub texture_type: u64,
+    pub pixel_format: u64,
+    pub mipmap_level_count: u64,
+    pub array_length: u64,
+}
+
+/// What a texture or a view answers about its parent and about sharing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewParent {
     /// Whether `parentTexture` answered a texture at all. A texture that is not a view answers
     /// nil, which is the baseline every other row is read against.
     pub has_parent: bool,
@@ -360,45 +392,45 @@ pub struct ViewFacts {
     pub parent_relative_level: u64,
     /// `parentRelativeSlice`.
     pub parent_relative_slice: u64,
-    /// `swizzle`, by its four raw `MTLTextureSwizzle` ordinals in Metal's order.
-    ///
-    /// Raw and not the translator's own enumeration, deliberately: that type is
-    /// `#[non_exhaustive]` and has no constructor from a raw value, so a side mapping Metal's
-    /// answer into it would have to **coerce** a channel Metal has a name for and the enumeration
-    /// does not. The ordinals are Metal's own, which is the suite's convention everywhere else.
-    pub swizzle: [u32; 4],
     /// `shareable`.
     pub shareable: bool,
-    /// `textureType`, `pixelFormat`, `mipmapLevelCount` and `arrayLength` of the view, so a
-    /// recording states the shape the relative getters are relative to rather than leaving a
-    /// reader to find this module.
-    pub texture_type: u64,
-    pub pixel_format: u64,
-    pub mipmap_level_count: u64,
-    pub array_length: u64,
 }
 
 impl ViewFacts {
-    /// The facts as the sites a case emits under one node.
+    /// The facts as the sites a case emits under one node, in the order the recordings hold
+    /// them; each of the parent's four getters (five sites) holds the side's failure where it
+    /// answered none.
     pub fn node(&self, name: impl Into<NodeName>) -> Node {
         let number = |value: u64| Observed::value(Value::Uint(value));
-        let flag = |held: bool| Observed::value(Value::Bool(held));
+        let parent = |of: fn(&ViewParent) -> Observed| match &self.parent {
+            Ok(parent) => of(parent),
+            Err(failure) => Observed::value(failure.recorded()),
+        };
         Node::branch(name, Vec::new())
-            .with(Node::leaf("has_parent", flag(self.has_parent)))
-            .with(Node::leaf("expected_parent", flag(self.expected_parent)))
+            .with(Node::leaf(
+                "has_parent",
+                parent(|p| Observed::value(Value::Bool(p.has_parent))),
+            ))
+            .with(Node::leaf(
+                "expected_parent",
+                parent(|p| Observed::value(Value::Bool(p.expected_parent))),
+            ))
             .with(Node::leaf(
                 "parent_relative_level",
-                number(self.parent_relative_level),
+                parent(|p| Observed::value(Value::Uint(p.parent_relative_level))),
             ))
             .with(Node::leaf(
                 "parent_relative_slice",
-                number(self.parent_relative_slice),
+                parent(|p| Observed::value(Value::Uint(p.parent_relative_slice))),
             ))
             .with(Node::leaf(
                 "swizzle",
                 Observed::value(swizzle_value(self.swizzle)),
             ))
-            .with(Node::leaf("shareable", flag(self.shareable)))
+            .with(Node::leaf(
+                "shareable",
+                parent(|p| Observed::value(Value::Bool(p.shareable))),
+            ))
             .with(Node::leaf("texture_type", number(self.texture_type)))
             .with(Node::leaf("pixel_format", number(self.pixel_format)))
             .with(Node::leaf(

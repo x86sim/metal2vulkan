@@ -14,15 +14,6 @@
           "words": 37,
           "differing_words": 26,
           "values": "26 of 37 words: tan 1-2 representable values from Metal's, atan 1-199, asin 1-3,528 (D208.5's table)."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "8a950fcdd5f2c7a2ae7005750f918ea80404a2c5468cdf1225479849cd10316e",
-          "candidate_output_sha256": "d4980787239df509054e5d66f862b9394617adfa0caf5831b3c113eb9378563e",
-          "golden_output_sha256": "d23bdd80deb0d0426628cb5e62acdca3f2d297b7dde6ecea02a432bec2fa94fc",
-          "words": 37,
-          "differing_words": 26,
-          "values": "26 of 37 words: tan 1-2 representable values from Metal's, atan 1-199, asin 1-3,528 (D208.5's table)."
         }
       ],
       "lanes": [
@@ -103,15 +94,6 @@
         {
           "environment_id": "ubuntu-26.04-lavapipe@engine",
           "spv_sha256": "2b43f574b231869985ea1ea4fe78ad86aefdaa1c8036994bb8c4b529eb32b7ed",
-          "candidate_output_sha256": "42dbd27f51bfd158df547b05c9fc4cf89779c9080d3935eb529fd1d428d9ec1d",
-          "golden_output_sha256": "cf687333a70730192ab788f957de469cd190643e7019ddf38655cf2dc6bf28d4",
-          "words": 15,
-          "differing_words": 10,
-          "values": "10 of 15 words, each 1-3 representable values from Metal's."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "87895c24ff6c053c280a6683aaf3a560bdacd5465c38c36ebffffa57bcfcf8c9",
           "candidate_output_sha256": "42dbd27f51bfd158df547b05c9fc4cf89779c9080d3935eb529fd1d428d9ec1d",
           "golden_output_sha256": "cf687333a70730192ab788f957de469cd190643e7019ddf38655cf2dc6bf28d4",
           "words": 15,
@@ -234,15 +216,6 @@
         {
           "environment_id": "ubuntu-26.04-lavapipe@engine",
           "spv_sha256": "7a1fbdf4a49f7f0655ed35679e91e810dc60c6b3ba021f0ccd0ec5e45aac719f",
-          "candidate_output_sha256": "627093b1234b4ac202bf9292317eba340de79a3796dbc6352c5a020b03a420f9",
-          "golden_output_sha256": "e453a4874387c8f6fb378b04a404071d3dcfbd863bf87611b61439fc3c921544",
-          "words": 10,
-          "differing_words": 8,
-          "values": "8 of 10 words, 1-45 representable values from Metal's; the two sqrt words now match (fast sqrt is Metal's x * rsqrt(x), D253)."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "275bbf44f8caf8ae52901c852e035469227561e589f05207091406edfbf32b6a",
           "candidate_output_sha256": "627093b1234b4ac202bf9292317eba340de79a3796dbc6352c5a020b03a420f9",
           "golden_output_sha256": "e453a4874387c8f6fb378b04a404071d3dcfbd863bf87611b61439fc3c921544",
           "words": 10,
@@ -377,15 +350,6 @@
           "words": 8,
           "differing_words": 2,
           "values": "2 of 8 words: words 1 and 2 (sin of 1e6 and of 6588397.5), one representable value from Metal's. Words 6 and 7 now match: fast sin and cos answer +0 past float(pi/2) * 2^22 (D253)."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "60f3f761a7755a167a059eea4e545b05599f6c5b30a6358f5fb0c14148b3fbea",
-          "candidate_output_sha256": "99cd93ecef818da15e908153185d3bc21ce8c4a4bbdc432e8f39fa2d8eb3e3ec",
-          "golden_output_sha256": "43b6f6b67c749ec03a0bcd37173da4652c29c9c22ae8a4cb79f53c7a5c6296fb",
-          "words": 8,
-          "differing_words": 2,
-          "values": "2 of 8 words: words 1 and 2 (sin of 1e6 and of 6588397.5), one representable value from Metal's. Words 6 and 7 now match: fast sin and cos answer +0 past float(pi/2) * 2^22 (D253)."
         }
       ],
       "lanes": [
@@ -490,15 +454,6 @@
           "words": 8192,
           "differing_words": 1313,
           "values": "1,313 of 8,192 words: 1,250 f32 words (1,125 within 1.8e-7 absolute of Metal's, and 125 at a NaN or infinity input) and 63 half words at a NaN input. tanh(44) now matches."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "b40bfda9fa19300d753186ab818037def36a235ad7185174b8083b71365d3ade",
-          "candidate_output_sha256": "d5f3f8a108a8753e3aa4a6160aa23713801cb2a35689e7f8dc502845d328cb17",
-          "golden_output_sha256": "69e49c332c2a93830dd4944b54e705d700c4384eea765573907cac33a15ce254",
-          "words": 8192,
-          "differing_words": 1313,
-          "values": "1,313 of 8,192 words: 1,250 f32 words (1,125 within 1.8e-7 absolute of Metal's, and 125 at a NaN or infinity input) and 63 half words at a NaN input. tanh(44) now matches."
         }
       ],
       "lanes": [
@@ -588,15 +543,6 @@
           "words": 8,
           "differing_words": 1,
           "values": "1 of 8 words: word 3, 0.999909163 against Metal's 0.999909222, one representable value. Word 5 (x = 44) now matches: Metal's fast division flushes the reciprocal and both answer 0."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "0b0917adaf995d01d22eb5b474f8eefe0eeeb650f23cc615cc5411b0131c60a3",
-          "candidate_output_sha256": "db629e90d19bb6f6a33ccb99b4490ed3c2ee7339ed3e585c98d85cad18d4c060",
-          "golden_output_sha256": "1f7955b8a664e4325fbf810667e5d2a3ed29739ee3a0279a95be461b0e1c4a8d",
-          "words": 8,
-          "differing_words": 1,
-          "values": "1 of 8 words: word 3, 0.999909163 against Metal's 0.999909222, one representable value. Word 5 (x = 44) now matches: Metal's fast division flushes the reciprocal and both answer 0."
         }
       ],
       "lanes": [
@@ -643,15 +589,6 @@
         {
           "environment_id": "ubuntu-26.04-lavapipe@engine",
           "spv_sha256": "e891abe89c27dc37f078db01352eb25ade1246c42dd494c4fa40ef1f78c9ef4d",
-          "candidate_output_sha256": "88c52304e0ed5f6f12c1b720e12374d3823e0b5af1c434c642ffef922d9ea3c9",
-          "golden_output_sha256": "206a9e6a70540a81c16b5f758db5f04778f30aeb1ec4ff405b037e8199cd3df2",
-          "words": 13,
-          "differing_words": 1,
-          "values": "1 of 13 words: word 11, Metal -0.00936 against llvmpipe's 0.00464. The other six words that differed now match: WP-FMX lowers fast fmod as Metal composes it, around a fused multiply-add (D253)."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "0aa1b8ae5132104cec78982d313e9718622ec854895567c7d60e922cd16ce9bb",
           "candidate_output_sha256": "88c52304e0ed5f6f12c1b720e12374d3823e0b5af1c434c642ffef922d9ea3c9",
           "golden_output_sha256": "206a9e6a70540a81c16b5f758db5f04778f30aeb1ec4ff405b037e8199cd3df2",
           "words": 13,
@@ -760,15 +697,6 @@
         {
           "environment_id": "ubuntu-26.04-lavapipe@engine",
           "spv_sha256": "c652ac199ee2554dc5f14b25aed8b6ac29e7d7b28222088cc9c7bb46212683df",
-          "candidate_output_sha256": "1aa2a981b50fe59a9cdc0ef1f93f3f298c020ee8d829f55a3e1c7a487f9d420e",
-          "golden_output_sha256": "0e3fa4fcb38b955530fa56bfb161e17c4418d5105ce9b16ef293daa1520aae18",
-          "words": 192,
-          "differing_words": 21,
-          "values": "21 of 192 words: denormal operands and results kept where Metal flushes, NaN 0xffc00000 against 0x7fc00000, and reciprocals beyond 2^126 kept where Metal flushes them."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "0817ebae0e2eee409821868213de1ae99ce4646438d3a9eaf27aaa58c08d9f49",
           "candidate_output_sha256": "1aa2a981b50fe59a9cdc0ef1f93f3f298c020ee8d829f55a3e1c7a487f9d420e",
           "golden_output_sha256": "0e3fa4fcb38b955530fa56bfb161e17c4418d5105ce9b16ef293daa1520aae18",
           "words": 192,
@@ -947,15 +875,6 @@
           "words": 192,
           "differing_words": 6,
           "values": "6 of 192 words, all in the precise division lane, each a denormal operand or result that Metal flushes and llvmpipe keeps: two denormal quotients where Metal answers +0, 2^127 and 2 where Metal divides by a flushed zero and answers infinity, and 1 twice where Metal flushes both operands and answers NaN."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "fc68214c5f7243c9bf9352a154ba886d746cc175c470553de0fd83bbe65063a9",
-          "candidate_output_sha256": "c3a22d491ea2f6fb8e6587a3510b233015d4e46bcdf9c7e1a9ecfa416c95da5a",
-          "golden_output_sha256": "463b4b22139a229ab33bcf98e1bc1dc7588b5148a8d85998ea6403301690080c",
-          "words": 192,
-          "differing_words": 6,
-          "values": "6 of 192 words, all in the precise division lane, each a denormal operand or result that Metal flushes and llvmpipe keeps: two denormal quotients where Metal answers +0, 2^127 and 2 where Metal divides by a flushed zero and answers infinity, and 1 twice where Metal flushes both operands and answers NaN."
         }
       ],
       "lanes": [
@@ -1129,15 +1048,6 @@
           "words": 13,
           "differing_words": 0,
           "values": "0 of 13 words: every zero is +0 on both devices."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "ab6a23894889492ae30bb3244c118aff85861833eab39d2e1601935d2af9a0bf",
-          "candidate_output_sha256": "9fe4aa061bd83377c8671a61edc1081eea2381371daf3e2645789c97310fccb7",
-          "golden_output_sha256": "9fe4aa061bd83377c8671a61edc1081eea2381371daf3e2645789c97310fccb7",
-          "words": 13,
-          "differing_words": 0,
-          "values": "0 of 13 words: every zero is +0 on both devices."
         }
       ],
       "lanes": [
@@ -1237,15 +1147,6 @@
         {
           "environment_id": "ubuntu-26.04-lavapipe@engine",
           "spv_sha256": "501f8560eeca50ab2a5f5a2f95bd1c97bc1fa9f904164228d591555f4f67e17a",
-          "candidate_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
-          "golden_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
-          "words": 13,
-          "differing_words": 0,
-          "values": "0 of 13 words: every zero is +0 on both devices."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "bd83aeff7fb18c032316efa6e04f76dde0b66ee5980fc63e7dc3d52c3687de6b",
           "candidate_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
           "golden_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
           "words": 13,
@@ -1380,15 +1281,6 @@
           "words": 13,
           "differing_words": 0,
           "values": "0 of 13 words: every zero is +0 on both devices."
-        },
-        {
-          "environment_id": "ubuntu-26.04-lavapipe@engine+robustness-off",
-          "spv_sha256": "bd83aeff7fb18c032316efa6e04f76dde0b66ee5980fc63e7dc3d52c3687de6b",
-          "candidate_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
-          "golden_output_sha256": "ce6a853ebf4163d4ae4ab5f32c3ed2b41ed806cce2d6fc34f7d4b52f915f2fcf",
-          "words": 13,
-          "differing_words": 0,
-          "values": "0 of 13 words: every zero is +0 on both devices."
         }
       ],
       "lanes": [
@@ -1500,512 +1392,6 @@
         "sign_off": {
           "state": "signed_off",
           "decision": "C3 apple_reading: accept only within Apple's bound (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "2e67d4ecaaefa00a6a54df0d6bebffc200696433305296fb0391eb5fba986fbd",
-      "name": "linked-single-radix5-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "582f008c4a6cf0b59a29acc582d600557a976949467bea0dccaaddd33150da24",
-          "candidate_output_sha256": "7a7ad65159a287f546c4a8845ad14cc66466c18e6f6781d24303129c759a3af1",
-          "golden_output_sha256": "5ba0adf44b81eb5809e6e342be7b7c2834b21957444ac4c67d418c5657fdde0d",
-          "words": 5,
-          "differing_words": 2,
-          "values": "2 of 5 words (4 of 10 half lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 2.38e-07 in the device's reading and 1.19e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 5, half). MoltenVK compiles SPIRV-Cross's MSL with -fmetal-math-mode=fast, and Metal's front end regroups the chains; its output evaluated in its own order reproduced MoltenVK's bytes for radix 5, 7, and 11 (D175.1). Metal's own grouping moved between macOS 26.5.2 and 26.7, so matching it is not a goal. The product leaves only operations carrying both contract and reassoc undecorated (D175.2) and records FastMathRewrites, so the observation is Unbounded. Re-pinned at the candidate WP-FMX's lowering compiles (EV SGN-c3rows at 79cf7adf, fresh Metal, MoltenVK, and lavapipe rows; D273.8): a current MoltenVK row. Keyed by its cause since D557: it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites; re-pinned at the snapshot's M3 Max row (master 752908b6).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "380b9b9f0979e03292dea5fcd5cc642c03c9bb5df2f409c684a57d81cdf966e8",
-      "name": "linked-single-radix7-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "828202a6d35773f69efb4af7c01f28dc806a4a114989e4bda3806af1103a407e",
-          "candidate_output_sha256": "945bde05e2fb639195929ca887f7cf17aa44ef370cd79b63390e36ec78b42749",
-          "golden_output_sha256": "387ce2a23f9ff172412c93739f9a250ee707ef5ac47ae9f18c3ba396ccdd44bc",
-          "words": 7,
-          "differing_words": 4,
-          "values": "4 of 7 words (8 of 14 half lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 4.77e-07 in the device's reading and 2.98e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 7, half). MoltenVK compiles SPIRV-Cross's MSL with -fmetal-math-mode=fast, and Metal's front end regroups the chains; its output evaluated in its own order reproduced MoltenVK's bytes for radix 5, 7, and 11 (D175.1). Metal's own grouping moved between macOS 26.5.2 and 26.7, so matching it is not a goal. The product leaves only operations carrying both contract and reassoc undecorated (D175.2) and records FastMathRewrites, so the observation is Unbounded. Re-pinned at the candidate WP-FMX's lowering compiles (EV SGN-c3rows at 79cf7adf, fresh Metal, MoltenVK, and lavapipe rows; D273.8): a current MoltenVK row. Keyed by its cause since D557: it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites; re-pinned at the snapshot's M3 Max row (master 752908b6).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "cd50e77be3ef88a987c936309321bf53ce72a31534522c2203f884e6ec3718ad",
-      "name": "linked-single-radix11-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "2273f82305260f512ff97e7210c5987225b79736a3eb6d4ee92ec76b7808b554",
-          "candidate_output_sha256": "d8ae9087d74ab96e4f902fdd98991dc8d8e60c2c73419d7f952048841b7ebd4b",
-          "golden_output_sha256": "80b3252dc92f373f626a68bd61db38ae9b9f763b2e0a88cbaccb4b44d814c57c",
-          "words": 22,
-          "differing_words": 13,
-          "values": "13 of 22 words (13 of 22 float lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 2.38e-07 in the device's reading and 4.77e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 11, float). MoltenVK compiles SPIRV-Cross's MSL with -fmetal-math-mode=fast, and Metal's front end regroups the chains; its output evaluated in its own order reproduced MoltenVK's bytes for radix 5, 7, and 11 (D175.1). Metal's own grouping moved between macOS 26.5.2 and 26.7, so matching it is not a goal. The product leaves only operations carrying both contract and reassoc undecorated (D175.2) and records FastMathRewrites, so the observation is Unbounded. Re-pinned at the candidate WP-FMX's lowering compiles (EV SGN-c3rows at 79cf7adf, fresh Metal, MoltenVK, and lavapipe rows; D273.8): a current MoltenVK row. Keyed by its cause since D557: it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites; re-pinned at the snapshot's M3 Max row (master 752908b6).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "85a566716580a4f5417a70f849a40d362f64250b47b19965f5ea8947a54172cd",
-      "name": "linked-single-radix11-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "41882b92350f2ef3ea9af79554b1a04c2fd4fde04df07f1b41340cc2cd7fbcb5",
-          "candidate_output_sha256": "c6ea68c5aff11be40887b41f24d789526f93320a73c6c568a0326633cd433257",
-          "golden_output_sha256": "36afbf49fad08006146b30366ebd73ddceb7091eee42e03cf22d5e7efe7d125e",
-          "words": 11,
-          "differing_words": 9,
-          "values": "9 of 11 words (11 of 22 half lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 2.38e-07 in the device's reading and 4.77e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 11, half). MoltenVK compiles SPIRV-Cross's MSL with -fmetal-math-mode=fast, and Metal's front end regroups the chains; its output evaluated in its own order reproduced MoltenVK's bytes for radix 5, 7, and 11 (D175.1). Metal's own grouping moved between macOS 26.5.2 and 26.7, so matching it is not a goal. The product leaves only operations carrying both contract and reassoc undecorated (D175.2) and records FastMathRewrites, so the observation is Unbounded. Re-pinned at the candidate WP-FMX's lowering compiles (EV SGN-c3rows at 79cf7adf, fresh Metal, MoltenVK, and lavapipe rows; D273.8): a current MoltenVK row. Keyed by its cause since D557: it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites; re-pinned at the snapshot's M3 Max row (master 752908b6).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "de0124c93fb9d10fb6d78b8b5da8367a6b9bec8ac5c38807411a8525d3d470a1",
-      "name": "linked-single-radix13-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "b960991bb435693e9217b5c19cf9e01df4559d96f19e7503edcb5d7c1e8d8ccd",
-          "candidate_output_sha256": "7d02bdf035208470bc61277581e5f47968cd9a494f4f8f8f26822a7ad08da816",
-          "golden_output_sha256": "9bfec8ea8d8a59ae669ebcc604d470e5e118fb8eaeeb9fa632b3cad7497da12c",
-          "words": 13,
-          "differing_words": 5,
-          "values": "5 of 13 words (5 of 26 half lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 4.77e-07 in the device's reading and 3.58e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 13, half). MoltenVK compiles SPIRV-Cross's MSL with -fmetal-math-mode=fast, and Metal's front end regroups the chains; its output evaluated in its own order reproduced MoltenVK's bytes for radix 5, 7, and 11 (D175.1). This kernel's own bytes (radix 13, half) were not reproduced: D175.1 reproduced radix 13 only for float, where MoltenVK matches Metal, so this entry is attributed by the family and the residue lanes it differs in. Metal's own grouping moved between macOS 26.5.2 and 26.7, so matching it is not a goal. The product leaves only operations carrying both contract and reassoc undecorated (D175.2) and records FastMathRewrites, so the observation is Unbounded. Re-pinned at the candidate WP-FMX's lowering compiles (EV SGN-c3rows at 79cf7adf, fresh Metal, MoltenVK, and lavapipe rows; D273.8): a current MoltenVK row. Keyed by its cause since D557: it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites; re-pinned at the snapshot's M3 Max row (master 752908b6).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "8f4525d29027a76b6bca0aa935aa1646c698e6a7edfb35a5a32f08bc2d710fd4",
-      "name": "linked-single-radix5-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "3c09c279adf1f55b35a2e570f2ca9dfb2811b1f1fa59458548f4e8c610ffb3d7",
-          "candidate_output_sha256": "dd09a3a8cf9b9ae1973f60669972881a76eb167a0d30b24b7a85a1625c3d645a",
-          "golden_output_sha256": "dbcb6ec07e6707815f6a0aecce5fbcdf7476d8f146d71506832372432a42c70a",
-          "words": 10,
-          "differing_words": 4,
-          "values": "4 of 10 words (4 of 10 float lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 2.38e-07 in the device's reading and 1.19e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 5, float): fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The list held the case only as the cause of its old-engine mismatch (its reading was removed when its MoltenVK row matched, D273 item 8); its engine rows mismatch Metal on every venue, each in the same residue lanes (the snapshot at master 752908b6). Listed under the user's answer, which accepted every fast_math_regrouping entry (D273 item 2), keyed by its cause (D557): it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "421b21bac80d60a446415dec5a6afa23aef24dcf500c8deb44969f6d80f365f5",
-      "name": "linked-single-radix7-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "9283c01ec94804b4376d960582af5d18a2e0ee04764096c31baa03b40f1f3c42",
-          "candidate_output_sha256": "bc0f8bac98ddf7b94e77abcc3c4acb69a6b6b8daf6485c4512c0ed7ce0809188",
-          "golden_output_sha256": "10c4aae0fbb3a33266ef114f024c526456d79995736504663d17c0104acb4e29",
-          "words": 14,
-          "differing_words": 8,
-          "values": "8 of 14 words (8 of 14 float lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 4.77e-07 in the device's reading and 2.98e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 7, float): fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The list held the case only as the cause of its old-engine mismatch (its reading was removed when its MoltenVK row matched, D273 item 8); its engine rows mismatch Metal on every venue, each in the same residue lanes (the snapshot at master 752908b6). Listed under the user's answer, which accepted every fast_math_regrouping entry (D273 item 2), keyed by its cause (D557): it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "4825f9c3595bfe824e80f768c3ddf840609b4ca219f82e6342fd917be215e58b",
-      "name": "linked-single-radix13-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "dcbed11db73ca901c9dc2c962b0ed652a6bacf2757e9610d1bf0cd32be1b3e90",
-          "candidate_output_sha256": "68d7fac24a7cff0f1e5b6bf922c5b55017af3237f4adcdda8f663c617372924d",
-          "golden_output_sha256": "457fdc9c9af61c957ac00c50076198600adb56ceaf0aa09fcb2d1453051d5caa",
-          "words": 26,
-          "differing_words": 5,
-          "values": "5 of 26 words (5 of 26 float lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 4.77e-07 in the device's reading and 3.58e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 13, float): fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The list held the case only as the cause of its old-engine mismatch; its engine rows mismatch Metal on every venue, each in the same residue lanes (the snapshot at master 752908b6). Listed under the user's answer, which accepted every fast_math_regrouping entry (D273 item 2), keyed by its cause (D557): it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "456861185b49180b0dd830f9d213d48b01d12ebc7ecd30236466ffa34dcffda0",
-      "name": "linked-single-radix15-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "3a608a9dc8d865a4d3d231aa74548de971ac307866f8a3afec6a3b01ca636a42",
-          "candidate_output_sha256": "281b5b4a5c66388394e136c446cf46fa7b08a5b6e9d1cbceb60c7b79e9819017",
-          "golden_output_sha256": "b015b18fe37a1267dd1a86e9d5e47fdae64874ae27edd26d8099d68c741b2cc6",
-          "words": 15,
-          "differing_words": 4,
-          "values": "4 of 15 words (8 of 30 half lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 1.19e-07 in the device's reading and 2.38e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 15, half): fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The list held the case only as the cause of its old-engine mismatch; its engine rows mismatch Metal on every venue, each in the same residue lanes (the snapshot at master 752908b6). Listed under the user's answer, which accepted every fast_math_regrouping entry (D273 item 2), keyed by its cause (D557): it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "845d96f2755d3e19fad12cab86488409277eb003f34f1b9752ee5b952389c900",
-      "name": "linked-single-radix15-zero-write",
-      "cause": "fast_math_regrouping",
-      "bound": "No numeric bound: every butterfly is a chain of fadd fast and fmul fast (reassoc, contract) over the radix's twiddle constants, so the AIR allows any grouping. Every authored input is (1, 2), so each product is exact and only the order of the additions decides the last-place residues (D175.1).",
-      "observations": [
-        {
-          "environment_id": "apple-m3-max-moltenvk@engine",
-          "spv_sha256": "ce920518a3e5bcbd907235ad83e749a55ec9ca916bcf459a295a946e6581f122",
-          "candidate_output_sha256": "f3a2ec44d7e9ebd6312ccebfd1a1be3154ac8bb98d06e2d592fbd075fccb22f3",
-          "golden_output_sha256": "8492054da7e7a0d20c703e3c54ddb9d2addc28ab1cb68daf193b9fd1a2b81ec5",
-          "words": 30,
-          "differing_words": 8,
-          "values": "8 of 30 words (8 of 30 float lanes): every differing lane is a residue of the sums' rounding where the exact transform of the constant input is 0; the largest is 1.19e-07 in the device's reading and 2.38e-07 in Metal's (macOS 26.7). The DC term matches. Every venue's committed stated row reads these words."
-        }
-      ],
-      "review": {
-        "evidence": [
-          "D175",
-          "D273",
-          "D557"
-        ],
-        "note": "An MPS ND-array FFT kernel (radix 15, float): fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The list held the case only as the cause of its old-engine mismatch; its engine rows mismatch Metal on every venue, each in the same residue lanes (the snapshot at master 752908b6). Listed under the user's answer, which accepted every fast_math_regrouping entry (D273 item 2), keyed by its cause (D557): it reviews the case's mismatch in every venue's slots while the row records FastMathRewrites.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    }
-  ],
-  "old_mismatches": [
-    {
-      "case_id": "85a566716580a4f5417a70f849a40d362f64250b47b19965f5ea8947a54172cd",
-      "name": "linked-single-radix11-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in. The engine still differs (its reading is reviewed). One row of another old-engine build differs as well.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "cd50e77be3ef88a987c936309321bf53ce72a31534522c2203f884e6ec3718ad",
-      "name": "linked-single-radix11-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). D175 reproduced MoltenVK's bytes for radix 11 from the engine's module; the old engine's module was not reproduced, so its rows are attributed by the family and the residue lanes they differ in. The engine still differs (its reading is reviewed). Thirteen rows of other old-engine builds (masks, groupings, native fma, typed cancellation) differ as well.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "4825f9c3595bfe824e80f768c3ddf840609b4ca219f82e6342fd917be215e58b",
-      "name": "linked-single-radix13-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). Fixed: the engine matches Metal (executor v18; one of D175.4's guards). For radix 13 (float), Metal's regrouped front-end output of the engine's module, evaluated in its own order, gives Metal's own reading (D175.1). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "de0124c93fb9d10fb6d78b8b5da8367a6b9bec8ac5c38807411a8525d3d470a1",
-      "name": "linked-single-radix13-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in. The engine still differs (its reading is reviewed). Six rows of other old-engine builds differ as well.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "456861185b49180b0dd830f9d213d48b01d12ebc7ecd30236466ffa34dcffda0",
-      "name": "linked-single-radix15-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's own row in apple-m3-max-moltenvk matched, as does the engine (executor v18). The one mismatching row is another old-engine build's, recorded under its own environment (byte-exact-closed-20260830).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "845d96f2755d3e19fad12cab86488409277eb003f34f1b9752ee5b952389c900",
-      "name": "linked-single-radix15-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's own row in apple-m3-max-moltenvk matched, as does the engine (executor v18). The four mismatching rows are other old-engine builds recorded under their own environments (byte-exact-closed-20260830, fast-shape-debug, radix15-leading-pair, radix15-topology).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "2e67d4ecaaefa00a6a54df0d6bebffc200696433305296fb0391eb5fba986fbd",
-      "name": "linked-single-radix5-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's row in apple-m3-max-moltenvk (executor v46) was compared with Metal's macOS 26.5.2 reading; its output equals Metal's 26.7 reading byte for byte, so Metal's own grouping moved between the releases. The engine still differs from 26.7 (its reading is reviewed). Six rows of other old-engine builds differ as well.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "8f4525d29027a76b6bca0aa935aa1646c698e6a7edfb35a5a32f08bc2d710fd4",
-      "name": "linked-single-radix5-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's row in apple-m3-max-moltenvk (executor v46) was compared with Metal's macOS 26.5.2 reading; its output equals Metal's 26.7 reading byte for byte, so Metal's own grouping moved between the releases. The engine still differs from 26.7 (its reading is reviewed). Three rows of other old-engine builds, recorded under their own environments, differ as well.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "380b9b9f0979e03292dea5fcd5cc642c03c9bb5df2f409c684a57d81cdf966e8",
-      "name": "linked-single-radix7-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in. The engine still differs (its reading is reviewed).",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "421b21bac80d60a446415dec5a6afa23aef24dcf500c8deb44969f6d80f365f5",
-      "name": "linked-single-radix7-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). D175 reproduced MoltenVK's bytes for radix 7 from Metal's regrouped front-end output of the engine's module; the old engine's module was not reproduced, so its rows are attributed by the family and the residue lanes they differ in. The engine still differs (its reading is reviewed). Five rows of other old-engine builds differ as well; three of them equal Metal's 26.7 reading.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "d34084bcd8e19a9b7799c4bb81c33d7db666708f9bd2997ef39b0ab38d1a652a",
-      "name": "linked-single-radix9-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). Fixed: the engine matches Metal (executor v18). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
-          "date": "2026-10-03"
-        }
-      }
-    },
-    {
-      "case_id": "e515289a7d832addcf0e1ca3c55ff5bd38dfa62f3f83153ba5b726690667193c",
-      "name": "linked-single-radix9-zero-write",
-      "cause": "fast_math_regrouping",
-      "review": {
-        "evidence": [
-          "D175",
-          "D273"
-        ],
-        "note": "An MPS ND-array FFT kernel: fast-flagged butterfly chains over exact products, where only the order of the additions decides the residue lanes (D175.1). Fixed: the engine matches Metal (executor v18). The old engine's module was not reproduced; its row is attributed by the family and the residue lanes it differs in.",
-        "sign_off": {
-          "state": "signed_off",
-          "decision": "C3 fast_math_regrouping: accept (the user's answer of 2026-10-03)",
           "date": "2026-10-03"
         }
       }
@@ -2263,7 +1649,7 @@
       }
     },
     {
-      "case_id": "6ece8087a1124a9baebcbcefc0f858712d7b37abecf21d9d28c629406ce42eaf",
+      "case_id": "722202f0e4f7172f265f75422d37bbafb26b9763e6a4caab1489e61c5ab8451f",
       "name": "coverage-read-by-each-run-of-a-memory-writer-at-2x",
       "gap": "clipped_primitive_split",
       "review": {
@@ -2272,7 +1658,7 @@
           "D341.7",
           "D341.9"
         ],
-        "note": "A memory writer that reads [[sample_mask]] and no sample index runs once per covered sample over the generated full-screen triangle at 2 samples in a 1x1 pass without attachments; Apple's rasterizer splits no pixel of this draw at 2 samples, and the M4 counts 2 runs of 0x3 (EV VSM-nat-m4). A Vulkan device's loop reads the whole primitive's coverage; MoltenVK, which runs the function as written, reads Metal's (D341 item 9). Open until an exact emulation exists (the user's decision of 2026-10-06): the mismatch stays counted, its reason naming the gap.",
+        "note": "A memory writer that reads [[sample_mask]] and no sample index, drawn by the generated full-screen triangle at 2 samples in a 1x1 pass without attachments: word 0 ORs the coverages its runs read, 0x3 on the M3, the pixel's coverage, which a Vulkan device's runs over the whole primitive's coverage also give. Documented Metal names no run count for a memory-writing fragment, and the device runs one as it runs it (PrecisionNote::DeviceFragmentRuns), so the case compares no run count. Listed by its structure; the gap is named only for a mismatching row.",
         "sign_off": {
           "state": "awaiting_user",
           "decision": "C3 answer gap: Apple's rasterizer splits the primitives it clips; open until an exact emulation exists (the user's decision of 2026-10-06)"
@@ -2280,7 +1666,7 @@
       }
     },
     {
-      "case_id": "74b594b3df7dfe5a11ba2fd1aba919c0ac0af3e194f913ff86fc1a682606fc47",
+      "case_id": "bc5c29ad7fd0f978d1a4541cc63b38f71f54fe2f5eeb604af6f3760de5933b83",
       "name": "coverage-read-by-each-run-of-a-memory-writer-at-4x",
       "gap": "clipped_primitive_split",
       "review": {
@@ -2289,7 +1675,7 @@
           "D341.7",
           "D341.9"
         ],
-        "note": "The same at 4 samples, where Apple's rasterizer splits the clipped triangle's pixel (D341 item 6): the M4 counts 2 runs of 0x3 and 2 of 0xc (EV VSM-nat-m4). A Vulkan device's loop reads the whole primitive's coverage; MoltenVK, which runs the function as written, reads Metal's (D341 item 9). Open until an exact emulation exists (the user's decision of 2026-10-06): the mismatch stays counted, its reason naming the gap.",
+        "note": "The same at 4 samples, where Apple's rasterizer splits the clipped triangle's pixel into runs of 0x3 and of 0xc: word 0, their OR, is 0xf on the M3, the pixel's coverage. Documented Metal names no run count for a memory-writing fragment, and the device runs one as it runs it (PrecisionNote::DeviceFragmentRuns), so the case compares no run count. Listed by its structure; the gap is named only for a mismatching row.",
         "sign_off": {
           "state": "awaiting_user",
           "decision": "C3 answer gap: Apple's rasterizer splits the primitives it clips; open until an exact emulation exists (the user's decision of 2026-10-06)"
@@ -2297,7 +1683,7 @@
       }
     },
     {
-      "case_id": "6322020d4a6af24b6ac804511fb58c15862359d356b8c03483d6c3f66f78171a",
+      "case_id": "870c5c61ed694d0355c3efe41cc59a5148886cc6ac2784f38ce3690be26a6d41",
       "name": "coverage-and-pixel-center-read-by-each-run-at-4x",
       "gap": "clipped_primitive_split",
       "review": {
@@ -2306,7 +1692,24 @@
           "D341.7",
           "D341.9"
         ],
-        "note": "The same beside [[position]] at 4 samples: the M4 counts 2 runs of 0x3 and 2 of 0xc, each reading the pixel center (EV VSM-nat-m4). A Vulkan device's loop reads the whole primitive's coverage; MoltenVK, which runs the function as written, reads Metal's (D341 item 9). Open until an exact emulation exists (the user's decision of 2026-10-06): the mismatch stays counted, its reason naming the gap.",
+        "note": "The same beside [[position]] at 4 samples: word 18 ORs the position each run reads, the pixel center, 0x202 on the M3. Documented Metal names no run count for a memory-writing fragment, and the device runs one as it runs it (PrecisionNote::DeviceFragmentRuns), so the case compares no run count. Listed by its structure; the gap is named only for a mismatching row.",
+        "sign_off": {
+          "state": "awaiting_user",
+          "decision": "C3 answer gap: Apple's rasterizer splits the primitives it clips; open until an exact emulation exists (the user's decision of 2026-10-06)"
+        }
+      }
+    },
+    {
+      "case_id": "a997be267654b9c1d11c139af4e477dfeb1ff40244962ae93e5fb2c6d363fbdd",
+      "name": "coverage-beside-the-pixel-center-ored-over-its-runs-at-4x",
+      "gap": "clipped_primitive_split",
+      "review": {
+        "evidence": [
+          "D341.6",
+          "D341.7",
+          "D341.9"
+        ],
+        "note": "The same function's word 0, the OR of the coverages its runs read: 0xf on the M3, the pixel's coverage. Documented Metal names no run count for a memory-writing fragment, and the device runs one as it runs it (PrecisionNote::DeviceFragmentRuns), so the case compares no run count. Listed by its structure; the gap is named only for a mismatching row.",
         "sign_off": {
           "state": "awaiting_user",
           "decision": "C3 answer gap: Apple's rasterizer splits the primitives it clips; open until an exact emulation exists (the user's decision of 2026-10-06)"

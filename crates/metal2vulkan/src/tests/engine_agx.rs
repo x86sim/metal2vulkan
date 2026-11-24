@@ -2,13 +2,15 @@
 //!
 //! MSL has no spelling for `llvm.agx*`, so the kernels are hand-written AIR (`llvm-as`
 //! assembles them; a missing tool skips visibly). Each runs on the CPU interpreter against
-//! expectations computed here from the device-measured contracts the old engine recorded:
+//! expectations computed here from the device-measured contracts (the old engine's records, and
+//! the bit interleave measured on an M3 Max):
 //!
 //! - `llvm.agx3.edgecheck` over signed and unsigned edge triples (negative lanes, `INT_MAX`
 //!   overflow, a nonzero `low`, count 0 and `u32::MAX`);
 //! - the emask loads and stores in both spaces and every element width, under every mask:
 //!   an inactive lane is never written and reads zero;
 //! - `llvm.agx2.cluster.num` is 0 in every thread;
+//! - `llvm.agx2.shfl` interleaves its operands' bits, on edge and pseudo-random pairs;
 //! - the four `agx2` matrix multiply-adds over the distributed 8x8 tile, in the `Direct` tier
 //!   at 32 lanes and the `Cluster32` tier at 64 lanes, in both scheduling orders, with several
 //!   simdgroups per threadgroup.
@@ -23,17 +25,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::device::subgroup::{self, OpBits, SimdClass, Tier};
 use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
-use crate::error::{Error, Feature, LowerFamily, Needs};
+use crate::error::{Error, Feature, Needs};
 use crate::lower::arith::legal::{f16_to_f64, f64_to_f16};
 use crate::lower::select::Plan;
 use crate::pipeline::artifact::PrecisionNote;
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, fixtures_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
+use crate::spirv::testing::threadgroup_profiles;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -91,19 +94,19 @@ fn kernel(name: &str, buffers: u32, globals: &str, body: &str, decls: &str) -> S
 }
 
 fn moltenvk() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 /// A wave64-only compute device: the committed RDNA3 description with its subgroup size range
 /// narrowed to 64 (the `Cluster32` tier).
 fn wave64() -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/amd-rdna3-radv.json");
+        .join("../metal2vulkan-validation/profiles/amd-780m-radv.json");
     let text = std::fs::read_to_string(&path).expect("read the RDNA3 description");
     let narrowed = text.replace("\"minSubgroupSize\": 32", "\"minSubgroupSize\": 64");
     assert_ne!(narrowed, text, "the description names minSubgroupSize");
     let desc = DeviceDescription::from_khronos_json(&narrowed, None).expect("description");
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -119,10 +122,7 @@ fn run_all(
     bufs: &[Vec<u8>],
 ) -> Vec<Vec<u8>> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([local, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(local));
+    spec.extend(crate::pipeline::threadgroup_constants([local, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     let res = Resources {
         buffers: bufs
@@ -540,6 +540,79 @@ fn cluster_number_is_zero_everywhere() {
     assert!(words(&out[0]).iter().all(|&w| w == 0));
 }
 
+// ---- shfl ------------------------------------------------------------------------------------
+
+/// Thread `t` interleaves the two halves of word `t` of buffer 0 into word `t` of buffer 1.
+fn shfl_kernel() -> String {
+    let body = "  %t64 = zext i32 %t to i64\n  \
+                %p = getelementptr inbounds i32, ptr addrspace(1) %b0, i64 %t64\n  \
+                %w = load i32, ptr addrspace(1) %p, align 4\n  %a = trunc i32 %w to i16\n  \
+                %h = lshr i32 %w, 16\n  %b = trunc i32 %h to i16\n  \
+                %r = tail call i32 @llvm.agx2.shfl(i16 %a, i16 %b)\n  \
+                %q = getelementptr inbounds i32, ptr addrspace(1) %b1, i64 %t64\n  \
+                store i32 %r, ptr addrspace(1) %q, align 4\n";
+    let decl = "declare i32 @llvm.agx2.shfl(i16, i16) #0\n\
+                attributes #0 = { nounwind speculatable memory(none) }\n";
+    kernel("shfl", 2, "", body, decl)
+}
+
+/// The contract measured on an M3 Max over every pair of operands: bit `2i` of the result is bit
+/// `i` of `a`, and bit `2i + 1` is bit `i` of `b`.
+fn interleave(a: u16, b: u16) -> u32 {
+    (0..16).fold(0, |r, i| {
+        r | (u32::from(a) >> i & 1) << (2 * i) | (u32::from(b) >> i & 1) << (2 * i + 1)
+    })
+}
+
+/// `llvm.agx2.shfl` interleaves its operands' bits on the edge pairs (zeros, ones, each single
+/// bit in either operand and in both, alternating bits) and on pseudo-random pairs, with no
+/// subgroup operation.
+#[test]
+fn shfl_interleaves_the_bits_of_its_operands() {
+    let Some(bc) = assemble_text("shfl", &shfl_kernel()) else {
+        return;
+    };
+    let mut pairs = vec![
+        (0u16, 0u16),
+        (0xFFFF, 0xFFFF),
+        (0xFFFF, 0),
+        (0, 0xFFFF),
+        (0xAAAA, 0x5555),
+        (0x5555, 0xAAAA),
+    ];
+    for i in 0..16 {
+        let bit = 1u16 << i;
+        pairs.extend([(bit, 0), (0, bit), (bit, bit), (bit, 1 << (15 - i))]);
+    }
+    let mut x = 0x2545_F491u32;
+    for _ in 0..64 {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        pairs.push((x as u16, (x >> 16) as u16));
+    }
+    let n = pairs.len() as u32;
+    let input: Vec<u32> = pairs
+        .iter()
+        .map(|&(a, b)| u32::from(a) | u32::from(b) << 16)
+        .collect();
+    let p = moltenvk();
+    let (plan, m) = typed_module(&bc, "shfl", &p).expect("compile");
+    assert_eq!(plan.simd.1, Tier::NoSubgroup, "no subgroup operation");
+    assert_eq!(plan.census().get("agx.shfl").map(|c| c.0), Some(1));
+    let out = run_all(
+        &plan,
+        &m,
+        n,
+        SubgroupSize::W32,
+        &[bytes_of(&input), vec![0; n as usize * 4]],
+    );
+    let got = words(&out[1]);
+    for (t, &(a, b)) in pairs.iter().enumerate() {
+        assert_eq!(got[t], interleave(a, b), "shfl({a:#06x}, {b:#06x})");
+    }
+    assert_eq!(interleave(0xFFFF, 0), 0x5555_5555);
+    assert_eq!(interleave(0, 1 << 15), 1 << 31);
+}
+
 // ---- matrix multiply-adds --------------------------------------------------------------------
 
 /// The four `agx2` multiply-adds: (name, `half`, dimension).
@@ -696,8 +769,8 @@ fn matmads_run_cluster32_at_64_lanes() {
 /// tile's cells are exchanged through workgroup memory.
 #[test]
 fn matmads_run_emulated_at_8_and_16_lanes() {
-    let p =
-        crate::pipeline::testing::profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
     for lanes in [SubgroupSize::W8, SubgroupSize::W16] {
         run_matmads(&p, Tier::Emulated, lanes, &[32, 64, 96]);
     }
@@ -730,13 +803,13 @@ fn matmads_record_their_precision() {
 
 /// Every AGX kernel compiles, links, relocates, and passes L3 on every committed profile; a
 /// multiply-add exactly where a cross-lane shuffle class has a compute tier (a subgroup tier, or
-/// emulated simdgroups), and elsewhere it is refused as that tier is. The plan's size estimate
-/// bounds the emitted words.
+/// emulated simdgroups), and elsewhere it is refused as that tier is.
 #[test]
 fn agx_kernels_compile_or_refuse_with_the_tier() {
     let mut kernels = vec![
         ("edge".to_string(), edge_kernel(), false),
         ("emask_local".to_string(), emask_local_kernel(), false),
+        ("shfl".to_string(), shfl_kernel(), false),
     ];
     for (lanes, bits) in [(4u32, 32u32), (2, 16), (4, 8)] {
         let name = format!("emask_v{lanes}i{bits}");
@@ -754,7 +827,7 @@ fn agx_kernels_compile_or_refuse_with_the_tier() {
         assembled.push((name, bc, shuffles));
     }
     let (mut ok, mut refused, mut emulated) = (0, 0, 0);
-    for (stem, p) in committed_profiles().expect("profiles") {
+    for (stem, p) in threadgroup_profiles().expect("profiles") {
         let tier = subgroup::tier(
             &SimdClass::CrossLane(OpBits::SHUFFLE),
             Stage::Kernel,
@@ -768,13 +841,6 @@ fn agx_kernels_compile_or_refuse_with_the_tier() {
                     if *shuffles && tier == Ok(Tier::Emulated) {
                         emulated += 1;
                     }
-                    let (plan, _) = typed_module(bc, name, &p).expect("plan");
-                    let words = a.module.words.len() as u64;
-                    assert!(
-                        plan.estimate.words >= words,
-                        "{stem} {name}: estimate {} < emitted {words}",
-                        plan.estimate.words
-                    );
                     ok += 1;
                 }
                 Err(Error::Unsupported(u)) if *shuffles => {
@@ -795,7 +861,7 @@ fn agx_kernels_compile_or_refuse_with_the_tier() {
 /// AGX operations without a modeled contract, and an emask shape mask other than the vector's
 /// (which the backend rejects), are refused as `AgxUnmodeled`. An unmodeled operation with a
 /// pointer operand (a `wide` emask load) is refused one step earlier, by the memory analysis, which
-/// knows no access contract for it.
+/// knows no access contract for it, and under the same feature.
 #[test]
 fn unmodeled_agx_operations_are_refused() {
     let permute = "  %r = tail call i32 @llvm.agx2.lane.permute(i32 %t)\n  \
@@ -829,7 +895,7 @@ fn unmodeled_agx_operations_are_refused() {
     for (name, text, feature) in [
         ("permute", permute, Feature::AgxUnmodeled),
         ("shape", shape, Feature::AgxUnmodeled),
-        ("wide", wide, Feature::Lowering(LowerFamily::Access)),
+        ("wide", wide, Feature::AgxUnmodeled),
     ] {
         let Some(bc) = assemble_text(name, &text) else {
             return;

@@ -21,23 +21,23 @@ use crate::device::DevicePolicy;
 use crate::error::{Error, Feature, LowerFamily, Needs};
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::{Inst, StorageClass, Type, TypedModule};
+use crate::spirv::testing::refuses_threadgroup_memory;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
 /// Profile A (device addresses) and Profile F (none), with and without robust descriptors,
 /// with and without the Vulkan memory model.
-const PROFILES: [&str; 4] = [
-    "moltenvk-m3",
-    "lavapipe",
-    "vk12-floor",
-    "lunarg-desktop-baseline-2023",
-];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "lavapipe", NO_VULKAN_MODEL];
+
+/// `runtime-floor` without the Vulkan memory model (below the runtime's floor): the GLSL memory
+/// model's form.
+const NO_VULKAN_MODEL: &str = "runtime-floor without vulkanMemoryModel";
 
 const THREADS: u32 = 32;
 
@@ -46,7 +46,18 @@ const WG: StorageClass = StorageClass::Workgroup;
 const PRIV: StorageClass = StorageClass::Private;
 
 fn p(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("profile")
+    if stem == NO_VULKAN_MODEL {
+        return crate::pipeline::testing::profile_without(
+            "runtime-floor",
+            &[
+                VkFeature::VulkanMemoryModel,
+                VkFeature::VulkanMemoryModelDeviceScope,
+            ],
+            DevicePolicy::RESIDENT_TABLES,
+        )
+        .expect("below the runtime's floor");
+    }
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn assemble(name: &str, text: &str) -> Option<Vec<u8>> {
@@ -124,10 +135,7 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 /// The resources of `plan` with buffer `i` holding `bufs[i]`, each bound at its start.
 fn resources(plan: &Plan, bufs: &[Vec<u32>]) -> Resources {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(THREADS));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(THREADS));
+    spec.extend(crate::pipeline::threadgroup_constants([THREADS, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -228,7 +236,7 @@ fn accesses(m: &TypedModule) -> Accesses {
 
 /// Whether the module declares the Vulkan memory model.
 fn vulkan_model(m: &TypedModule) -> bool {
-    m.requirements()
+    crate::spirv::testing::requirements(m)
         .spirv_capabilities
         .iter()
         .any(|c| format!("{c:?}") == "VulkanMemoryModel")
@@ -250,7 +258,8 @@ fn twin(text: &str) -> String {
         .replace(", i1 true)", ", i1 false)")
 }
 
-/// Compile the volatile kernel `text` and its non-volatile twin on every profile: both pass L3
+/// Compile the volatile kernel `text` and its non-volatile twin on every profile that takes it (a
+/// kernel with threadgroup memory on those with zeroed workgroup memory): both pass L3
 /// and emit the same loads and stores, the twin none volatile and the kernel exactly `want` of
 /// the profile, in
 /// the `GLSL450` model; run the kernel over `bufs`. Returns each profile's buffers and plan.
@@ -269,7 +278,11 @@ fn run_everywhere(
     let mut out = Vec::new();
     for stem in PROFILES {
         let prof = p(stem);
-        let a = compile(&bc, name, &prof).unwrap_or_else(|e| panic!("{stem} {name}: {e}"));
+        let a = match compile(&bc, name, &prof) {
+            // A profile without zeroed workgroup memory takes no threadgroup memory.
+            Err(e) if refuses_threadgroup_memory(&e, &prof) => continue,
+            a => a.unwrap_or_else(|e| panic!("{stem} {name}: {e}")),
+        };
         link_and_validate(&a, &prof).unwrap_or_else(|e| panic!("{stem} {name}: L3: {e}"));
         let (plan, m) = typed_module(&bc, name, &prof).expect("module");
         let (_, twin) = typed_module(&plain, name, &prof).expect("twin");
@@ -904,9 +917,8 @@ const DEVICE_ARGUMENT_METADATA: (&str, &str) = (
 /// A volatile load of a heap texture handle (an argument-buffer member) is its plain lookup with
 /// the resource id's words volatile: where the plain kernel compiles, the volatile one compiles
 /// with the same loads and passes L3; where the plain kernel is refused (no descriptor indexing),
-/// the volatile one is refused alike. A `device` argument buffer's two id words carry `Volatile`; a
-/// `constant` one is read through its uniform view, whose read-only words stay plain, so its module
-/// is the twin's.
+/// the volatile one is refused alike. The two id words carry `Volatile` in a `device` argument
+/// buffer and a `constant` one alike: each is read through its storage view.
 #[test]
 fn a_volatile_heap_texture_handle_load_is_its_lookup() {
     let entry = "argument_buffer_read";
@@ -917,7 +929,7 @@ fn a_volatile_heap_texture_handle_load_is_its_lookup() {
             &[][..],
             None,
             "%6 = load ptr addrspace(1), ptr addrspace(2) %5, align 8",
-            Volatiles::none(),
+            Volatiles::of(&[(SB, 2)], &[]),
         ),
         (
             "device",

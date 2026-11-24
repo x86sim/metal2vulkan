@@ -144,12 +144,10 @@
 //!
 //! # Why a case stops at its first refusal
 //!
-//! The runtime holds **no image of 26 of the 33** (it holds `BGRA4Unorm`, in the Vulkan word of
-//! its bits, and ASTC's six 4x2 and 8x4 forms, whose blocks lie in a carrier with a decoded twin):
-//! every other one is refused `Unsupported { feature: Format, needs: NotImplemented }`, measured
-//! over every descriptor of every case of this family. A case that recorded a refusal at each site and went on — which is
+//! The runtime holds **no image of most of the 33**: it refuses them typed
+//! (`Gap::TextureFormat`). A case that recorded a refusal at each site and went on — which is
 //! what `heap_metal_sizes` does, because the runtime answers all of its descriptors — would print
-//! some 2900 `Refused` rows and need a `known-gaps.tsv` row for each, which is a ledger nobody
+//! some 2900 `Refused` rows and need a `known-gaps-rt.tsv` row for each, which is a ledger nobody
 //! reads and therefore no ledger. So each case stops at the first site it is refused, and the
 //! family's refusal rows stand for the gap: the full list is in the orchestrator's
 //! todos, where work belongs, and the recordings hold Metal's answer for every one, which is what
@@ -163,13 +161,11 @@
 //! the point: the gap was a number in a generated document and it is now a row of the report
 //! naming the format, the descriptor and both answers.
 
-use crate::allowance::Allowance;
+use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{Abort, Case, Input, MetalSource, Side, TextureRole, TextureSpec};
 use crate::texture_query::{HeapTextureQuery as Q, Storage};
 use crate::transcript::{Aspect, ByteLayout, Element, Gaps, Node, Observed, Region, Sites, Value};
-use metal2vulkan::bind::AstcDecode;
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use metal2vulkan_runtime::Degradation;
 
 /// The two storage modes every case of the family sweeps.
 const BOTH_STORAGE: [Storage; 2] = [Storage::Shared, Storage::Private];
@@ -317,16 +313,6 @@ pub struct FootprintCase {
     /// The formats a round trip runs for, in order. Empty where Metal makes no texture of any
     /// format of the case.
     round_trips: Vec<PixelFormat>,
-    /// Whether the runtime makes a `Shared` texture buffer of one of the case's formats: the
-    /// buffer under it is `Shared` memory, which a device without unified memory places in system
-    /// memory and announces (`shared-in-system-memory`). Measured on the RTX 5080 Laptop
-    /// (615.71.09): the plain stragglers' case announced it in the whole-set replay. Measured on
-    /// the RX 7900 XTX (RADV NAVI31, the round's replay at 6898863f3f): the one-plane YCbCr and
-    /// padded wide-channel cases announced it too, the runtime now making their formats'
-    /// `Shared` texture buffers as Metal makes them, and no other case of the family did: the
-    /// ASTC formats take no texture buffer, the two-plane ones are refused and the packed ones
-    /// nil.
-    shared_texture_buffers: bool,
 }
 
 /// Every case of the family.
@@ -388,7 +374,6 @@ fn case_over(
         } else {
             Vec::new()
         },
-        shared_texture_buffers: false,
     }
 }
 
@@ -403,7 +388,6 @@ fn astc_footprints() -> FootprintCase {
 /// answers are what a reader compares the rest of the family against.
 fn plain_stragglers() -> FootprintCase {
     FootprintCase {
-        shared_texture_buffers: true,
         ..case_over(PLAIN_STRAGGLERS, &PLAIN, &all_types(), true)
     }
 }
@@ -412,7 +396,6 @@ fn plain_stragglers() -> FootprintCase {
 /// **no texture**.
 fn one_plane_ycbcr() -> FootprintCase {
     FootprintCase {
-        shared_texture_buffers: true,
         ..case_over(ONE_PLANE_YCBCR, &ONE_PLANE, &all_types(), true)
     }
 }
@@ -421,7 +404,6 @@ fn one_plane_ycbcr() -> FootprintCase {
 /// `*10A2Unorm` ones.
 fn padded_wide_channels() -> FootprintCase {
     FootprintCase {
-        shared_texture_buffers: true,
         ..case_over(PADDED_WIDE_CHANNELS, &PADDED, &all_types(), true)
     }
 }
@@ -572,33 +554,18 @@ impl Case for FootprintCase {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // An ASTC 4x2 or 8x4 texture lies in a carrier image with a decoded twin on every device
-        // (no Vulkan format holds such a block), announced `carried-decoded-twin`; the round
-        // trip's `replaceRegion` decodes its blocks into the twin on the CPU (`cpu-block-decode`).
-        // An LDR form's twin holds 8-bit codes, whose `decoded-texel-precision` is announced at a
-        // command's first read of the twin, which the case never makes. Metal announces nothing,
-        // so the notices are declared by their codes. They loosen the notices site alone: the
-        // case reads bytes, every one compared with Metal's exactly. Measured: lavapipe announced
-        // both, MoltenVK over an M3 Max the first, and every other field was Metal's on both.
-        let astc = self
-            .round_trips
+        // The runtime's answers are the device's own, held by their property and not by
+        // Metal's numbers (`texture_query::DEVICE_OWN_SIZES`).
+        self.queries
             .iter()
-            .any(|&pf| AstcDecode::of(pf).is_some());
-        let mut named = Vec::new();
-        if astc {
-            named.extend(
-                [Degradation::CarriedDecodedTwin, Degradation::CpuBlockDecode]
-                    .into_iter()
-                    .map(|kind| crate::replay::notice_allowance(kind.code())),
-            );
-        }
-        // A `Shared` texture buffer's own buffer, on a device without unified memory
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It loosens the notices
-        // site alone, like the two above.
-        if self.shared_texture_buffers {
-            named.push(crate::replay::shared_memory_notice());
-        }
-        named
+            .map(|query| {
+                Allowance::new(
+                    format!("case/{}/{}/Ok/*", query.site(), site::QUERY),
+                    Loosening::Unchecked,
+                    Justification::accepted(crate::texture_query::DEVICE_OWN_SIZES),
+                )
+            })
+            .collect()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -878,68 +845,5 @@ mod tests {
             }
         }
         assert_eq!(patterns.len(), 31, "other than 31 formats round-trip");
-    }
-}
-
-/// The safety guard this family rests on, run on a device.
-///
-/// The same guard `heap_metal_sizes` carries, in the family that needs it most: the subject here is
-/// formats whose descriptor Metal's own validation may stop, which ends Metal's process. The
-/// runtime's model is what tells the two apart — `Error::Invalid` is "Metal's validation stops it,
-/// ending the process", `Error::Nil` is "plain Metal answers nil, the process going on" — so a
-/// table that makes the runtime answer `Invalid` anywhere must never be recorded.
-///
-/// Unlike `heap_metal_sizes`' guard this one tolerates every **other** typed error. The runtime
-/// holds no image of 32 of this family's 33 formats and refuses each `NotImplemented(Format)`,
-/// which is the gap this family exists to make visible; only `Invalid` says the descriptor itself
-/// is one Metal stops.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    #[test]
-    fn no_descriptor_of_the_family_is_one_metals_validation_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_descriptor_of_the_family_is_one_metals_validation_stops"),
-        );
-        let mut stopped = Vec::new();
-        for case in all() {
-            for query in &case.queries {
-                for answer in [
-                    side.heap_texture_size_and_align(query)
-                        .err()
-                        .map(|failure| failure.recorded()),
-                    side.makes_texture(query)
-                        .err()
-                        .map(|failure| failure.recorded()),
-                ] {
-                    let Some(recorded) = answer else {
-                        continue;
-                    };
-                    if format!("{recorded:?}").contains("Invalid") {
-                        stopped.push(format!("{} {}: {recorded:?}", case.name, query.site()));
-                    }
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these descriptors answer `Invalid` on the runtime, so Metal's validation stops them \
-             and record mode would end Metal's process; take them out of the table:\n{}",
-            stopped.join("\n")
-        );
     }
 }

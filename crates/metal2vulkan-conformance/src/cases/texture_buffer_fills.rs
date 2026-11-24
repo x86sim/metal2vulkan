@@ -1,5 +1,4 @@
-//! Metal's private fills of a texture over a buffer, ported from
-//! `runtime_lane::texture_buffer_fills`.
+//! Metal's private fills of a texture over a buffer.
 //!
 //! The probes (`tb.m` and `tblf.m`, an Apple M3 Max under macOS 27.0.1): a texture buffer 12
 //! texels wide of a format of 1 to 16 bytes a texel, at an offset into a shared buffer of 512
@@ -24,11 +23,10 @@
 //! no public call to record it from. Re-recording is forbidden for that reason, as for the
 //! indirect-command seed case.
 //!
-//! **Not ported, and why**: `tblf.m`'s pattern one byte past Metal's longest (32,752) ends Metal's
-//! process in the call. The runtime refuses it (`Problem::LongTextureBufferFillPattern`), and the
-//! lane checks that refusal, but the suite has no outcome kind for "Metal ends the process" — the
-//! plan leaves that unbuilt on purpose — so the row stays the lane's. Nothing here can fault or
-//! hang a GPU: every fill is inside Metal's measured bounds.
+//! **Not a case, and why**: `tblf.m`'s pattern one byte past Metal's longest (32,752) ends Metal's
+//! process in the call, and the Metal side refuses such a fill before it makes the call
+//! (`LongTextureBufferFillPattern`). Nothing here can fault or hang a GPU: every fill is inside
+//! Metal's measured bounds.
 
 use crate::case::{call, Abort, Case, Input, MetalSource, Side};
 use crate::measured::{public_fixture, stripes};
@@ -39,9 +37,7 @@ use crate::transcript::{
 use crate::work::{Rect, Resource, Step, Storage, TextureKind, TextureSpec, Work};
 
 /// Where the carried values were measured.
-const MEASURED_IN: &str =
-    "runtime_lane::texture_buffer_fills, from the probes tb.m and tblf.m (an Apple M3 Max, \
-     macOS 27.0.1)";
+const MEASURED_IN: &str = "the probes tb.m and tblf.m (an Apple M3 Max, macOS 27.0.1)";
 
 /// Why record mode must not run these cases on Metal.
 const NO_PUBLIC_CALL: &str =
@@ -525,20 +521,6 @@ impl Case for ByteFills {
         Ok(Some((MEASURED_RUNS, sites.finish())))
     }
 
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // The fills whose last copy of the pattern is cut at the texel read the bytes past it and
-        // write them as zeros, as Metal's do, and the device announces it once. Metal announces
-        // nothing, so the notices site differs, and the notice is what justifies it.
-        vec![
-            crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::TextureBufferFillLeftover.code(),
-            ),
-            // The texture buffer these fills write into is backed by a `Shared` buffer
-            // ([`crate::replay::shared_memory_notice`]).
-            crate::replay::shared_memory_notice(),
-        ]
-    }
-
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
         let work = self.work().map_err(|why| Abort {
             at: "work".to_owned(),
@@ -662,20 +644,6 @@ impl Case for LongFills {
         }
         sites.notices(NOTICES_SITE, &[] as &[&str]);
         Ok(Some((MEASURED_RUNS, sites.finish())))
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // The fills whose last copy of the pattern is cut at the texel read the bytes past it and
-        // write them as zeros, as Metal's do, and the device announces it once. Metal announces
-        // nothing, so the notices site differs, and the notice is what justifies it.
-        vec![
-            crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::TextureBufferFillLeftover.code(),
-            ),
-            // The texture buffer these fills write into is backed by a `Shared` buffer
-            // ([`crate::replay::shared_memory_notice`]).
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {

@@ -1,5 +1,7 @@
-//! An ASTC texture's texels as Metal decodes them, from its blocks, for a device without its ASTC
-//! block: the texels a decoded twin of the texture holds (the runtime's `texture/decoded_twin.rs`).
+//! An ASTC texture's texels as Metal decodes them, from its blocks: the texels a decoded twin of
+//! the texture holds, for a consumer that keeps one on a device without its ASTC block. The
+//! runtime keeps none (it makes no texture of such a format, `Gap::TextureFormat`); the
+//! conformance suite holds Metal's recorded texels to this decode.
 //!
 //! **The decode** is the Khronos Data Format Specification's (its ASTC chapter): the block mode,
 //! the integer sequence encoding of the colour endpoints and the weights, the colour endpoint
@@ -49,36 +51,15 @@
 //! (`metal::texel_format::srgb_coded`) and the device decodes through the image's `R8G8B8A8_SRGB`
 //! view (`PrecisionNote::SrgbTexelDecode`). Whatever its policy, the runtime holds an LDR or sRGB
 //! format's twin in 8-bit codes and an HDR format's in halves.
-//!
-//! **The GPU's decode** ([`astc_decode_module`]) is this decode in integer operations, each
-//! texel's from its block alone, writing the texels [`decode`](AstcDecode::decode) writes; its
-//! bindings, shape and dispatch are the block decode's ([`BlockDecodeModule`]), its blocks and
-//! texels laid out as [`decode`](AstcDecode::decode)'s are.
 
 use std::sync::OnceLock;
 
-use super::block_decode::{decode_module, BlockDecodeModule};
-use crate::device::Device;
-use crate::error::Error;
 use crate::lower::arith::srgb::SRGB_DECODE_STEPS;
 use crate::metal::PixelFormat;
+#[cfg(test)]
 use crate::vk::Format;
 
 mod hdr;
-mod kernel;
-
-/// The module of `device` that decodes `decode`'s blocks into the texels of `texels` on the GPU
-/// (the module docs): the bindings, shape and dispatch of [`BlockDecodeModule`], of which it
-/// reads the shape's first three words (the region's width, height and depth), its blocks
-/// `decode`'s, `⌈width / w⌉` across and `⌈height / h⌉` down of each layer for the footprint
-/// `w` x `h`.
-pub fn astc_decode_module(
-    device: &Device,
-    decode: AstcDecode,
-    texels: AstcTexels,
-) -> Result<BlockDecodeModule, Error> {
-    decode_module(device, kernel::typed_module(decode, texels)?, "ASTC decode")
-}
 
 /// How an ASTC format's blocks decode: its footprint, and its profile (LDR, sRGB-encoded LDR, or
 /// HDR).
@@ -207,27 +188,6 @@ impl AstcDecode {
         [self.width, self.height]
     }
 
-    /// The Vulkan format of the twin's texels of `texels` ([`form`](Self::form)'s):
-    /// `R8G8B8A8_UNORM` (an sRGB format's viewed as `R8G8B8A8_SRGB` too, where its linear samples
-    /// are the device's filter), `R16G16B16A16_SFLOAT` or `R32G32B32A32_SFLOAT`.
-    pub fn texel_format(self, texels: AstcTexels) -> Format {
-        match self.form(texels) {
-            AstcTexels::Unorm8 => Format::R8G8B8A8_UNORM,
-            AstcTexels::Half => Format::R16G16B16A16_SFLOAT,
-            AstcTexels::Float => Format::R32G32B32A32_SFLOAT,
-        }
-    }
-
-    /// The Metal pixel format whose texels the twin's of `texels` are: `RGBA8Unorm`,
-    /// `RGBA16Float` or `RGBA32Float`.
-    pub fn texel_pixel_format(self, texels: AstcTexels) -> PixelFormat {
-        match self.form(texels) {
-            AstcTexels::Unorm8 => PixelFormat::RGBA8Unorm,
-            AstcTexels::Half => PixelFormat::RGBA16Float,
-            AstcTexels::Float => PixelFormat::RGBA32Float,
-        }
-    }
-
     /// The bytes of a twin's texel of `texels` ([`form`](Self::form)'s): 4, 8 or 16.
     pub fn texel_bytes(self, texels: AstcTexels) -> u32 {
         match self.form(texels) {
@@ -235,20 +195,6 @@ impl AstcDecode {
             AstcTexels::Half => 8,
             AstcTexels::Float => 16,
         }
-    }
-
-    /// The block's texels, each channel's 16-bit interpolation result `C` (red, green, blue,
-    /// alpha), or for an HDR format its half-precision value's bits, row-major; `None` for an
-    /// error block (whose texels read magenta, or NaN for an HDR format).
-    pub fn block_values(self, block: &[u8; 16]) -> Option<Vec<[u16; 4]>> {
-        self.block_values_why(block).ok()
-    }
-
-    /// [`block_values`](Self::block_values), with why a block is an error block.
-    pub(crate) fn block_values_why(self, block: &[u8; 16]) -> Result<Vec<[u16; 4]>, Illegal> {
-        let mut out = [[0; 4]; MOST_TEXELS];
-        decode_block(self, u128::from_le_bytes(*block), &mut out)?;
-        Ok(out[..(self.width * self.height) as usize].to_vec())
     }
 
     /// The `float` channels Metal reads of a texel whose 16-bit interpolation results (an HDR
@@ -347,6 +293,34 @@ impl AstcDecode {
                 }
             }
         }
+    }
+
+    /// The Vulkan format of the twin's texels of `texels` ([`form`](Self::form)'s):
+    /// `R8G8B8A8_UNORM` (an sRGB format's viewed as `R8G8B8A8_SRGB` too, where its linear samples
+    /// are the device's filter), `R16G16B16A16_SFLOAT` or `R32G32B32A32_SFLOAT`.
+    #[cfg(test)]
+    pub(crate) fn texel_format(self, texels: AstcTexels) -> Format {
+        match self.form(texels) {
+            AstcTexels::Unorm8 => Format::R8G8B8A8_UNORM,
+            AstcTexels::Half => Format::R16G16B16A16_SFLOAT,
+            AstcTexels::Float => Format::R32G32B32A32_SFLOAT,
+        }
+    }
+
+    /// The block's texels, each channel's 16-bit interpolation result `C` (red, green, blue,
+    /// alpha), or for an HDR format its half-precision value's bits, row-major; `None` for an
+    /// error block (whose texels read magenta, or NaN for an HDR format).
+    #[cfg(test)]
+    pub(crate) fn block_values(self, block: &[u8; 16]) -> Option<Vec<[u16; 4]>> {
+        self.block_values_why(block).ok()
+    }
+
+    /// [`block_values`](Self::block_values), with why a block is an error block.
+    #[cfg(test)]
+    pub(crate) fn block_values_why(self, block: &[u8; 16]) -> Result<Vec<[u16; 4]>, Illegal> {
+        let mut out = [[0; 4]; MOST_TEXELS];
+        decode_block(self, u128::from_le_bytes(*block), &mut out)?;
+        Ok(out[..(self.width * self.height) as usize].to_vec())
     }
 }
 

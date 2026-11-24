@@ -1,167 +1,1127 @@
-//! The imageblock size a compute encoder takes (`compute::imageblock_size`), and an indirect
-//! command's (`compute::validated_imageblock_size`); and the offset an indirect dispatch reads its
-//! arguments at (`indirect_dispatch::arguments_offset`).
+//! Compute encoders, under a device cfg on every device of the cfg's kind: dispatches over bound
+//! buffers and `set_bytes`, parameters past the push window
+//! through the ring, indirect dispatch, indirect arguments read only at a multiple of 4 of their
+//! block, barriers only at hazards in a serial encoder and only on
+//! request in a concurrent one, end barriers that reach the host only after Shared writes and
+//! signals, a dispatch of a kernel without effects that records nothing, 2,000 dispatches whose
+//! counts reach the device's counters only at their encoder's end, on a GPU the lock budget of
+//! dispatches (`crate::tests::locks`), a dispatch's instructions unchanged under a stage-in region
+//! its kernel does not read, and Metal's refusals.
 
-use super::super::compute::{imageblock_size, validated_imageblock_size};
-use super::super::error::{Error, Invalid, Problem};
-use super::super::indirect_dispatch::arguments_offset;
-use metal2vulkan::bind::ImageblockSize;
-
-/// Metal's API validation takes a width and a height that are powers of two and at most 1024 cells,
-/// and refuses the rest at `setImageblockWidth:height:`, the same on an M3 and an M4 whatever the
-/// pipeline (probe 6). An indirect command's size is held to it.
-#[test]
-fn a_validated_imageblock_size_is_powers_of_two_of_at_most_1024_cells() {
-    for (width, height) in [
-        (1, 1),
-        (8, 8),
-        (16, 16),
-        (32, 32),
-        (1024, 1),
-        (1, 1024),
-        (64, 16),
-    ] {
-        assert_eq!(
-            validated_imageblock_size(width, height),
-            Ok(ImageblockSize::new(width as u32, height as u32))
-        );
-    }
-    for (width, height) in [
-        (0, 0),
-        (0, 8),
-        (8, 0),
-        (3, 5),
-        (5, 3),
-        (48, 40),
-        (64, 33),
-        (64, 32),
-        (2048, 1),
-        (65536, 1),
-        (4096, 4096),
-        (1 << 40, 1),
-        (1 << 63, 1 << 63),
-        (u64::MAX, 1),
-    ] {
-        assert_eq!(
-            validated_imageblock_size(width, height),
-            Err(Problem::ImageblockSize { width, height }),
-            "{width}x{height}"
-        );
-    }
-}
-
-/// Plain Metal's answers where its API validation asserts, measured on an M3 Max and an M4 alike,
-/// and on an M4, each the size the kernel's `get_width` and `get_height` read. A side of 0 reads 1
-/// by 1, a side that is not a power of two reads the power above, and more than 1024 cells in one
-/// row or column read one cell. More than 1024 cells over more rows and columns read 1024 by 1 with
-/// every cell 0, and a side past 65536 is unmeasured: both stay refused.
-#[test]
-fn an_imageblock_size_is_what_plain_metal_sets() {
-    for ((width, height), read) in [
-        ((8, 8), (8, 8)),
-        ((0, 0), (1, 1)),
-        ((0, 3), (1, 1)),
-        ((0, 8), (1, 1)),
-        ((5, 0), (1, 1)),
-        ((8, 0), (1, 1)),
-        ((0, 2048), (1, 1)),
-        ((2048, 0), (1, 1)),
-        ((3, 5), (4, 8)),
-        ((5, 3), (8, 4)),
-        ((6, 6), (8, 8)),
-        ((17, 17), (32, 32)),
-        ((3, 1), (4, 1)),
-        ((1, 3), (1, 4)),
-        ((1023, 1), (1024, 1)),
-        ((2048, 1), (1, 1)),
-        ((65536, 1), (1, 1)),
-        ((1, 2048), (1, 1)),
-    ] {
-        assert_eq!(
-            imageblock_size(width, height),
-            Ok(ImageblockSize::new(read.0, read.1)),
-            "{width}x{height}"
-        );
-    }
-    for (width, height) in [
-        (2, 1024),
-        (33, 31),
-        (40, 48),
-        (48, 40),
-        (64, 32),
-        (64, 33),
-        (64, 64),
-        (65537, 1),
-        (1, 1 << 40),
-        (u64::MAX, u64::MAX),
-    ] {
-        assert_eq!(
-            imageblock_size(width, height),
-            Err(Problem::ImageblockSize { width, height }),
-            "{width}x{height}"
-        );
-    }
-}
-
-/// An indirect dispatch whose arguments run past its buffer's length is input plain Metal takes:
-/// it reads them out of the buffer's allocation, not out of its length. Measured on an Apple M3
-/// Max under macOS 27.0.1 with the API validation layer off: a no-copy buffer of length 8 over a
-/// 16 KiB page holding the group counts `(7, 1, 1)` ran its
-/// `dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:0`, whose kernel counted 7
-/// threadgroups, so Metal read the third `u32` at byte 8, past the length; the same call on a
-/// 256-byte buffer of `(3, 1, 1)` counted 3, so the counts come from the buffer and not from a
-/// copy the encoder kept. With the layer on Metal reported the range and ran the dispatch anyway.
-///
-/// So the runtime takes the arguments as far as the bytes it holds at Metal's address
-/// (`Buffer::copy_reach`, a no-copy buffer's host pages to the end of its `VkBuffer`, else the
-/// length), and refuses only past them, where it holds none of the bytes Metal reads -- the bound
-/// a blit's read of a buffer is held to.
-#[test]
-fn indirect_dispatch_arguments_reach_past_the_buffer_s_length() {
-    const CALL: &str = "dispatch_threadgroups_indirect";
-    let refusal = |offset, bytes, length| {
-        Error::Invalid(Invalid::new(
-            CALL,
-            Problem::IndirectDispatchRange {
-                offset,
-                bytes,
-                length,
-            },
-        ))
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+pub(crate) mod on_device {
+    use crate::hazard::Access;
+    use crate::pipeline::{Constant, Field, FieldValue, Interface, Memory, OwnMemory, Place};
+    use crate::tests::command::on_device::{each_device, finished, shared_event, Arena, PATIENCE};
+    use crate::tests::kernels;
+    use crate::{
+        Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState, Device, DispatchType,
+        Error, Gap, HeapRange, Limit, MemoryClass, Refusal, RefusalBasis,
     };
-    // Inside the length: taken, whatever the reach.
-    for (length, offset) in [(12, 0), (64, 40), (16384, 16372)] {
-        assert_eq!(
-            arguments_offset(CALL, (length, length), offset, 12),
-            Ok(offset),
-            "{offset} of {length}"
-        );
+    use metal2vulkan::pipeline::{Axis, SpecKey};
+
+    /// Words in each test buffer: 256 bytes.
+    pub(crate) const WORDS: usize = 64;
+
+    fn region() -> Field {
+        Field {
+            place: Place::Push(0),
+            value: FieldValue::DispatchRegion,
+        }
     }
-    // The measured case: the arguments run past the length and inside the allocation the runtime
-    // holds, so they are taken and the dispatch runs.
-    assert_eq!(arguments_offset(CALL, (8, 16384), 0, 12), Ok(0));
-    assert_eq!(arguments_offset(CALL, (8, 16384), 0, 24), Ok(0));
-    assert_eq!(arguments_offset(CALL, (8, 16384), 16372, 12), Ok(16372));
-    // Past the reach: refused, naming the buffer's length as Metal's own report does.
-    assert_eq!(
-        arguments_offset(CALL, (8, 16384), 16376, 12).unwrap_err(),
-        refusal(16376, 12, 8)
-    );
-    // A buffer whose reach is its length refuses the same arguments the measured one takes.
-    assert_eq!(
-        arguments_offset(CALL, (8, 8), 0, 12).unwrap_err(),
-        refusal(0, 12, 8)
-    );
-    // An offset that is not a multiple of 4 reads at the multiple below, and is checked there:
-    // 6 rounds to 4, whose 12 bytes end at 16, inside a reach of 16 and past one of 8.
-    assert_eq!(arguments_offset(CALL, (8, 16), 6, 12), Ok(4));
-    assert_eq!(
-        arguments_offset(CALL, (8, 8), 6, 12).unwrap_err(),
-        refusal(4, 12, 8)
-    );
-    // An offset whose arguments overflow is past the reach, never taken.
-    assert_eq!(
-        arguments_offset(CALL, (16, 16), u64::MAX - 3, 12).unwrap_err(),
-        refusal(u64::MAX - 3, 12, 16)
-    );
+
+    fn address(slot: u32, place: Place) -> Field {
+        Field {
+            place,
+            value: FieldValue::BufferAddress { slot, mask: 0 },
+        }
+    }
+
+    fn interface(buffers: Vec<(u32, Access)>, fields: Vec<Field>, push_len: u32) -> Interface {
+        Interface {
+            buffers,
+            textures: Vec::new(),
+            storage_reads: Vec::new(),
+            formatless: Vec::new(),
+            numbered: Vec::new(),
+            constexprs: Vec::new(),
+            reads_unbound: false,
+            writes_unbound: false,
+            unbound_storage: false,
+            has_effects: true,
+            push_len,
+            block_len: 0,
+            block_address: 0,
+            fields,
+            stage_in_region: false,
+            private_arena: None,
+            imageblock: None,
+            constants: vec![
+                (0, Constant::Threadgroup(SpecKey::LocalSize(Axis::X))),
+                (1, Constant::Threadgroup(SpecKey::LocalSize(Axis::Y))),
+                (2, Constant::Threadgroup(SpecKey::LocalSize(Axis::Z))),
+            ],
+            threadgroups: Vec::new(),
+            max_total_threads: 1024,
+            metal_max_total_threads: 1024,
+            memory: Memory {
+                own: OwnMemory::Static(0),
+                vote: 0,
+            },
+            multiples: Vec::new(),
+            required_subgroup_size: None,
+            stage_flags: ash::vk::PipelineShaderStageCreateFlags::empty(),
+        }
+    }
+
+    /// `o = a + b` over slots 0, 1 and 2.
+    pub(crate) fn add(device: &Device) -> ComputePipelineState {
+        add_capped(device, 1024)
+    }
+
+    /// [`add`] with `max` as its `maxTotalThreadsPerThreadgroup` on this device, Metal's for the
+    /// kernel staying 1024.
+    fn add_capped(device: &Device, max: u32) -> ComputePipelineState {
+        let fields = vec![
+            region(),
+            address(0, Place::Push(32)),
+            address(1, Place::Push(40)),
+            address(2, Place::Push(48)),
+        ];
+        let buffers = vec![(0, Access::Read), (1, Access::Read), (2, Access::Write)];
+        let mut interface = interface(buffers, fields, 56);
+        interface.max_total_threads = max;
+        ComputePipelineState::for_test(device, &kernels::ADD, interface).expect("the add kernel")
+    }
+
+    /// `x = x * 2 + 1` over slot 0.
+    pub(crate) fn step(device: &Device) -> ComputePipelineState {
+        let fields = vec![region(), address(0, Place::Push(32))];
+        let buffers = vec![(0, Access::ReadWrite)];
+        ComputePipelineState::for_test(device, &kernels::STEP, interface(buffers, fields, 40))
+            .expect("the step kernel")
+    }
+
+    /// [`step`]'s words under an interface that writes no memory (`Interface::has_effects` false,
+    /// from the translator's `PipelineInterface::writes_memory`): its dispatches record nothing.
+    pub(crate) fn quiet_step(device: &Device) -> ComputePipelineState {
+        let fields = vec![region(), address(0, Place::Push(32))];
+        let mut quiet = interface(vec![(0, Access::ReadWrite)], fields, 40);
+        quiet.has_effects = false;
+        ComputePipelineState::for_test(device, &kernels::STEP, quiet).expect("the step kernel")
+    }
+
+    /// [`step`] taking one threadgroup memory length from the encoder, at index 0, which its words
+    /// do not read: each length the encoder sets, rounded up to 16 bytes, is a variant of its own.
+    pub(crate) fn step_with_length(device: &Device) -> ComputePipelineState {
+        let fields = vec![region(), address(0, Place::Push(32))];
+        let mut with_length = interface(vec![(0, Access::ReadWrite)], fields, 40);
+        with_length.threadgroups = vec![0];
+        ComputePipelineState::for_test(device, &kernels::STEP, with_length)
+            .expect("the step kernel")
+    }
+
+    fn write_words(buffer: &Buffer, word: impl Fn(u32) -> u32) {
+        let contents = buffer.contents().expect("a Shared buffer").cast::<u32>();
+        for index in 0..WORDS {
+            // SAFETY: the buffer is alive, 256 bytes long, and no GPU work uses it.
+            unsafe {
+                contents
+                    .as_ptr()
+                    .add(index)
+                    .write_volatile(word(index as u32))
+            };
+        }
+    }
+
+    pub(crate) fn words(buffer: &Buffer) -> Vec<u32> {
+        let contents = buffer.contents().expect("a Shared buffer").cast::<u32>();
+        // SAFETY: the buffer is alive and 256 bytes long, and its work completed.
+        (0..WORDS)
+            .map(|index| unsafe { contents.as_ptr().add(index).read_volatile() })
+            .collect()
+    }
+
+    fn run(name: &str, command_buffer: &CommandBuffer) {
+        command_buffer.commit().expect("a commit");
+        finished(name, command_buffer);
+        assert_eq!(command_buffer.error(), None, "{name}");
+    }
+
+    /// A dispatch reads bound buffers and `set_bytes` data by address and writes a bound buffer.
+    #[test]
+    fn every_device_dispatches_over_bound_buffers_and_set_bytes() {
+        each_device("compute_bound", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (a, o) = (arena.buffer(), arena.buffer());
+            write_words(&a, |index| index);
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            encoder.set_buffer(Some(&a), 0, 0).expect("a buffer");
+            let bytes: Vec<u8> = (0..WORDS as u32)
+                .flat_map(|index| (100 + index).to_le_bytes())
+                .collect();
+            encoder.set_bytes(&bytes, 1).expect("bytes");
+            encoder.set_buffer(Some(&o), 0, 2).expect("a buffer");
+            encoder
+                .dispatch_threads([WORDS as u32, 1, 1], [16, 1, 1])
+                .expect("a dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 2 * index + 100).collect();
+            assert_eq!(words(&o), expected, "{name}");
+        });
+    }
+
+    /// The user-space instructions a dispatch of a kernel that does not read the stage-in region
+    /// (`add`) retires on the encoding thread, with no region set, with `set_stage_in_region`
+    /// called before each, and the setter's own, called as often with no dispatch between: the
+    /// second less the third is the first, within 2% and 16 instructions, so such a kernel pays
+    /// nothing for a region it does not read. Printed per dispatch where the kernel offers the
+    /// counter (Linux).
+    #[test]
+    fn every_device_counts_no_instructions_for_a_stage_in_region_a_kernel_does_not_read() {
+        use crate::Region;
+        use metal2vulkan_devtools::instructions::InstructionCounter;
+        const DISPATCHES: u32 = 512;
+        each_device("compute_stage_in_instructions", |name, _, device| {
+            let Ok(mut counter) = InstructionCounter::new() else {
+                println!("{name}: no instruction counter here");
+                return;
+            };
+            let mut arena = Arena::new(&device);
+            let (a, b, o) = (arena.buffer(), arena.buffer(), arena.buffer());
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let region = Region {
+                origin: [1, 2, 3],
+                size: [4, 5, 6],
+            };
+            let mut per_dispatch = Vec::new();
+            // No region, a region set before each dispatch, and the setter with no dispatch.
+            for (set, dispatched) in [(false, true), (true, true), (true, false)] {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&state).expect("a state");
+                for (slot, buffer) in [&a, &b, &o].into_iter().enumerate() {
+                    (encoder.set_buffer(Some(buffer), 0, slot as u32)).expect("a buffer");
+                }
+                let dispatch = |encoder: &mut ComputeCommandEncoder| {
+                    (encoder.dispatch_threads([WORDS as u32, 1, 1], [16, 1, 1]))
+                        .unwrap_or_else(|error| panic!("{name}: {error}"))
+                };
+                // One dispatch first, so the counted ones find their facts made.
+                dispatch(&mut encoder);
+                let ((), counted) = (counter.measure(|| {
+                    for _ in 0..DISPATCHES {
+                        if set {
+                            encoder.set_stage_in_region(region);
+                        }
+                        if dispatched {
+                            dispatch(&mut encoder);
+                        }
+                    }
+                }))
+                .expect("a count");
+                encoder.end_encoding();
+                run(name, &command_buffer);
+                per_dispatch.push(counted / u64::from(DISPATCHES));
+            }
+            let [plain, with_region, setter] = per_dispatch[..] else {
+                unreachable!("three arms");
+            };
+            println!(
+                "{name}: user-space instructions a dispatch: {plain} with no stage-in region, \
+                 {with_region} with one set before each, of which the setter alone {setter}"
+            );
+            let paid = with_region.saturating_sub(setter);
+            assert!(
+                paid.abs_diff(plain) <= (plain / 50).max(16),
+                "{name}: a dispatch {plain} instructions, {paid} under a region it does not read"
+            );
+        });
+    }
+
+    /// A dispatch whose kernel takes a bound buffer's address to be a multiple of an alignment
+    /// (`FieldValue::BufferAddress`'s mask, `RuntimeFact::AddressAlignment` in a translated
+    /// kernel) that the address, the buffer's `gpuAddress` plus the offset, is not is refused, as
+    /// Metal's API validation refuses the bind offset (`Refusal::BufferOffsetAlignment`), and
+    /// records nothing. At each alignment, 2, 4, 8 and 16, every bind 1, 3, 4, 8, 12 or 15 bytes
+    /// past a multiple of 16 that is not a multiple of the alignment is refused (17 binds) and
+    /// leaves every word as it was; the same buffer bound 16 bytes past one then runs, stepping
+    /// the 16 words from its address.
+    #[test]
+    fn every_device_refuses_a_bound_address_off_its_alignment() {
+        each_device("compute_misaligned_address", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let mut refusals = 0;
+            for align in [2u64, 4, 8, 16] {
+                let fields = vec![
+                    region(),
+                    Field {
+                        place: Place::Push(32),
+                        value: FieldValue::BufferAddress {
+                            slot: 0,
+                            mask: align - 1,
+                        },
+                    },
+                ];
+                let buffers = vec![(0, Access::ReadWrite)];
+                let state = ComputePipelineState::for_test(
+                    &device,
+                    &kernels::STEP,
+                    interface(buffers, fields, 40),
+                )
+                .expect("the step kernel");
+                let x = arena.buffer();
+                assert_eq!(x.gpu_address() % 16, 0, "{name}: the buffer's address");
+                write_words(&x, |index| index);
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&state).expect("a state");
+                for at in [1u64, 3, 4, 8, 12, 15] {
+                    if at % align == 0 {
+                        continue;
+                    }
+                    encoder.set_buffer(Some(&x), 32 + at, 0).expect("a buffer");
+                    assert!(
+                        matches!(
+                            encoder.dispatch_threadgroups([1, 1, 1], [16, 1, 1]),
+                            Err(Error::Refused(Refusal::BufferOffsetAlignment {
+                                index: 0,
+                                offset,
+                                alignment,
+                            })) if offset == 32 + at && alignment == align
+                        ),
+                        "{name}: alignment {align}, bound at 32 + {at}"
+                    );
+                    refusals += 1;
+                }
+                encoder.end_encoding();
+                run(name, &command_buffer);
+                let unchanged: Vec<u32> = (0..WORDS as u32).collect();
+                assert_eq!(words(&x), unchanged, "{name}: alignment {align}, refused");
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&state).expect("a state");
+                encoder.set_buffer(Some(&x), 48, 0).expect("a buffer");
+                encoder
+                    .dispatch_threadgroups([1, 1, 1], [16, 1, 1])
+                    .expect("an aligned dispatch");
+                encoder.end_encoding();
+                run(name, &command_buffer);
+                let expected: Vec<u32> = (0..WORDS as u32)
+                    .map(|index| match (12..28).contains(&index) {
+                        true => index * 2 + 1,
+                        false => index,
+                    })
+                    .collect();
+                assert_eq!(
+                    words(&x),
+                    expected,
+                    "{name}: alignment {align}, bound at 48"
+                );
+            }
+            assert_eq!(refusals, 17, "{name}: the binds");
+            println!("{name}: {refusals} binds off their alignment refused, each aligned bind run");
+        });
+    }
+
+    /// A serial encoder places a barrier at each hazard and none between independent dispatches;
+    /// a concurrent encoder places one only on request. The values show the order held.
+    #[test]
+    fn every_device_places_barriers_at_hazards_only() {
+        each_device("compute_barriers", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let state = step(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let count = 8;
+
+            // Dependent: every dispatch reads and writes one buffer.
+            let x = arena.buffer();
+            write_words(&x, |index| index);
+            let before = device.counters().metrics();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            encoder.set_buffer(Some(&x), 0, 0).expect("a buffer");
+            for _ in 0..count {
+                encoder
+                    .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+            }
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let after = device.counters().metrics();
+            // A barrier before each dispatch but the first, and the segment's end.
+            assert_eq!(after.barriers - before.barriers, count, "{name}: dependent");
+            let chained = |start: u32| (0..count).fold(start, |x, _| x * 2 + 1);
+            let expected: Vec<u32> = (0..WORDS as u32).map(chained).collect();
+            assert_eq!(words(&x), expected, "{name}: dependent");
+
+            // Independent: each dispatch has a buffer of its own.
+            let buffers: Vec<Buffer> = (0..count).map(|_| arena.buffer()).collect();
+            for buffer in &buffers {
+                write_words(buffer, |index| index);
+            }
+            let before = device.counters().metrics();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            for buffer in &buffers {
+                encoder.set_buffer(Some(buffer), 0, 0).expect("a buffer");
+                encoder
+                    .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+            }
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let after = device.counters().metrics();
+            assert_eq!(after.barriers - before.barriers, 1, "{name}: independent");
+            let expected: Vec<u32> = (0..WORDS as u32).map(|x| x * 2 + 1).collect();
+            for buffer in &buffers {
+                assert_eq!(words(buffer), expected, "{name}: independent");
+            }
+
+            // Concurrent: barriers where asked for, and none at the hazards.
+            write_words(&x, |index| index);
+            let before = device.counters().metrics();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Concurrent)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            encoder.set_buffer(Some(&x), 0, 0).expect("a buffer");
+            for index in 0..count {
+                if index > 0 {
+                    encoder.memory_barrier();
+                }
+                encoder
+                    .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+            }
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let after = device.counters().metrics();
+            assert_eq!(
+                after.barriers - before.barriers,
+                count,
+                "{name}: concurrent"
+            );
+            let expected: Vec<u32> = (0..WORDS as u32).map(chained).collect();
+            assert_eq!(words(&x), expected, "{name}: concurrent");
+        });
+    }
+
+    /// A heap's resources are one resource in the hazard sets, as Metal tracks a heap's: in a
+    /// serial encoder, a dispatch that uses a heap's buffer after one that wrote another of the
+    /// heap gets a barrier, the two over the same bytes or apart, and the second sees the first's
+    /// writes; two heaps' buffers get none. A buffer past its heap's end is refused, and the
+    /// device's map of heaps stays bounded as heaps come and go.
+    #[test]
+    fn every_device_orders_a_heap_s_resources_as_one() {
+        each_device("compute_heap_ids", |name, _, device| {
+            let state = step(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let block = (device.take_block(MemoryClass::Shared, 8192)).expect("a Shared block");
+            let heap = |offset, len| HeapRange {
+                block: block.id,
+                offset,
+                len,
+            };
+            let placed = |at: HeapRange, offset| {
+                (device.new_heap_buffer(at, offset, WORDS as u64 * 4))
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+            };
+            // Two dispatches of `step`, each over one buffer: the barriers they take, the
+            // segment's end among them.
+            let barriers = |buffers: [&Buffer; 2]| -> u64 {
+                let before = device.counters().metrics();
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&state).expect("a state");
+                for buffer in buffers {
+                    encoder.set_buffer(Some(buffer), 0, 0).expect("a buffer");
+                    encoder
+                        .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                        .expect("a dispatch");
+                }
+                encoder.end_encoding();
+                run(name, &command_buffer);
+                device.counters().metrics().barriers - before.barriers
+            };
+            let (a, b) = (placed(heap(0, 1024), 0), placed(heap(0, 1024), 0));
+            let apart = placed(heap(0, 1024), 512);
+            let other = placed(heap(4096, 1024), 0);
+
+            // Over the same bytes: the second step reads the first's words.
+            write_words(&a, |index| index);
+            assert_eq!(barriers([&a, &b]), 2, "{name}: one heap, the same bytes");
+            let twice: Vec<u32> = (0..WORDS as u32).map(|x| (x * 2 + 1) * 2 + 1).collect();
+            assert_eq!(words(&b), twice, "{name}: one heap, the same bytes");
+
+            // Apart in one heap: still one resource.
+            assert_eq!(barriers([&a, &apart]), 2, "{name}: one heap, apart");
+            // Two heaps of one block: two resources.
+            assert_eq!(barriers([&apart, &other]), 1, "{name}: two heaps");
+
+            match device.new_heap_buffer(heap(0, 1024), 1000, 256) {
+                Err(Error::Refused(refusal)) => assert_eq!(
+                    refusal,
+                    Refusal::HeapBufferPlace {
+                        offset: 1000,
+                        length: 256,
+                        heap_len: 1024
+                    },
+                    "{name}: a buffer past its heap's end"
+                ),
+                other => panic!("{name}: a buffer past its heap's end: {:?}", other.err()),
+            }
+
+            // Heaps that come and go: the map drops the gone ones.
+            for at in 0..200 {
+                drop(placed(heap(at * 32, 32 + WORDS as u64 * 4), 0));
+            }
+            let entries = device.core().heap_ids.entries();
+            assert!(
+                entries <= 64 + 4,
+                "{name}: {entries} heaps mapped after 200 came and went"
+            );
+        });
+    }
+
+    /// What an encoder's commands count reaches the device's counters once, at the encoder's
+    /// end: 2,000 dispatches that each read the one before's writes move none of them while the
+    /// encoder is open, and its end adds the pass, the 1,999 barriers between them, the push and
+    /// the 1,999 pushes held.
+    #[test]
+    fn every_device_counts_an_encoders_dispatches_at_its_end() {
+        each_device("compute_counts", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let state = step(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let count = 2_000;
+            let x = arena.buffer();
+            write_words(&x, |index| index);
+            let counters = device.counters();
+            let counted =
+                |m: &crate::Metrics| (m.passes, m.barriers, m.pushes, m.pushes_held, m.ring_writes);
+            let before = counters.metrics();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            encoder.set_buffer(Some(&x), 0, 0).expect("a buffer");
+            for _ in 0..count {
+                encoder
+                    .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+            }
+            let open = counters.metrics();
+            assert_eq!(
+                counted(&open),
+                counted(&before),
+                "{name}: passes, barriers, pushes, pushes held and ring writes while it is open"
+            );
+            encoder.end_encoding();
+            let ended = counters.metrics();
+            assert_eq!(
+                (
+                    ended.passes - before.passes,
+                    ended.barriers - before.barriers,
+                    ended.pushes - before.pushes,
+                    ended.pushes_held - before.pushes_held,
+                ),
+                (1, count - 1, 1, count - 1),
+                "{name}: passes, barriers, pushes and pushes held at its end"
+            );
+            run(name, &command_buffer);
+            let chained = |start: u32| (0..count).fold(start, |x, _| x.wrapping_mul(2) + 1);
+            let expected: Vec<u32> = (0..WORDS as u32).map(chained).collect();
+            assert_eq!(words(&x), expected, "{name}");
+            println!("{name}: 2,000 dispatches counted once, at the encoder's end");
+        });
+    }
+
+    /// The lock budget of dispatches (`crate::tests::locks`): a recording of 4,000 dispatches,
+    /// each reading the one before's writes, executes no more locked instructions than one of
+    /// 2,000.
+    #[test]
+    #[cfg(m2v_gpu)]
+    fn every_gpu_adds_no_locked_instruction_per_dispatch() {
+        use crate::tests::locks::Locks;
+        let Some(locks) = Locks::open("compute_locks", "dispatch") else {
+            return;
+        };
+        locks.each_device("compute_locks", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let state = step(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let x = arena.buffer();
+            locks.per_added(name, ("dispatch", "dispatch"), 2_000, |count| {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&state).expect("a state");
+                encoder.set_buffer(Some(&x), 0, 0).expect("a buffer");
+                for _ in 0..count {
+                    encoder
+                        .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                        .expect("a dispatch");
+                }
+                encoder.end_encoding();
+                run(name, &command_buffer);
+            });
+        });
+    }
+
+    /// Eleven buffer addresses fill the push window after the region and the block's address;
+    /// five more go in a block in the parameter ring.
+    #[test]
+    fn every_device_reads_parameters_past_the_push_window_from_the_ring() {
+        each_device("compute_ring", |name, _, device| {
+            let mut fields = vec![region()];
+            for slot in 0..11 {
+                fields.push(address(slot, Place::Push(40 + 8 * slot)));
+            }
+            for slot in 11..16 {
+                fields.push(address(slot, Place::Block(8 * (slot - 11))));
+            }
+            let mut buffers: Vec<(u32, Access)> =
+                (0..15).map(|slot| (slot, Access::Read)).collect();
+            buffers.push((15, Access::Write));
+            let mut wide = interface(buffers, fields, 128);
+            wide.block_len = 48;
+            wide.block_address = 32;
+            let state = ComputePipelineState::for_test(&device, &kernels::WIDE, wide)
+                .expect("the wide kernel");
+            let mut arena = Arena::new(&device);
+            let inputs: Vec<Buffer> = (0..15).map(|_| arena.buffer()).collect();
+            for (k, buffer) in inputs.iter().enumerate() {
+                write_words(buffer, |index| index * (k as u32 + 1));
+            }
+            let out = arena.buffer();
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            for (slot, buffer) in inputs.iter().chain([&out]).enumerate() {
+                encoder
+                    .set_buffer(Some(buffer), 0, slot as u32)
+                    .expect("a buffer");
+            }
+            encoder
+                .dispatch_threads([WORDS as u32, 1, 1], [32, 1, 1])
+                .expect("a dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            // The sum of index * k for k in 1..=15.
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| index * 120).collect();
+            assert_eq!(words(&out), expected, "{name}");
+        });
+    }
+
+    /// A segment's end barrier reaches the host only where the segment wrote Shared memory or
+    /// signals an event, and the host reads the bytes once the command buffer completes or it sees
+    /// the event. A segment that wrote only Private memory leaves the host out, and a later command
+    /// buffer still reads its writes.
+    #[test]
+    fn every_device_reaches_the_host_only_after_shared_writes_and_signals() {
+        each_device("compute_host_reach", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let counters = device.counters();
+            let (add, step) = (add(&device), step(&device));
+            let queue = device.new_command_queue(4).expect("a queue");
+            let block = device
+                .take_block(MemoryClass::Private, 1)
+                .expect("a Private block");
+            let private = device
+                .new_buffer(block.id, 0, 256, Some(0))
+                .expect("a Private buffer");
+            let bytes: Vec<u8> = (0..WORDS as u32)
+                .flat_map(|index| (100 + index).to_le_bytes())
+                .collect();
+            let encode_step = |command_buffer: &CommandBuffer, buffer: &Buffer| {
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&step).expect("a state");
+                encoder.set_buffer(Some(buffer), 0, 0).expect("a buffer");
+                encoder
+                    .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+                encoder.end_encoding();
+            };
+            // `o = private + 100 + index`, into Shared memory.
+            let encode_add = |command_buffer: &CommandBuffer, o: &Buffer| {
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&add).expect("a state");
+                encoder.set_buffer(Some(&private), 0, 0).expect("a buffer");
+                encoder.set_bytes(&bytes, 1).expect("bytes");
+                encoder.set_buffer(Some(o), 0, 2).expect("a buffer");
+                encoder
+                    .dispatch_threads([WORDS as u32, 1, 1], [16, 1, 1])
+                    .expect("a dispatch");
+                encoder.end_encoding();
+            };
+
+            // Private only: the end barrier leaves the host out.
+            let before = counters.host_reaches();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            encode_step(&command_buffer, &private);
+            run(name, &command_buffer);
+            assert_eq!(counters.host_reaches(), before, "{name}: Private only");
+
+            // A later command buffer adds the Private words into Shared memory: the host reads
+            // them once it completes.
+            let o = arena.buffer();
+            let before = counters.host_reaches();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            encode_add(&command_buffer, &o);
+            run(name, &command_buffer);
+            assert_eq!(counters.host_reaches(), before + 1, "{name}: Shared write");
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 101 + index).collect();
+            assert_eq!(words(&o), expected, "{name}: after Private only");
+
+            // A Private write before a signal reaches the host; the add after it reads 3.
+            let signaled = shared_event(&device);
+            let o = arena.buffer();
+            let before = counters.host_reaches();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            encode_step(&command_buffer, &private);
+            command_buffer
+                .encode_signal_event(signaled.as_event(), 1)
+                .expect("a signal");
+            encode_add(&command_buffer, &o);
+            run(name, &command_buffer);
+            assert!(
+                signaled
+                    .wait_until_signaled_value(1, PATIENCE)
+                    .expect("a wait outside a scheduled handler"),
+                "{name}"
+            );
+            assert_eq!(counters.host_reaches(), before + 2, "{name}: signal");
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 103 + index).collect();
+            assert_eq!(words(&o), expected, "{name}: after a signal");
+
+            // A Shared write before a signal: the host reads it once it sees the event, while the
+            // command buffer waits on the host behind it.
+            let x = arena.buffer();
+            write_words(&x, |index| index);
+            let (signaled, release) = (shared_event(&device), shared_event(&device));
+            let before = counters.host_reaches();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            encode_step(&command_buffer, &x);
+            command_buffer
+                .encode_signal_event(signaled.as_event(), 1)
+                .expect("a signal");
+            command_buffer
+                .encode_wait_for_event(release.as_event(), 1)
+                .expect("a wait");
+            command_buffer.commit().expect("a commit");
+            assert!(
+                signaled
+                    .wait_until_signaled_value(1, PATIENCE)
+                    .expect("a wait outside a scheduled handler"),
+                "{name}"
+            );
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 2 * index + 1).collect();
+            assert_eq!(words(&x), expected, "{name}: at the signal");
+            release.set_signaled_value(1);
+            finished(name, &command_buffer);
+            assert_eq!(command_buffer.error(), None, "{name}");
+            assert_eq!(
+                counters.host_reaches(),
+                before + 1,
+                "{name}: Shared write and signal"
+            );
+        });
+    }
+
+    /// An indirect dispatch reads its threadgroup counts from a buffer, and its kernel takes the
+    /// grid from them.
+    #[test]
+    fn every_device_dispatches_indirectly() {
+        each_device("compute_indirect", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (a, b, o, arguments) = (
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+            );
+            write_words(&a, |index| index);
+            write_words(&b, |index| 1000 * index);
+            write_words(&arguments, |index| match index {
+                4 => 4,
+                5 | 6 => 1,
+                _ => 0,
+            });
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            for (slot, buffer) in [&a, &b, &o].into_iter().enumerate() {
+                encoder
+                    .set_buffer(Some(buffer), 0, slot as u32)
+                    .expect("a buffer");
+            }
+            encoder
+                .dispatch_threadgroups_with_indirect_buffer(&arguments, 16, [16, 1, 1])
+                .expect("an indirect dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 1001 * index).collect();
+            assert_eq!(words(&o), expected, "{name}");
+        });
+    }
+
+    /// Vulkan reads indirect arguments only at a multiple of 4 of the `VkBuffer`, which spans
+    /// the block's allocation: in a buffer the consumer placed 2 bytes into its block, arguments
+    /// at offsets Metal takes are refused (`Refusal::ArgumentPlace`, at their byte of the
+    /// allocation), and arguments in a buffer placed at byte 4100, a multiple of 4 no Metal buffer
+    /// starts at, are read where they lie.
+    #[test]
+    fn every_device_reads_indirect_arguments_only_at_a_multiple_of_4_of_their_block() {
+        each_device("compute_indirect_place", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (a, b, o) = (arena.buffer(), arena.buffer(), arena.buffer());
+            write_words(&a, |index| index);
+            write_words(&b, |index| 1000 * index);
+            let block = (device.take_block(MemoryClass::Shared, 8192)).expect("a Shared block");
+            let placed = |at| (device.new_buffer(block.id, at, 256, Some(0))).expect("a buffer");
+            let (off, on) = (placed(2), placed(4100));
+            write_words(&on, |index| match index {
+                4 => 4,
+                5 | 6 => 1,
+                _ => 0,
+            });
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            for (slot, buffer) in [&a, &b, &o].into_iter().enumerate() {
+                encoder
+                    .set_buffer(Some(buffer), 0, slot as u32)
+                    .expect("a buffer");
+            }
+            for offset in [0, 16] {
+                match encoder.dispatch_threadgroups_with_indirect_buffer(&off, offset, [16, 1, 1]) {
+                    Err(Error::Refused(Refusal::ArgumentPlace { place, alignment })) => {
+                        assert_eq!(
+                            (place, alignment),
+                            (block.offset + 2 + offset, 4),
+                            "{name}: at {offset}"
+                        );
+                    }
+                    other => panic!("{name}: arguments at {offset}: {other:?}"),
+                }
+            }
+            encoder
+                .dispatch_threadgroups_with_indirect_buffer(&on, 16, [16, 1, 1])
+                .expect("an indirect dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 1001 * index).collect();
+            assert_eq!(words(&o), expected, "{name}");
+        });
+    }
+
+    /// An indirect dispatch's offset that is not a multiple of 4 is Metal's documented refusal,
+    /// `Refusal::IndirectOffset`, which is checked first: at 2, and at 246, whose 12 bytes would
+    /// also run past the 256-byte buffer's end. Arguments at a multiple of 4 that run past the end
+    /// are the runtime's own refusal, `Refusal::IndirectArgumentsPastEnd`: at 248, and at an
+    /// offset whose end overflows. The arguments in the buffer's last 12 bytes, at 244, dispatch.
+    #[test]
+    fn every_device_refuses_an_indirect_dispatch_off_4_or_past_the_buffer_s_end() {
+        each_device("compute_indirect_offset", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (a, b, o, arguments) = (
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+            );
+            write_words(&a, |index| index);
+            write_words(&b, |index| 1000 * index);
+            write_words(&arguments, |index| match index {
+                61 => 4,
+                62 | 63 => 1,
+                _ => 0,
+            });
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            for (slot, buffer) in [&a, &b, &o].into_iter().enumerate() {
+                encoder
+                    .set_buffer(Some(buffer), 0, slot as u32)
+                    .expect("a buffer");
+            }
+            let mut refused = |offset: u64| {
+                let result = encoder.dispatch_threadgroups_with_indirect_buffer(
+                    &arguments,
+                    offset,
+                    [16, 1, 1],
+                );
+                match result {
+                    Err(Error::Refused(refusal)) => (refusal, refusal.basis()),
+                    other => panic!("{name}: arguments at {offset}: {other:?}"),
+                }
+            };
+            let length = 256;
+            for offset in [2, 246] {
+                let off_4 = Refusal::IndirectOffset { offset, length };
+                let want = (off_4, RefusalBasis::MetalDocumented);
+                assert_eq!(refused(offset), want, "{name}: at {offset}");
+            }
+            for offset in [248, u64::MAX - 3] {
+                let needed = 12;
+                let past = Refusal::IndirectArgumentsPastEnd {
+                    offset,
+                    length,
+                    needed,
+                };
+                assert_eq!(
+                    refused(offset),
+                    (past, RefusalBasis::Ours),
+                    "{name}: at {offset}"
+                );
+            }
+            encoder
+                .dispatch_threadgroups_with_indirect_buffer(&arguments, 244, [16, 1, 1])
+                .expect("an indirect dispatch of the buffer's last 12 bytes");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let expected: Vec<u32> = (0..WORDS as u32).map(|index| 1001 * index).collect();
+            assert_eq!(words(&o), expected, "{name}");
+            println!(
+                "{name}: indirect dispatches off 4 and past the end refused; the last 12 bytes ran"
+            );
+        });
+    }
+
+    /// A dispatch of a kernel that writes no memory (`Interface::has_effects` false, from the
+    /// translator's `PipelineInterface::writes_memory`) records nothing: given the step kernel's
+    /// words under such an interface, a direct and an indirect dispatch leave its buffer as it was,
+    /// a third with no buffer bound owes no bind, and each is counted.
+    #[test]
+    fn every_device_records_nothing_for_a_dispatch_of_a_kernel_without_effects() {
+        each_device("compute_without_effects", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (x, arguments) = (arena.buffer(), arena.buffer());
+            write_words(&x, |index| index);
+            write_words(&arguments, |index| match index {
+                0..=2 => 1,
+                _ => 0,
+            });
+            let state = quiet_step(&device);
+            let before = device.counters().metrics().dispatches_without_effects;
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            encoder
+                .dispatch_threadgroups([1, 1, 1], [16, 1, 1])
+                .expect("an unbound dispatch");
+            encoder.set_buffer(Some(&x), 0, 0).expect("a buffer");
+            encoder
+                .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                .expect("a dispatch");
+            encoder
+                .dispatch_threadgroups_with_indirect_buffer(&arguments, 0, [16, 1, 1])
+                .expect("an indirect dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let expected: Vec<u32> = (0..WORDS as u32).collect();
+            assert_eq!(words(&x), expected, "{name}: the words");
+            assert_eq!(
+                device.counters().metrics().dispatches_without_effects - before,
+                3,
+                "{name}: the dispatches counted"
+            );
+        });
+    }
+
+    /// An indirect dispatch after a write that no barrier since has ordered before indirect
+    /// argument reads gets a barrier that does: a dispatch writes the arguments, a direct
+    /// dispatch that reads them follows (its barrier reaches shader accesses alone), and the
+    /// indirect dispatch, which conflicts with neither, reads them.
+    #[test]
+    fn every_device_orders_an_indirect_dispatch_after_the_write_of_its_arguments() {
+        each_device("compute_indirect_after_write", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (a, b, arguments, c, o) = (
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+                arena.buffer(),
+            );
+            write_words(&a, |index| if index == 4 { 3 } else { index * 10 });
+            write_words(&b, |index| match index {
+                4..=6 => 1,
+                _ => 0,
+            });
+            for buffer in [&arguments, &c, &o] {
+                write_words(buffer, |_| 0);
+            }
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let before = device.counters().metrics();
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            let bind = |encoder: &mut ComputeCommandEncoder, buffers: [&Buffer; 3]| {
+                for (slot, buffer) in buffers.into_iter().enumerate() {
+                    encoder
+                        .set_buffer(Some(buffer), 0, slot as u32)
+                        .expect("a buffer");
+                }
+            };
+            // The arguments, a + b: (4, 1, 1) threadgroups at words 4 to 6.
+            bind(&mut encoder, [&a, &b, &arguments]);
+            encoder
+                .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                .expect("a dispatch");
+            // A direct dispatch that reads them, after a barrier for shader accesses alone.
+            bind(&mut encoder, [&arguments, &b, &c]);
+            encoder
+                .dispatch_threadgroups([4, 1, 1], [16, 1, 1])
+                .expect("a dispatch");
+            // The indirect dispatch: a barrier that reaches its argument read.
+            bind(&mut encoder, [&a, &b, &o]);
+            encoder
+                .dispatch_threadgroups_with_indirect_buffer(&arguments, 16, [16, 1, 1])
+                .expect("an indirect dispatch");
+            encoder.end_encoding();
+            run(name, &command_buffer);
+            let after = device.counters().metrics();
+            // The direct dispatch's, the indirect dispatch's, and the segment's end.
+            assert_eq!(after.barriers - before.barriers, 3, "{name}");
+            let sum = |index: u32| {
+                if index == 4 {
+                    4
+                } else {
+                    index * 10 + u32::from((4..=6).contains(&index))
+                }
+            };
+            let expected: Vec<u32> = (0..WORDS as u32).map(sum).collect();
+            assert_eq!(words(&o), expected, "{name}");
+        });
+    }
+
+    /// What Metal refuses in an encoder, and the limits the device sets.
+    #[test]
+    fn every_device_refuses_what_metal_refuses_in_an_encoder() {
+        each_device("compute_refusals", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let buffer = arena.buffer();
+            let state = add(&device);
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut encoder = command_buffer
+                .compute_command_encoder(DispatchType::Serial)
+                .expect("an encoder");
+            let refused = |result: Result<(), Error>| match result {
+                Err(Error::Refused(refusal)) => refusal,
+                other => panic!("{name}: {other:?}"),
+            };
+            assert_eq!(
+                refused(encoder.dispatch_threadgroups([1, 1, 1], [1, 1, 1])),
+                Refusal::NoPipeline
+            );
+            assert_eq!(
+                refused(encoder.set_buffer(Some(&buffer), 0, 31)),
+                Refusal::BufferIndex { index: 31 }
+            );
+            assert_eq!(
+                refused(encoder.set_buffer_offset(4, 3)),
+                Refusal::NoBufferAtIndex { index: 3 }
+            );
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            assert_eq!(
+                refused(encoder.dispatch_threadgroups([1, 1, 1], [0, 1, 1])),
+                Refusal::ThreadgroupSize {
+                    size: [0, 1, 1],
+                    max: 1024
+                }
+            );
+            assert_eq!(
+                refused(encoder.dispatch_threadgroups([1, 1, 1], [64, 32, 1])),
+                Refusal::ThreadgroupSize {
+                    size: [64, 32, 1],
+                    max: 1024
+                }
+            );
+            // Within Metal's limit for the kernel and past the state's on this device, the
+            // threadgroup is the device's limit, not Metal's refusal.
+            let capped = add_capped(&device, 256);
+            encoder
+                .set_compute_pipeline_state(&capped)
+                .expect("a capped state");
+            assert!(matches!(
+                encoder.dispatch_threadgroups([1, 1, 1], [32, 16, 1]),
+                Err(Error::Limit(Limit::ThreadgroupThreads {
+                    size: [32, 16, 1],
+                    max: 256
+                }))
+            ));
+            encoder.set_compute_pipeline_state(&state).expect("a state");
+            // A kernel without a partial-threadgroups variant runs no partial threadgroup.
+            assert!(matches!(
+                encoder.dispatch_threads([60, 1, 1], [16, 1, 1]),
+                Err(Error::Unsupported(Gap::PartialThreadgroups { .. }))
+            ));
+            // While the encoder is open, the command buffer takes no other call.
+            assert!(matches!(
+                command_buffer.compute_command_encoder(DispatchType::Serial),
+                Err(Error::Refused(Refusal::EncoderOpen))
+            ));
+            assert_eq!(refused(command_buffer.commit()), Refusal::EncoderOpen);
+            // A grid with no threadgroups records nothing.
+            encoder
+                .dispatch_threadgroups([0, 4, 1], [16, 1, 1])
+                .expect("an empty dispatch");
+            drop(encoder);
+            run(name, &command_buffer);
+        });
+    }
 }

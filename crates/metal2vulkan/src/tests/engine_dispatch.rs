@@ -21,16 +21,16 @@ use crate::lower::dispatch::{region_bytes, LocalSizeForm};
 use crate::lower::select::Plan;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
 use crate::pipeline::testing::{
-    compile, engine_dir, link_and_validate, llvm_assemble, profile, status_reach, status_reach_on,
-    typed_module, AssembleError, Scratch, StatusReach,
+    compile, device_f, engine_dir, link_and_validate, llvm_assemble, profile, status_reach,
+    status_reach_on, typed_module, AssembleError, Scratch, StatusReach, PROFILE_F,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize, TrapKind};
 use crate::spirv::ir::{Inst, StorageClass, Type, TypedModule};
 use crate::spirv::testing::{committed_profiles, spirv_dis};
 
-const PROFILES: [&str; 3] = ["moltenvk-m3", "lunarg-desktop-baseline-2023", "vk12-floor"];
+const PROFILES: [&str; 2] = ["moltenvk-m3", "runtime-floor"];
 
 const MARKERS: [&str; 6] = [
     "thread_index_marker",
@@ -71,15 +71,15 @@ fn single(local: [u32; 3], groups: [u32; 3]) -> Dispatch {
 /// The device address of the command buffer's `ExecutionStatus` buffer in [`run_word0`].
 const STATUS_AT: u64 = 0x0000_0042_0000_0000;
 
+/// The `ExecutionStatus` buffer's bytes: through its last word.
+const STATUS_BYTES: usize =
+    crate::bind::status::StatusWord::SeqCstFences.byte_offset() as usize + 4;
+
 /// Run `m` (planned as `plan`) once in each scheduling order with the planner's values and return
 /// word 0 of buffer 0.
 fn run_word0(plan: &Plan, m: &TypedModule, d: &Dispatch) -> u32 {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(d.local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    let n: u32 = d.local.iter().product();
-    spec.insert(SpecKey::FlatLocalSize, u64::from(n));
+    spec.extend(crate::pipeline::threadgroup_constants(d.local));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         let PushLoc::Push { offset } = f.loc else {
@@ -121,7 +121,7 @@ fn run_word0(plan: &Plan, m: &TypedModule, d: &Dispatch) -> u32 {
             Buffer {
                 slot: Some(crate::lower::access::absent::symbol(Stage::Kernel)),
                 address: Some(STATUS_AT),
-                bytes: vec![0; crate::bind::status::ExecutionStatus::BYTES],
+                bytes: vec![0; STATUS_BYTES],
             },
         ],
         push,
@@ -150,7 +150,7 @@ fn run_word0(plan: &Plan, m: &TypedModule, d: &Dispatch) -> u32 {
 fn dispatch_kernels_compile_link_and_validate() {
     let Some(bc) = fixture() else { return };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect(stem);
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect(stem);
         for entry in MARKERS
             .iter()
             .chain(&["threadgroup_barrier_store", "device_fence_store"])
@@ -256,7 +256,7 @@ fn a_simdgroup_barrier_flattens_or_is_emulated_with_the_tier() {
 #[test]
 fn single_region_builtins_run_on_the_interpreter() {
     let Some(bc) = fixture() else { return };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let cases: [(&str, Dispatch, u32); 12] = [
         ("thread_index_marker", single([8, 1, 1], [1, 1, 1]), 105),
         ("thread_index_marker", single([4, 1, 1], [2, 1, 1]), 0),
@@ -287,7 +287,7 @@ fn single_region_builtins_run_on_the_interpreter() {
 #[test]
 fn edge_region_builtins_run_on_the_interpreter() {
     let Some(bc) = fixture() else { return };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (t, l) = ([40, 1, 1], [16, 1, 1]);
     let interior = || Dispatch {
         local: [16, 1, 1],
@@ -320,7 +320,7 @@ fn edge_region_builtins_run_on_the_interpreter() {
 #[test]
 fn barrier_kernels_run_on_the_interpreter() {
     let Some(bc) = fixture() else { return };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     for (entry, local, want, form) in [
         (
             "threadgroup_barrier_store",
@@ -357,9 +357,10 @@ fn barrier_kernels_run_on_the_interpreter() {
         );
     }
     // The `seq_cst` fence orders through the kernel's binding of the status word where the device
-    // does not address buffers.
-    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
-    let (plan, m) = typed_module(&bc, "device_fence_store", &floor).expect("device_fence_store");
+    // does not address buffers (below the runtime's floor).
+    let floor = device_f(DevicePolicy::RESIDENT_TABLES).expect(PROFILE_F);
+    let (plan, m) =
+        typed_module(&bc, "device_fence_store", floor.profile()).expect("device_fence_store");
     assert_eq!(
         plan.families.access.status_binding,
         Some(crate::lower::access::absent::StatusBinding::Required)
@@ -394,11 +395,15 @@ const DFDX: &str = "  %d = tail call float @air.dfdx.f32(float 1.000000e+00)";
 const DFDX_DECL: &str = "declare float @air.dfdx.f32(float)";
 const SIMD_BARRIER: &str = "  tail call void @air.simdgroup.barrier(i32 0, i32 4)";
 const SIMD_BARRIER_DECL: &str = "declare void @air.simdgroup.barrier(i32, i32)";
+const QUAD_SHUFFLE: &str = "  %q = tail call i32 @air.quad_shuffle.u.i32(i32 1, i16 1)\n  store i32 %q, ptr addrspace(1) %0, align 4";
+const QUAD_SHUFFLE_DECL: &str = "declare i32 @air.quad_shuffle.u.i32(i32, i16)";
 
 /// A kernel's derivatives use `DerivativeGroupLinearKHR` where the profile has
 /// `computeDerivativeGroupLinear` (and depend on a local size that is a multiple of 4), are refused
 /// naming the feature elsewhere, and are refused as `ComputeDerivativesWithSimd` when a simdgroup
-/// barrier flattens the kernel.
+/// barrier flattens the kernel. Beside a quad operation they keep the tier the quad class takes: a
+/// device whose quads are emulated keeps the local size, and no such kernel takes its quads from
+/// the subgroup at the device's size (which would flatten it).
 #[test]
 fn compute_derivatives_need_the_linear_group_and_no_flattening() {
     let Some(deriv) = store_const_with("dfdx", &[DFDX], &[DFDX_DECL]) else {
@@ -411,7 +416,14 @@ fn compute_derivatives_need_the_linear_group_and_no_flattening() {
     ) else {
         return;
     };
-    let (mut ok, mut missing, mut flattened) = (0, 0, 0);
+    let Some(with_quad) = store_const_with(
+        "dfdx-quad",
+        &[DFDX, QUAD_SHUFFLE],
+        &[DFDX_DECL, QUAD_SHUFFLE_DECL],
+    ) else {
+        return;
+    };
+    let (mut ok, mut missing, mut flattened, mut kept) = (0, 0, 0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
         let linear = p.fields().images.compute_derivative_linear;
         match compile(&deriv, "store_const", &p) {
@@ -454,10 +466,24 @@ fn compute_derivatives_need_the_linear_group_and_no_flattening() {
                 (other, t) => panic!("{stem} {t:?}: {other:?}"),
             }
         }
+        let quad = subgroup::tier(&SimdClass::Quad, Stage::Kernel, &p.fields().subgroup);
+        if linear && quad.is_ok() {
+            match (compile(&with_quad, "store_const", &p), quad) {
+                (Ok(a), Ok(Tier::Emulated)) => {
+                    link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+                    assert_eq!(a.subgroup, SubgroupRequirement::NONE, "{stem}");
+                    kept += 1;
+                }
+                (Err(Error::Unsupported(u)), Ok(Tier::Direct | Tier::Cluster32)) => {
+                    assert_eq!(u.feature, Feature::ComputeDerivativesWithSimd, "{stem}");
+                }
+                (other, t) => panic!("{stem} quad {t:?}: {other:?}"),
+            }
+        }
     }
     assert!(
-        ok > 0 && missing > 0 && flattened > 0,
-        "{ok} ok, {missing} missing, {flattened} flattened"
+        ok > 0 && missing > 0 && flattened > 0 && kept > 0,
+        "{ok} ok, {missing} missing, {flattened} flattened, {kept} kept beside a quad"
     );
 }
 
@@ -511,11 +537,8 @@ fn run_derivatives(
     local: [u32; 3],
 ) -> Result<Vec<u32>, crate::spirv::interp::InterpError> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
+    spec.extend(crate::pipeline::threadgroup_constants(local));
     let n: u32 = local.iter().product();
-    spec.insert(SpecKey::FlatLocalSize, u64::from(n));
     for f in &plan.push.fields {
         assert!(
             matches!(
@@ -745,13 +768,10 @@ fn a_position_first_used_in_sibling_arms_is_derived_once() {
             assert!(loads.values().all(|&n| n == 1), "{stem} {what}: {loads:?}");
         }
     }
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (plan, m) = typed_module(&arms, "k", &p).expect("compile");
     let mut spec = BTreeMap::new();
-    for a in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(a), if a == Axis::X { 4 } else { 1 });
-    }
-    spec.insert(SpecKey::FlatLocalSize, 4);
+    spec.extend(crate::pipeline::threadgroup_constants([4, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     let res = Resources {
         buffers: vec![Buffer {
@@ -785,7 +805,7 @@ fn a_position_first_used_in_sibling_arms_is_derived_once() {
 
 /// How many times `m` loads each push-block or `ArgumentTable` member: a load through an access
 /// chain with constant indices into a `PushConstant` or `Uniform` variable, keyed by the chain.
-fn field_loads(m: &TypedModule) -> BTreeMap<(u32, Vec<u32>), usize> {
+pub(super) fn field_loads(m: &TypedModule) -> BTreeMap<(u32, Vec<u32>), usize> {
     let chains: BTreeMap<u32, (u32, Vec<u32>)> = m
         .blocks()
         .iter()
@@ -849,13 +869,10 @@ done:
         assert!(loads.values().all(|&n| n == 1), "{stem}: {loads:?}");
     }
     assert!(read > 0, "no profile reads a push field");
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (plan, m) = typed_module(&bc, "k", &p).expect("compile");
     let mut spec = BTreeMap::new();
-    for a in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(a), if a == Axis::X { 4 } else { 1 });
-    }
-    spec.insert(SpecKey::FlatLocalSize, 4);
+    spec.extend(crate::pipeline::threadgroup_constants([4, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     let res = Resources {
         buffers: vec![Buffer {

@@ -13,17 +13,13 @@
 //! state, which is a claim of its own: Metal filters through a sampler state the host made as it
 //! filters through one the shader declares.
 //!
-//! **What the port changes.** `runtime_lane::two_plane_samples` holds these sixteen answers as
-//! sixteen SHA-256 constants taken on an Apple M4, and compares a digest. On a difference it prints
-//! the first sixteen results as hex and nothing more, so the lane cannot say which of the 4,096
-//! coordinates moved. The values are recoverable and small — a `float` case is 4,096 `float4`s, 64
-//! KiB — so record mode runs every case on native Metal and the recordings hold all 4,096 results
-//! of each. The comparison then names the sample, the lane and both values, and the digest stays
-//! beside the value as a projection of it.
+//! The values are small — a `float` case is 4,096 `float4`s, 64 KiB — so record mode runs every
+//! case on native Metal and the recordings hold all 4,096 results of each. The comparison names the
+//! sample, the lane and both values, and the digest stays beside the value as a projection of it.
 //!
 //! Every result compares exactly. The linear cases declare one notice of the runtime's: an
 //! extended-range texture's linear filter blends its decoded taps in the device's arithmetic
-//! (`bicubic-filter-arithmetic`), which moves their values (`known-gaps.tsv`). The note follows
+//! (`bicubic-filter-arithmetic`), which moves their values (`known-gaps-rt.tsv`). The note follows
 //! the word of the sampler bound at the runtime slot, so a nearest case announces none.
 //!
 //! Nothing here can fault a GPU: two compute passes a case, one texture, three buffers, no loop.
@@ -255,7 +251,7 @@ pub struct TwoPlaneSamples {
     constexpr_too: bool,
 }
 
-/// Every pairing of format, sampler state and result type, as the lane sweeps them.
+/// Every pairing of format, sampler state and result type, in a fixed order.
 pub fn all() -> Vec<TwoPlaneSamples> {
     let mut cases = Vec::new();
     let mut names = NAMES.iter();
@@ -362,7 +358,7 @@ impl TwoPlaneSamples {
     }
 
     /// The node one set of results emits: every sample raw, with the digest beside it as a
-    /// projection of the value, which is the form the lane's constant is.
+    /// projection of the value.
     fn results_node(&self, name: &str, bytes: Vec<u8>) -> Node {
         let digest = Digest::sha256(&bytes);
         Node::leaf(
@@ -382,16 +378,14 @@ impl Case for TwoPlaneSamples {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Declarations and no tolerance: the buffer each pass writes its samples into is `Shared`,
-        // which is what [`crate::replay::shared_memory_notice`] is for, and a linear case's filter
-        // of the decoded taps is the device's arithmetic (`bicubic-filter-arithmetic`, announced on
-        // the M3 Max for the eight linear cases; a nearest sampler's word holds no such note).
-        // Each loosens the notices site alone, so every value this case reads still compares
-        // exactly.
-        let mut named = vec![crate::replay::shared_memory_notice()];
+        // A declaration and no tolerance: a linear case's filter of the decoded taps is the
+        // device's arithmetic (`bicubic-filter-arithmetic`, announced on the M3 Max for the eight
+        // linear cases; a nearest sampler's word holds no such note). It loosens the notices site
+        // alone, so every value this case reads still compares exactly.
+        let mut named = Vec::new();
         if self.state.starts_with('l') {
             named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::BicubicFilterArithmetic.code(),
+                crate::degradation::Degradation::BicubicFilterArithmetic.code(),
             ));
         }
         named
@@ -583,7 +577,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// The generator is the probe's: the FNV-1a words the probe printed of seed 4's planes and
-    /// seed 5's coordinates, and their SHA-256, which the lane pins beside them.
+    /// seed 5's coordinates, and their SHA-256 beside them.
     #[test]
     fn the_generators_are_the_probes() {
         let fnv = |bytes: &[u8]| {

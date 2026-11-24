@@ -83,15 +83,13 @@
 //!
 //! # What is not asked, and why
 //!
-//! - **`MTLLoadActionDontCare` as pass B's load.** Metal keeps the texels of the tiles no
-//!   primitive of the pass touched; which tiles those are is the GPU's placement of the vertices,
-//!   and our runtime clears the render area instead and announces the near-equivalent
-//!   (`Degradation::DontCareLoadTiles`). A cell over it would compare two rasterizers rather than
-//!   Metal's rule, which is the reading `pass_bound_pairs` and `pass_attachment_pairs` both
-//!   reached. `MTLStoreActionDontCare` as pass A's **store** is a different matter and is swept:
-//!   Metal's answer there is the earlier texels, measured over 926 passes on an M3 Max
-//!   (`metal2vulkan_runtime`'s `kept_bytes.rs`), and the eight runs of each cell are what say
-//!   whether it held.
+//! - **`MTLLoadActionDontCare` as pass B's load.** Metal keeps the texels of the tiles no primitive
+//!   of the pass touched; which tiles those are is the GPU's placement of the vertices. A cell over
+//!   it would compare two rasterizers rather than Metal's rule, which is the reading
+//!   `pass_bound_pairs` and `pass_attachment_pairs` both reached. `MTLStoreActionDontCare` as pass
+//!   A's **store** is a different matter and is swept: Metal's answer there is the earlier texels,
+//!   measured over 926 passes on an M3 Max, and the eight runs of each cell are what say whether it
+//!   held.
 //! - **A resolving store followed by a load.** `MTLStoreActionMultisampleResolve` writes the
 //!   resolve texture and keeps nothing of the multisampled one, and
 //!   `MTLStoreActionStoreAndMultisampleResolve` keeps both — so a pass B that loads the
@@ -121,9 +119,9 @@ use crate::render::{
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::{LoadAction, StoreAction};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType, StencilOperation};
-use metal2vulkan_runtime::{Degradation, LoadAction, StoreAction};
 
 /// The colour fixture: the fullscreen triangle, and the fragment that returns its own texel's
 /// `float4` of a buffer times its own texel's entry of a second one.
@@ -155,7 +153,7 @@ const ASPECT_FRAGMENT: &str = "stx_stencil_with_depth";
 const SIDE: u32 = 40;
 
 /// The side, in pixels, of the tiles Metal's `Clear` load clears in past the render area, on both
-/// axes: what `metal2vulkan_runtime`'s `clear_reach.rs` measured on an M3 Max and an M4.
+/// axes: what a probe measured on an M3 Max and an M4.
 ///
 /// Stated as the number this family **expects Metal to answer**; the recording is what says
 /// whether it does.
@@ -341,7 +339,6 @@ fn load_name(load: LoadAction) -> &'static str {
         LoadAction::DontCare => "MTLLoadActionDontCare",
         LoadAction::Load => "MTLLoadActionLoad",
         LoadAction::Clear => "MTLLoadActionClear",
-        _ => "MTLLoadActionUnknown",
     }
 }
 
@@ -389,7 +386,34 @@ impl ColorCell {
     fn b_reach(&self) -> [u32; 2] {
         reach(self.b_area.unwrap_or([SIDE; 2]))
     }
+
+    /// The texels of the plane that hold what pass A's `DontCare` store left, by their byte
+    /// offsets in the plane: none where pass A stores; otherwise every texel pass B's draw does not
+    /// cover, under pass B's `Load`, and those past its clear's reach, under its `Clear`.
+    fn dont_care_texels(&self) -> Vec<u32> {
+        if self.a_store != StoreAction::DontCare {
+            return Vec::new();
+        }
+        let reach = self.b_reach();
+        let drawn = |x: u64, y: u64| {
+            (B_RECT.x..B_RECT.x + B_RECT.width).contains(&x)
+                && (B_RECT.y..B_RECT.y + B_RECT.height).contains(&y)
+        };
+        (0..SIDE)
+            .flat_map(|y| (0..SIDE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let cleared = self.b_load == LoadAction::Clear && x < reach[0] && y < reach[1];
+                !drawn(u64::from(x), u64::from(y)) && !cleared
+            })
+            .map(|(x, y)| (y * SIDE + x) * COLOR_TEXEL)
+            .collect()
+    }
 }
+
+/// The slug of `docs/API.md`'s accepted difference that says what a `DontCare` store leaves on
+/// `metal2vulkan-runtime`: what the pass rendered, where Apple's page lets the GPU replace the
+/// attachment's contents with arbitrary data.
+const DONT_CARE_TEXELS: &str = "the-runtime-s-dontcare-store-writes-what-the-pass-rendered";
 
 /// The two load actions either pass states: the two whose answer is defined on both sides.
 const LOADS: [LoadAction; 2] = [LoadAction::Load, LoadAction::Clear];
@@ -831,40 +855,24 @@ impl Case for SequenceActions {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // **No value is loosened**: every texel Metal leaves is one we must leave, in every cell
-        // of both cases. Two notices are declared and neither is a difference.
-        //
-        // `DontCareStore`: every cell of both cases stores an attachment `DontCare` somewhere. Under
-        // the suite's exact policy (`DontCareColorPolicy::Kept`) a colour stored `DontCare` keeps
-        // its earlier texels through a backing of its queue's and announces nothing
-        // (`kept_bytes.rs`), so in the colour case it fires only where no backing could be made;
-        // under the default policy the colour is stored as the driver stores it and announced. A
-        // depth or stencil aspect stored `DontCare` on a device whose `DontCare` store is not
-        // Metal's own announces that it took the near-equivalent under either. It fires on no
-        // venue whose driver stores `DONT_CARE` as Metal does (MoltenVK on this M3 Max among
-        // them), which is why it is declared rather than relied on.
-        //
-        // `SharedInSystemMemory`: both cases read their attachments back through a `Shared`
-        // buffer, and a device with no unified memory keeps a `Shared` allocation in system memory
-        // because that is the only memory both sides can reach. It belongs to the venue's memory
-        // model rather than to a load or a store action.
-        let mut allowances = vec![
-            crate::replay::notice_allowance(Degradation::DontCareStore.code()),
-            crate::replay::shared_memory_notice(),
-        ];
-        // `SeparateDepthStencil`: the aspect case's two attachments are a `Depth32Float` beside a
-        // `Stencil8`, which the runtime renders through a scratch image of a combined format,
-        // copying each loaded aspect in and each stored one back. That route is the whole point of
-        // the case -- it is where an aspect's own action can reach the wrong half -- and it is a
-        // performance notice, not a value.
-        // `ShaderSideStencil`: the same scratch route makes the stencil reference and the stencil
-        // test the shader's work on a device whose own separate-aspect path is not Metal's, which
-        // is a statement about how the aspect was reached and not about the aspect's value.
-        if self.cross == Cross::Aspects {
-            allowances.extend([
-                crate::replay::notice_allowance(Degradation::SeparateDepthStencil.code()),
-                crate::replay::notice_allowance(Degradation::ShaderSideStencil.code()),
-            ]);
+        // One set of values is loosened: in a colour cell whose pass A stores `DontCare`, the
+        // texels that hold what that store left (`ColorCell::dont_care_texels`), unchecked
+        // (`DONT_CARE_TEXELS`). Apple's page for `MTLStoreAction.dontCare` lets the GPU replace the
+        // attachment's contents with arbitrary data: Metal's answer on the M3 Max (the texels it
+        // held before pass A) is one outcome of that, the runtime's (what pass A rendered)
+        // another. Every other texel compares exactly.
+        let mut allowances = Vec::new();
+        if self.cross == Cross::Color {
+            for cell in color_cells() {
+                let site = cell.site();
+                allowances.extend(cell.dont_care_texels().into_iter().map(|at| {
+                    Allowance::new(
+                        format!("case/planes/{site}/{at}"),
+                        crate::allowance::Loosening::Unchecked,
+                        crate::allowance::Justification::accepted(DONT_CARE_TEXELS),
+                    )
+                }));
+            }
         }
         allowances
     }
@@ -1426,6 +1434,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A `DontCare` store moves only the texels the rt-only declaration leaves unchecked**:
+    /// Metal's recorded plane of each cell whose pass A stores `DontCare` equals its `Store`
+    /// twin's at every texel outside `ColorCell::dont_care_texels`, so the declaration loosens no
+    /// texel pass A's store action does not decide, and some cell's store does move a texel.
+    #[test]
+    fn a_dont_care_store_moves_only_the_texels_it_leaves() {
+        let case = "pass-sequence-color-actions";
+        let mut moved = 0;
+        for cell in color_cells() {
+            if cell.a_store != StoreAction::DontCare {
+                continue;
+            }
+            let twin = ColorCell {
+                a_store: StoreAction::Store,
+                ..cell
+            };
+            let (Some(left), Some(stored)) = (
+                recorded(case, &cell.site(), None),
+                recorded(case, &twin.site(), None),
+            ) else {
+                println!("{case}: no recording of {} in the tree yet", cell.site());
+                return;
+            };
+            let leaves = cell.dont_care_texels();
+            for at in 0..TEXELS {
+                if word(&left, at).to_bits() != word(&stored, at).to_bits() {
+                    assert!(
+                        leaves.contains(&(at * COLOR_TEXEL)),
+                        "{}: texel ({}, {}) moved with the store action outside the texels a \
+                         DontCare store leaves",
+                        cell.site(),
+                        at % SIDE,
+                        at / SIDE
+                    );
+                    moved += 1;
+                }
+            }
+        }
+        assert!(
+            moved > 0,
+            "no cell's store action moved a texel: the check is vacuous"
+        );
     }
 
     /// **Metal's recorded aspect case holds each aspect's own actions in its own plane**, which is

@@ -109,11 +109,15 @@ pub struct MemberLayout {
     pub matrix_stride: Option<u32>,
 }
 
-/// The explicit layout of a struct: its rule, member offsets, and whether it is a `Block`.
+/// The explicit layout of a struct: its rule, member offsets, whether it is a `Block`, and whether
+/// its members are `NonWritable`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StructLayout {
     pub rule: LayoutRule,
     pub block: bool,
+    /// Every member is decorated `NonWritable`: the block of a device-address place of memory
+    /// nothing writes while the module runs (`FunctionBuilder::device_place_read_only`).
+    pub non_writable: bool,
     pub members: Box<[MemberLayout]>,
 }
 
@@ -162,12 +166,6 @@ pub enum Type {
     },
     Float {
         width: u8,
-    },
-    /// An 8-bit float of `encoding` (`OpTypeFloat 8` with its `FPEncoding`, `SPV_EXT_float8`):
-    /// `Float8E4M3EXT` (OCP's E4M3, finite: `S.1111.111` is NaN) or `Float8E5M2EXT` (OCP's E5M2,
-    /// IEEE-like). Only conversions and bitcasts read or make one.
-    Float8 {
-        encoding: crate::spv::FPEncoding,
     },
     Vector {
         elem: TypeId,
@@ -427,13 +425,9 @@ impl Types {
                 }
                 _ => ty_err(TypeRule::ScalarWidth),
             },
-            Type::Float8 { .. } => Ok(TypeFacts::plain([1; 3], Some(1))),
             Type::Vector { elem, len } => {
                 let e = self.get(*elem)?;
-                let scalar = matches!(
-                    e,
-                    Type::Bool | Type::Int { .. } | Type::Float { .. } | Type::Float8 { .. }
-                );
+                let scalar = matches!(e, Type::Bool | Type::Int { .. } | Type::Float { .. });
                 if !scalar || !(2..=4).contains(len) {
                     return ty_err(TypeRule::VectorShape);
                 }
@@ -804,16 +798,9 @@ impl Types {
             StorageClass::Input | StorageClass::Output => {
                 matches!(f.shape, Shape::Plain | Shape::Implicit)
             }
-            StorageClass::Workgroup => {
-                // Explicit layout in `Workgroup` is `SPV_KHR_workgroup_memory_explicit_layout`, which
-                // lays out `Block` variables only (`ModuleBuilder::plain_global` requires that);
-                // pointers to their laid-out members come from access chains.
-                match f.shape {
-                    Shape::Plain | Shape::Implicit => true,
-                    Shape::Explicit => !f.runtime_sized,
-                    _ => false,
-                }
-            }
+            // `Workgroup` memory is implicitly laid out: an explicit layout there is
+            // `SPV_KHR_workgroup_memory_explicit_layout`, which no module needs.
+            StorageClass::Workgroup => matches!(f.shape, Shape::Plain | Shape::Implicit),
             StorageClass::Image => matches!(t, Type::Int { .. } | Type::Float { .. }),
             // An object function's payload is implicitly laid out data.
             StorageClass::TaskPayloadWorkgroupEXT => {
@@ -924,6 +911,7 @@ pub fn natural_layout(
     Ok(StructLayout {
         rule,
         block,
+        non_writable: false,
         members: out.into_boxed_slice(),
     })
 }

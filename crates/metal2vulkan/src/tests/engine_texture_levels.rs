@@ -24,33 +24,26 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::air::intrinsics::ImageDim;
-use crate::bind::{BindState, BoundBuffer, BoundTexture, Dispatch, StageTable, TextureFacts};
-use crate::bind::{BindingPlan, FieldLocation, PlanDiagnostic, WriteSource};
-use crate::budget::Budget;
-use crate::device::profile::{Containment, DeviceProfile, GuestIsolation};
+use crate::device::profile::{DeviceProfile, HandleDomain, PointerDomain};
 use crate::device::requirements::VkFeature;
 use crate::device::requirements::VkLimit;
-use crate::device::{ContainmentPolicy, Device, DeviceDescription, DevicePolicy};
-use crate::error::{BindError, Capability, Error, Feature, LowerFamily, Unsupported};
-use crate::library::{FunctionArtifact, Library};
+use crate::device::{Device, DeviceDescription, DevicePolicy};
+use crate::error::{Capability, Error, Feature, LowerFamily, Needs, Unsupported};
+use crate::library::FunctionArtifact;
 use crate::lower::select::Plan;
 use crate::lower::texture::max_levels;
-use crate::metal::{PixelFormat, TextureType, TextureUsage};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::layout::BindingSource;
 use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
+    PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
 };
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
-use crate::pipeline::{
-    ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor, StageSource,
-};
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
+use crate::spirv::testing::threadgroup_profiles;
 
 // ---- Harness ----
 
@@ -110,8 +103,26 @@ fn is(e: &Error, want: &Unsupported) -> bool {
     matches!(e, Error::Unsupported(u) if (&u.feature, &u.needs) == (&want.feature, &want.needs))
 }
 
+/// Whether `e` refuses a stage's level views past the device's storage images a stage
+/// (`maxPerStageDescriptorStorageImages`: the runtime's floor has Vulkan's minimum, 4, fewer than
+/// the levels of its largest texture).
+fn too_few_storage_images(e: &Error) -> bool {
+    let limit = |c: &Capability| {
+        matches!(
+            c,
+            Capability::Limit {
+                limit: VkLimit::MaxPerStageDescriptorStorageImages,
+                ..
+            }
+        )
+    };
+    matches!(e, Error::Unsupported(u) if u.feature == Feature::DescriptorCount
+        && matches!(&u.needs, Needs::AnyOf(alts) if alts.iter().flatten().any(limit)))
+}
+
 /// The module of `entry` on `p`, compiled and validated (L3), or `None` when `p` needs a runtime
-/// input for it (a storage format) or cannot index the level views by a dynamic level.
+/// input for it (a storage format), cannot index the level views by a dynamic level, or has fewer
+/// storage images a stage than they take.
 fn module(bc: &[u8], entry: &str, stem: &str, p: &DeviceProfile) -> Option<(Plan, TypedModule)> {
     match typed_module(bc, entry, p) {
         Ok(m) => {
@@ -121,6 +132,7 @@ fn module(bc: &[u8], entry: &str, stem: &str, p: &DeviceProfile) -> Option<(Plan
         }
         Err(Error::NeedsInput(_)) => None,
         Err(e) if is(&e, &no_non_uniform()) && !non_uniform(p) => None,
+        Err(e) if too_few_storage_images(&e) => None,
         Err(e) => panic!("{stem}: {entry}: {e}"),
     }
 }
@@ -200,8 +212,6 @@ fn push_bytes(plan: &Plan, levels: &[(u32, u32)]) -> Vec<u8> {
                 push[offset as usize..offset as usize + 4].copy_from_slice(&n.to_le_bytes());
             }
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -216,13 +226,7 @@ fn run(
     images: &[Image],
 ) -> Result<(Vec<Vec<u8>>, Vec<Image>), String> {
     let mut spec = BTreeMap::new();
-    for (axis, n) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(r.local) {
-        spec.insert(SpecKey::LocalSize(axis), u64::from(n));
-    }
-    spec.insert(
-        SpecKey::FlatLocalSize,
-        u64::from(r.local.iter().product::<u32>()),
-    );
+    spec.extend(crate::pipeline::threadgroup_constants(r.local));
     spec.extend(r.spec.iter().copied());
     let buffers: Vec<Buffer> = r
         .buffers
@@ -493,7 +497,7 @@ fn a_slice_lands_on_its_level() {
         return;
     };
     let mut ran = 0;
-    for (stem, p) in committed_profiles().expect("profiles") {
+    for (stem, p) in threadgroup_profiles().expect("profiles") {
         let Some((plan, m)) = module(&bc, "txt_level_slice", &stem, &p) else {
             continue;
         };
@@ -685,57 +689,39 @@ fn without(stem: &str, drop: &[VkFeature]) -> DeviceProfile {
     for f in drop {
         desc.features.remove(f);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
 }
 
-/// How a profile contains an image read out of bounds: the device reads Metal's texel
-/// (`robustImageAccess2`), the shader checks reads under `robustImageAccess` alone, the shader
-/// checks reads with no robustness, or nothing is contained (`ContainmentPolicy::UnsafeOff`).
+/// How a profile bounds an image read out of bounds: the device reads Metal's texel
+/// (`robustImageAccess2`), the shader checks reads under `robustImageAccess` alone, or the shader
+/// checks reads with no robustness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Class {
     Device,
     ShaderReads,
     Shader,
-    Off,
 }
 
 /// Every committed profile, `moltenvk-m3` without `robustImageAccess2`, `moltenvk-m3` and
-/// `lavapipe` without any robustness (as `src/tests/engine_texture_oob.rs` runs them), and
-/// `moltenvk-m3` and `lavapipe` without containment, with each one's class.
+/// `lavapipe` without any robustness (as `src/tests/engine_texture_oob.rs` runs them), with each
+/// one's class.
 fn classed_profiles() -> Vec<(String, DeviceProfile, Class)> {
     let mut out = committed_profiles().expect("profiles");
     out.push((
         "moltenvk-m3 robust1".into(),
         without("moltenvk-m3", &[VkFeature::RobustImageAccess2]),
     ));
-    let all = [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ];
+    let all = [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2];
     for stem in ["moltenvk-m3", "lavapipe"] {
         out.push((format!("{stem} unrobust"), without(stem, &all)));
-    }
-    let unsafe_off = DevicePolicy {
-        containment: ContainmentPolicy::UnsafeOff,
-        isolation: GuestIsolation::Off,
-        ..Default::default()
-    };
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        out.push((
-            format!("{stem} unsafe-off"),
-            profile(stem, unsafe_off).expect("profile"),
-        ));
     }
     out.into_iter()
         .map(|(stem, p)| {
             let f = p.fields();
-            let class = match f.containment {
-                Containment::UnsafeOff => Class::Off,
+            let class = match () {
                 _ if f.images.robust_image_access2 => Class::Device,
                 _ if f.images.robust_image_access => Class::ShaderReads,
                 _ => Class::Shader,
@@ -851,18 +837,16 @@ fn seeded_views(
         .collect()
 }
 
-/// A thread's `p[i]`, the texel its read takes (level, layer, `xyz`; `None`: Metal's read is out
-/// of bounds), and whether every coordinate is inside each element the read can reach (only
-/// those rows run without containment, where nothing contains a coordinate).
+/// A thread's `p[i]` and the texel its read takes (level, layer, `xyz`; `None`: Metal's read is out
+/// of bounds).
 #[derive(Clone, Copy, Debug)]
 struct Row {
     p: [u32; 4],
     at: Option<(u32, u32, [u32; 3])>,
-    inside: bool,
 }
 
-fn row(p: [u32; 4], at: Option<(u32, u32, [u32; 3])>, inside: bool) -> Row {
-    Row { p, at, inside }
+fn row(p: [u32; 4], at: Option<(u32, u32, [u32; 3])>) -> Row {
+    Row { p, at }
 }
 
 /// A level-read kernel: its entry, texel class, whether it observes its alpha, its texture, and
@@ -881,22 +865,19 @@ fn cases_2d(n: u32) -> Vec<(u32, Vec<Row>)> {
         (
             3,
             vec![
-                row([1, 2, 0, 0], Some((0, 0, [1, 2, 0])), true),
-                row([1, 1, 1, 0], Some((1, 0, [1, 1, 0])), true),
-                row([0, 0, 2, 0], Some((2, 0, [0, 0, 0])), true),
-                row([0, 0, 3, 0], None, true),
-                row([1, 0, 5, 0], None, false),
-                row([0, 0, n - 1, 0], None, true),
-                row([0, 0, u32::MAX, 0], None, true),
-                row([3, 3, 7, 0], None, false),
-                row([4, 0, 0, 0], None, false),
-                row([1, 1, 2, 0], None, false),
+                row([1, 2, 0, 0], Some((0, 0, [1, 2, 0]))),
+                row([1, 1, 1, 0], Some((1, 0, [1, 1, 0]))),
+                row([0, 0, 2, 0], Some((2, 0, [0, 0, 0]))),
+                row([0, 0, 3, 0], None),
+                row([1, 0, 5, 0], None),
+                row([0, 0, n - 1, 0], None),
+                row([0, 0, u32::MAX, 0], None),
+                row([3, 3, 7, 0], None),
+                row([4, 0, 0, 0], None),
+                row([1, 1, 2, 0], None),
             ],
         ),
-        (
-            0,
-            vec![row([0, 0, 0, 0], None, true), row([0, 0, 1, 0], None, true)],
-        ),
+        (0, vec![row([0, 0, 0, 0], None), row([0, 0, 1, 0], None)]),
     ]
 }
 
@@ -906,17 +887,11 @@ fn cases_level_two(_: u32) -> Vec<(u32, Vec<Row>)> {
         (
             3,
             vec![
-                row([0, 0, 0, 0], Some((2, 0, [0, 0, 0])), true),
-                row([1, 0, 0, 0], None, false),
+                row([0, 0, 0, 0], Some((2, 0, [0, 0, 0]))),
+                row([1, 0, 0, 0], None),
             ],
         ),
-        (
-            2,
-            vec![
-                row([0, 0, 0, 0], None, true),
-                row([1, 1, 0, 0], None, false),
-            ],
-        ),
+        (2, vec![row([0, 0, 0, 0], None), row([1, 1, 0, 0], None)]),
     ]
 }
 
@@ -926,23 +901,17 @@ fn cases_array(n: u32) -> Vec<(u32, Vec<Row>)> {
         (
             3,
             vec![
-                row([1, 2, 1, 0], Some((0, 1, [1, 2, 0])), true),
-                row([1, 1, 0, 1], Some((1, 0, [1, 1, 0])), true),
-                row([0, 0, 1, 2], Some((2, 1, [0, 0, 0])), true),
-                row([0, 0, 1, 3], None, true),
-                row([0, 0, 0, n - 1], None, true),
-                row([0, 0, 1, u32::MAX], None, true),
-                row([0, 0, 2, 0], None, false),
-                row([2, 1, 5, 4], None, false),
+                row([1, 2, 1, 0], Some((0, 1, [1, 2, 0]))),
+                row([1, 1, 0, 1], Some((1, 0, [1, 1, 0]))),
+                row([0, 0, 1, 2], Some((2, 1, [0, 0, 0]))),
+                row([0, 0, 1, 3], None),
+                row([0, 0, 0, n - 1], None),
+                row([0, 0, 1, u32::MAX], None),
+                row([0, 0, 2, 0], None),
+                row([2, 1, 5, 4], None),
             ],
         ),
-        (
-            0,
-            vec![
-                row([0, 0, 0, 0], None, true),
-                row([0, 0, 1, 1], None, false),
-            ],
-        ),
+        (0, vec![row([0, 0, 0, 0], None), row([0, 0, 1, 1], None)]),
     ]
 }
 
@@ -952,19 +921,16 @@ fn cases_3d(n: u32) -> Vec<(u32, Vec<Row>)> {
         (
             3,
             vec![
-                row([1, 2, 3, 0], Some((0, 0, [1, 2, 3])), true),
-                row([1, 1, 1, 1], Some((1, 0, [1, 1, 1])), true),
-                row([0, 0, 0, 2], Some((2, 0, [0, 0, 0])), true),
-                row([0, 0, 0, 3], None, true),
-                row([0, 0, 0, n - 1], None, true),
-                row([0, 0, 1, 2], None, false),
-                row([3, 3, 3, 9], None, false),
+                row([1, 2, 3, 0], Some((0, 0, [1, 2, 3]))),
+                row([1, 1, 1, 1], Some((1, 0, [1, 1, 1]))),
+                row([0, 0, 0, 2], Some((2, 0, [0, 0, 0]))),
+                row([0, 0, 0, 3], None),
+                row([0, 0, 0, n - 1], None),
+                row([0, 0, 1, 2], None),
+                row([3, 3, 3, 9], None),
             ],
         ),
-        (
-            0,
-            vec![row([0, 0, 0, 0], None, true), row([0, 0, 0, 2], None, true)],
-        ),
+        (0, vec![row([0, 0, 0, 0], None), row([0, 0, 0, 2], None)]),
     ]
 }
 
@@ -974,19 +940,16 @@ fn cases_cube(n: u32) -> Vec<(u32, Vec<Row>)> {
         (
             3,
             vec![
-                row([1, 2, 5, 0], Some((0, 5, [1, 2, 0])), true),
-                row([1, 1, 3, 1], Some((1, 3, [1, 1, 0])), true),
-                row([0, 0, 0, 2], Some((2, 0, [0, 0, 0])), true),
-                row([0, 0, 4, 3], None, true),
-                row([0, 0, 2, n - 1], None, true),
-                row([0, 0, 2, u32::MAX], None, true),
-                row([1, 0, 1, 2], None, false),
+                row([1, 2, 5, 0], Some((0, 5, [1, 2, 0]))),
+                row([1, 1, 3, 1], Some((1, 3, [1, 1, 0]))),
+                row([0, 0, 0, 2], Some((2, 0, [0, 0, 0]))),
+                row([0, 0, 4, 3], None),
+                row([0, 0, 2, n - 1], None),
+                row([0, 0, 2, u32::MAX], None),
+                row([1, 0, 1, 2], None),
             ],
         ),
-        (
-            0,
-            vec![row([0, 0, 3, 0], None, true), row([0, 0, 0, 1], None, true)],
-        ),
+        (0, vec![row([0, 0, 3, 0], None), row([0, 0, 0, 1], None)]),
     ]
 }
 
@@ -1050,8 +1013,7 @@ const LEVEL_READ_KERNELS: [LevelRead; 7] = [
 /// observed and on none where it is not. 2D, 2D-array, 3D, and cube textures are read at a dynamic
 /// level (at the count, past it, at the views' last element, at `u32::MAX`, and with nothing
 /// bound), and a 2D texture at the constant level 2 (a 2-level texture's neutral). Coordinates past
-/// an existing level stay as before; without containment only rows whose coordinates are inside
-/// every element they can reach run.
+/// an existing level stay as before.
 #[test]
 fn a_read_at_a_missing_level_is_metals_out_of_bounds_texel() {
     let Some(bc) = assemble("level_reads", LEVEL_READS) else {
@@ -1079,15 +1041,11 @@ fn a_read_at_a_missing_level_is_metals_out_of_bounds_texel() {
             assert_eq!(plan.facts.contains(&fact), k.observed, "{stem}: {entry}");
             let n = max_levels(&p, k.tex.dim);
             for (levels, rows) in (k.cases)(n) {
-                let rows: Vec<Row> = rows
-                    .into_iter()
-                    .filter(|r| class != Class::Off || r.inside)
-                    .collect();
                 for alpha in [0, k.lanes.one()] {
                     let robust = match class {
                         Class::Device => Some([0, 0, 0, alpha]),
                         Class::ShaderReads => Some([0xDEAD_BEEF; 4]),
-                        Class::Shader | Class::Off => None,
+                        Class::Shader => None,
                     };
                     let imgs = seeded_views(k.lanes, k.tex, levels, n, robust);
                     let p_rows: Vec<u8> = rows
@@ -1131,7 +1089,7 @@ fn a_read_at_a_missing_level_is_metals_out_of_bounds_texel() {
         classes.dedup();
         assert_eq!(
             classes,
-            [Class::Device, Class::ShaderReads, Class::Shader, Class::Off],
+            [Class::Device, Class::ShaderReads, Class::Shader],
             "{} ran on every class",
             k.entry
         );
@@ -1142,8 +1100,10 @@ fn a_read_at_a_missing_level_is_metals_out_of_bounds_texel() {
 
 /// A level-view slot (`txt_level_write`, written at a level from a buffer) declares one storage
 /// descriptor per level the device's largest texture of its type has, with both facts and the
-/// level-count push field; profiles that cannot index storage arrays by a non-uniform value refuse
-/// its dynamic level, typed. A slot whose level count alone is read, or whose size is queried at a
+/// level-count push field, where the stage has that many storage images; a device that cannot
+/// index storage arrays by a non-uniform value (the runtime's floor without
+/// `shaderStorageImageArrayNonUniformIndexing`, below that floor) refuses its dynamic level, typed.
+/// A slot whose level count alone is read, or whose size is queried at a
 /// level (`txt_level_queries`), keeps one descriptor and has the count, on every profile: the
 /// query answers from the first level.
 #[test]
@@ -1153,7 +1113,18 @@ fn level_views_declare_every_level_of_the_largest_texture() {
         return;
     };
     let (mut ok, mut refused) = (0, 0);
-    for (stem, p) in committed_profiles().expect("profiles") {
+    let mut profiles = committed_profiles().expect("profiles");
+    let uniform_only = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::ShaderStorageImageArrayNonUniformIndexing],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
+    profiles.push((
+        "runtime-floor without shaderStorageImageArrayNonUniformIndexing".to_string(),
+        uniform_only,
+    ));
+    for (stem, p) in profiles {
         let has_push = |a: &FunctionArtifact, s: u32| {
             a.interface
                 .push
@@ -1196,6 +1167,7 @@ fn level_views_declare_every_level_of_the_largest_texture() {
                 continue;
             }
             Err(Error::NeedsInput(_)) => continue,
+            Err(e) if too_few_storage_images(&e) => continue,
             Err(e) => panic!("{stem}: {e}"),
         };
         assert!(
@@ -1309,7 +1281,7 @@ fn an_atomic_slot_with_level_views_is_refused() {
     let Some(bc) = assemble("atomic_and_level", ATOMIC_AND_LEVEL) else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let want = Unsupported::not_implemented(Feature::Lowering(LowerFamily::Texture));
     match compile(&bc, "k", &p) {
         Err(e) if is(&e, &want) => {}
@@ -1336,14 +1308,25 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 
 /// A constant level at or past the level views' count indexes them as a dynamic level does
 /// (clamped, `NonUniform`), so it needs `shaderStorageImageArrayNonUniformIndexing` like one:
-/// typed where the profile lacks it, and on every other profile a write that is dropped.
+/// typed where the profile lacks it (`runtime-floor` without it, below the runtime's floor), and
+/// on every other profile a write that is dropped.
 #[test]
 fn a_constant_level_past_every_texture_is_indexed_as_a_dynamic_one() {
     let Some(bc) = assemble("past_every_level", PAST_EVERY_LEVEL) else {
         return;
     };
     let (mut ran, mut refused) = (0, 0);
-    for (stem, p) in committed_profiles().expect("profiles") {
+    let mut profiles = committed_profiles().expect("profiles");
+    profiles.push((
+        "runtime-floor without shaderStorageImageArrayNonUniformIndexing".into(),
+        crate::pipeline::testing::profile_without(
+            "runtime-floor",
+            &[crate::device::requirements::VkFeature::ShaderStorageImageArrayNonUniformIndexing],
+            DevicePolicy::RESIDENT_TABLES,
+        )
+        .expect("below the runtime's floor"),
+    ));
+    for (stem, p) in profiles {
         let Some((plan, m)) = module(&bc, "k", &stem, &p) else {
             if !non_uniform(&p) {
                 assert!(
@@ -1426,506 +1409,43 @@ fn one_d_textures_have_no_levels() {
     assert!(ran > 0);
 }
 
-// ---- The binder, end to end ----
+// ---- Under the identity domains ----
 
-fn device(stem: &str) -> Device {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
-}
-
-fn pipeline(dev: &Device, bc: &[u8], entry: &str) -> ComputePipeline {
-    let lib = Library::from_air(bc).expect("library");
-    let f = FunctionDescriptor::new(lib.function(entry).expect("function"));
-    let d = ComputePipelineDescriptor::new(StageSource::Function(f));
-    dev.compile_compute_pipeline(&d, &Budget::standard())
-        .unwrap_or_else(|e| panic!("{entry}: {e}"))
-}
-
-/// A bind state of `txt_level_write`: two bytes of level at buffer 0 and, when `levels` is
-/// `Some`, a 2D `RGBA16Float` texture of that many levels at texture 0.
-fn state(levels: Option<u32>) -> BindState {
-    let mut t = StageTable::default();
-    t.buffers.insert(
-        0,
-        BoundBuffer::Bytes {
-            len: 2,
-            attribute_stride: None,
-        },
-    );
-    if let Some(n) = levels {
-        let mut facts = TextureFacts::new(TextureType::Type2D, PixelFormat::RGBA16Float);
-        facts.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
-        facts.mipmap_level_count = n;
-        t.textures.insert(
-            0,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
+/// The identity domains (`PointerDomain::Identity` with `HandleDomain::Identity`), which the
+/// runtime translates every state under.
+fn identity() -> DevicePolicy {
+    DevicePolicy {
+        pointer_domain: PointerDomain::Identity,
+        handle_domain: HandleDomain::Identity,
+        ..DevicePolicy::RESIDENT_TABLES
     }
-    let mut s = BindState::default();
-    s.stages.insert(Stage::Kernel, t);
-    s
 }
 
-/// The binder plans `txt_level_write`'s level views (one write per element: element `i` a view
-/// of level `i` alone, the neutral past the last level or for an unbound slot) and pushes the
-/// bound level count; running the module over exactly those writes and push bytes writes the
-/// level the buffer names and nothing past the count. Plans of textures with different level
-/// counts differ (the shape carries the count).
+/// Under the identity domains a storage slot written at a level read from a buffer
+/// (`txt_level_write`) is lowered: it states no fact of the bound texture's levels, pushes the
+/// bound level count beside the slot's resource ID, and passes L3.
 #[test]
-fn the_binder_binds_each_level_and_pushes_the_count() {
+fn under_the_identity_domains_a_write_at_a_run_time_level_is_lowered() {
     let Some(bc) = fixture("txt_level_write") else {
         return;
     };
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = device(stem);
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
-        let pipe = pipeline(&dev, &bc, "txt_level_write");
-        let (_, m) = typed_module(&bc, "txt_level_write", &p).expect("module");
-        let n = max_levels(&p, ImageDim::D2);
-        let binding = pipe
-            .layout
-            .sets
-            .iter()
-            .flat_map(|s| s.bindings.iter().map(move |b| (s.set, b)))
-            .find(|(_, b)| b.source == BindingSource::Texture(tslot(0)))
-            .map(|(set, b)| (set, b.binding))
-            .expect("the texture binding");
-        assert_ne!(state(Some(3)).shape(), state(Some(2)).shape(), "{stem}");
-        for (levels, lod) in [(Some(3), 2u16), (Some(3), 3), (Some(1), 0), (None, 0)] {
-            let what = format!("{stem}: {levels:?} levels, lod {lod}");
-            let s = state(levels);
-            let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-            let writes: Vec<_> = plan
-                .descriptors
-                .iter()
-                .filter(|w| (w.set, w.binding) == binding)
-                .collect();
-            assert_eq!(writes.len(), n as usize, "{what}");
-            let bound = levels.unwrap_or(0);
-            let mut imgs = Vec::new();
-            for (i, w) in writes.iter().enumerate() {
-                let i = i as u32;
-                assert_eq!(w.array_element, i, "{what}");
-                let extent = match &w.source {
-                    WriteSource::Texture { view, .. } => {
-                        assert!(i < bound, "{what}: element {i}");
-                        assert_eq!(view.level, Some(i), "{what}");
-                        [4 >> i, 4 >> i, 1]
-                    }
-                    WriteSource::Neutral(_) => {
-                        assert!(i >= bound, "{what}: element {i}");
-                        [1, 1, 1]
-                    }
-                    other => panic!("{what}: {other:?}"),
-                };
-                let mut img = Image::new(texture(0), extent, 1, 1, 1).at_element(i);
-                img.texels.fill(POISON);
-                imgs.push(img);
-            }
-            let (push, spec) = bound_inputs(&pipe, &plan, &s, [1, 1, 1]);
-            let res = Resources {
-                buffers: vec![Buffer {
-                    slot: Some(ResourceSlot {
-                        stage: Stage::Kernel,
-                        kind: ResourceKind::Buffer,
-                        index: 0,
-                    }),
-                    address: None,
-                    bytes: lod_bytes(u32::from(lod)),
-                }],
-                push,
-                spec,
-            };
-            let cfg = Config {
-                workgroups: [1, 1, 1],
-                ..Config::default()
-            };
-            let (_, out) = run_with_images(&m, &cfg, res, imgs).expect("run");
-            for img in &out {
-                let want = if u32::from(lod) < bound && img.element == u32::from(lod) {
-                    [fl(0.0), fl(0.0), fl(1.0), fl(0.5)]
-                } else {
-                    POISON
-                };
-                assert_eq!(img.texels[0], want, "{what}: element {}", img.element);
-            }
-        }
-    }
-}
-
-/// The push bytes and specialization values `plan` instantiates for `s` (a dispatch of `groups`
-/// one-thread threadgroups), each value by its key.
-fn bound_inputs(
-    pipe: &ComputePipeline,
-    plan: &BindingPlan,
-    s: &BindState,
-    groups: [u32; 3],
-) -> (Vec<u8>, BTreeMap<SpecKey, u64>) {
-    let cmds = plan
-        .instantiate_dispatch(
-            s,
-            &Dispatch::Threadgroups {
-                groups,
-                threads_per_group: [1, 1, 1],
-            },
-        )
-        .expect("instantiate");
-    let region = &cmds.regions[0];
-    let mut push = Vec::new();
-    if let Some(w) = region.push_constants.first() {
-        push = vec![0u8; w.offset as usize + w.bytes.len()];
-        push[w.offset as usize..].copy_from_slice(&w.bytes);
-    }
-    let ids: BTreeMap<u32, SpecKey> = pipe
-        .stage
-        .specialization
-        .constants
-        .iter()
-        .map(|c| (c.id, c.key))
-        .collect();
-    let mut spec = BTreeMap::new();
-    for e in &region.specialization.entries {
-        let at = e.offset as usize;
-        let mut v = [0u8; 8];
-        v[..e.size as usize].copy_from_slice(&region.specialization.data[at..at + e.size as usize]);
-        spec.insert(ids[&e.constant_id], u64::from_le_bytes(v));
-    }
-    // The values the binder pushes for the keys the function reads as data.
-    for placement in &pipe.interface.push {
-        spec.extend(placement.pushed_values(&push));
-    }
-    (push, spec)
-}
-
-/// The binder specializes a level-view read's out-of-bounds alpha from the bound texture's
-/// format, as it does a checked read's, on profiles whose robustness leaves the coordinates to the
-/// device: 1 for `R32Float`, which has no alpha, 0 for `RGBA32Float` and an unbound slot. Running
-/// `read_level` over the binder's level views, push bytes, and specialization reads Metal's
-/// out-of-bounds texel at a missing level, `(0, 0, 0, 1)` exactly for the format without alpha, and
-/// the bound level below the count.
-#[test]
-fn the_binder_specializes_a_level_reads_alpha_from_the_bound_format() {
-    let Some(bc) = assemble("level_reads", LEVEL_READS) else {
-        return;
-    };
-    let key = SpecKey::OutOfBoundsAlpha(tslot(0));
-    // p[0] reads (1, 1) of level 1, p[1] (0, 0) of the missing level 5.
-    let rows: Vec<u8> = [[1u32, 1, 1, 0], [0, 0, 5, 0]]
-        .iter()
-        .flatten()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-    let texel = [fl(1.0), fl(2.0), fl(3.0), fl(4.0)];
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = device(stem);
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
-        assert!(p.fields().images.robust_image_access2, "{stem}");
-        let pipe = pipeline(&dev, &bc, "read_level");
-        let (_, m) = typed_module(&bc, "read_level", &p).expect("module");
-        assert!(pipe
-            .stage
-            .specialization
-            .constants
-            .iter()
-            .any(|c| c.key == key));
-        let n = max_levels(&p, ImageDim::D2);
-        for (format, alpha) in [
-            (Some(PixelFormat::R32Float), fl(1.0)),
-            (Some(PixelFormat::RGBA32Float), 0),
-            (None, 0),
-        ] {
-            let what = format!("{stem}: {format:?}");
-            let mut t = StageTable::default();
-            t.buffers.insert(
-                0,
-                BoundBuffer::Bytes {
-                    len: 32,
-                    attribute_stride: None,
-                },
-            );
-            t.buffers.insert(
-                1,
-                BoundBuffer::Bytes {
-                    len: 32,
-                    attribute_stride: None,
-                },
-            );
-            if let Some(f) = format {
-                let mut facts = TextureFacts::new(TextureType::Type2D, f);
-                facts.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
-                facts.mipmap_level_count = 3;
-                t.textures.insert(
-                    0,
-                    BoundTexture::Texture {
-                        facts,
-                        resource_id: None,
-                    },
-                );
-            }
-            let mut s = BindState::default();
-            s.stages.insert(Stage::Kernel, t);
-            let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-            let (push, spec) = bound_inputs(&pipe, &plan, &s, [2, 1, 1]);
-            assert_eq!(spec.get(&key), Some(&u64::from(alpha != 0)), "{what}");
-            let mut imgs = Vec::new();
-            for w in plan
-                .descriptors
-                .iter()
-                .filter(|w| matches!(w.ty, crate::vk::DescriptorType::STORAGE_IMAGE))
-            {
-                let i = w.array_element;
-                let extent = match &w.source {
-                    WriteSource::Texture { view, .. } => {
-                        assert_eq!(view.level, Some(i), "{what}");
-                        [4 >> i, 4 >> i, 1]
-                    }
-                    WriteSource::Neutral(_) => [1, 1, 1],
-                    other => panic!("{what}: {other:?}"),
-                };
-                let mut img = Image::new(texture(0), extent, 1, 1, 1).at_element(i);
-                img.texels.fill(if i == 1 && format.is_some() {
-                    texel
-                } else {
-                    POISON
-                });
-                img.robust = Some([0, 0, 0, alpha]);
-                imgs.push(img);
-            }
-            assert_eq!(imgs.len(), n as usize, "{what}");
-            let res = Resources {
-                buffers: [rows.clone(), vec![0; 32]]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, bytes)| Buffer {
-                        slot: Some(ResourceSlot {
-                            stage: Stage::Kernel,
-                            kind: ResourceKind::Buffer,
-                            index: i as u32,
-                        }),
-                        address: None,
-                        bytes,
-                    })
-                    .collect(),
-                push,
-                spec,
-            };
-            let cfg = Config {
-                workgroups: [2, 1, 1],
-                ..Config::default()
-            };
-            let (out, _) = run_with_images(&m, &cfg, res, imgs).expect("run");
-            let first = if format.is_some() {
-                texel
-            } else {
-                [0, 0, 0, 0]
-            };
-            assert_eq!(words(&out.buffers[1][..16]), first, "{what}: level 1");
-            assert_eq!(
-                words(&out.buffers[1][16..]),
-                [0, 0, 0, alpha],
-                "{what}: level 5"
-            );
-        }
-    }
-}
-
-/// The pushed level count of `plan`'s texture slot 0, as instantiated for `s`.
-fn pushed_levels(plan: &BindingPlan, s: &BindState) -> u32 {
-    let at = plan
-        .push
-        .fields
-        .iter()
-        .find(|f| f.field == PushField::TextureLevels(tslot(0)))
-        .map(|f| match f.location {
-            FieldLocation::PushWindow { offset } => offset as usize,
-            other => panic!("{other:?}"),
-        })
-        .expect("a level-count field");
-    let cmds = plan
-        .instantiate_dispatch(
-            s,
-            &Dispatch::Threadgroups {
-                groups: [1, 1, 1],
-                threads_per_group: [1, 1, 1],
-            },
-        )
-        .expect("instantiate");
-    let w = cmds.regions[0].push_constants.first().expect("push bytes");
-    let i = at - w.offset as usize;
-    u32::from_le_bytes(w.bytes[i..i + 4].try_into().expect("u32"))
-}
-
-/// A plan's key keeps a bound texture's level count only at a slot whose levels the pipeline
-/// reads (`StorageTextureLevels` or `StorageTextureLevelViews`): a texture another slot samples,
-/// and a used texture (a heap array views level 0 alone), key one level, and a shape with nothing
-/// to project is borrowed.
-#[test]
-fn a_plan_s_key_keeps_levels_only_where_the_pipeline_reads_them() {
-    use crate::bind::{TextureShape, UsedClass, UsedShape};
-    use crate::pipeline::artifact::RuntimeDependency;
-    use crate::pipeline::facts::Mechanism;
-    use std::borrow::Cow;
-
-    let levels = |shape: &TextureShape| match shape {
-        TextureShape::Texture {
-            mipmap_level_count, ..
-        } => *mipmap_level_count,
-        other => panic!("{other:?}"),
-    };
-    let texture = |n: u32| {
-        let mut facts = TextureFacts::new(TextureType::Type2D, PixelFormat::RGBA16Float);
-        facts.usage = TextureUsage::SHADER_READ;
-        facts.mipmap_level_count = n;
-        facts
-    };
-    let mut s = state(Some(3));
-    let table = s.stages.get_mut(&Stage::Kernel).expect("kernel table");
-    table.textures.insert(
-        1,
-        BoundTexture::Texture {
-            facts: texture(5),
-            resource_id: None,
-        },
-    );
-    let mut shape = s.shape();
-    shape.used.insert(
-        7,
-        UsedShape {
-            class: UsedClass::Texture(texture(4).shape()),
-            usage: crate::metal::ResourceUsage::empty(),
-            stages: crate::metal::RenderStages::empty(),
-        },
-    );
-    let at = |shape: &crate::bind::BindShape, index: u32| {
-        levels(&shape.stages[&Stage::Kernel].textures[&index])
-    };
-    let used = |shape: &crate::bind::BindShape| match &shape.used[&7].class {
-        UsedClass::Texture(t) => levels(t),
-        other => panic!("{other:?}"),
-    };
-    assert_eq!((at(&shape, 0), at(&shape, 1), used(&shape)), (3, 5, 4));
-
-    for fact in [
-        RuntimeFact::StorageTextureLevels { slot: tslot(0) },
-        RuntimeFact::StorageTextureLevelViews { slot: tslot(0) },
-    ] {
-        let deps = [RuntimeDependency::new(fact, Mechanism::PushConstant)];
-        let key = shape.for_plan(&deps);
-        assert!(matches!(key, Cow::Owned(_)), "{fact:?}");
-        assert_eq!(
-            (at(&key, 0), at(&key, 1), used(&key)),
-            (3, 1, 1),
-            "{fact:?}"
-        );
-        assert_eq!(key.for_plan(&deps), Cow::Borrowed(key.as_ref()), "{fact:?}");
-    }
-    let key = shape.for_plan(&[]);
-    assert_eq!((at(&key, 0), at(&key, 1), used(&key)), (1, 1, 1));
-    let one = state(Some(1)).shape();
-    assert!(matches!(one.for_plan(&[]), Cow::Borrowed(_)));
-}
-
-/// A level slot binds a texture of any usage at its levels: plain Metal writes a texture made
-/// without `ShaderWrite` at every level, through every write form, as one made with it
-/// (CoreAnimation's blur textures are `ShaderRead | RenderTarget | BlockWritesOnly`),
-/// where the binder bound the neutral there and dropped the writes. Its shape states its levels
-/// whatever the usage, and the plan's key (`BindShape::for_plan`) keeps them only where the
-/// pipeline reads them. A texture with more levels than the views hold is larger than the device's
-/// largest 2D image: refused, naming `maxImageDimension2D`.
-#[test]
-fn level_slots_bind_textures_of_every_usage_the_device_can_hold() {
-    let Some(bc) = fixture("txt_level_write") else {
-        return;
-    };
-    let stem = "moltenvk-m3";
-    let dev = device(stem);
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
-    let pipe = pipeline(&dev, &bc, "txt_level_write");
-    let n = max_levels(&p, ImageDim::D2);
-    let with_usage = |levels: Option<u32>, usage: TextureUsage| {
-        let mut s = state(levels);
-        if let Some(BoundTexture::Texture { facts, .. }) = s
-            .stages
-            .get_mut(&Stage::Kernel)
-            .and_then(|t| t.textures.get_mut(&0))
-        {
-            facts.usage = usage;
-        }
-        s
-    };
-    let private =
-        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET | TextureUsage::BLOCK_WRITES_ONLY;
-    for usage in [
-        TextureUsage::SHADER_READ,
-        TextureUsage::RENDER_TARGET,
-        TextureUsage::BLOCK_WRITES_ONLY,
-        private,
-        TextureUsage::empty(),
-    ] {
-        let what = format!("{usage:?}");
-        let (three, one) = (with_usage(Some(3), usage), with_usage(Some(1), usage));
-        assert_ne!(three.shape(), one.shape(), "{what}");
-        assert_ne!(
-            three.shape().for_plan(&pipe.dependencies),
-            one.shape().for_plan(&pipe.dependencies),
-            "{what}: the pipeline reads the slot's levels"
-        );
-        assert_eq!(
-            three.shape().for_plan(&[]),
-            one.shape().for_plan(&[]),
-            "{what}: a pipeline that reads no levels"
-        );
-
-        let plan = pipe.plan(&dev, &three.shape()).expect("plan");
-        let writes: Vec<_> = plan
-            .descriptors
-            .iter()
-            .filter(|w| matches!(w.ty, crate::vk::DescriptorType::STORAGE_IMAGE))
-            .collect();
-        assert_eq!(writes.len(), n as usize, "{what}");
-        for (i, w) in writes.iter().enumerate() {
-            match &w.source {
-                WriteSource::Texture { view, .. } => {
-                    assert!(i < 3, "{what}: element {i}");
-                    assert_eq!(view.level, Some(i as u32), "{what}");
-                }
-                WriteSource::Neutral(_) => assert!(i >= 3, "{what}: element {i}"),
-                other => panic!("{what}: {other:?}"),
-            }
-        }
+    for stem in ["lavapipe", "runtime-floor"] {
+        let p = profile(stem, identity()).unwrap_or_else(|e| panic!("{e}"));
+        let a = compile(&bc, "txt_level_write", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         assert!(
-            !plan.diagnostics.iter().any(
-                |d| matches!(d, PlanDiagnostic::IncompatibleBinding { slot, .. } if *slot == tslot(0))
-            ),
-            "{what}: {:?}",
-            plan.diagnostics
+            !(a.facts.iter()).any(|f| matches!(
+                f,
+                RuntimeFact::StorageTextureLevels { .. }
+                    | RuntimeFact::StorageTextureLevelViews { .. }
+            )),
+            "{stem}: {:?}",
+            a.facts
         );
-        assert_eq!(pushed_levels(&plan, &three), 3, "{what}");
-    }
-
-    let s = state(Some(3));
-    let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-    assert_eq!(pushed_levels(&plan, &s), 3);
-
-    let want = Unsupported::needs(
-        Feature::Lowering(LowerFamily::Texture),
-        Capability::Limit {
-            limit: VkLimit::MaxImageDimension2D,
-            required: 1 << n,
-            available: u64::from(p.fields().limits.max_image_dimension_2d),
-        },
-    );
-    match pipe.plan(&dev, &state(Some(n + 1)).shape()) {
-        Err(BindError::Unsupported(u)) => {
-            assert_eq!((u.feature, u.needs), (want.feature, want.needs))
-        }
-        other => panic!("{:?}", other.map(|_| ())),
+        let pushed = |field| (a.interface.push.fields.iter()).any(|f| f.field == field);
+        assert!(pushed(PushField::TextureLevels(tslot(0))), "{stem}");
+        assert!(pushed(PushField::SlotGuestBase(tslot(0))), "{stem}");
     }
 }
+
+// ---- The binder, end to end ----

@@ -167,6 +167,10 @@ pub enum ConstRule {
     /// An `OpSpecConstantOp` whose operands are not scalar constants of the types its operation
     /// requires, or none of which is specialization-dependent.
     SpecOpOperands,
+    /// A `WorkgroupSize` part that is an `OpSpecConstantOp`: each part is a plain constant or a
+    /// plain specialization constant, so the size a driver reads from the parts as declared is the
+    /// one the module's body computes with.
+    WorkgroupSizeOp,
 }
 
 /// A violated module-scope variable rule.
@@ -202,10 +206,6 @@ pub enum GlobalRule {
     PlainClass(StorageClass),
     /// An initializer whose type differs from the variable's.
     InitializerType,
-    /// An entry interface whose `Workgroup` variables mix explicitly laid-out `Block`s with
-    /// implicitly laid-out variables (`SPV_KHR_workgroup_memory_explicit_layout` allows all or
-    /// none).
-    MixedWorkgroupLayout,
     /// `Invariant` on a variable other than the `Position`, `ClipDistance`, `FragDepth`,
     /// `SampleMask` and `FragStencilRefEXT` outputs.
     InvariantTarget,
@@ -252,9 +252,6 @@ pub enum EntryRule {
     TessellationModes,
     /// A mesh entry without a nonzero vertex and primitive count and its primitive kind.
     MeshModes,
-    /// A geometry entry without its input primitive, its output primitive, and a nonzero count of
-    /// output vertices and invocations.
-    GeometryModes,
     /// An instruction the entry's execution model (and modes) cannot run: implicit derivatives
     /// outside fragment (or derivative-group compute), fragment-only operations elsewhere, or
     /// interlock without an interlock mode.

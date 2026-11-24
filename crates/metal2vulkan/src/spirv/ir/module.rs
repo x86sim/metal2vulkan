@@ -139,6 +139,11 @@ pub struct LocalVar {
     pub ptr_ty: TypeId,
     pub value: Value,
     pub init: Option<ConstId>,
+    /// Whether no trip of a loop whose body holds every whole store of the variable reads the
+    /// value an earlier trip left in it: a demoted value's or a phi's variable of a walk that is
+    /// not predicated, which P8 marks. [`crate::spirv::carry`] ends such a value at each trip's
+    /// top.
+    pub trip_local: bool,
 }
 
 /// One member of the push-constant block, placed by `select`.
@@ -210,8 +215,6 @@ pub enum Inst {
         offset: Value,
         count: Value,
     },
-    /// `OpFmaKHR` (`SPV_KHR_fma`): `a * b + c` rounded once (Vulkan: "Correctly rounded").
-    Fma { a: Value, b: Value, c: Value },
     /// `OpBitFieldSExtract` (`signed`) or `OpBitFieldUExtract`.
     BitFieldExtract {
         signed: bool,
@@ -260,9 +263,9 @@ pub enum Inst {
     Undef,
     // ---- Memory (builder/ops/memory.rs) ----
     /// `OpAccessChain`. `non_uniform` marks an element of a descriptor array chosen by an index
-    /// that may differ between invocations: the result and every value that carries the element
-    /// on ([`Inst::carries_non_uniform`]) are decorated `NonUniform`
-    /// (VUID-RuntimeSpirv-NonUniform-06274), and derivation requires the array kind's non-uniform
+    /// that may differ between invocations: the result and every value that carries the element on
+    /// ([`Inst::carries_non_uniform`]) are decorated `NonUniform` (VUID-RuntimeSpirv-None-10148 and
+    /// VUID-RuntimeSpirv-subgroupSize-10149), and derivation requires the array kind's non-uniform
     /// indexing capability instead of its dynamic one.
     AccessChain {
         base: Value,
@@ -404,10 +407,6 @@ pub enum Inst {
     IsHelperInvocation,
     /// `OpSetMeshOutputsEXT`: the vertices and primitives a mesh workgroup outputs.
     SetMeshOutputs { vertices: Value, primitives: Value },
-    /// `OpEmitVertex`: a geometry entry emits a vertex of its output values.
-    EmitVertex,
-    /// `OpEndPrimitive`: a geometry entry ends its output primitive.
-    EndPrimitive,
     // ---- Ray queries (builder/ops/ray.rs) ----
     /// A `SPV_KHR_ray_query` instruction.
     RayQuery(RayQueryInst),
@@ -444,9 +443,9 @@ impl Inst {
     /// sampler, or sampled image): a non-uniform access chain or a chain into a block element one
     /// reached, an opaque load of one (the image or sampler), a texel pointer into one (an image
     /// atomic's pointer), a sampled image of such an image or sampler, and the image of such a
-    /// sampled image. Each result is decorated `NonUniform` (VUID-RuntimeSpirv-NonUniform-06274);
-    /// the builder refuses the other uses that would carry the element on. Data loaded from a block
-    /// element carries none.
+    /// sampled image. Each result is decorated `NonUniform` (VUID-RuntimeSpirv-None-10148 and
+    /// VUID-RuntimeSpirv-subgroupSize-10149); the builder refuses the other uses that would carry
+    /// the element on. Data loaded from a block element carries none.
     pub fn carries_non_uniform(&self, marked: impl Fn(Value) -> bool, opaque: bool) -> bool {
         match self {
             Inst::AccessChain {
@@ -527,11 +526,6 @@ impl Inst {
                 f(*t);
                 f(*e);
             }
-            Inst::Fma { a, b, c } => {
-                f(*a);
-                f(*b);
-                f(*c);
-            }
             Inst::BitFieldInsert {
                 base,
                 insert,
@@ -583,9 +577,7 @@ impl Inst {
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
             | Inst::ControlBarrier { .. }
-            | Inst::MemoryBarrier { .. }
-            | Inst::EmitVertex
-            | Inst::EndPrimitive => {}
+            | Inst::MemoryBarrier { .. } => {}
             Inst::SetMeshOutputs {
                 vertices,
                 primitives,
@@ -756,11 +748,6 @@ impl Inst {
                 f(t);
                 f(e);
             }
-            Inst::Fma { a, b, c } => {
-                f(a);
-                f(b);
-                f(c);
-            }
             Inst::BitFieldInsert {
                 base,
                 insert,
@@ -812,9 +799,7 @@ impl Inst {
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
             | Inst::ControlBarrier { .. }
-            | Inst::MemoryBarrier { .. }
-            | Inst::EmitVertex
-            | Inst::EndPrimitive => {}
+            | Inst::MemoryBarrier { .. } => {}
             Inst::SetMeshOutputs {
                 vertices,
                 primitives,
@@ -991,7 +976,6 @@ impl Inst {
             | Inst::Select { .. }
             | Inst::BitFieldInsert { .. }
             | Inst::BitFieldExtract { .. }
-            | Inst::Fma { .. }
             | Inst::Convert { .. }
             | Inst::CompositeConstruct { .. }
             | Inst::CompositeExtract { .. }
@@ -1018,9 +1002,7 @@ impl Inst {
             | Inst::EndInterlock
             | Inst::DemoteToHelperInvocation
             | Inst::IsHelperInvocation
-            | Inst::SetMeshOutputs { .. }
-            | Inst::EmitVertex
-            | Inst::EndPrimitive => {}
+            | Inst::SetMeshOutputs { .. } => {}
         }
     }
 
@@ -1041,7 +1023,6 @@ impl Inst {
             } => Some(ModelNeed::Fragment),
             Inst::BeginInterlock | Inst::EndInterlock => Some(ModelNeed::Interlock),
             Inst::SetMeshOutputs { .. } => Some(ModelNeed::Mesh),
-            Inst::EmitVertex | Inst::EndPrimitive => Some(ModelNeed::Geometry),
             Inst::AtomicLoad { scope, .. }
             | Inst::AtomicStore { scope, .. }
             | Inst::Atomic { scope, .. }
@@ -1172,6 +1153,29 @@ impl Terminator {
     }
 
     /// Call `f` on every block the terminator may branch to, in operand order.
+    pub fn for_each_target(&self, mut f: impl FnMut(BlockId)) {
+        match self {
+            Terminator::Branch(t) => f(*t),
+            Terminator::CondBranch { t, f: e, .. } => {
+                f(*t);
+                f(*e);
+            }
+            Terminator::Switch { default, cases, .. } => {
+                f(*default);
+                for (_, c) in cases {
+                    f(*c);
+                }
+            }
+            Terminator::Return
+            | Terminator::ReturnValue(_)
+            | Terminator::Kill
+            | Terminator::TerminateInvocation
+            | Terminator::Unreachable
+            | Terminator::EmitMeshTasks { .. } => {}
+        }
+    }
+
+    /// Call `f` on every block the terminator may branch to, in operand order.
     pub fn for_each_target_mut(&mut self, mut f: impl FnMut(&mut BlockId)) {
         match self {
             Terminator::Branch(t) => f(t),
@@ -1216,19 +1220,11 @@ pub struct Function {
     pub blocks: Vec<BlockId>,
     /// `Function`-storage variables, declared at the top of the entry block.
     pub vars: Vec<VarId>,
-    /// Whether the function is a routine its callers share (`ModuleBuilder::routine`), which
-    /// `serialize::serialize_for` declares `DontInline` for a profile whose driver converts every
-    /// function to one inlined at each call.
-    pub routine: bool,
-    /// Whether the routine is a texel routine (`ModuleBuilder::texel_routine`): a linear filter
-    /// emulation's sum, which `serialize` declares `DontInline` for every profile, so a driver
-    /// that honours the control compiles it once and calls it from each site.
+    /// Whether the function is a kept routine (`ModuleBuilder::kept_routine`): one combined
+    /// binding's sample emulation, which `serialize` declares
+    /// `DontInline`, so a driver that honours the control compiles it once and calls it from each
+    /// site.
     pub kept: bool,
-    /// Whether the routine is a sampling routine (`ModuleBuilder::sampling_routine`): one
-    /// combined binding's sample emulation, which `serialize::serialize_for` declares
-    /// `DontInline` for a profile whose driver keeps such a call a call
-    /// (`DriverWorkaround::DontInlineKeepsCalls`) or inlines every function at each call.
-    pub sampling: bool,
 }
 
 /// Metadata of every loop, recorded by `FunctionBuilder::loop_`.
@@ -1299,9 +1295,6 @@ pub enum ExecModel {
     TaskEXT,
     /// A mesh function (`SPV_EXT_mesh_shader`).
     MeshEXT,
-    /// The pass-through geometry stage link synthesizes for a fragment function that reads
-    /// `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric`.
-    Geometry,
 }
 
 impl ExecModel {
@@ -1326,7 +1319,6 @@ pub enum ExecMode {
     DepthLess,
     StencilRefReplacing,
     PixelInterlockOrdered,
-    SampleInterlockOrdered,
     LocalSize {
         x: u32,
         y: u32,
@@ -1351,9 +1343,6 @@ pub enum ExecMode {
     /// `RequireFullQuadsKHR` (`SPV_KHR_quad_control`, fragment only): every quad starts with its
     /// four invocations, helpers included, and they take part in every group operation.
     RequireFullQuads,
-    /// `PostDepthCoverage` (`SPV_KHR_post_depth_coverage`, fragment only): `SampleMask` reads the
-    /// coverage after the early depth and stencil tests.
-    PostDepthCoverage,
     // ---- Tessellation ----
     /// The triangle patch domain.
     Triangles,
@@ -1380,29 +1369,12 @@ pub enum ExecMode {
     OutputLines,
     /// Triangles (`OutputTrianglesEXT`).
     OutputTriangles,
-    // ---- Geometry ----
-    /// A geometry entry's input primitive: points (`InputPoints`). Its triangles are
-    /// [`ExecMode::Triangles`] and its output points [`ExecMode::OutputPoints`].
-    InputPoints,
-    /// Lines (`InputLines`).
-    InputLines,
-    /// A geometry entry's output primitive: line strips (`OutputLineStrip`).
-    OutputLineStrip,
-    /// Triangle strips (`OutputTriangleStrip`).
-    OutputTriangleStrip,
-    /// A geometry entry's invocations per input primitive (`Invocations`).
-    Invocations {
-        n: u32,
-    },
 }
 
 impl ExecMode {
     /// Whether this mode declares fragment shader interlock.
     pub fn is_interlock(self) -> bool {
-        matches!(
-            self,
-            ExecMode::PixelInterlockOrdered | ExecMode::SampleInterlockOrdered
-        )
+        matches!(self, ExecMode::PixelInterlockOrdered)
     }
 }
 
@@ -1479,13 +1451,6 @@ pub struct TypedModule {
     /// The values decorated `NonUniform`: every result that carries a non-uniform descriptor
     /// element ([`Inst::carries_non_uniform`]), recorded as the builder appends it.
     pub(in crate::spirv) non_uniform: std::collections::BTreeSet<Value>,
-    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured
-    /// to answer Metal's where the driver takes `DriverDeviation::MetalHalfConversion`
-    /// (`ModuleBuilder::measured_roundings`), recorded as the builder emits them.
-    pub(in crate::spirv) measured_roundings: std::collections::BTreeSet<Value>,
-    /// The texels the texture family's writes store, whose stored NaN the write's own notes
-    /// account for (`ModuleBuilder::stored_texels`), recorded as the builder emits them.
-    pub(in crate::spirv) stored_texels: std::collections::BTreeSet<Value>,
     /// The `Function` variables the emitter holds workgroup uniform by construction: the `cont`
     /// flag of a predicated loop that iterates together, which the lowering's uniformity analysis
     /// proved. An in-memory record for checks (`spirv::testing::barriers`), kept only where they
@@ -1509,17 +1474,6 @@ impl TypedModule {
     /// The constant table.
     pub fn consts(&self) -> &Consts {
         &self.consts
-    }
-
-    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured to
-    /// answer Metal's (`ModuleBuilder::note_measured_rounding`).
-    pub fn measured_roundings(&self) -> &std::collections::BTreeSet<Value> {
-        &self.measured_roundings
-    }
-
-    /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`).
-    pub fn stored_texels(&self) -> &std::collections::BTreeSet<Value> {
-        &self.stored_texels
     }
 
     /// The SSA value of a constant.
@@ -1597,10 +1551,5 @@ impl TypedModule {
     #[cfg(test)]
     pub fn interface(&self) -> &[GlobalId] {
         &self.interface
-    }
-
-    /// The module's derived device requirements.
-    pub fn requirements(&self) -> &Requirements {
-        &self.requirements
     }
 }

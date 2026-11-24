@@ -15,13 +15,10 @@
 //! `engine/multisample`'s render pipelines of four samples. A fragment function of a pipeline
 //! of four samples compiles under `LoweringInputs::multisampled`. Each framebuffer-fetch fixture
 //! (`engine/fragment_fetch`, `exf_*`, `exf2_fetch_unwritten`, `msf_fetch_ms`) adds its fragment
-//! functions under the fetch state of a pipeline of the attachment formats its cases use, which the
-//! interlocked storage form needs, and each whose cases draw multisampled (`exf_fetch_blend`,
-//! `exf_fetch_count`, `msf_fetch_ms`) the same state at four samples, compiled under
-//! `multisampled`: the per-sample forms. `engine/tob_renders` adds the snapshot of its own-pixel
-//! texture read (`tob_read` under `LoweringInputs::snapshot_textures`) in the form that holds a
-//! 16-bit float texel's code and in one of narrower codes: the two-draw copy-and-read form, which
-//! the entry alone, compiled without the input, never reaches.
+//! functions under the fetch state of a pipeline of the attachment formats its cases use, which a
+//! write the function computes over its input attachment needs, and each whose cases draw
+//! multisampled (`exf_fetch_blend`, `exf_fetch_count`, `msf_fetch_ms`) the same state at four
+//! samples, compiled under `multisampled`: the per-sample form.
 //!
 //! A cell is the first 64 bits of SHA-256 over the final SPIR-V words of the subject's stage
 //! modules (each prefixed by its word count), or the typed outcome class of a refusal, so a new
@@ -30,13 +27,14 @@
 //! for the cache key of the output, host-independently (the key's AIR hash covers bitcode that
 //! differs between `llvm-as` versions).
 //!
-//! `golden_hashes.tsv` must match the observed table, cell for cell; it records no version, so a
-//! `SEMANTICS_VERSION` bump alone leaves it as it is. A cell that changed while its fixture source
-//! and profile fingerprint did not is output that changed under an unchanged key: it needs
-//! `cache::SEMANTICS_VERSION` above its value at the table's last bless, and a bless. New, removed,
-//! or re-keyed cells only need a bless. The bless (ignored) records what it observes and names the
-//! cells that changed under an unchanged key; the master bless refuses those without the bump. It
-//! needs every assembler, so it runs on macOS:
+//! `golden_hashes.tsv` must match the observed table, cell for cell, and records
+//! `cache::SEMANTICS_VERSION` as it was at its bless (its `semantics` line), which a bump alone
+//! leaves as it is. A cell that changed while its fixture source and profile fingerprint did not is
+//! output that changed under an unchanged key: it needs `cache::SEMANTICS_VERSION` above the
+//! table's, and a bless. Such a cell under the table's own number is a missing bump, which the
+//! check names, and which the bless refuses; under a higher one it is a bless due. New, removed,
+//! or re-keyed cells only need a bless. The bless (ignored) records what it observes. It needs
+//! every assembler, so it runs on macOS:
 //!
 //! ```text
 //! cargo nextest run -p metal2vulkan --all-features --run-ignored ignored-only -E 'test(bless_golden_hashes)'
@@ -59,22 +57,21 @@ use crate::pipeline::testing::{
     engine_dir, fixtures_dir, link_standalone, llvm_assemble, metal_assemble, AssembleError,
 };
 use crate::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, FramebufferFetchInputs,
-    FunctionDescriptor, LoweringInputs, RenderPipelineDescriptor, SlotClass, SlotRef, SnapshotForm,
-    Stage, StageSource, StorageImageClass, TileRenderPipelineDescriptor, VertexAttributeDescriptor,
-    VertexBufferLayoutDescriptor, VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, FunctionDescriptor, LoweringInputs,
+    RenderPipelineDescriptor, SlotClass, SlotRef, Stage, StageSource, StorageImageClass,
+    TileRenderPipelineDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+    VertexDescriptor,
 };
 use crate::Budget;
 
-/// One golden table: where it is committed, the policy its devices compile under, and the
-/// fixtures it takes.
+/// One golden table: where it is committed and the fixtures it takes. Its devices compile under
+/// the default policy, the runtime's.
 #[derive(Clone, Copy)]
 struct Golden {
     /// The committed table, relative to the crate root.
     table: &'static str,
     /// The first lines of its header, before the bless command.
     title: &'static str,
-    policy: DevicePolicy,
     /// Whether it takes a fixture, by its source text.
     takes: fn(&str) -> bool,
 }
@@ -84,7 +81,6 @@ const DEFAULT: Golden = Golden {
     table: "tests/golden_hashes.tsv",
     title: "# Golden output hashes of the engine over the public fixtures x the committed\n\
             # profiles (src/tests/golden_hashes.rs). Written by the bless; do not edit:\n",
-    policy: DevicePolicy::UNTRUSTED,
     takes: every,
 };
 
@@ -128,24 +124,10 @@ enum Subject {
         vertex: &'static str,
         fragment: &'static str,
     },
-    /// Fragment `entry` compiled under the framebuffer-fetch state of a pipeline whose color
-    /// attachments are `formats` (by index, each read), linked alone: the interlocked storage form
-    /// on a device that orders fetch only through the pixel interlock, which the entry alone,
-    /// compiled without the state, needs. Above one sample, compiled under `multisampled`: the
-    /// per-sample forms.
-    Fetch {
-        entry: &'static str,
-        formats: &'static [PixelFormat],
-        samples: u32,
-    },
-    /// Fragment `entry` compiled under a snapshot of its texture slot 0 in `form`
-    /// (`LoweringInputs::snapshot_textures`), linked alone: the two-draw copy-and-read form a draw
-    /// that reads a texture its own subpass renders takes, which the entry alone, compiled without
-    /// the input, never reaches.
-    Snapshot {
-        entry: &'static str,
-        form: SnapshotForm,
-    },
+    /// Fragment `entry`, which reads the color attachments of a pipeline, linked alone (the
+    /// attachments' formats name the row, and the function compiles alike for any). Above one
+    /// sample, compiled under `multisampled`: the per-sample form.
+    Fetch { entry: &'static str, samples: u32 },
     /// The module does not decode: its refusal class in every column.
     Undecodable(String),
     /// The installed assembler rejects the fixture. Every committed fixture assembles with the
@@ -253,10 +235,6 @@ fn pipelines(fixture: &str) -> Vec<(String, Subject)> {
             [1, 4].map(|samples| fetch_subject(entry, &[PixelFormat::RGBA32Float], samples))
         })
         .collect(),
-        "engine/tob_renders.ll" => [SnapshotForm::Half, SnapshotForm::Unorm8]
-            .into_iter()
-            .map(|form| snapshot_subject("tob_read", form))
-            .collect(),
         "engine/multisample.ll" => [
             "multisample_center_at_sample",
             "multisample_sampled_varying",
@@ -296,18 +274,7 @@ fn fetch_subject(
     };
     (
         format!("fetch {entry} as {formats:?}{at}"),
-        Subject::Fetch {
-            entry,
-            formats,
-            samples,
-        },
-    )
-}
-
-fn snapshot_subject(entry: &'static str, form: SnapshotForm) -> (String, Subject) {
-    (
-        format!("snapshot {entry} as {form:?}"),
-        Subject::Snapshot { entry, form },
+        Subject::Fetch { entry, samples },
     )
 }
 
@@ -368,8 +335,8 @@ fn multisampled_descriptor(
 
 // ---- Inputs ----
 
-/// Every committed profile as a device under `policy`, by stem.
-fn devices(policy: DevicePolicy) -> Vec<(String, Device)> {
+/// Every committed profile as a device under the default policy, by stem.
+fn devices() -> Vec<(String, Device)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
@@ -384,7 +351,8 @@ fn devices(policy: DevicePolicy) -> Vec<(String, Device)> {
         let text = std::fs::read_to_string(&path).expect("read profile");
         let desc = DeviceDescription::from_khronos_json(&text, None)
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let dev = Device::new(desc, policy).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let dev = Device::from_queries(desc, DevicePolicy::default())
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
         out.push((stem, dev));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -529,7 +497,6 @@ fn refusal(e: &Error) -> Option<String> {
                 Needs::AnyOf(alts) => format!("AnyOf{alts:?}"),
                 Needs::NotImplemented => "NotImplemented".to_owned(),
                 Needs::NotRepresentable => "NotRepresentable".to_owned(),
-                other => format!("{other:?}"),
             };
             format!("Unsupported{{{:?}; {needs}}}", u.feature)
         }
@@ -603,31 +570,9 @@ fn compiled(lib: &Library, subject: &Subject, dev: &Device) -> Result<Vec<Vec<u3
             let p = dev.compile_render_pipeline(&d, &b)?;
             Ok(p.stages.iter().map(|s| s.spirv.to_vec()).collect())
         }
-        Subject::Fetch {
-            entry,
-            formats,
-            samples,
-        } => {
-            let colors: Vec<Option<ColorAttachmentDescriptor>> = formats
-                .iter()
-                .map(|&f| Some(ColorAttachmentDescriptor::new(f)))
-                .collect();
+        Subject::Fetch { entry, samples } => {
             let mut inputs = LoweringInputs::new();
-            inputs.framebuffer_fetch = Some(FramebufferFetchInputs::of(
-                0..formats.len() as u32,
-                &colors,
-                false,
-                false,
-                1,
-            ));
             inputs.multisampled = *samples > 1;
-            let f = FunctionDescriptor::new(lib.function(entry)?);
-            let c = dev.compile_function(&f, &inputs, &b)?;
-            Ok(vec![link_standalone(c.artifact(), dev.profile())?.1])
-        }
-        Subject::Snapshot { entry, form } => {
-            let mut inputs = LoweringInputs::new();
-            inputs.snapshot_textures.insert(snapshot_slot(), *form);
             let f = FunctionDescriptor::new(lib.function(entry)?);
             let c = dev.compile_function(&f, &inputs, &b)?;
             Ok(vec![link_standalone(c.artifact(), dev.profile())?.1])
@@ -641,15 +586,6 @@ fn compiled(lib: &Library, subject: &Subject, dev: &Device) -> Result<Vec<Vec<u3
 fn storage_slot() -> SlotRef {
     SlotRef {
         stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index: 0,
-    }
-}
-
-/// The fragment texture slot a snapshot subject reads through its snapshot.
-fn snapshot_slot() -> SlotRef {
-    SlotRef {
-        stage: Stage::Fragment,
         class: SlotClass::Texture,
         index: 0,
     }
@@ -711,6 +647,8 @@ struct Row {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Table {
+    /// `cache::SEMANTICS_VERSION` when the table was observed (for the committed one, blessed).
+    semantics: u32,
     /// (stem, fingerprint prefix), sorted by stem.
     profiles: Vec<(String, String)>,
     /// By (fixture, subject).
@@ -739,8 +677,9 @@ impl Table {
         s.push_str(
             "# A cell is the first 64 bits of SHA-256 over the final SPIR-V of its subject, or its\n\
              # refusal class. A cell that changes under an unchanged fixture source and profile\n\
-             # fingerprint needs cache::SEMANTICS_VERSION above its value at the last bless.\n",
+             # fingerprint needs cache::SEMANTICS_VERSION above the semantics line, its bless's.\n",
         );
+        s.push_str(&format!("semantics\t{}\n", self.semantics));
         for (stem, fp) in &self.profiles {
             s.push_str(&format!("profile\t{stem}\t{fp}\n"));
         }
@@ -762,6 +701,7 @@ impl Table {
     }
 
     fn parse(text: &str) -> Result<Table, String> {
+        let mut semantics = None;
         let mut profiles = Vec::new();
         let mut header = false;
         let mut rows = BTreeMap::new();
@@ -771,6 +711,9 @@ impl Table {
             }
             let f: Vec<&str> = line.split('\t').collect();
             match f.as_slice() {
+                ["semantics", value] => {
+                    semantics = Some(value.parse().map_err(|e| format!("line {n}: {e}"))?);
+                }
                 ["profile", stem, fp] => profiles.push(((*stem).to_owned(), (*fp).to_owned())),
                 ["fixture", "source", "subject", stems @ ..] => {
                     let expected: Vec<&str> = profiles.iter().map(|(s, _)| s.as_str()).collect();
@@ -797,7 +740,12 @@ impl Table {
                 _ => return Err(format!("line {n}: unexpected {line:?}")),
             }
         }
-        Ok(Table { profiles, rows })
+        let semantics = semantics.ok_or("no semantics line: the SEMANTICS_VERSION of its bless")?;
+        Ok(Table {
+            semantics,
+            profiles,
+            rows,
+        })
     }
 }
 
@@ -855,7 +803,11 @@ fn observe(golden: Golden, devices: &[(String, Device)]) -> Observed {
         .map(|(stem, dev)| (stem.clone(), hex16(&dev.profile().fingerprint())))
         .collect();
     Observed {
-        table: Table { profiles, rows },
+        table: Table {
+            semantics: crate::cache::SEMANTICS_VERSION,
+            profiles,
+            rows,
+        },
         skipped,
     }
 }
@@ -915,6 +867,26 @@ fn diff(committed: &Table, observed: &Observed) -> Diff {
     d
 }
 
+/// Whether a cell that changed under an unchanged key between `committed` and `observed` is a
+/// missing bump: `observed`'s `cache::SEMANTICS_VERSION` is not above the committed table's, so a
+/// cached artifact under that key is served stale. Above it, the change is a bless due.
+fn missing_bump(committed: &Table, observed: &Table) -> bool {
+    observed.semantics <= committed.semantics
+}
+
+/// The stale cells by kind, in the words the matrix reads (scripts/matrix/results.py): a cell under
+/// a changed profile fingerprint is one whose device, built by `Device::from_queries`, changed.
+fn stale_counts(stale: &[String]) -> String {
+    let count = |kind: &str| stale.iter().filter(|l| l.starts_with(kind)).count();
+    format!(
+        "{} new, {} gone, {} under a changed fixture source, {} under a changed profile fingerprint",
+        count("new:"),
+        count("gone:"),
+        count("fixture source changed:"),
+        count("profile changed:")
+    )
+}
+
 fn shown(lines: &[String]) -> String {
     let mut s = String::new();
     for l in lines.iter().take(SHOWN) {
@@ -928,8 +900,13 @@ fn shown(lines: &[String]) -> String {
     s
 }
 
-/// The required pair: wherever bgra8 is not storage-capable (its choice swizzles), the bgra8 and
-/// rgba8 storage-texture pipelines both compile and differ.
+/// The required pair: wherever bgra8 is not storage-capable (its choice swizzles), the bgra8
+/// storage-texture pipeline is `Unsupported{IdentityDomains}`, the swizzle being state of the bound
+/// texture beyond its resource ID, and the rgba8 one compiles where its choice is the format's own
+/// image declared without a format and is that refusal where the choice declares the format, a
+/// storage image the identity arrays hold no element of (both in the runtime's known gaps, and
+/// `tests::engine_identity`'s
+/// `a_storage_choice_the_identity_arrays_hold_no_element_of_is_refused_naming_the_texture_argument`).
 fn check_storage_pair(observed: &Table, devices: &[(String, Device)]) -> usize {
     let row = |format| {
         observed
@@ -947,9 +924,18 @@ fn check_storage_pair(observed: &Table, devices: &[(String, Device)]) -> usize {
             continue;
         }
         let (r, b) = (&rgba.cells[i], &bgra.cells[i]);
+        let refused = "Unsupported{IdentityDomains; NotImplemented}";
+        let formatless = storage_image_choice(PixelFormat::RGBA8Unorm, dev.profile())
+            .is_ok_and(|c| c.vk_format == crate::vk::Format::UNDEFINED);
         assert!(
-            r.len() == 16 && b.len() == 16 && r != b,
-            "{stem}: the bgra8 ({b}) and rgba8 ({r}) storage pipelines must both compile and differ"
+            b == refused
+                && (if formatless {
+                    r.len() == 16
+                } else {
+                    r == refused
+                }),
+            "{stem}: the bgra8 storage pipeline ({b}) must be refused, and the rgba8 one ({r}) \
+             compile where its choice declares no format ({formatless}) and be refused elsewhere"
         );
         swizzled += 1;
     }
@@ -959,7 +945,7 @@ fn check_storage_pair(observed: &Table, devices: &[(String, Device)]) -> usize {
 #[test]
 #[ignore = "x86Sim: 16-byte leaves no longer use uvec4 units (memory::leaf::VEC4_UNITS), which changes these outputs"]
 fn golden_hashes_match_the_table() {
-    let devices = devices(DEFAULT.policy);
+    let devices = devices();
     let observed = observe(DEFAULT, &devices);
     if !observed.skipped.contains(STORAGE_FIXTURE) {
         let swizzled = check_storage_pair(&observed.table, &devices);
@@ -985,22 +971,34 @@ fn matches_the_table(golden: Golden, devices: &[(String, Device)], observed: &Ob
     };
     let d = diff(&committed, observed);
     if !d.changed.is_empty() {
-        panic!(
-            "{table}: output changed under an unchanged key: {} cell(s) changed while their \
-             fixture source and profile fingerprint did not, so a cached artifact under the same \
-             key would be stale unless cache::SEMANTICS_VERSION (src/cache/mod.rs) is above its \
-             value at the table's last bless. Bump it if this change has not, and bless:\n  \
-             {BLESS}\n{}",
-            d.changed.len(),
-            shown(&d.changed)
-        );
+        let (was, now) = (committed.semantics, observed.table.semantics);
+        match missing_bump(&committed, &observed.table) {
+            true => panic!(
+                "{table}: SEMANTICS bump missing: output changed under an unchanged key: {} \
+                 cell(s) changed while their fixture source and profile fingerprint did not, and \
+                 cache::SEMANTICS_VERSION (src/cache/mod.rs) is {now}, the table's at its last \
+                 bless, so a cached artifact under the same key is stale. Bump it, and bless:\n  \
+                 {BLESS}\n{}",
+                d.changed.len(),
+                shown(&d.changed)
+            ),
+            false => panic!(
+                "{table}: bless due: output changed under an unchanged key: {} cell(s) changed \
+                 while their fixture source and profile fingerprint did not, under \
+                 cache::SEMANTICS_VERSION {now}, above the table's {was}. Bless it with\n  \
+                 {BLESS}\n{}",
+                d.changed.len(),
+                shown(&d.changed)
+            ),
+        }
     }
     if !d.stale.is_empty() {
         panic!(
             "{table} is stale: {} cell(s) are new, gone, or under a changed fixture source or \
-             profile (their keys changed, so no SEMANTICS_VERSION bump is needed). Bless it \
+             profile (their keys changed, so no SEMANTICS_VERSION bump is needed): {}. Bless it \
              with\n  {BLESS}\n{}",
             d.stale.len(),
+            stale_counts(&d.stale),
             shown(&d.stale)
         );
     }
@@ -1011,16 +1009,16 @@ fn matches_the_table(golden: Golden, devices: &[(String, Device)], observed: &Ob
     );
 }
 
-/// Rewrite the table from what this build observes: `BLESS` above. Refuses when an assembler is
-/// missing; names the cells that changed under an unchanged key, which need a
-/// `cache::SEMANTICS_VERSION` bump since the last bless (the master bless checks it).
+/// Rewrite the table from what this build observes, with this build's `cache::SEMANTICS_VERSION`:
+/// `BLESS` above. Refuses when an assembler is missing, and when a cell changed under an unchanged
+/// key while `cache::SEMANTICS_VERSION` is still the table's ([`missing_bump`]): a bump is missing.
 #[test]
 #[ignore]
 fn bless_golden_hashes() {
     {
         let golden = DEFAULT;
         let table = golden.table;
-        let devices = devices(golden.policy);
+        let devices = devices();
         let observed = observe(golden, &devices);
         assert!(
             observed.skipped.is_empty(),
@@ -1029,14 +1027,15 @@ fn bless_golden_hashes() {
         );
         if let Some(committed) = committed(golden) {
             let d = diff(&committed, &observed);
-            if !d.changed.is_empty() {
-                eprintln!(
-                    "{table}: {} cell(s) changed under an unchanged key: they need \
-                     cache::SEMANTICS_VERSION above its value at the table's last bless\n{}",
-                    d.changed.len(),
-                    shown(&d.changed)
-                );
-            }
+            assert!(
+                d.changed.is_empty() || !missing_bump(&committed, &observed.table),
+                "refusing to bless: SEMANTICS bump missing: {} cell(s) changed under an unchanged \
+                 key while cache::SEMANTICS_VERSION is {}, the table's at its last bless; bump it \
+                 first\n{}",
+                d.changed.len(),
+                committed.semantics,
+                shown(&d.changed)
+            );
         }
         std::fs::write(table_path(golden), observed.table.render(golden)).expect("write the table");
         eprintln!(
@@ -1057,6 +1056,7 @@ fn bless_golden_hashes() {
 fn a_stale_cell_names_the_key_that_moved_and_not_an_unmoved_cell() {
     let at = ("f.ll".to_owned(), "main".to_owned());
     let table = |fp: &str, source: &str, cell: &str| Table {
+        semantics: 1,
         profiles: vec![("a-gpu".to_owned(), fp.to_owned())],
         rows: BTreeMap::from([(
             at.clone(),
@@ -1113,6 +1113,7 @@ fn the_table_format_round_trips() {
         },
     );
     let t = Table {
+        semantics: 2234,
         profiles: vec![
             ("p".to_owned(), "22".repeat(8)),
             ("q".to_owned(), "33".repeat(8)),
@@ -1120,6 +1121,41 @@ fn the_table_format_round_trips() {
         rows,
     };
     assert_eq!(Table::parse(&t.render(DEFAULT)), Ok(t.clone()));
+    // A table with no semantics line is refused: it would make every change a bless due.
+    let unversioned: String = (t.render(DEFAULT).lines())
+        .filter(|line| !line.starts_with("semantics\t"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(Table::parse(&unversioned).is_err());
+}
+
+/// A cell changed under an unchanged key is a missing bump while the observing build's
+/// `cache::SEMANTICS_VERSION` is the committed table's (emitted SPIR-V changed with the bump left
+/// for a later commit, so a warm cache serves the old modules), and a bless due once it is above.
+#[test]
+fn a_cell_changed_under_its_key_at_the_table_s_own_semantics_is_a_missing_bump() {
+    let table = |semantics: u32, cell: &str| Table {
+        semantics,
+        profiles: vec![("p".to_owned(), "f".to_owned())],
+        rows: BTreeMap::from([(
+            ("a.ll".to_owned(), "k".to_owned()),
+            Row {
+                source: "s".to_owned(),
+                cells: vec![cell.to_owned()],
+            },
+        )]),
+    };
+    let committed = table(2205, "h1");
+    let observed = |semantics: u32| Observed {
+        table: table(semantics, "h2"),
+        skipped: BTreeSet::new(),
+    };
+    let same = observed(2205);
+    assert_eq!(diff(&committed, &same).changed.len(), 1);
+    assert!(missing_bump(&committed, &same.table));
+    let bumped = observed(2206);
+    assert_eq!(diff(&committed, &bumped).changed.len(), 1);
+    assert!(!missing_bump(&committed, &bumped.table));
 }
 
 /// The rule itself on synthetic tables: a changed cell under unchanged inputs needs a bump; a
@@ -1127,6 +1163,7 @@ fn the_table_format_round_trips() {
 #[test]
 fn only_a_cell_changed_under_its_key_needs_a_bump() {
     let table = |source: &str, fp: &str, cells: &[(&str, &str)]| Table {
+        semantics: 1,
         profiles: vec![("p".to_owned(), fp.to_owned())],
         rows: cells
             .iter()
@@ -1152,8 +1189,16 @@ fn only_a_cell_changed_under_its_key_needs_a_bump() {
     assert_eq!((d.changed.len(), d.stale.len()), (0, 1));
     let d = diff(&base, &observed(table("s", "f2", &[("a.ll", "h2")]), &[]));
     assert_eq!((d.changed.len(), d.stale.len()), (0, 1));
+    assert_eq!(
+        stale_counts(&d.stale),
+        "0 new, 0 gone, 0 under a changed fixture source, 1 under a changed profile fingerprint"
+    );
     let d = diff(&base, &observed(table("s", "f", &[("b.ll", "h1")]), &[]));
     assert_eq!((d.changed.len(), d.stale.len()), (0, 2));
+    assert_eq!(
+        stale_counts(&d.stale),
+        "1 new, 1 gone, 0 under a changed fixture source, 0 under a changed profile fingerprint"
+    );
     let d = diff(&base, &observed(table("s", "f", &[]), &["a.ll"]));
     assert_eq!((d.changed.len(), d.stale.len()), (0, 0));
     let d = diff(&base, &observed(base.clone(), &[]));

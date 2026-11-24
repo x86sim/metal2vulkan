@@ -27,30 +27,24 @@ use crate::error::{Error, Feature, LowerFamily, Needs};
 use crate::lower::select::Plan;
 use crate::metal::PixelFormat;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
-};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage, SyntheticBinding};
 use crate::pipeline::testing::{
     compile, compile_given_storage_format, link_and_validate, llvm_assemble, profile, typed_module,
     AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
+use crate::spirv::testing::refuses_threadgroup_memory;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
 /// Profile A (device addresses) and Profile F (none), with and without robust descriptors.
-const PROFILES: [&str; 4] = [
-    "moltenvk-m3",
-    "lavapipe",
-    "vk12-floor",
-    "lunarg-desktop-baseline-2023",
-];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "lavapipe", "runtime-floor"];
 
 const THREADS: u32 = 32;
 
 fn p(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn assemble(name: &str, text: &str) -> Option<Vec<u8>> {
@@ -123,10 +117,7 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 /// The resources of `plan` with buffer `i` holding `bufs[i]`, each bound at its start.
 fn resources(plan: &Plan, bufs: &[Vec<u32>]) -> Resources {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(THREADS));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(THREADS));
+    spec.extend(crate::pipeline::threadgroup_constants([THREADS, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -195,9 +186,9 @@ fn count(plan: &Plan, name: &str) -> u32 {
     plan.census().get(name).map_or(0, |(n, _)| *n)
 }
 
-/// Compile `name` on every profile, check it passes L3, reads no root table, and moves its
-/// pointers through `cells` cell stores and loads; run it over `bufs` and return each profile's
-/// buffers.
+/// Compile `name` on every profile that takes it (a function with threadgroup memory on those
+/// with zeroed workgroup memory), check it passes L3, reads no root table, and moves its pointers
+/// through `cells` cell stores and loads; run it over `bufs` and return each profile's buffers.
 fn run_everywhere(
     bc: &[u8],
     name: &str,
@@ -207,7 +198,11 @@ fn run_everywhere(
     let mut out = Vec::new();
     for stem in PROFILES {
         let prof = p(stem);
-        let a = compile(bc, name, &prof).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let a = match compile(bc, name, &prof) {
+            // A profile without zeroed workgroup memory takes no threadgroup memory.
+            Err(e) if refuses_threadgroup_memory(&e, &prof) => continue,
+            a => a.unwrap_or_else(|e| panic!("{stem}: {e}")),
+        };
         link_and_validate(&a, &prof).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         let (plan, m) = typed_module(bc, name, &prof).expect("module");
         assert!(

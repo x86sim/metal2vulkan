@@ -1,10 +1,10 @@
 //! Whether a module writes memory of its own.
 //!
-//! Metal runs a multisampled fragment function that writes memory another invocation or a later
-//! command can read once per covered sample, so link runs such a function under sample shading
-//! (`StageInterface::writes_memory`). The writes that count are the function's: a store, a copy,
-//! or an atomic other than a load into a storage buffer, a physical storage buffer, or an image,
-//! and an image write.
+//! A multisampled fragment function that writes memory another invocation or a later command can
+//! read runs as many times per pixel as the device runs it, which its pipeline's compile records
+//! (`StageInterface::writes_memory`, `PrecisionNote::DeviceFragmentRuns`). The writes that count
+//! are the function's: a store, a copy, or an atomic other than a load into a storage buffer, a
+//! physical storage buffer, or an image, and an image write.
 //!
 //! The product also writes one buffer the guest never names: the command buffer's
 //! `ExecutionStatus` buffer, whose words the resident-miss count, an absent read's mark and a
@@ -15,34 +15,21 @@
 //! (`lower::push`'s `the_status_address_is_always_placed_in_the_push_block`); one of a device that
 //! does not reaches it through its `Synthetic(ExecutionStatus)` storage buffer, the buffer's
 //! binding, which counts as the buffer too. A
-//! written pointer is traced back through access chains, `OpConvertUToPtr`, and an `OpIAdd` of a
-//! constant; it addresses the status buffer exactly when the trace ends at that binding or at a
-//! load of that member. A pointer that traces anywhere else, or not at all (a phi, a parameter, a
-//! selected value), is the function's: the guest never holds the status buffer's address, so no
-//! write of the guest's is taken for the product's.
+//! written pointer is traced back through access chains, `OpConvertUToPtr`, an `OpIAdd` of a
+//! constant, and an `OpSelect` whose one hand is a constant (the floor's tail folds into each
+//! pushed field so: `lower::push::fold_never_pushed`); it addresses the status buffer exactly when
+//! the trace ends at that binding or at a load of that member. A pointer that traces anywhere else,
+//! or not at all (a phi, a parameter, a selection of two values), is the function's: the guest
+//! never holds the status buffer's address, so no write of the guest's is taken for the product's.
 //!
-//! The trace also ends at an `OpIAdd` whose one operand is a load of the address member, whatever
-//! the other: the guest does not hold the address, so no sum of the guest's has such an operand.
+//! The trace also ends at an `OpIAdd` whose one operand is a load of the address member, folded or
+//! not, whatever the other: the guest does not hold the address, so no sum of the guest's has such
+//! an operand.
 //!
-//! An emulated mesh function's records (`Synthetic(MeshRecords)`) are the product's too, traced as
-//! the status buffer's binding is: they hand the function's outputs to the pipeline's synthesized
-//! vertex stage, as a mesh function's output variables would. So is an emulated object function's
-//! slot of its draw's work buffer (`Synthetic(MeshWork)`), which hands its grid and payload to the
-//! mesh function, as `OpEmitMeshTasksEXT` would.
-//!
-//! The shader-side stencil's shadow (`Synthetic(ShadowStencil)`) is the product's too: its writes
-//! carry Metal's stencil test, which Metal applies per sample whether the function runs per pixel
-//! or per sample, so they do not make the function run per sample. An image write counts unless its
-//! image is a load of that binding. So are the depth and stencil attachments' stand-ins
-//! (`Synthetic(DepthStandIn)` and `Synthetic(StencilStandIn)`), whose writes carry Metal's depth
-//! and stencil tests.
-//!
-//! So are a color attachment's interlocked storage form (`TileAttachment`) and an extended-range
-//! color's `half` shadow (`ExtendedShadow`): their writes carry Metal's color attachment write, a
-//! color output, which Metal masks as it masks any (a sample mask, a failed test) and stores per
-//! sample whether the function runs per pixel or per sample, and which no other invocation or
-//! command reads but through the attachment. A multisampled pipeline's storage form runs per sample
-//! by its own `SampleId`. The function's other writes count as before.
+//! A tile function's color attachment (`TileAttachment`) is the product's too: its writes carry
+//! Metal's color attachment write, a color output, which no other invocation or command reads but
+//! through the attachment. An image write counts unless its image is a load of that binding. The
+//! function's other writes count as before.
 
 #[cfg(test)]
 mod tests;
@@ -99,19 +86,16 @@ fn class(m: &TypedModule, ptr: Value) -> BResult<StorageClass> {
 /// is traced through.
 #[derive(Default)]
 struct Status<'m> {
-    /// The variables of the `Synthetic(ExecutionStatus)`, `Synthetic(MeshRecords)` and
-    /// `Synthetic(MeshWork)` bindings.
+    /// The variables of the `Synthetic(ExecutionStatus)` binding.
     bindings: Vec<Value>,
-    /// The variables of the `Synthetic(ShadowStencil)`, `Synthetic(DepthStandIn)`,
-    /// `Synthetic(StencilStandIn)`, `TileAttachment`, `ExtendedShadow` and `SnapshotTexels`
-    /// bindings, and the loads of them.
+    /// The variables of the `TileAttachment` bindings, and the loads of them.
     shadows: Vec<Value>,
     /// The push block's variable.
     block: Option<Value>,
     /// The indices of its `ExecutionStatusAddress` members, the product's address.
     members: Vec<u32>,
-    /// The defining instruction of every access chain, `OpConvertUToPtr`, `OpIAdd`, and load;
-    /// empty when the module reaches no status buffer.
+    /// The defining instruction of every access chain, `OpConvertUToPtr`, `OpIAdd`, `OpSelect`,
+    /// and load; empty when the module reaches no status buffer.
     defs: BTreeMap<Value, &'m Inst>,
 }
 
@@ -123,26 +107,13 @@ impl<'m> Status<'m> {
                 GlobalKind::Resource(slot)
                     if matches!(
                         slot.kind,
-                        ResourceKind::Synthetic(
-                            SyntheticBinding::ExecutionStatus
-                                | SyntheticBinding::MeshRecords
-                                | SyntheticBinding::MeshWork
-                        )
+                        ResourceKind::Synthetic(SyntheticBinding::ExecutionStatus)
                     ) =>
                 {
                     s.bindings.push(g.value);
                 }
                 GlobalKind::Resource(slot)
-                    if matches!(
-                        slot.kind,
-                        ResourceKind::Synthetic(
-                            SyntheticBinding::ShadowStencil
-                                | SyntheticBinding::DepthStandIn
-                                | SyntheticBinding::StencilStandIn
-                        ) | ResourceKind::TileAttachment(_)
-                            | ResourceKind::ExtendedShadow(_)
-                            | ResourceKind::SnapshotTexels(_)
-                    ) =>
+                    if matches!(slot.kind, ResourceKind::TileAttachment(_)) =>
                 {
                     s.shadows.push(g.value);
                 }
@@ -186,6 +157,7 @@ impl<'m> Status<'m> {
                             op: BinOp::IAdd,
                             ..
                         }
+                        | Inst::Select { .. }
                         | Inst::Load { .. }
                 );
                 if let (true, Some(r)) = (traced, n.result) {
@@ -196,8 +168,8 @@ impl<'m> Status<'m> {
         Ok(s)
     }
 
-    /// Whether image `image` is the product's (the shadow of a shader-side stencil, the depth's
-    /// stand-in, a color's storage form or `half` shadow): a load of its binding.
+    /// Whether image `image` is the product's (a tile function's color attachment): a load of its
+    /// binding.
     fn shadow(&self, image: Value) -> bool {
         self.shadows.contains(&image)
     }
@@ -232,6 +204,10 @@ impl<'m> Status<'m> {
                     }
                     (true, true) => return Ok(false),
                 },
+                Some(Inst::Select { .. }) => match self.unfolded(m, v)? {
+                    Some(other) => other,
+                    None => return Ok(false),
+                },
                 Some(Inst::Load { ptr, .. }) => return self.is_member(m, *ptr),
                 _ => return Ok(false),
             };
@@ -239,12 +215,27 @@ impl<'m> Status<'m> {
         Ok(false)
     }
 
-    /// Whether `v` is a load of the push block's product address member.
+    /// Whether `v` is a load of the push block's product address member, or such a load folded
+    /// ([`Self::unfolded`]).
     fn loads_member(&self, m: &TypedModule, v: Value) -> BResult<bool> {
+        let v = self.unfolded(m, v)?.unwrap_or(v);
         match self.defs.get(&v) {
             Some(Inst::Load { ptr, .. }) => self.is_member(m, *ptr),
             _ => Ok(false),
         }
+    }
+
+    /// The other hand of `v` where `v` is an `OpSelect` whose one hand is a constant, the form the
+    /// floor's tail folds a pushed field in.
+    fn unfolded(&self, m: &TypedModule, v: Value) -> BResult<Option<Value>> {
+        let Some(Inst::Select { t, f, .. }) = self.defs.get(&v) else {
+            return Ok(None);
+        };
+        Ok(match (constant(m, *t)?, constant(m, *f)?) {
+            (true, false) => Some(*f),
+            (false, true) => Some(*t),
+            _ => None,
+        })
     }
 
     /// Whether `ptr` points to the push block's `ExecutionStatusAddress` member.

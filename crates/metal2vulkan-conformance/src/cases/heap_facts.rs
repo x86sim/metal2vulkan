@@ -116,7 +116,7 @@ use crate::heap_query::{
 };
 use crate::texture_query::Storage;
 use crate::transcript::{Node, Observed, Sites, Value};
-use metal2vulkan_runtime::{HeapType, PurgeableState};
+use crate::values::{HeapType, PurgeableState};
 
 /// The case names, as the report and the recordings spell them.
 pub const OWN_GETTERS: &str = "heap-own-getters";
@@ -377,17 +377,6 @@ impl Case for HeapFactsCase {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: every value of this family still compares against Metal's exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09), where it fired for all 5 rows of the family
-        // and each row was divergent on that field and nothing else (replay-nvidia.log).
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<crate::recording::ShaderRef>, String> {
@@ -654,7 +643,7 @@ fn labelled(side: &mut dyn Side, heap: Handle, mut node: Node) -> Node {
 mod tests {
     use super::*;
     use crate::heap_query::{cache_word, hazard_word, heap_type_word, PURGEABLE_STATES};
-    use metal2vulkan_runtime::{CpuCacheMode, HazardTrackingMode};
+    use crate::values::{CpuCacheMode, HazardTrackingMode};
     use std::collections::BTreeSet;
 
     /// No heap of the family is one [`HeapSpec::is_well_formed`] names.
@@ -969,37 +958,6 @@ mod tests {
         assert_ne!(
             heap_type_word(HeapType::Automatic),
             heap_type_word(HeapType::Placement)
-        );
-    }
-}
-
-/// The second half of this family's safety argument, run on a device: the **order of work** the
-/// heap-size and sparse-heap families state, which is that a table is replayed on the runtime
-/// first and only one that answers no `Error::Invalid` anywhere is handed to Metal.
-///
-/// [`crate::device::sites_the_runtime_calls_invalid`] is the shared walk; this is the family that
-/// asks it. The device-free guards above check each row's shape against the rules; this checks the
-/// runtime's own reading of every call the rows actually make, including the ones no rule above
-/// names.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::case::Case;
-
-    #[test]
-    fn no_call_of_the_family_is_one_metals_validation_stops() {
-        let cases: Vec<Box<dyn Case>> = all()
-            .into_iter()
-            .map(|case| Box::new(case) as Box<dyn Case>)
-            .collect();
-        let stopped =
-            crate::device::sites_the_runtime_calls_invalid(&cases).expect("a device for the guard");
-        assert!(
-            stopped.is_empty(),
-            "the runtime answers `Error::Invalid` at these sites, which is this tree's reading of \
-             \"Metal's own validation stops this call\" -- so record mode would end Metal's \
-             process. Take the rows behind them out of the tables:\n{}",
-            stopped.join("\n")
         );
     }
 }

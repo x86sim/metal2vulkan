@@ -10,8 +10,8 @@ use crate::error::{DescriptorError, Error};
 use crate::vk;
 
 mod description;
-mod driver_facts;
 mod enables;
+mod from_queries;
 mod host_identity;
 mod mechanism;
 mod profile;
@@ -34,6 +34,16 @@ pub(super) fn committed_profiles() -> Vec<(String, String)> {
         .collect();
     out.sort();
     out
+}
+
+/// `runtime-floor` without `features`. Without a feature the runtime's floor requires, the
+/// description is below that floor: a test of a form only such a device takes builds it so.
+pub(super) fn floor_without(features: &[VkFeature]) -> DeviceDescription {
+    let mut d = profile("runtime-floor");
+    for f in features {
+        d.features.remove(f);
+    }
+    d
 }
 
 /// The description of one committed profile.

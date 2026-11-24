@@ -80,7 +80,6 @@
 //! the 31 slots Metal's descriptor holds (`tests::every_row_is_a_descriptor_metal_admits`). The fixture is loop-free. Nothing here
 //! can hang, fault or trip a watchdog.
 
-use crate::allowance::Allowance;
 use crate::case::{
     call, made, probe, Abort, Bindings, Case, Failure, Input, MetalSource, Side, StageInAttribute,
     StageInLayout, StageInRegion, StageInput,
@@ -822,15 +821,12 @@ impl Case for StageInUnread {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Nothing here is loosened: every byte of every row compares exactly, the guard past the
-        // grid included.
-        //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone, so every value of this family still compares against Metal's exactly.
-        vec![crate::replay::shared_memory_notice()]
+    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
+        // One declaration, which loosens no value: `stage_in_fetch_wide` stores at an index of the
+        // grid's width, which the translator does not find disjoint between two threads of one
+        // SIMD-group, so the runtime's pipelines note SIMD-group access pairs on every device
+        // (`crate::replay::simdgroup_access_order_notice`).
+        vec![crate::replay::simdgroup_access_order_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -881,32 +877,35 @@ impl Case for StageInUnread {
             let at = |site: &str| format!("{}/{site}", row.name);
             // A pipeline either side refuses is recorded at its own site and the sweep carries on,
             // so one refused row compares as a refusal there while every other row still compares.
-            let pipeline = probe(
+            // The row stops at its refusal: the sites after it are the other side's alone, which
+            // the comparison folds under the refusal (`compare`'s walk), so a refused row is one
+            // refusal and not a divergence for each leaf of a dispatch that never ran.
+            let Some(pipeline) = probe(
                 sites,
                 &at("pipeline"),
                 side.compute_pipeline_with_stage_input(library, ENTRY, &row.stage_input()),
                 |_| Value::Absent,
-            );
+            ) else {
+                continue;
+            };
             let out = made(sites, &at("buffer/out"), side.buffer(&output()))?;
-            if let Some(pipeline) = pipeline {
-                let command_buffer = made(
-                    sites,
-                    &at("dispatch"),
-                    side.dispatch_threads(
-                        pipeline,
-                        &Bindings::buffers(&[out, source]),
-                        &[REGION],
-                        [THREADS, 1, 1],
-                        [THREADS, 1, 1],
-                    ),
-                )?;
-                call(
-                    sites,
-                    &at("status"),
-                    side.wait(command_buffer),
-                    Clone::clone,
-                )?;
-            }
+            let command_buffer = made(
+                sites,
+                &at("dispatch"),
+                side.dispatch_threads(
+                    pipeline,
+                    &Bindings::buffers(&[out, source]),
+                    &[REGION],
+                    [THREADS, 1, 1],
+                    [THREADS, 1, 1],
+                ),
+            )?;
+            call(
+                sites,
+                &at("status"),
+                side.wait(command_buffer),
+                Clone::clone,
+            )?;
             let bytes = call(
                 sites,
                 &at("read-back"),

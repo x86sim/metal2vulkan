@@ -25,7 +25,7 @@ use crate::pipeline::testing::{
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spv::Op;
 
-const PROFILES: [&str; 4] = ["amd-rdna3-radv", "lavapipe", "vk12-floor", "moltenvk-m3"];
+const PROFILES: [&str; 4] = ["amd-780m-radv", "lavapipe", "runtime-floor", "moltenvk-m3"];
 
 /// Two loops over a private `[4 x i32]`, each counted by an `i<bits>` whose increment carries
 /// `flag`: the first stores `3 * i`, the second sums the elements (18).
@@ -264,7 +264,7 @@ fn a_nuw_loop_counter_is_not_masked() {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for (entry, width, masked) in [
             ("nuw_i16_loops", 16, false),
             ("plain_i16_loops", 16, true),
@@ -291,7 +291,7 @@ fn a_poison_nuw_result_reaches_no_neighbour() {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for entry in [
             "frozen_wrap",
             "frozen_wrap_chunked",

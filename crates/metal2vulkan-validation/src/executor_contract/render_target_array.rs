@@ -1,6 +1,6 @@
 //! The render pass's render target array length both executors draw a case with: the Metal oracle's
-//! `MTLRenderPassDescriptor.renderTargetArrayLength` and the engine candidate's
-//! `BindState::render_target_array_length`, derived once, so the two agree.
+//! `MTLRenderPassDescriptor.renderTargetArrayLength` and the runtime candidate's
+//! `RenderPassDescriptor::render_target_array_length`, derived once, so the two agree.
 
 use crate::air::meta::{parse_air_fragment_meta, parse_air_vertex_meta, FragRole, VertOutRole};
 use crate::case::Stage;
@@ -37,7 +37,7 @@ mod tests {
     use super::*;
 
     fn fixture(name: &str) -> String {
-        let path = format!("{}/fixtures/public/{name}", env!("CARGO_MANIFEST_DIR"));
+        let path = metal2vulkan_devtools::fixtures_dir().join(name);
         std::fs::read_to_string(path).expect("public fixture")
     }
 

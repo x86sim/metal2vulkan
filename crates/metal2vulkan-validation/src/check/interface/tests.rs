@@ -18,11 +18,8 @@ pub(crate) fn of_text(
 }
 
 fn fixture(name: &str) -> String {
-    std::fs::read_to_string(format!(
-        "{}/fixtures/public/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .expect("public fixture")
+    std::fs::read_to_string(metal2vulkan_devtools::fixtures_dir().join(name))
+        .expect("public fixture")
 }
 
 /// A parameter with `role` and nothing else, present in the pipeline.
@@ -159,6 +156,42 @@ fn slots_and_declared_access_come_from_the_metadata_and_writes_from_the_ir() {
     assert!(!interface.writes(Root::Param(0)));
     assert!(interface.writes(Root::Param(1)));
     assert!(interface.writes_through(1));
+}
+
+#[test]
+fn program_scope_bindings_are_required_buffers_at_their_slots() {
+    // `psb_scale` and `psb_words` are bound at program scope at buffer(1) and buffer(2), and
+    // `psb_out` at buffer(0), the slot of the kernel's own `out`: each is a required buffer
+    // after the entry's parameters.
+    let interface = of_text(
+        &fixture("engine/kernel_program_scope_buffers.ll"),
+        "program_scope_buffers",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let buffers = interface
+        .params_of(|role| match role {
+            ParamRole::Buffer(buffer) => Some(buffer.access),
+            _ => None,
+        })
+        .map(|(param, access)| {
+            (
+                param.binding.param,
+                param.slots().unwrap(),
+                access,
+                param.required(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        buffers,
+        [
+            (0, (0, 1), Access::ReadWrite, true),
+            (2, (1, 1), Access::Read, true),
+            (3, (2, 1), Access::Read, true),
+            (4, (0, 1), Access::ReadWrite, true),
+        ]
+    );
 }
 
 #[test]
@@ -490,4 +523,41 @@ fn object_roles_bind_their_slots() {
         Vec::new(),
     );
     assert_eq!(interface.params[0].slots(), Some((3, 1)));
+}
+
+/// An entry's float reductions are the simdgroup float sums and products it calls, by the names
+/// the translator's strategy census gives them: a product's and a prefix product's of `float`
+/// and of `half` (their vector forms among them), a sum's and a prefix sum's. An integer one,
+/// and a quad's, is none.
+#[test]
+fn an_entrys_float_reductions_are_its_simdgroup_float_sums_and_products() {
+    let reductions = |ll: &str, entry: &str| {
+        of_text(ll, entry, &BTreeMap::new())
+            .unwrap()
+            .float_reductions
+    };
+    let products = fixture("engine/gsm2_simd_products.ll");
+    assert_eq!(
+        reductions(&products, "simd_float_products"),
+        BTreeSet::from(["simd.reduce.fmul.float", "simd.scan.fmul.float"])
+    );
+    assert_eq!(
+        reductions(&products, "simd_half_products"),
+        BTreeSet::from(["simd.reduce.fmul.half", "simd.scan.fmul.half"])
+    );
+    assert!(reductions(&products, "simd_int_products").is_empty());
+    let ops = fixture("engine/simd_ops.ll");
+    assert_eq!(
+        reductions(&ops, "simd_sum_k"),
+        BTreeSet::from(["simd.reduce.fadd.float"])
+    );
+    assert_eq!(
+        reductions(&ops, "simd_half_sum_k"),
+        BTreeSet::from(["simd.reduce.fadd.half"])
+    );
+    assert_eq!(
+        reductions(&ops, "simd_float_prefix_k"),
+        BTreeSet::from(["simd.scan.fadd.float"])
+    );
+    assert!(reductions(&ops, "quad_ops_k").is_empty());
 }

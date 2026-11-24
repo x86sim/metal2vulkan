@@ -37,14 +37,14 @@ fn fixture(stem: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Committed profile `stem` as a device with the default policy.
+/// Committed profile `stem` as a device with the resident-table domains.
 fn device(stem: &str) -> Device {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(&path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// `store_const` compiled on `dev`, with its compute pipeline.
@@ -251,7 +251,7 @@ fn foreign_bytes_are_refused() {
     let Some((compiled, pipe)) = store_const(&dev) else {
         return;
     };
-    let other = device("vk12-floor");
+    let other = device("runtime-floor");
     assert_ne!(other.profile().fingerprint(), dev.profile().fingerprint());
     assert_eq!(
         CompiledFunction::from_bytes(&compiled.to_bytes(), &other),
@@ -400,58 +400,6 @@ fn the_anisotropic_sampler_fact_round_trips() {
     assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
 }
 
-/// The fact format version 157 added encodes and decodes, and the artifact of a function whose
-/// `ulong` slots a `ulong` atomic updates carries it through its bytes: a compiled function of the
-/// owned fixture `unk_ulong_atomics` on a device with 64-bit image atomics, and its pipeline,
-/// decode to themselves with the fact for the atomic slot and none for the slot only read and
-/// written.
-#[test]
-fn the_ulong_atomic_view_fact_round_trips() {
-    use crate::pipeline::facts::RuntimeFact;
-    let slot = |index| SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index,
-    };
-    let fact = RuntimeFact::UlongAtomicView { slot: slot(5) };
-    assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
-    let Some(bc) = fixture("unk_ulong_atomics") else {
-        return;
-    };
-    let dev = device("amd-rdna3-radv");
-    let f = Library::from_air(&bc)
-        .expect("library")
-        .function("unk_ulong_atomic_rw")
-        .expect("function");
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(f),
-            &LoweringInputs::new(),
-            &Budget::standard(),
-        )
-        .expect("compile");
-    let facts = &compiled.artifact().facts;
-    assert!(facts.contains(&RuntimeFact::UlongAtomicView { slot: slot(0) }));
-    assert!(!facts.contains(&RuntimeFact::UlongAtomicView { slot: slot(1) }));
-    let bytes = compiled.to_bytes();
-    let back = CompiledFunction::from_bytes(&bytes, &dev).expect("decode");
-    assert_eq!(back.artifact(), compiled.artifact());
-    assert_eq!(back.to_bytes(), bytes);
-    let pipe = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline");
-    let bytes = pipe.to_bytes();
-    let back = ComputePipeline::from_bytes(&bytes, &dev).expect("decode");
-    assert_eq!(back.to_bytes(), bytes);
-    assert!(back
-        .dependencies
-        .iter()
-        .any(|d| d.fact == RuntimeFact::UlongAtomicView { slot: slot(0) }));
-}
-
 /// The members format version 178 appends encode and decode, and each decodes as itself:
 /// `VkFeature::Maintenance5` and the three framebuffer `VkLimit`s.
 #[test]
@@ -537,31 +485,6 @@ fn the_version_190_members_round_trip() {
     assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
 }
 
-/// The fields format version 193 adds encode and decode with the fact and the pipeline state that
-/// carry them: `RuntimeFact::FragmentImageblock`'s and `FragmentImageblock`'s `data_size` and
-/// `alignment`.
-#[test]
-fn the_version_193_fields_round_trip() {
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::{FragmentImageblock, ImageblockMechanism};
-    let fact = RuntimeFact::FragmentImageblock {
-        words: 3,
-        writes: true,
-        master: [5; 32],
-        data_size: 11,
-        alignment: 2,
-    };
-    assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
-    let state = FragmentImageblock {
-        mechanism: ImageblockMechanism::StorageImageInterlock,
-        words: 8,
-        master: [6; 32],
-        data_size: 32,
-        alignment: 16,
-    };
-    assert_eq!(decode::<FragmentImageblock>(&encode(&state)), Ok(state));
-}
-
 /// The members format version 187 appends encode and decode, and each decodes as itself:
 /// `PushField::ViewportCount`, `RuntimeFact::ViewportCount`, and `IoRole::ViewportIndex`.
 #[test]
@@ -645,8 +568,6 @@ fn the_version_180_members_round_trip() {
     let mut properties = vec![
         VkProperty::IndependentResolveNone,
         VkProperty::IndependentResolve,
-        VkProperty::VariableSampleLocations,
-        VkProperty::SampleLocationSampleCount(4),
     ];
     for mode in ResolveMode::ALL {
         properties.push(VkProperty::DepthResolveMode(mode));
@@ -682,6 +603,17 @@ fn the_version_327_members_round_trip() {
     assert_eq!(decode::<VkFeature>(&encode(&feature)), Ok(feature));
     let extension = VkExtension::ExtExtendedDynamicState2;
     assert_eq!(decode::<VkExtension>(&encode(&extension)), Ok(extension));
+}
+
+/// The member format version 593 appends encodes and decodes as itself: a deep kernel's workgroup
+/// size on one axis.
+#[test]
+fn the_version_593_member_round_trips() {
+    use crate::pipeline::sym::{Axis, SpecKey};
+    for axis in [Axis::X, Axis::Y, Axis::Z] {
+        let key = SpecKey::WorkgroupSize(axis);
+        assert_eq!(decode::<SpecKey>(&encode(&key)), Ok(key));
+    }
 }
 
 /// The members format version 234 appends encode and decode, each as itself: the object function's
@@ -740,28 +672,6 @@ fn the_version_267_members_round_trip() {
     assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
 }
 
-/// The member format version 326 appends encodes and decodes as itself: whether a texture slot's
-/// bound format has no family Metal's `half` conversion is measured for on a device sampling
-/// through Metal's own texture unit.
-#[test]
-fn the_version_326_member_round_trips() {
-    use crate::pipeline::sym::SpecKey;
-    let key = SpecKey::UnmeasuredTexels(SlotRef {
-        stage: Stage::Fragment,
-        class: SlotClass::Texture,
-        index: 7,
-    });
-    assert_eq!(decode::<SpecKey>(&encode(&key)), Ok(key));
-    assert_ne!(
-        encode(&key),
-        encode(&SpecKey::ConstantLanes(SlotRef {
-            stage: Stage::Fragment,
-            class: SlotClass::Texture,
-            index: 7,
-        }))
-    );
-}
-
 /// The member format version 374 appends encodes and decodes as itself: the axes on which a texture
 /// slot's bound view's parent's base-level size, which Metal's texel-offset rule reads, is not a
 /// power of two where the view's own is.
@@ -776,34 +686,6 @@ fn the_version_374_member_round_trips() {
     let key = SpecKey::OffsetBaseAxes(slot);
     assert_eq!(decode::<SpecKey>(&encode(&key)), Ok(key));
     assert_ne!(encode(&key), encode(&SpecKey::BoundTexelFormat(slot)));
-}
-
-/// The member format version 377 appends encodes and decodes as itself, with the key it carries: a
-/// sampler slot's word, carried as data, and a texture slot's format class.
-#[test]
-fn the_version_377_member_round_trips() {
-    use crate::pipeline::sym::{PushField, SpecKey};
-    let sampler = SlotRef {
-        stage: Stage::Fragment,
-        class: SlotClass::Sampler,
-        index: 3,
-    };
-    let texture = SlotRef {
-        stage: Stage::Fragment,
-        class: SlotClass::Texture,
-        index: 3,
-    };
-    for key in [
-        SpecKey::SamplerState {
-            slot: sampler,
-            fields: 0x0003_00ff,
-        },
-        SpecKey::TexelFormat(texture),
-    ] {
-        let field = PushField::Specialized(key);
-        assert_eq!(decode::<PushField>(&encode(&field)), Ok(field));
-        assert_ne!(encode(&field), encode(&key));
-    }
 }
 
 /// The member format version 485 appends encodes and decodes as itself: the word of the sampler
@@ -821,31 +703,30 @@ fn the_version_485_member_round_trips() {
     assert_ne!(encode(&key), encode(&SpecKey::NearestPixelSampler(slot)));
 }
 
-/// The member format version 486 appends encodes and decodes as itself: the measured unary
-/// operations' kept denormals, a property a module requires.
+/// The member format version 535 appends encodes and decodes as itself: a kernel's image-only
+/// fact.
 #[test]
-fn the_version_486_member_round_trips() {
-    use crate::device::requirements::VkProperty;
-    let p = VkProperty::MetalUnaryDenormals;
-    assert_eq!(decode::<VkProperty>(&encode(&p)), Ok(p));
-    assert_ne!(encode(&p), encode(&VkProperty::MetalSmallFloatNans));
+fn the_version_535_member_round_trips() {
+    use crate::library::KernelFacts;
+    let facts = KernelFacts {
+        image_only: true,
+        ..KernelFacts::default()
+    };
+    assert_eq!(decode::<KernelFacts>(&encode(&facts)), Ok(facts));
+    assert_ne!(encode(&facts), encode(&KernelFacts::default()));
 }
 
 /// The members format versions 153, 154, 155, 157 and 161 joined from every side encode and
 /// decode together in one render pipeline: `PrecisionNote::CubeGradientFootprint` and
-/// `CombinedSampler`, `RuntimeFact::InterlockedFramebufferFetch` and
-/// `GraphicsState::storage_attachments`, `SpecKey::TexelFormat`, `RuntimeFact::TexelFormat` and
-/// `SrgbTexture`, `VkProperty::MetalSampler`, and `PrecisionNote::HalfTexelConversion`,
-/// `HalfSampleFilter`, `SrgbTexelDecode`, and `FloatSampleFilter`,
+/// `CombinedSampler`, `RuntimeFact::SrgbTexture` and
+/// `SrgbTexture`, `PrecisionNote::HalfTexelConversion` and `SrgbTexelDecode`,
 /// `HandleClass::Sampler { compare, integer }` and
-/// `SyntheticBinding::SamplerTable`, and `RuntimeFact::UlongAtomicView`, each beside the others
-/// rather than only on its own side's fixtures.
+/// `SyntheticBinding::SamplerTable`, each beside the others rather than only on its own side's
+/// fixtures.
 #[test]
 fn the_merged_members_round_trip_in_one_render_pipeline() {
-    use crate::device::requirements::VkProperty;
     use crate::pipeline::artifact::{PrecisionNote, RuntimeDependency, SpecConstant};
     use crate::pipeline::facts::{Mechanism, RuntimeFact};
-    use crate::pipeline::graphics::StorageAttachmentUse;
     use crate::pipeline::layout::{BindingSource, DescriptorBinding, DescriptorSetLayout};
     use crate::pipeline::sym::{
         CombinedSampler, HandleClass, ResourceKind, SamplerRef, SpecKey, SyntheticBinding,
@@ -862,9 +743,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
     let notes = [
         PrecisionNote::CubeGradientFootprint,
         PrecisionNote::HalfTexelConversion,
-        PrecisionNote::HalfSampleFilter,
         PrecisionNote::SrgbTexelDecode,
-        PrecisionNote::FloatSampleFilter,
     ];
     let dev = device("moltenvk-m3");
     let Some(bc) = fixture("stage_io") else {
@@ -883,12 +762,11 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
     let id = p.stages[0].specialization.constants.len() as u32;
     p.stages[0].specialization.constants.push(SpecConstant {
         id,
-        key: SpecKey::TexelFormat(texture),
+        key: SpecKey::BicubicTexels(texture),
         size: 4,
         default: 0,
         unread_bits: 0,
     });
-    p.requirements.properties.insert(VkProperty::MetalSampler);
     let set = p.layout.sets.len() as u32;
     p.layout.sets.push(DescriptorSetLayout {
         set,
@@ -953,46 +831,9 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
     if let Some(last) = p.layout.sets.last_mut() {
         last.bindings.extend(argument_samplers);
     }
-    p.graphics.storage_attachments.push(StorageAttachmentUse {
-        color_index: 0,
-        format: vk::Format::R8G8B8A8_UNORM,
-        writes: true,
-        formatless: false,
-        view: crate::pipeline::StorageAttachmentView::SamplePlanes { layers: 4 },
-        view_alias: Some(vk::Format::R32_UINT),
-        kept: vk::ColorComponentFlags::B,
-    });
-    p.dependencies.push(RuntimeDependency {
-        fact: RuntimeFact::InterlockedFramebufferFetch {
-            color: 0,
-            format: vk::Format::R8G8B8A8_UNORM,
-            writes: true,
-            early_tests: true,
-            kept: vk::ColorComponentFlags::A,
-            blend: Some(crate::pipeline::lower_inputs::BlendEquation {
-                source_rgb: crate::metal::BlendFactor::One,
-                destination_rgb: crate::metal::BlendFactor::OneMinusSourceAlpha,
-                rgb_operation: crate::metal::BlendOperation::Add,
-                source_alpha: crate::metal::BlendFactor::One,
-                destination_alpha: crate::metal::BlendFactor::Zero,
-                alpha_operation: crate::metal::BlendOperation::Add,
-            }),
-            rounded: true,
-        },
-        mechanism: Mechanism::RenderPassContract,
-    });
-    p.dependencies.push(RuntimeDependency {
-        fact: RuntimeFact::TexelFormat { slot: texture },
-        mechanism: Mechanism::Specialization,
-    });
     p.dependencies.push(RuntimeDependency {
         fact: RuntimeFact::SrgbTexture { slot: texture },
         mechanism: Mechanism::Variant,
-    });
-    let ulong_view = RuntimeFact::UlongAtomicView { slot: texture };
-    p.dependencies.push(RuntimeDependency {
-        fact: ulong_view,
-        mechanism: Mechanism::BinderView,
     });
     let bytes = encode(&p);
     let back = decode::<RenderPipeline>(&bytes).expect("decoded");
@@ -1007,11 +848,7 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
         .specialization
         .constants
         .iter()
-        .any(|c| c.key == SpecKey::TexelFormat(texture)));
-    assert!(sealed
-        .requirements
-        .properties
-        .contains(&VkProperty::MetalSampler));
+        .any(|c| c.key == SpecKey::BicubicTexels(texture)));
     let bindings = sealed.layout.sets.last().map(|s| &s.bindings[..]);
     assert!(matches!(
         bindings.map(|b| &b[0].source),
@@ -1036,352 +873,11 @@ fn the_merged_members_round_trip_in_one_render_pipeline() {
             ..
         })
     ));
-    for fact in [
-        RuntimeFact::TexelFormat { slot: texture },
-        RuntimeFact::SrgbTexture { slot: texture },
-    ] {
-        assert!(
-            sealed.dependencies.iter().any(|d| d.fact == fact),
-            "{fact:?}"
-        );
-    }
-    assert_eq!(sealed.graphics.storage_attachments.len(), 1);
-    assert!(sealed.dependencies.iter().any(|d| matches!(
-        d.fact,
-        RuntimeFact::InterlockedFramebufferFetch {
-            early_tests: true,
-            ..
-        }
-    )));
-    assert!(sealed.dependencies.iter().any(|d| d.fact == ulong_view));
-}
-
-/// The emulated-simdgroups variant of a kernel moltenvk-m3 runs on whole subgroups round trips as a
-/// function and as a pipeline, and the decoded pipeline's plan states the variant, so a cached
-/// variant settles as the compiled one does.
-#[test]
-fn the_emulated_simdgroups_variant_round_trips() {
-    use crate::bind::BindShape;
-    use crate::cache::VariantKey;
-    use crate::pipeline::facts::RuntimeFact;
-    let dev = device("moltenvk-m3");
-    let Some(bc) = fixture("simd_ops") else {
-        return;
-    };
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("simd_sum_k"))
-        .expect("kernel");
-    let mut key = VariantKey::new();
-    key.emulated_simdgroups = true;
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(f),
-            &key.lowering_inputs(Stage::Kernel),
-            &Budget::standard(),
-        )
-        .expect("variant");
-    assert!(compiled
-        .artifact()
-        .facts
-        .contains(&RuntimeFact::EmulatedSimdgroups));
-    assert_eq!(
-        CompiledFunction::from_bytes(&compiled.to_bytes(), &dev),
-        Ok(compiled.clone())
+    let fact = RuntimeFact::SrgbTexture { slot: texture };
+    assert!(
+        sealed.dependencies.iter().any(|d| d.fact == fact),
+        "{fact:?}"
     );
-    let pipeline = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline");
-    let decoded = ComputePipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-    assert_eq!(decoded, pipeline);
-    let plan = decoded.plan(&dev, &BindShape::default()).expect("plan");
-    assert_eq!(plan.variant, key);
-}
-
-/// The `SrgbTexture` fact round trips, and a kernel compiled under the `SrgbTexture` variant (a
-/// slot bound to an 8-bit sRGB format the device holds as its UNORM twin) round trips as a
-/// function and as a pipeline, whose decoded plan for a shape binding such a texture at the slot
-/// states the variant, so a cached variant settles as the compiled one does; a shape binding an
-/// sRGB format the device samples states none.
-#[test]
-fn the_srgb_texture_variant_round_trips() {
-    use crate::bind::{BindState, BoundTexture, StageTable, TextureFacts};
-    use crate::cache::VariantKey;
-    use crate::pipeline::artifact::PrecisionNote;
-    use crate::pipeline::facts::RuntimeFact;
-    let slot = SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index: 2,
-    };
-    let fact = RuntimeFact::SrgbTexture { slot };
-    assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
-    let note = PrecisionNote::SrgbTexelDecode;
-    assert_eq!(decode::<PrecisionNote>(&encode(&note)), Ok(note));
-
-    let dev = device("lavapipe");
-    let Some(bc) = fixture("texture_ops") else {
-        return;
-    };
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("short_texels"))
-        .expect("kernel");
-    let mut key = VariantKey::new();
-    key.srgb_textures.insert(slot);
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(f),
-            &key.lowering_inputs(Stage::Kernel),
-            &Budget::standard(),
-        )
-        .expect("variant");
-    assert!(compiled
-        .artifact()
-        .facts
-        .contains(&RuntimeFact::SrgbTexture { slot }));
-    assert_eq!(
-        CompiledFunction::from_bytes(&compiled.to_bytes(), &dev),
-        Ok(compiled.clone())
-    );
-    let pipeline = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline");
-    let decoded = ComputePipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-    assert_eq!(decoded, pipeline);
-    let mut table = StageTable::default();
-    // lavapipe samples no `RG8Unorm_sRGB`, which the runtime holds as `RG8Unorm`, and samples
-    // `RGBA8Unorm_sRGB` itself.
-    for (pf, twin) in [
-        (metal::PixelFormat::RG8UnormSRGB, true),
-        (metal::PixelFormat::RGBA8UnormSRGB, false),
-    ] {
-        let mut facts = TextureFacts::new(metal::TextureType::Type3D, pf);
-        facts.usage = metal::TextureUsage::SHADER_READ;
-        table.textures.insert(
-            2,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-        let mut state = BindState::default();
-        state.stages.insert(Stage::Kernel, table.clone());
-        let plan = decoded.plan(&dev, &state.shape()).expect("plan");
-        match twin {
-            true => assert_eq!(plan.variant.srgb_textures, key.srgb_textures, "{pf:?}"),
-            false => assert!(plan.variant.srgb_textures.is_empty(), "{pf:?}"),
-        }
-    }
-}
-
-/// The `CubicSampler` fact round trips, and a kernel compiled under the cubic-sampler variant round
-/// trips as a function and as a pipeline, whose decoded plan for a shape binding a sampler with a
-/// `Cubic` filter at the slot states the variant (the bound word's `SamplerWord::CUBIC_STATE`
-/// bits), so a cached variant settles as the compiled one does. A nearest sampler at the slot
-/// states none; every sample through the slot states the fact, with the variant or without it.
-#[test]
-fn the_cubic_sampler_variant_round_trips() {
-    use crate::bind::{
-        BindState, BoundSampler, BoundTexture, SamplerDescriptor, StageTable, TextureFacts,
-    };
-    use crate::cache::VariantKey;
-    use crate::metal::sampler::SamplerWord;
-    use crate::pipeline::facts::RuntimeFact;
-    let slot = SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Sampler,
-        index: 0,
-    };
-    let fact = RuntimeFact::CubicSampler { slot };
-    assert_eq!(decode::<RuntimeFact>(&encode(&fact)), Ok(fact));
-
-    let dev = device("lavapipe");
-    let Some(bc) = fixture("gsm2_cubic_samplers") else {
-        return;
-    };
-    let function = || {
-        Library::from_air(&bc)
-            .and_then(|lib| lib.function("gsm2_cubic_samples"))
-            .expect("kernel")
-    };
-    let plain = dev
-        .compile_function(
-            &FunctionDescriptor::new(function()),
-            &LoweringInputs::new(),
-            &Budget::standard(),
-        )
-        .expect("plain");
-    assert!(plain.artifact().facts.contains(&fact));
-    let mut cubic = SamplerDescriptor::new();
-    cubic.min_filter = metal::SamplerMinMagFilter::Cubic;
-    cubic.mag_filter = metal::SamplerMinMagFilter::Linear;
-    cubic.s_address_mode = metal::SamplerAddressMode::Repeat;
-    cubic.t_address_mode = metal::SamplerAddressMode::ClampToBorderColor;
-    cubic.border_color = metal::SamplerBorderColor::OpaqueWhite;
-    let mut key = VariantKey::new();
-    key.cubic_samplers
-        .insert(slot, SamplerWord::of(&cubic).0 & SamplerWord::CUBIC_STATE);
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(function()),
-            &key.lowering_inputs(Stage::Kernel),
-            &Budget::standard(),
-        )
-        .expect("variant");
-    assert!(compiled.artifact().facts.contains(&fact));
-    assert_eq!(
-        CompiledFunction::from_bytes(&compiled.to_bytes(), &dev),
-        Ok(compiled.clone())
-    );
-    let pipeline = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline");
-    let decoded = ComputePipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-    assert_eq!(decoded, pipeline);
-    let shape = |desc: SamplerDescriptor| {
-        let mut table = StageTable::default();
-        let mut facts =
-            TextureFacts::new(metal::TextureType::Type2D, metal::PixelFormat::RGBA8Unorm);
-        facts.usage = metal::TextureUsage::SHADER_READ;
-        table.textures.insert(
-            0,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-        table.samplers.insert(
-            0,
-            BoundSampler {
-                desc,
-                resource_id: None,
-            },
-        );
-        let mut state = BindState::default();
-        state.stages.insert(Stage::Kernel, table);
-        state.shape()
-    };
-    let plan = decoded.plan(&dev, &shape(cubic)).expect("plan");
-    assert_eq!(plan.variant.cubic_samplers, key.cubic_samplers);
-    let plan = decoded
-        .plan(&dev, &shape(SamplerDescriptor::new()))
-        .expect("plan");
-    assert!(plan.variant.cubic_samplers.is_empty());
-}
-
-/// A render pipeline whose vertex function is compiled without its `Layer` output round trips,
-/// keeps its `RenderTargetArrayLength` fact, and the decoded pipeline's plan for a pass of one
-/// layer states the variant, so a cached variant settles as the compiled one does. The variant that
-/// writes `Layer` keeps the length's push field, which the other lacks.
-#[test]
-fn the_dropped_vertex_layer_variant_round_trips() {
-    use crate::bind::BindShape;
-    use crate::cache::VariantKey;
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::sym::PushField;
-    let dev = device("moltenvk-m3");
-    let Some(bc) = fixture("vertex_amplification") else {
-        return;
-    };
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("amp_vertex_layer"))
-        .expect("vertex");
-    let d = RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
-    for dropped in [false, true] {
-        let mut key = VariantKey::new();
-        key.dropped_vertex_layer = dropped;
-        let pipeline = dev
-            .compile_render_variant(&d, &key, &Budget::standard())
-            .expect("pipeline");
-        let decoded = RenderPipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-        assert_eq!(decoded, pipeline);
-        assert!(decoded.dependencies.iter().any(|d| d.fact
-            == RuntimeFact::RenderTargetArrayLength {
-                layer_dropped: dropped
-            }));
-        let reads_length = decoded.interface.push.iter().any(|p| {
-            p.fields
-                .iter()
-                .any(|f| f.field == PushField::RenderTargetArrayLength)
-        });
-        assert_eq!(reads_length, !dropped);
-        let shape = BindShape {
-            render_target_array_length: if dropped { 1 } else { 2 },
-            ..BindShape::default()
-        };
-        let plan = decoded.plan(&dev, &shape).expect("plan");
-        assert_eq!(plan.variant, key);
-    }
-}
-
-/// A render pipeline compiled under the amplification draws variant round trips with its fact and
-/// its amplification push fields, and the decoded pipeline's plan for a state whose amplification
-/// multiview cannot express states the variant, so a cached variant settles as the compiled one
-/// does.
-#[test]
-fn the_amplification_draws_variant_round_trips() {
-    use crate::bind::{BindState, VertexAmplification, ViewMapping};
-    use crate::cache::VariantKey;
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::sym::PushField;
-    use crate::pipeline::AmplificationDraws;
-    let dev = device("moltenvk-m3");
-    let Some(bc) = fixture("vertex_amplification") else {
-        return;
-    };
-    let lib = Library::from_air(&bc).expect("library");
-    let stage = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            lib.function(name).expect("function"),
-        ))
-    };
-    let mut d = RenderPipelineDescriptor::new(stage("amp_vertex"));
-    d.fragment = Some(stage("amp_fragment"));
-    d.max_vertex_amplification_count = 2;
-    let mut key = VariantKey::new();
-    key.amplification_draws = Some(AmplificationDraws::new(true, true));
-    let pipeline = dev
-        .compile_render_variant(&d, &key, &Budget::standard())
-        .expect("pipeline");
-    let decoded = RenderPipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-    assert_eq!(decoded, pipeline);
-    assert!(decoded.dependencies.iter().any(|d| d.fact
-        == RuntimeFact::AmplificationDraws {
-            layered: true,
-            viewports: true
-        }));
-    for field in [
-        PushField::AmplificationId,
-        PushField::AmplificationLayerOffset,
-        PushField::AmplificationViewportOffset,
-    ] {
-        assert!(
-            decoded
-                .interface
-                .push
-                .iter()
-                .any(|p| p.fields.iter().any(|f| f.field == field)),
-            "{field:?}"
-        );
-    }
-    let state = BindState {
-        render_target_array_length: 2,
-        vertex_amplification: VertexAmplification::new(
-            2,
-            vec![ViewMapping::new(1, 1), ViewMapping::new(0, 0)],
-        ),
-        ..Default::default()
-    };
-    let plan = decoded.plan(&dev, &state.shape()).expect("plan");
-    assert_eq!(plan.variant, key);
 }
 
 /// A kernel compiled under the storage-view variant round trips with its uniform-view facts (kept,
@@ -1472,75 +968,6 @@ fn combined_and_separate_texture_symbols_round_trip() {
             }
         }
     }
-}
-
-#[test]
-fn the_storage_view_variant_round_trips() {
-    use crate::bind::{BindState, BoundBuffer, StageTable};
-    use crate::cache::VariantKey;
-    use crate::pipeline::facts::{RuntimeFact, UniformViewChoice};
-    let dev = device("vk12-floor");
-    let Some(bc) = fixture("descriptor_limit_uniform_views") else {
-        return;
-    };
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("descriptor_limit_uniform_views"))
-        .expect("kernel");
-    let slot = |index| SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Buffer,
-        index,
-    };
-    let mut key = VariantKey::new();
-    key.storage_view_slots.insert(slot(2));
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(f),
-            &key.lowering_inputs(Stage::Kernel),
-            &Budget::standard(),
-        )
-        .expect("function");
-    let pipeline = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline");
-    let decoded = ComputePipeline::from_bytes(&pipeline.to_bytes(), &dev).expect("decoded");
-    assert_eq!(decoded, pipeline);
-    let has = |fact| decoded.dependencies.iter().any(|d| d.fact == fact);
-    let range = |index, choice| RuntimeFact::UniformViewRange {
-        slot: slot(index),
-        choice,
-    };
-    assert!(has(range(2, UniformViewChoice::Kept)));
-    assert!(has(range(4, UniformViewChoice::Viewed)));
-    assert!(has(range(0, UniformViewChoice::Spare)));
-    assert!(has(RuntimeFact::UniformViewAliasing { slot: slot(3) }));
-    let mut t = StageTable::default();
-    for (index, length) in [
-        (0, 256),
-        (1, 256),
-        (2, 1 << 16),
-        (3, 16),
-        (4, 256),
-        (5, 256),
-    ] {
-        t.buffers.insert(
-            index,
-            BoundBuffer::Buffer {
-                length,
-                offset: 0,
-                gpu_address: u64::from(index + 1) << 32,
-                device_address: None,
-                attribute_stride: None,
-            },
-        );
-    }
-    let mut state = BindState::default();
-    state.stages.insert(Stage::Kernel, t);
-    let plan = decoded.plan(&dev, &state.shape()).expect("plan");
-    assert_eq!(plan.variant, key);
 }
 
 /// A body that passes the checksum is still decoded strictly (every byte used) and scanned: a
@@ -1827,7 +1254,7 @@ fn a_content_digest_is_the_content_not_the_key() {
     edited.stage.spirv = words.into();
     assert_ne!(edited.content_digest(), digest);
     let mut edited = pipe.clone();
-    edited.layout.push_descriptor_eligible = !edited.layout.push_descriptor_eligible;
+    edited.layout.sets.push(Default::default());
     assert_ne!(edited.content_digest(), digest);
     let mut edited = pipe.clone();
     edited
@@ -1860,231 +1287,6 @@ fn a_content_digest_is_the_content_not_the_key() {
     assert_ne!(edited.content_digest(), digest);
 }
 
-/// A pipeline state's creation compile on a device that reads storage textures only with a declared
-/// format takes stand-ins (`runtime::pipeline::stand_in`: the first of `R32Float`, `R32Uint` and
-/// `R32Sint` each slot's texels take). On ANV on Iris Xe (RPL-P), the compile of
-/// `a2_storage_read_formats` (a float, a uint and an int `read_write` texture, read) under those
-/// stand-ins is the compile of the bind of those formats: its plan for that bind names its own key,
-/// and the bind's compile has the same function and pipeline cache keys (what the disk cache stores
-/// and loads them under) and byte-identical artifacts, so the compile carries nothing of the
-/// stand-in beyond its key. Every bind of another format at any of the slots plans another key,
-/// except where the plan does not bind that texture at all: a texture the slot cannot take is
-/// replaced by the slot's neutral (`IncompatibleBinding`, `CrossClassNeutral` for a storage read
-/// of another numeric class, or `AstcStorageNeutral` for an ASTC texture), an `R32` texture of the
-/// slot's texel type, whose compile is the stand-in's.
-#[test]
-fn a_stand_in_compile_is_the_compile_of_its_formats_bind_and_no_other() {
-    use crate::bind::{BindState, BoundTexture, PlanDiagnostic, StageTable, TextureFacts};
-    use crate::cache::VariantKey;
-    use crate::error::{Error, RuntimeInput};
-    use crate::metal::format::storage_image_choice;
-    use crate::metal::{PixelFormat, TextureType, TextureUsage};
-
-    let Some(bc) = fixture("a2_storage_read_formats") else {
-        return;
-    };
-    let dev = device("intel-irisxe-rplp-anv");
-    let profile = dev.profile();
-    assert!(!profile.fields().images.storage_read_without_format);
-    let descriptor = FunctionDescriptor::new(
-        Library::from_air(&bc)
-            .and_then(|lib| lib.function("a2_storage_read_formats"))
-            .expect("kernel"),
-    );
-    let budget = Budget::standard();
-    // The runtime's compile of a variant (`Variant::compiled`, without the cache).
-    let compile = |key: &VariantKey| -> Result<(CompiledFunction, ComputePipeline), Error> {
-        let inputs = key.lowering_inputs(Stage::Kernel);
-        let function = dev.compile_function(&descriptor, &inputs, &budget)?;
-        assert_eq!(
-            *function.key(),
-            dev.function_compile_key(&descriptor, &inputs)
-        );
-        let pipeline = dev.compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(function.clone())),
-            &budget,
-        )?;
-        Ok((function, pipeline))
-    };
-    let slot = |index: u32| SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index,
-    };
-    assert!(matches!(
-        compile(&VariantKey::new()),
-        Err(Error::NeedsInput(RuntimeInput::StorageTextureFormat { .. }))
-    ));
-    let formats = [
-        (0, PixelFormat::R32Float),
-        (1, PixelFormat::R32Uint),
-        (2, PixelFormat::R32Sint),
-    ];
-    let mut stand_in_key = VariantKey::new();
-    for (index, pf) in formats {
-        let choice = storage_image_choice(pf, profile).expect("a stand-in's choice");
-        stand_in_key.storage_images.insert(slot(index), choice);
-    }
-    let (stand_in_function, stand_in) = compile(&stand_in_key).expect("the stand-in compile");
-    // The plan of a bind of `bound`, as the runtime's `settle` reads it off the creation compile.
-    let planned = |bound: &[(u32, PixelFormat)]| {
-        let mut table = StageTable::default();
-        for &(index, pf) in bound {
-            let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-            facts.usage = TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE;
-            let texture = BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            };
-            table.textures.insert(index, texture);
-        }
-        let mut state = BindState::default();
-        state.stages.insert(Stage::Kernel, table);
-        stand_in.plan(&dev, &state.shape())
-    };
-    let own = planned(&formats).expect("the stand-ins' bind plans");
-    assert!(own.diagnostics.is_empty(), "{:?}", own.diagnostics);
-    assert_eq!(own.variant, stand_in_key);
-    let (own_function, own_pipeline) = compile(&own.variant).expect("the bind's compile");
-    assert_eq!(own_function.key(), stand_in_function.key());
-    assert_eq!(own_pipeline.key(), stand_in.key());
-    assert_eq!(own_function.to_bytes(), stand_in_function.to_bytes());
-    assert_eq!(own_pipeline.to_bytes(), stand_in.to_bytes());
-    // Any other format a texture can have, at any slot: another key, or the slot's neutral.
-    let (mut other_keys, mut replaced) = (0, 0);
-    let mut same = Vec::new();
-    for at in 0..formats.len() {
-        for &pf in metal::PixelFormat::ALL {
-            if pf == formats[at].1 || pf == PixelFormat::Invalid {
-                continue;
-            }
-            let mut bound = formats;
-            bound[at].1 = pf;
-            let Ok(plan) = planned(&bound) else {
-                continue;
-            };
-            let neutral = plan.diagnostics.iter().any(|d| match d {
-                PlanDiagnostic::IncompatibleBinding { slot: s, .. }
-                | PlanDiagnostic::CrossClassNeutral { slot: s, .. }
-                | PlanDiagnostic::AstcStorageNeutral { slot: s, .. } => *s == slot(bound[at].0),
-                _ => false,
-            });
-            if neutral {
-                replaced += 1;
-            } else if plan.variant == stand_in_key {
-                same.push((at, pf));
-            } else {
-                other_keys += 1;
-            }
-        }
-    }
-    assert!(
-        same.is_empty(),
-        "binds that plan the stand-ins' key: {same:?}"
-    );
-    // An ASTC texture, of every profile and footprint, at a storage slot: the slot's neutral, and
-    // the plan says why (`PlanDiagnostic::AstcStorageNeutral`), which the runtime announces.
-    let astc = metal::PixelFormat::ALL
-        .iter()
-        .filter(|&&pf| crate::bind::AstcDecode::of(pf).is_some());
-    for &pf in astc {
-        let mut bound = formats;
-        bound[0].1 = pf;
-        let plan = planned(&bound).unwrap_or_else(|e| panic!("{pf:?}: {e}"));
-        let said = plan.diagnostics.iter().any(
-            |d| matches!(d, PlanDiagnostic::AstcStorageNeutral { slot: s, .. } if *s == slot(0)),
-        );
-        assert!(said, "{pf:?}: {:?}", plan.diagnostics);
-    }
-    assert!(other_keys > 0, "no other format plans");
-    eprintln!(
-        "{other_keys} binds of other formats plan other keys; {replaced} are replaced by the \
-         slot's neutral"
-    );
-}
-
-/// Kernel buffer slot `index`.
-fn kernel_buffer(index: u32) -> SlotRef {
-    SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Buffer,
-        index,
-    }
-}
-
-/// A variant key with device-address kernel buffer slots `slots`.
-fn addressed(slots: &[u32]) -> super::VariantKey {
-    let mut key = super::VariantKey::new();
-    key.psb_slots = slots.iter().copied().map(kernel_buffer).collect();
-    key
-}
-
-/// The large-buffer form's variant runs every dispatch or draw whose plan asks for fewer
-/// device-address slots, and no other variant's.
-#[test]
-fn the_large_buffer_variant_covers_plans_of_fewer_device_address_slots() {
-    let large = addressed(&[0, 3]);
-    assert!(large.covers(&large));
-    assert!(large.covers(&addressed(&[3])));
-    assert!(large.covers(&super::VariantKey::new()));
-    assert!(!large.covers(&addressed(&[1])));
-    assert!(!addressed(&[3]).covers(&large));
-    let mut emulated = addressed(&[3]);
-    emulated.emulated_simdgroups = true;
-    assert!(!large.covers(&emulated));
-}
-
-/// The large-buffer form moves every slot whose range a large buffer exceeds to its device address,
-/// unless the shape binds it without one (bytes), keeping what the key held; on a device without
-/// device addresses (the fact a plan-time check) it moves none, so a variant still follows the
-/// bound buffers there.
-#[test]
-fn the_large_buffer_form_moves_the_range_limited_slots_to_device_addresses() {
-    use crate::bind::{BindShape, BufferShape, StageShape};
-    use crate::pipeline::{Mechanism, RuntimeDependency, RuntimeFact};
-    let limited = |index, mechanism| {
-        let slot = kernel_buffer(index);
-        RuntimeDependency::new(RuntimeFact::BufferRangeLimit { slot }, mechanism)
-    };
-    let addressed_device = [
-        limited(0, Mechanism::Variant),
-        limited(2, Mechanism::Variant),
-        RuntimeDependency::new(
-            RuntimeFact::ThreadsPerThreadgroup,
-            Mechanism::Specialization,
-        ),
-    ];
-    let unbound = BindShape::default();
-    let empty = super::VariantKey::new();
-    assert_eq!(
-        empty.large_buffer_form(&addressed_device, &unbound),
-        addressed(&[0, 2])
-    );
-    let mut stage = StageShape::default();
-    stage.buffers.insert(
-        2,
-        BufferShape::Bytes {
-            attribute_stride: None,
-        },
-    );
-    let mut bytes = BindShape::default();
-    bytes.stages.insert(Stage::Kernel, stage);
-    assert_eq!(
-        empty.large_buffer_form(&addressed_device, &bytes),
-        addressed(&[0])
-    );
-    let mut emulated = addressed(&[5]);
-    emulated.emulated_simdgroups = true;
-    let mut widened = addressed(&[0, 5]);
-    widened.emulated_simdgroups = true;
-    assert_eq!(
-        emulated.large_buffer_form(&addressed_device, &bytes),
-        widened
-    );
-    let floor_device = [limited(0, Mechanism::PlanTimeCheck)];
-    assert_eq!(empty.large_buffer_form(&floor_device, &unbound), empty);
-}
-
 /// A render descriptor's linked-use answers and reflection decode as they were encoded, under
 /// their descriptor key on the device they were encoded for; another key or profile is
 /// `WrongDevice`, another kind of frame `Corrupt`, a changed byte `Corrupt`.
@@ -2094,7 +1296,7 @@ fn a_descriptors_answers_and_reflection_round_trip_under_its_key() {
         DirectArgumentUse, LinkedUseAnswers, LinkedUseGap, UnwrittenFragmentInputs,
     };
     let dev = device("moltenvk-m3");
-    let other = device("vk12-floor");
+    let other = device("runtime-floor");
     let key = PipelineKey::new([3; 32]);
     let wrong_key = PipelineKey::new([4; 32]);
     let mut answers = LinkedUseAnswers::default();
@@ -2153,7 +1355,7 @@ fn a_descriptors_answers_and_reflection_round_trip_under_its_key() {
         metal::PixelFormat::RGBA8Unorm,
     ));
     let reflection = d.reflection(&Budget::standard()).expect("reflection");
-    let key = dev.render_descriptor_key(&d);
+    let key = dev.queried_render_descriptor_key(&d);
     let bytes = reflection.to_bytes(&key, &dev);
     assert_eq!(
         crate::reflection::RenderPipelineReflection::from_bytes_for_key(&bytes, &key, &dev),

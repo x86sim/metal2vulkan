@@ -20,19 +20,18 @@ use std::sync::Arc;
 
 use crate::budget::SPIRV_WORDS;
 use crate::device::profile::BufferAccess;
-use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
 use crate::error::{Error, Feature, LowerFamily, Needs};
 use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::lower::select::Plan;
 use crate::metal::{VertexFormat, VertexStepFunction};
-use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
+use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{
-    AccessSet, BufferForm, BufferSlot, DescriptorView, PushLoc, SlotInterface, Window,
+    AccessSet, BufferForm, BufferSlot, PushLoc, SlotInterface, Window,
 };
 use crate::pipeline::link::vertex::vertex_fetch_projection;
 use crate::pipeline::link::{link, LinkInputs};
@@ -49,7 +48,7 @@ use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::testing::check_words_valid;
 use crate::vk;
 
-const PROFILES: [&str; 3] = ["moltenvk-m3", "lunarg-desktop-baseline-2023", "vk12-floor"];
+const PROFILES: [&str; 2] = ["moltenvk-m3", "runtime-floor"];
 const ENTRY: &str = "stage_io_vertex";
 
 fn fixture() -> Option<Vec<u8>> {
@@ -64,7 +63,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 fn inputs(proj: VertexFetchProjection) -> LoweringInputs {
@@ -143,22 +142,6 @@ fn shared_pulled(rate: u32) -> VertexFetchProjection {
         .insert(0, pulled(VertexFormat::Float3, 0, 1, S::PerVertex, 1));
     proj.attributes
         .insert(1, pulled(VertexFormat::Half2, 12, 1, S::PerVertex, 1));
-    proj
-}
-
-/// [`all_pulled`] with the position and uv in normalized formats (signed 10:10:10:2 and SNORM16),
-/// whose correctly rounded quotients are the dearest per-lane decode.
-fn normalized_pulled(rate: u32) -> VertexFetchProjection {
-    use VertexStepFunction as S;
-    let mut proj = all_pulled(rate);
-    proj.attributes.insert(
-        0,
-        pulled(VertexFormat::Int1010102Normalized, 0, 0, S::PerVertex, 1),
-    );
-    proj.attributes.insert(
-        1,
-        pulled(VertexFormat::Short2Normalized, 12, 0, S::PerVertex, 1),
-    );
     proj
 }
 
@@ -251,24 +234,10 @@ fn prof_with(stem: &str, change: impl FnOnce(&mut DeviceDescription)) -> DeviceP
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     change(&mut desc);
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
-}
-
-/// The committed profiles, and each without buffer robustness (the in-shader containment check).
-fn profiles_both_encodings() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in PROFILES {
-        out.push((stem.to_owned(), prof(stem)));
-        let bare = prof_with(stem, |d| {
-            d.features.remove(&VkFeature::RobustBufferAccess);
-            d.features.remove(&VkFeature::RobustBufferAccess2);
-        });
-        out.push((format!("{stem} without robustness"), bare));
-    }
-    out
 }
 
 /// Relocate `a` under the numbering link gives it alone and run L3.
@@ -314,7 +283,7 @@ fn pulled_attributes_compile_and_state_their_inputs() {
                         a.interface.slots.get(&slot(b)),
                         Some(SlotInterface::Buffer(s)) if s.access == AccessSet::READ
                             && s.window == Window::Whole
-                            && s.form == BufferForm::Descriptor(DescriptorView::Storage)
+                            && s.form == BufferForm::Descriptor
                     ),
                     "{what} {b}: {:?}",
                     a.interface.slots.get(&slot(b))
@@ -463,8 +432,8 @@ fn unestablished_conversions_are_refused() {
 }
 
 /// An unnormalized 8- or 16-bit integer format read into the fixture's `float3` and `half2`
-/// attributes is fixed function in its scaled form where the profile fetches that, and pulled
-/// (converted in the shader) where the profile has no buffer robustness; both compile and pass
+/// attributes is fixed function in its scaled form where the identity domains' profile fetches
+/// that, and pulled (converted in the shader) outside the identity domains; both compile and pass
 /// L3 on every profile.
 #[test]
 fn integer_formats_feed_float_attributes() {
@@ -481,79 +450,48 @@ fn integer_formats_feed_float_attributes() {
         desc.attributes
             .insert(attr, VertexAttributeDescriptor::new(format, offset, 0));
     }
-    for (stem, p) in profiles_both_encodings() {
+    use crate::device::requirements::FormatUsage;
+    let scaled = [
+        (0, vk::Format::R16G16B16_USCALED),
+        (1, vk::Format::R8G8_SSCALED),
+    ];
+    // Outside the identity domains every attribute is pulled and converts in the shader.
+    let mut pulled_all = VertexFetchProjection::new();
+    for (attr, d) in &desc.attributes {
+        pulled_all.attributes.insert(
+            *attr,
+            VertexFetch::pulled(d, &desc.layouts[&d.buffer_index]),
+        );
+    }
+    for stem in PROFILES {
+        let p = prof(stem);
         let proj = vertex_fetch_projection(Some(&desc), &classes(), &p)
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let robust = !stem.ends_with("without robustness");
-        for (attr, scaled) in [
-            (0, vk::Format::R16G16B16_USCALED),
-            (1, vk::Format::R8G8_SSCALED),
-        ] {
-            let fixed = robust
-                && p.supports_format(
-                    scaled,
-                    crate::device::requirements::FormatUsage::VertexBuffer,
-                );
-            let entry = VertexFetch::FixedFunction;
-            assert_eq!(
-                proj.attributes[&attr] == entry,
-                fixed,
-                "{stem} {attr}: {:?}",
-                proj.attributes[&attr]
-            );
-        }
+        assert_eq!(proj.attributes, pulled_all.attributes, "{stem}");
         let a = compile_with(&bc, &p, proj).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        validate(&a, &p);
-        // Every attribute pulled converts in the shader.
-        let mut pulled_all = VertexFetchProjection::new();
-        for (attr, d) in &desc.attributes {
-            pulled_all.attributes.insert(
-                *attr,
-                VertexFetch::pulled(d, &desc.layouts[&d.buffer_index]),
-            );
-        }
-        let a = compile_with(&bc, &p, pulled_all).unwrap_or_else(|e| panic!("{stem}: {e}"));
         validate(&a, &p);
         assert_eq!(indices(&a.interface.io.pulled), [0, 1, 4, 7], "{stem}");
     }
-}
-
-/// The plan's size estimate bounds the emitted words with every attribute pulled, through views, a
-/// shared slot, and (where the profile has them) device addresses, and with normalized formats'
-/// exact quotients.
-#[test]
-fn the_estimate_bounds_pulled_fetches() {
-    let Some(bc) = fixture() else { return };
+    // Under them the scaled forms are fixed function where the device fetches them, and the
+    // projection is refused, typed, where it does not.
     for stem in PROFILES {
-        let p = prof(stem);
-        let mut variant = inputs(both_pulled(3));
-        variant.psb_slots = [0, 1, 2, 3].into_iter().map(slot).collect();
-        let mut cases = vec![
-            inputs(all_pulled(3)),
-            inputs(shared_pulled(3)),
-            inputs(normalized_pulled(3)),
-        ];
-        if p.fields().buffer_access == BufferAccess::Addressed {
-            cases.push(variant);
-        }
-        for i in cases {
-            let plan = plan_bitcode(
-                &bc,
-                EntryRef::Name(ENTRY),
-                &FunctionConstantValues::defaults(),
-                &p,
-                &i,
-                &mut meter(),
-            )
-            .expect("plan");
-            let a = compile_inputs(&bc, &p, &i).expect("compile");
-            let words = a.module.words.len() as u64;
-            assert!(
-                plan.estimate.words >= words,
-                "{stem} {:?}: estimate {} < emitted {words}",
-                i.psb_slots,
-                plan.estimate.words
-            );
+        let p = profile(stem, DevicePolicy::default()).expect("committed profile");
+        let fetched = scaled
+            .iter()
+            .all(|&(_, f)| p.supports_format(f, FormatUsage::VertexBuffer));
+        match vertex_fetch_projection(Some(&desc), &classes(), &p) {
+            Ok(proj) => {
+                assert!(fetched, "{stem}");
+                for (attr, _) in scaled {
+                    assert_eq!(proj.attributes[&attr], VertexFetch::FixedFunction, "{stem}");
+                }
+                let a = compile_with(&bc, &p, proj).unwrap_or_else(|e| panic!("{stem}: {e}"));
+                validate(&a, &p);
+            }
+            Err(Error::Unsupported(u)) => {
+                assert!(!fetched && u.feature == Feature::Format, "{stem}: {u}")
+            }
+            Err(e) => panic!("{stem}: {e}"),
         }
     }
 }
@@ -565,7 +503,8 @@ fn the_estimate_bounds_pulled_fetches() {
 #[test]
 fn a_source_buffer_shares_its_arguments_slot() {
     let Some(bc) = fixture() else { return };
-    for (stem, p) in profiles_both_encodings() {
+    for stem in PROFILES {
+        let p = prof(stem);
         let alone = compile_with(&bc, &p, all_pulled(1)).unwrap_or_else(|e| panic!("{stem}: {e}"));
         let scale = buffer_slot(&alone, 1).expect("scale's slot");
         assert!(
@@ -581,7 +520,7 @@ fn a_source_buffer_shares_its_arguments_slot() {
             assert!(
                 s.is_some_and(|s| s.access == AccessSet::READ
                     && s.window == Window::Whole
-                    && s.form == BufferForm::Descriptor(DescriptorView::Storage)),
+                    && s.form == BufferForm::Descriptor),
                 "{what}: {s:?}"
             );
             assert_eq!(buffer_slot(&a, 0), None, "{what}: buffer 0 is not read");
@@ -679,11 +618,7 @@ fn the_descriptor_limit_fallback_moves_source_buffers() {
         assert_eq!(form(3), Some(BufferForm::Psb), "{stem}");
         assert_eq!(form(2), Some(BufferForm::Psb), "{stem}");
         for b in [0, 1] {
-            assert_eq!(
-                form(b),
-                Some(BufferForm::Descriptor(DescriptorView::Storage)),
-                "{stem} {b}"
-            );
+            assert_eq!(form(b), Some(BufferForm::Descriptor), "{stem} {b}");
         }
         let storage = a
             .interface
@@ -841,8 +776,7 @@ const ATOMIC_DECL: &str =
 /// runs once before the body, so the function's accesses never reach the attribute. The shared slot
 /// is one `Whole`, read-write storage binding (not `NonWritable`), or a `Psb` slot in the
 /// `BufferRangeLimit` variant, and passes L3, on every profile with
-/// `vertexPipelineStoresAndAtomics` (the others refuse the store by name, as alone); the size
-/// estimate bounds the emitted words.
+/// `vertexPipelineStoresAndAtomics` (the others refuse the store by name, as alone).
 #[test]
 fn a_written_or_atomic_argument_shares_its_slot() {
     let (Some(write), Some(atomic)) = (
@@ -871,21 +805,6 @@ fn a_written_or_atomic_argument_shares_its_slot() {
                 }
                 let a = r.unwrap_or_else(|e| panic!("{what}: {e}"));
                 validate(&a, &p);
-                let plan = plan_bitcode(
-                    bc,
-                    EntryRef::Name("probe"),
-                    &FunctionConstantValues::defaults(),
-                    &p,
-                    &i,
-                    &mut meter(),
-                )
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-                let words = a.module.words.len() as u64;
-                assert!(
-                    plan.estimate.words >= words,
-                    "{what}: estimate {} < emitted {words}",
-                    plan.estimate.words
-                );
                 let s = buffer_slot(&a, 1).expect("buf's slot");
                 assert!(s.access.write, "{what}: {s:?}");
                 if how == "alone" {
@@ -899,11 +818,7 @@ fn a_written_or_atomic_argument_shares_its_slot() {
                 assert_eq!(s.access, AccessSet::READ_WRITE, "{what}");
                 assert_eq!(s.window, Window::Whole, "{what}");
                 if how == "shared" {
-                    assert_eq!(
-                        s.form,
-                        BufferForm::Descriptor(DescriptorView::Storage),
-                        "{what}"
-                    );
+                    assert_eq!(s.form, BufferForm::Descriptor, "{what}");
                     assert_eq!(
                         bindings_of(&a, 1),
                         [vk::DescriptorType::STORAGE_BUFFER],
@@ -1144,9 +1059,9 @@ fn compile_inputs_of(
 /// `UShort2` among them read as `float2`; nine varyings of mixed interpolation beside the
 /// position; a `BGRA8Unorm_sRGB` target blended source-over beside `Depth32Float_Stencil8`),
 /// makes on every committed profile with the depth and stencil format, and passes L3 (a profile
-/// without the format refuses it, typed). Its `UShort2` attribute is fixed function in
-/// `R16G16_USCALED` on the shipped profiles, and wherever else fixed-function input takes it;
-/// elsewhere it is pulled.
+/// without the format refuses it, typed). Under the identity domains its `UShort2` attribute is
+/// fixed function in `R16G16_USCALED` on the shipped profiles, and wherever else fixed-function
+/// input takes it; a profile without the format refuses it, typed. Outside them it is pulled.
 #[test]
 fn a_label_pipeline_reads_its_integer_attribute_as_float() {
     use crate::budget::Budget;
@@ -1215,14 +1130,30 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
         })
         .collect();
     stems.sort();
-    let mut fixed = Vec::new();
-    for stem in &stems {
+    let device = |stem: &str, policy| {
         let text = std::fs::read_to_string(dir.join(format!("{stem}.json"))).expect("profile");
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        Device::from_queries(desc, policy).expect("device")
+    };
+    let resident = device("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .compile_render_pipeline(&d, &Budget::standard())
+        .expect("lavapipe");
+    assert!(
+        resident
+            .vertex_input
+            .pulled
+            .iter()
+            .any(|a| a.attribute == 2),
+        "{:?}",
+        resident.vertex_input
+    );
+    let mut fixed = Vec::new();
+    for stem in &stems {
+        let dev = device(stem, DevicePolicy::default());
         let p = match dev.compile_render_pipeline(&d, &Budget::standard()) {
             Ok(p) => p,
-            // A device without the depth and stencil format (roadmap-2022).
+            // A device without the depth and stencil format (roadmap-2022), or without the
+            // attribute's scaled format.
             Err(Error::Unsupported(u)) if u.feature == Feature::Format => {
                 assert!(!shipped.contains(&stem.as_str()), "{stem}: {u}");
                 eprintln!("{stem}: {u}");
@@ -1234,17 +1165,10 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
             check_words_valid(&s.spirv, &p.requirements, dev.profile())
                 .unwrap_or_else(|e| panic!("{stem} L3: {e}"));
         }
-        match p.vertex_input.attributes.iter().find(|a| a.offset == 12) {
-            Some(a) => {
-                assert_eq!(a.format, vk::Format::R16G16_USCALED, "{stem}");
-                fixed.push(stem.as_str());
-            }
-            None => assert!(
-                p.vertex_input.pulled.iter().any(|a| a.attribute == 2),
-                "{stem}: {:?}",
-                p.vertex_input
-            ),
-        }
+        let a = p.vertex_input.attributes.iter().find(|a| a.offset == 12);
+        let a = a.unwrap_or_else(|| panic!("{stem}: {:?}", p.vertex_input));
+        assert_eq!(a.format, vk::Format::R16G16_USCALED, "{stem}");
+        fixed.push(stem.as_str());
     }
     for stem in shipped {
         assert!(fixed.contains(&stem), "{stem} pulls it: {fixed:?}");
@@ -1269,7 +1193,9 @@ fn a_label_pipeline_reads_its_integer_attribute_as_float() {
 /// infinite word passes through, and a `Float4` attribute keeps every word, NaNs included, as
 /// Metal's fetch of a 32-bit float does. The module is the same for every format and records
 /// nothing of it: the render pipeline's link notes a narrow float's NaN on its vertex stage
-/// (`link::vertex::fixed_function_notes`).
+/// (`link::vertex::fixed_function_notes`). The projection is the identity domains' (outside them
+/// every attribute is pulled); the module is compiled with it on the profile's resident tables,
+/// whose output slot the interpreter binds by its descriptor.
 #[test]
 fn a_fixed_function_vertex_attribute_keeps_the_words_the_device_delivers() {
     use crate::pipeline::artifact::PrecisionNote;
@@ -1306,6 +1232,7 @@ fn a_fixed_function_vertex_attribute_keeps_the_words_the_device_delivers() {
         if !p.fields().leaf.vertex_stores_and_atomics {
             continue;
         }
+        let identity = profile(stem, DevicePolicy::default()).expect("committed profile");
         for format in [
             VertexFormat::Half4,
             VertexFormat::FloatRG11B10,
@@ -1317,14 +1244,15 @@ fn a_fixed_function_vertex_attribute_keeps_the_words_the_device_delivers() {
             d.attributes
                 .insert(0, VertexAttributeDescriptor::new(format, 0, 0));
             let what = format!("{stem} {format:?}");
-            let proj =
-                vertex_fetch_projection(Some(&d), &BTreeMap::from([(0, IoNumeric::Float)]), &p)
-                    .unwrap_or_else(|e| panic!("{what}: {e}"));
-            // A format the device's vertex input cannot fetch is pulled and is the pulled
-            // fetch's own test.
-            if proj.attributes[&0] != VertexFetch::FixedFunction {
-                continue;
-            }
+            let classes = BTreeMap::from([(0, IoNumeric::Float)]);
+            let proj = match vertex_fetch_projection(Some(&d), &classes, &identity) {
+                Ok(proj) => proj,
+                // A format the device's vertex input cannot fetch is refused under the identity
+                // domains, and pulled (the pulled fetch's own test) outside them.
+                Err(Error::Unsupported(u)) if u.feature == Feature::Format => continue,
+                Err(e) => panic!("{what}: {e}"),
+            };
+            assert_eq!(proj.attributes[&0], VertexFetch::FixedFunction, "{what}");
             let i = inputs(proj);
             let a = compile_inputs_of(&bc, "int_attribute_to_float4", &p, &i)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));

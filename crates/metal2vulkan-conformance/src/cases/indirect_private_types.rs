@@ -10,8 +10,8 @@
 //!
 //! Metal's answer is **carried**, and re-recording it is **forbidden**: Metal exposes this
 //! read-back through private getters alone, so there is no public call for a Metal side to make.
-//! The values are our own measurement of this chip, taken by the runtime lane that holds the
-//! table, and record mode refuses the case rather than pretending it can ask Metal again.
+//! The values are our own measurement of an Apple M3 Max under macOS 27.0.1, and record mode
+//! refuses the case rather than pretending it can ask Metal again.
 
 use crate::case::{Abort, Case, Input, MetalSource, Side};
 use crate::recording::ShaderRef;
@@ -25,7 +25,7 @@ pub const PRIVATE_TYPE_GETTERS: &str = "indirect-private-type-getters";
 const MEASURED_IN: &str =
     "the runtime lane's indirect command buffer table (an Apple M3 Max, macOS 27.0.1)";
 
-/// The runs the carried table stands on: the lane's own probes of the ten types in both forms.
+/// The runs the carried table stands on: the probes of the ten types in both forms.
 pub const MEASURED_RUNS: u32 = 1;
 
 /// Why record mode must not run the case on Metal.
@@ -141,17 +141,6 @@ impl Case for IndirectPrivateTypes {
         MetalSource::carried_only(MEASURED_IN, NO_PUBLIC_CALL)
     }
 
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: every value of this family still compares against Metal's exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09), where it fired for all this case
-        // and each row was divergent on that field and nothing else (replay-nvidia.log).
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         Ok(Vec::new())
     }
@@ -191,13 +180,15 @@ impl Case for IndirectPrivateTypes {
                             read.recorded_primitive_type,
                         ));
                     }
+                    // The refusal under the type's node, at the site the abort names: pushed
+                    // beside the node, it sat at a site Metal never observed and read as a
+                    // divergence rather than a refusal.
                     Err(failure) => {
                         let at = format!("type/{primitive_type}/{}", form(indexed));
-                        sites.push(node);
-                        sites.push(Node::leaf(
+                        sites.push(node.with(Node::leaf(
                             form(indexed),
                             Observed::value(failure.recorded()),
-                        ));
+                        )));
                         return Err(Abort { at, failure });
                     }
                 }

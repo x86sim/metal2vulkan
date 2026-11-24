@@ -1,21 +1,19 @@
 //! The coordinates a device's gathers and samples read. A gather and a sample through a constexpr
-//! normalized sampler are the device's sampler's on every device (Metal's own on MoltenVK), at the
-//! coordinate as given: a subnormal coordinate reaches the device unflushed, the border axes'
-//! included. A constexpr pixel sampler's sample or gather of a 1D or 2D texture that is no array
-//! hands the device's unnormalized sampler the coordinate itself (a nearest sample with an offset,
-//! its texel's centre moved by the offset), with no `PixelSamplerScaling`; of an array or a 3D
-//! texture its nearest sample hands its texel's centre and the rest the coordinate divided by the
-//! level-0 size, noted; a cube reads it as a normalized sampler. A runtime sampler's gather reads
-//! only its word's coordinates bit, and its sample also its `NearestPixelSampler` specialization.
-//! Every module requires the device's sampler (`VkProperty::MetalSampler` or
-//! `VkProperty::DeviceSampling`) and validates on every committed profile, and the plan's word
-//! estimate bounds what it emits.
+//! normalized sampler are the device's sampler's on every device, at the coordinate as given: a
+//! subnormal coordinate reaches the device unflushed, the border axes' included. A constexpr pixel
+//! sampler's sample or gather of a 1D or 2D texture that is no array hands the device's
+//! unnormalized sampler the coordinate itself (a nearest sample with an offset, its texel's centre
+//! moved by the offset), with no `PixelSamplerScaling`; of an array or a 3D texture its nearest
+//! sample hands its texel's centre and the rest the coordinate divided by the level-0 size, noted;
+//! a cube reads it as a normalized sampler. A runtime sampler's gather reads only its word's
+//! coordinates bit, and its sample also its `NearestPixelSampler` specialization. Every module
+//! requires the device's sampler (`VkProperty::DeviceSampling`) and validates on every committed
+//! profile.
 //!
 //! `llvm-as` assembles the kernels; without it the tests skip visibly.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkProperty;
 use crate::library::FunctionArtifact;
 use crate::pipeline::artifact::PrecisionNote;
@@ -236,19 +234,11 @@ fn uses(a: &FunctionArtifact, name: &str) -> u32 {
     a.strategies.entries.get(name).map_or(0, |u| u.uses)
 }
 
-/// Whether compiled `a` requires the device's sampler: `VkProperty::MetalSampler` on a profile
-/// that samples through Metal's own sampler, `VkProperty::DeviceSampling` on any other.
-fn requires_the_sampler(a: &FunctionArtifact, p: &DeviceProfile) -> bool {
-    let property = match p
-        .fields()
-        .enabled
+/// Whether compiled `a` requires the device's sampler (`VkProperty::DeviceSampling`).
+fn requires_the_sampler(a: &FunctionArtifact) -> bool {
+    a.requirements
         .properties
-        .contains(&VkProperty::MetalSampler)
-    {
-        true => VkProperty::MetalSampler,
-        false => VkProperty::DeviceSampling,
-    };
-    a.requirements.properties.contains(&property)
+        .contains(&VkProperty::DeviceSampling)
 }
 
 /// The kernels of the selection test, each with its access's census name.
@@ -362,7 +352,7 @@ fn normalized_gathers_and_samples_are_the_device_s_sampler_s() {
             let a = compile(&bc, "k", p).unwrap_or_else(|e| panic!("{what}: {e}"));
             link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: {e}"));
             assert_eq!(uses(&a, census), 1, "{what}");
-            assert!(requires_the_sampler(&a, p), "{what}");
+            assert!(requires_the_sampler(&a), "{what}");
         }
     }
 }
@@ -388,7 +378,7 @@ fn the_fixture_cube_gathers_are_the_device_s() {
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_eq!(uses(&a, "sampler.gather"), 5, "{stem}");
         assert_eq!(uses(&a, "sampler.gather_compare"), 4, "{stem}");
-        assert!(requires_the_sampler(&a, &p), "{stem}");
+        assert!(requires_the_sampler(&a), "{stem}");
     }
 }
 
@@ -605,7 +595,7 @@ fn pixel_samplers_hand_the_device_their_coordinate() {
                     assert_eq!(a.requirements, b.requirements, "{what}");
                 }
             }
-            assert!(requires_the_sampler(&a, p), "{what}");
+            assert!(requires_the_sampler(&a), "{what}");
         }
     }
 }
@@ -658,7 +648,7 @@ fn a_runtime_samplers_gather_and_sample_read_only_its_coordinates() {
             let what = format!("{name} on {stem}");
             let a = compile(&bc, "k", p).unwrap_or_else(|e| panic!("{what}: {e}"));
             link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert!(requires_the_sampler(&a, p), "{what}");
+            assert!(requires_the_sampler(&a), "{what}");
             assert_eq!(sampler_fields(&a), SamplerWord::PIXEL_COORDINATES, "{what}");
             assert!(
                 a.precision.contains(&PrecisionNote::PixelSamplerScaling),
@@ -807,6 +797,9 @@ fn coordinates_pass_through(words: &[u32]) -> (bool, bool) {
             | O::CompositeInsert
             | O::VectorShuffle
             | O::CopyObject => ids(i).into_iter().all(|v| moves(v, defs, ids)),
+            // The in-shader check's `select(inb, v, 0)` moves either value; its condition is no
+            // value of the coordinate's.
+            O::Select => ids(i).into_iter().skip(1).all(|v| moves(v, defs, ids)),
             _ => false,
         }
     }
@@ -875,49 +868,9 @@ fn a_subnormal_coordinate_reaches_the_device_unflushed() {
                 assert!(sampled, "{what}: no sample or gather");
                 assert_eq!(through, !flushed, "{what}");
                 if !flushed {
-                    assert!(requires_the_sampler(&a, p), "{what}");
+                    assert!(requires_the_sampler(&a), "{what}");
                 }
             }
-        }
-    }
-}
-
-/// The plan's word estimate bounds the emitted module of every kernel above on every committed
-/// profile.
-#[test]
-fn the_coordinate_estimate_bounds_its_emission() {
-    use crate::budget::SPIRV_WORDS;
-    use crate::library::FunctionConstantValues;
-    use crate::lower::select::LowerInputs;
-    use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
-    use crate::pipeline::testing::meter;
-    let profiles = crate::spirv::testing::committed_profiles().expect("profiles");
-    let pixel = pixel_cases()
-        .into_iter()
-        .map(|(n, o, w, _)| (n, o, Some(w)));
-    for (name, op, words) in cases()
-        .into_iter()
-        .map(|(n, o, w, _)| (n, o, w))
-        .chain(pixel)
-    {
-        let Some(bc) = assemble(name, &kernel(op, words)) else {
-            return;
-        };
-        for (stem, p) in &profiles {
-            let what = format!("{name} on {stem}");
-            let (entry, consts) = (EntryRef::Name("k"), FunctionConstantValues::defaults());
-            let inputs = LowerInputs::new();
-            let plan = plan_bitcode(&bc, entry, &consts, p, &inputs, &mut meter())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let a = compile_bitcode(&bc, entry, &consts, p, &inputs, &mut meter(), SPIRV_WORDS)
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let emitted = a.module.words.len() as u64;
-            eprintln!("{what}: estimate {} emitted {emitted}", plan.estimate.words);
-            assert!(
-                plan.estimate.words >= emitted,
-                "{what}: estimate {} < emitted {emitted}",
-                plan.estimate.words
-            );
         }
     }
 }

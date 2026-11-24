@@ -14,12 +14,9 @@ fn input(device: DeviceType) -> DeviceInput {
         root: PathBuf::from("/nonexistent/device-worker-corpus"),
         case: crate::case::attachmentless_fragment_test_case("00".repeat(32), "frag".into()),
         device,
-        backend: Backend::Vulkan,
         input_sha256: "11".repeat(32),
         wait_timeout_ms: 7_000,
         restricted_to: None,
-        leg: Leg::Stated,
-        generated_commands: true,
         venue: None,
         source_index: None,
     }
@@ -75,7 +72,7 @@ fn run_restricted_to(restricted_to: Option<String>) -> DeviceRun {
     DeviceRun {
         timing: crate::observation::test_timing(),
         output: vec![0, 1, 2, 0xff],
-        spv_sha256: "ab".repeat(32),
+        spv_sha256: Some("ab".repeat(32)),
         translator_fingerprint: "cd".repeat(32),
         environment: serde_json::json!({}),
         comparison: ComparisonClass::Exact,
@@ -85,7 +82,6 @@ fn run_restricted_to(restricted_to: Option<String>) -> DeviceRun {
             device: None,
             product: TRANSLATOR_FINGERPRINT.into(),
             restricted_to,
-            leg: Some(Leg::Stated),
             modules: Vec::new(),
             artifact: None,
         },
@@ -144,7 +140,6 @@ fn output(result: Result<DeviceRun, ExecutorError>) -> DeviceOutput {
     DeviceOutput {
         product_fingerprint: TRANSLATOR_FINGERPRINT.into(),
         validation_fingerprint: VALIDATION_FINGERPRINT.into(),
-        generated_commands: true,
         result,
         refused_on: None,
     }
@@ -160,6 +155,24 @@ fn reporting(scratch: &ScratchDir, output: &DeviceOutput) -> Command {
         scratch.path().join("seen.json").display(),
         report.display()
     ))
+}
+
+/// The bug class: a device worker's report is the last line of its stdout, as every worker's is,
+/// and a line a library in the worker wrote to stdout before it (the validation layer names its
+/// log file there) is not the report.
+#[cfg(unix)]
+#[test]
+fn a_worker_s_report_is_the_last_line_of_its_stdout() {
+    let scratch = ScratchDir::new("device-worker-test").unwrap();
+    let report = scratch.path().join("report.json");
+    let envelope = serde_json::json!({"allocator_peak_bytes": null, "result": output(Ok(run()))});
+    fs::write(&report, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    let worker = shell(&format!(
+        "cat >/dev/null; echo 'Validation Layer Info - Logging validation error to x.log'; \
+         echo; cat '{}'; echo",
+        report.display()
+    ));
+    assert_eq!(ran(worker, &input(DeviceType::Cpu), no_tripwire), Ok(run()));
 }
 
 fn no_tripwire(record: &HangRecord) -> Result<(), String> {
@@ -320,34 +333,17 @@ fn the_input_and_every_typed_result_cross_the_boundary() {
     for input in [
         input(DeviceType::Cpu),
         restricted(DeviceType::Cpu, "gate-lavapipe"),
-        DeviceInput {
-            leg: Leg::RobustnessOff,
-            ..restricted(DeviceType::Cpu, "vk12-floor")
-        },
-        DeviceInput {
-            generated_commands: false,
-            ..restricted(DeviceType::Cpu, "gate-lavapipe")
-        },
+        restricted(DeviceType::Cpu, "runtime-floor"),
     ] {
-        let mut own = run_restricted_to(input.restricted_to.clone());
-        own.census.leg = Some(input.leg);
+        let own = run_restricted_to(input.restricted_to.clone());
         let results = results.iter().cloned().chain([Ok(own)]);
         for result in results {
             let scratch = ScratchDir::new("device-worker-test").unwrap();
-            let report = DeviceOutput {
-                generated_commands: input.generated_commands,
-                ..output(result.clone())
-            };
+            let report = output(result.clone());
             let worker = reporting(&scratch, &report);
             let expected = match result {
-                // An unrestricted run is the restricted parent's refusal, a stated one the
-                // robustness-off parent's ([`reported`]).
-                Ok(run)
-                    if run.census.restricted_to != input.restricted_to
-                        || run.census.leg != Some(input.leg) =>
-                {
-                    continue
-                }
+                // An unrestricted run is the restricted parent's refusal ([`reported`]).
+                Ok(run) if run.census.restricted_to != input.restricted_to => continue,
                 result => result,
             };
             assert_eq!(ran(worker, &input, no_tripwire), expected);
@@ -397,7 +393,7 @@ fn a_worker_run_under_another_restriction_is_refused() {
         (input(DeviceType::Cpu), Some("gate-lavapipe")),
         (
             restricted(DeviceType::Cpu, "gate-lavapipe"),
-            Some("vk12-floor"),
+            Some("runtime-floor"),
         ),
     ];
     for (input, census) in runs {
@@ -409,39 +405,6 @@ fn a_worker_run_under_another_restriction_is_refused() {
         match ran(worker, &input, no_tripwire) {
             Err(ExecutorError::Failed(error)) => {
                 assert!(error.starts_with("the device worker ran "), "{error}");
-                assert!(error.contains("not this tool's evidence"), "{error}");
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-}
-
-/// A worker whose census names another robustness leg than its parent asked for compiled under
-/// other containment encodings than the row's slot would say: a stated run stored as the
-/// robustness-off leg, or the reverse; a census of no leg is no leg asked for.
-#[cfg(unix)]
-#[test]
-fn a_worker_run_in_another_leg_is_refused() {
-    let runs = [
-        (Leg::Stated, Some(Leg::RobustnessOff)),
-        (Leg::RobustnessOff, Some(Leg::Stated)),
-        (Leg::Stated, None),
-    ];
-    for (asked, ran_in) in runs {
-        let scratch = ScratchDir::new("device-worker-test").unwrap();
-        let mut reported = run();
-        reported.census.leg = ran_in;
-        let worker = reporting(&scratch, &output(Ok(reported)));
-        let parent = DeviceInput {
-            leg: asked,
-            ..input(DeviceType::Cpu)
-        };
-        match ran(worker, &parent, no_tripwire) {
-            Err(ExecutorError::Failed(error)) => {
-                assert!(
-                    error.starts_with("the device worker ran in robustness leg"),
-                    "{error}"
-                );
                 assert!(error.contains("not this tool's evidence"), "{error}");
             }
             other => panic!("{other:?}"),
@@ -464,7 +427,7 @@ fn a_worker_run_under_another_venue_profile_is_refused() {
         ..input(DeviceType::Gpu)
     };
     let recorded = |profile: Option<&str>| {
-        let mut environment = serde_json::json!({"robustness": {"leg": "stated"}});
+        let mut environment = serde_json::json!({"robustness": {"enabled": [], "unmet": []}});
         if let Some(profile) = profile {
             environment[crate::c3::VENUE_PROFILE] =
                 serde_json::json!({"profile": profile, "sha256": "00", "fingerprint": "11"});
@@ -575,43 +538,9 @@ fn a_crash_names_its_signal() {
     assert_eq!(crash(99).outcome(), "device_crash{signal99}");
 }
 
-/// A worker that opened its devices on the other generated-commands path than its parent asked
-/// for ran the other device replay: its run, or its refusal, is not the parent's evidence, and a
-/// run without the extension would be stored only under the default.
-#[cfg(unix)]
-#[test]
-fn a_worker_run_on_another_generated_commands_path_is_refused() {
-    let refused: Result<DeviceRun, ExecutorError> =
-        Err(NotSupported::NotEnabled(vec!["deviceGeneratedCommands".into()]).into());
-    for asked in [true, false] {
-        let input = DeviceInput {
-            generated_commands: asked,
-            ..input(DeviceType::Cpu)
-        };
-        for result in [Ok(run()), refused.clone()] {
-            let scratch = ScratchDir::new("device-worker-test").unwrap();
-            let report = DeviceOutput {
-                generated_commands: !asked,
-                ..output(result)
-            };
-            let worker = reporting(&scratch, &report);
-            match ran(worker, &input, no_tripwire) {
-                Err(ExecutorError::Failed(error)) => {
-                    assert!(
-                        error.starts_with("the device worker opened its devices"),
-                        "{error}"
-                    );
-                    assert!(error.contains("not this tool's evidence"), "{error}");
-                }
-                other => panic!("{other:?}"),
-            }
-        }
-    }
-}
-
 /// A typed refusal after the device opened crosses the boundary with that device's facts; a device
-/// named beside anything but a typed refusal, or one opened in another leg or under another
-/// restriction than the parent asked for, is not this tool's evidence.
+/// named beside anything but a typed refusal, or one opened under another restriction than the
+/// parent asked for, is not this tool's evidence.
 #[cfg(unix)]
 #[test]
 fn a_refusal_names_the_device_it_was_refused_on() {
@@ -624,11 +553,10 @@ fn a_refusal_names_the_device_it_was_refused_on() {
         at_bind: false,
     }
     .into());
-    let opened = |leg: &str, profile: Option<&str>| OpenedDevice {
+    let opened = |profile: Option<&str>| OpenedDevice {
         timing: crate::observation::test_timing(),
         environment: serde_json::json!({
             "device": "AMD Radeon 780M Graphics (RADV PHOENIX)",
-            "robustness": {"leg": leg},
             "profiles_layer": profile.map(|profile| serde_json::json!({"profile": profile})),
         }),
         translator_fingerprint: "cd".repeat(32),
@@ -644,31 +572,28 @@ fn a_refusal_names_the_device_it_was_refused_on() {
     };
     let stated = input(DeviceType::Gpu);
     let named = DeviceOutput {
-        refused_on: Some(opened("stated", None)),
+        refused_on: Some(opened(None)),
         ..output(refusal.clone())
     };
     assert_eq!(
         outcome(&named, &stated),
         DeviceOutcome {
             result: refusal.clone(),
-            refused_on: Some(opened("stated", None)),
+            refused_on: Some(opened(None)),
         }
     );
-    // Restricted and in the robustness-off leg, as the parent asked.
-    let restricted_off = DeviceInput {
-        leg: Leg::RobustnessOff,
-        ..restricted(DeviceType::Gpu, "amd-rdna3-radv")
-    };
-    let named_off = DeviceOutput {
-        refused_on: Some(opened("robustness_off", Some("amd-rdna3-radv"))),
+    // Restricted, as the parent asked.
+    let restricted_to = restricted(DeviceType::Gpu, "amd-780m-radv");
+    let named_restricted = DeviceOutput {
+        refused_on: Some(opened(Some("amd-780m-radv"))),
         ..output(refusal.clone())
     };
     assert_eq!(
-        outcome(&named_off, &restricted_off).refused_on,
-        Some(opened("robustness_off", Some("amd-rdna3-radv")))
+        outcome(&named_restricted, &restricted_to).refused_on,
+        Some(opened(Some("amd-780m-radv")))
     );
-    // Another leg, or another restriction, than the parent's.
-    for (report, input) in [(&named, &restricted_off), (&named_off, &stated)] {
+    // Another restriction than the parent's.
+    for (report, input) in [(&named, &restricted_to), (&named_restricted, &stated)] {
         let refused = outcome(report, input);
         assert_eq!(refused.refused_on, None);
         let Err(ExecutorError::Failed(error)) = refused.result else {
@@ -682,7 +607,7 @@ fn a_refusal_names_the_device_it_was_refused_on() {
     // A device beside a run, or beside an outcome that is no typed refusal.
     for result in [Ok(run()), Err(ExecutorError::Failed("no device".into()))] {
         let report = DeviceOutput {
-            refused_on: Some(opened("stated", None)),
+            refused_on: Some(opened(None)),
             ..output(result)
         };
         let refused = outcome(&report, &stated);

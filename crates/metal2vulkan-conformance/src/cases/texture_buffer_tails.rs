@@ -9,10 +9,11 @@
 //! (`probes/texture_buffer_past_length.m`, an Apple M3 Max under macOS 27.0.1). Over a 4096-byte
 //! buffer, whose `allocatedSize` is its length, that memory is the buffer allocated next, which no
 //! case can state; over a 20000-byte buffer, whose `allocatedSize` is 32768, it is the rest of the
-//! buffer's own allocation, and it reads zero. The runtime keeps those texels in a tail of the
-//! texture buffer's own, zero when made, which its functions view. So the case asks the second
-//! shape: 1024 `R32Uint` texels from byte 16384 of a 20000-byte buffer, the first 904 inside the
-//! length and the last 120 past it.
+//! buffer's own allocation, and it reads zero. So the case asks the second shape, where Metal's
+//! answer is one a case can compare: 1024 `R32Uint` texels from byte 16384 of a 20000-byte
+//! buffer, the first 904 inside the length and the last 120 past it. The runtime refuses a texture
+//! buffer whose texels run past its buffer (`Refusal::BufferTextureLayout`), as it refuses a 2D
+//! texture's, so no run of it reaches the texels.
 //!
 //! `buffer-tails-texture-buffer` reads texels through `ob1_texel_buffer` (the owned fixture whose
 //! thread `t` of eight reads texel `idx[t]` of its first texture buffer and writes `0xA0000000 |
@@ -21,14 +22,7 @@
 //! wrote every texel, with the buffer's 20000 bytes after each write; and, in a program of blits,
 //! reads it into a buffer as made, writes texels 880 to 943 by a blit from a buffer, and reads it
 //! back by a blit and by `getBytes:`, with the buffer's bytes.
-//!
-//! Every byte compares exactly. What differs is the announcing: the runtime's functions view such
-//! a texture buffer's tail as a staging buffer and it announces `staged-texture-buffer`, which
-//! Metal never does, and a device without unified memory announces `shared-in-system-memory` for
-//! the `Shared` buffers the answers are read back through. Nothing here can fault a GPU: one
-//! small texture buffer, eight threads, no loop.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -295,20 +289,6 @@ impl Case for TextureBufferTails {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // The runtime's functions view a texture buffer whose texels run past its buffer's length
-        // through its tail, a staging buffer, and it announces `staged-texture-buffer`, which
-        // Metal never does. Every answer is read back through `Shared` buffers, so a device
-        // without unified memory announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice`).
-        vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::StagedTextureBuffer.code(),
-            ),
-        ]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

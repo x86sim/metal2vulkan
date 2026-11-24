@@ -1,5 +1,7 @@
-//! The indirect-command record format: what a translated kernel's command encoders write, what the
-//! CPU's do, and what a replay reads (`bind::indirect_commands` is the public path).
+//! The indirect-command record format: what the CPU's command encoders write and what a replay
+//! reads (`bind::indirect_commands` is the public path). No translated function writes it: every
+//! encoder operation is `Unsupported{GpuEncodedIndirectCommands, NotImplemented}`
+//! (`lower::access::object`).
 //!
 //! The records are ordinary buffer storage, a header and one fixed-size record per command; they
 //! are not Vulkan command buffers or device-generated-command tokens.
@@ -11,7 +13,6 @@ pub use host::{BindingError, CommandBuffer, CommandBufferError, RecordView, Reso
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::ops::Range;
 
 /// Buffer namespace of an encoded command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,52 +25,6 @@ pub enum BufferStage {
     /// buffers: a record holds one family's stages, as its descriptor allows one family's
     /// commands ([`BufferStage::of`]).
     Mesh,
-}
-
-/// Recognized command-encoder operation; recognition does not establish lowering support.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandEncoderOperation {
-    Buffer {
-        stage: BufferStage,
-        address_space: u32,
-    },
-    Dispatch {
-        exact_threads: bool,
-    },
-    Pipeline {
-        render: bool,
-    },
-    Barrier {
-        render: bool,
-        enabled: bool,
-    },
-    ThreadgroupMemory,
-    Draw,
-    /// `set_stage_in_region`: the six words of the region.
-    StageInRegion,
-    /// `set_imageblock_size`: the two `u16`s of the size.
-    ImageblockSize,
-    /// `reset`: the record restored to [`CommandRecord::default`], of a render command where
-    /// `render`, else a compute command.
-    Reset {
-        render: bool,
-    },
-    /// `draw_indexed_primitives`: an indexed draw's arguments.
-    DrawIndexed,
-    /// `draw_patches`: a patch draw's arguments.
-    DrawPatches,
-    /// `copy_command`: a compute command's record from a source command, whose buffer's header
-    /// the lowering checks against the destination's (`lower::access::encode`).
-    Copy,
-    /// `draw_indexed_patches`: an indexed patch draw's arguments, a patch draw's and its
-    /// control-point index buffer's address ([`Action::DrawIndexedPatches`]).
-    DrawIndexedPatches,
-    /// `draw_mesh_threadgroups` (`threads` false) or `draw_mesh_threads`: a mesh draw's grid and
-    /// its object and mesh threadgroups' threads ([`Action::DrawMeshThreadgroups`],
-    /// [`Action::DrawMeshThreads`]).
-    DrawMesh {
-        threads: bool,
-    },
 }
 
 /// Number of buffer slots represented in a command.
@@ -97,13 +52,10 @@ pub const COMMAND_BUFFER_HEADER_BYTES: usize = 16;
 pub const WRITTEN_FLAG_BYTES: usize = 4;
 
 /// The byte offset of command `index`'s written flag in the storage of a buffer of `capacity`
-/// commands: the flags follow the records, one `u32` a command. Each encoder operation that
-/// writes a command's record (one the header's policy takes, `lower::access::encode`) stores 1
-/// at its flag, contained as the record's fields are: storage that ends at its records takes no
-/// flag, and its records are written as before. A consumer whose storage holds the flags, and
-/// whose own writes of the records set them as well, knows a record whose flag is clear to hold
-/// what it last reset it to, and may reset only the flagged ones, clearing each flag with its
-/// record (`bind::IcbResetModule`).
+/// commands: the flags follow the records, one `u32` a command. No translated function writes a
+/// record or its flag. A consumer whose storage holds the flags, and whose own writes of the
+/// records set them, knows a record whose flag is clear to hold what it last reset it to, and may
+/// reset only the flagged ones, clearing each flag with its record.
 pub const fn written_flag_offset(capacity: u32, index: u32) -> u64 {
     COMMAND_BUFFER_HEADER_BYTES as u64
         + capacity as u64 * COMMAND_BYTES as u64
@@ -115,8 +67,7 @@ pub const fn written_flag_offset(capacity: u32, index: u32) -> u64 {
 pub const RECORDS_ADDRESS_BASE: u64 = 1 << 63;
 /// How far an indirect command buffer's resource ID is shifted to give the guest address its
 /// records start at past [`RECORDS_ADDRESS_BASE`] ([`records_address`]): 2^31 bytes from one ID's
-/// start to the next's. Records of more bytes run past the next IDs' starts, which a search for
-/// those IDs' records still tells apart: it finds an ID's records only at their start.
+/// start to the next's. Records of more bytes run past the next IDs' starts.
 pub(crate) const RECORDS_ADDRESS_SHIFT: u32 = 31;
 /// The first resource ID whose records [`records_address`] cannot place, 2^31: the IDs of indirect
 /// command buffers run from 1 below it, as Metal's do (on an M3 Max, a reservation of 2^31 - 2
@@ -128,63 +79,27 @@ pub const RECORDS_ID_LIMIT: u64 = 1 << 31;
 /// [`RECORDS_ID_LIMIT`]) start at: `2^63 + id * 2^31`. An argument buffer's command-buffer member
 /// holds the ID, as Metal's `gpuResourceID` and `setIndirectCommandBuffer:atIndex:` give it (small
 /// integers from 1, measured on an M3 Max and an M4, or the IDs a reservation leaves next, up to
-/// 2^31 - 1 on an M3 Max), and a translated kernel that encodes through it reaches the records
-/// that start at this address in its resident set, and no other: records of more than 2^31 bytes
-/// run past the next IDs' starts, and the resident set keeps each records range whole
-/// (`ResidentSet`). So a consumer that makes an indirect command buffer with ID `id` makes its
-/// record buffer resident at `records_address(id)`, a range no Metal buffer reaches (each lies
-/// below 2^63). The null ID 0 gives an address no records start at, so an encoder operation
-/// through it is contained as one through an ID whose records are not resident is.
+/// 2^31 - 1 on an M3 Max). Records of more than 2^31 bytes run past the next IDs' starts, and the
+/// resident set keeps each records range whole. So a consumer that makes an
+/// indirect command buffer with ID `id` makes its record buffer resident at `records_address(id)`,
+/// a range no Metal buffer reaches (each lies below 2^63). The null ID 0 gives an address no
+/// records start at. No translated function reaches the records through it: every encoder
+/// operation is refused (`GpuEncodedIndirectCommands`).
 pub const fn records_address(id: u64) -> u64 {
     RECORDS_ADDRESS_BASE | (id << RECORDS_ADDRESS_SHIFT)
 }
 
-/// The byte offsets the lowering of the encoder operations writes through device addresses
-/// (`lower::access::encode`), with the header checks of [`Policy`].
+/// The byte offsets of the header's and a record's fields, which the CPU's encoder writes and the
+/// device replay reads (`bind::replay`).
 pub(crate) mod layout {
-    use super::{
-        BufferStage, BINDING_COUNT, BUFFER_STAGES, BUFFER_WORDS, HEADER_WORDS, THREADGROUP_COUNT,
-        THREADGROUP_WORD,
-    };
+    use super::{THREADGROUP_COUNT, THREADGROUP_WORD};
 
-    /// The header's command capacity (`u32`).
-    pub(crate) const CAPACITY: u64 = 0;
-    /// The header's sticky encoding-fault flag (`u32`, written atomically).
-    pub(crate) const FAULT: u64 = 4;
-    /// The header's descriptor policy bits (`u32`).
-    pub(crate) const POLICY: u64 = 8;
-    /// The header's packed binding counts (`u32`, one byte per count): a compute descriptor's
-    /// kernel buffers in byte 0 and threadgroup lengths in byte 3; a render descriptor's object,
-    /// vertex, fragment and mesh buffers in bytes 0 to 3.
-    pub(crate) const COUNTS: u64 = 12;
-    /// The first record.
-    pub(crate) const RECORDS: u64 = super::COMMAND_BUFFER_HEADER_BYTES as u64;
-    /// Bytes of one record.
-    pub(crate) const RECORD: u64 = super::COMMAND_BYTES as u64;
-    /// A record's action tag (`u32`).
-    pub(crate) const ACTION: u64 = 0;
-    /// A record's barrier flag (`u32`).
-    pub(crate) const BARRIER: u64 = 4;
-    /// A record's pipeline token (`u64`).
-    pub(crate) const PIPELINE: u64 = 8;
     /// A record's six action arguments (`u32` each): a dispatch's grid and local size, or a
     /// draw's primitive type, vertex start, vertex count, instance count, and base instance.
     pub(crate) const ARGUMENTS: u64 = 16;
-    /// Bytes of one buffer binding: its address (`u64`), then its attribute stride (`u64`).
-    pub(crate) const BINDING: u64 = (BUFFER_WORDS * 4) as u64;
-    /// A buffer binding's attribute stride, within the binding.
-    pub(crate) const STRIDE: u64 = 8;
     /// A record's threadgroup-memory lengths (`u32` each).
     pub(crate) const THREADGROUP: u64 = (THREADGROUP_WORD * 4) as u64;
 
-    /// The first buffer binding of `stage` in a record.
-    pub(crate) const fn buffers(stage: BufferStage) -> u64 {
-        ((HEADER_WORDS + stage.index() * BINDING_COUNT * BUFFER_WORDS) * 4) as u64
-    }
-
-    /// Every buffer binding of a record, all four stages' words (`BINDING` bytes each, from
-    /// `buffers(BufferStage::Kernel)`).
-    pub(crate) const ALL_BINDINGS: u64 = (BUFFER_STAGES * BINDING_COUNT) as u64;
     /// A record's stage-in region (`u32` each, after the six action arguments): origin x, y and
     /// z, then size x, y and z; all zero when the command sets none.
     pub(crate) const STAGE_IN: u64 = ARGUMENTS + 24;
@@ -221,30 +136,6 @@ pub(crate) mod layout {
     pub(crate) const STATE_BITS: u32 = RETAINED | KERNEL_PIPELINE;
 }
 
-/// The descriptor policy an encoder operation's write requires of the record header: its
-/// policy bits masked with `required | forbidden` equal `required`, and hold one of `any` where
-/// `any` is not 0, the command index is below the capacity, a binding index is below its count,
-/// and a dynamic stride is all ones unless the descriptor enables dynamic strides. A write that
-/// fails any of them sets the fault flag instead and writes nothing, but a draw on a buffer of
-/// `dropped_on` alone, which writes nothing and sets no fault. A threadgroup length is kept as
-/// set, a multiple of 16 or not, as Metal keeps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Policy {
-    pub(crate) required: u32,
-    pub(crate) forbidden: u32,
-    /// The kinds of which the descriptor must allow one (0: no such check): those whose Metal
-    /// record holds the operation's draw ([`DrawKind::holders`]).
-    pub(crate) any: u32,
-    /// The byte of the header's packed counts that bounds the operation's binding index, where
-    /// it binds one.
-    pub(crate) binding: Option<u8>,
-    pub(crate) dynamic_stride: bool,
-    /// The kinds on a buffer of which, allowing none of `any`, a draw that is otherwise valid is
-    /// dropped: it writes nothing and sets no fault (0: none). A kernel's draw of primitives on
-    /// a buffer of mesh draws alone draws nothing on Metal, without a fault (a Metal probe).
-    pub(crate) dropped_on: u32,
-}
-
 /// A draw's kind, as the command types Metal's records are made for order them: a buffer's
 /// records hold a draw of a kind its types allow, or of a kind whose record a kind it allows
 /// holds. Draws of primitives fit every render buffer's records but those of mesh draws alone,
@@ -277,7 +168,7 @@ impl DrawKind {
 }
 
 // The header's policy bits, which a command-buffer descriptor sets at initialization and the
-// encoder operations' lowering checks ([`Policy`]).
+// device replay reads.
 pub(crate) const COMPUTE: u32 = 1;
 pub(crate) const RENDER: u32 = 2;
 pub(crate) const GROUPS: u32 = 4;
@@ -707,7 +598,7 @@ pub enum RecordError {
     /// takes the first two lengths' words (`layout::CONTROL_POINT_INDICES`): a render command
     /// sets none.
     ThreadgroupMemoryLength,
-    /// A field's index past what a record holds ([`CommandRecord::write_field`]): a buffer slot
+    /// A field's index past what a record holds: a buffer slot
     /// at or past [`BINDING_COUNT`], or a threadgroup length at or past
     /// [`THREADGROUP_BUFFER_ARGUMENT_COUNT`].
     Index {
@@ -886,7 +777,7 @@ pub(crate) fn writes_of(action: &Action, barrier: bool) -> crate::pipeline::Comm
     writes
 }
 
-/// One field of a command's record, as one CPU setter writes it ([`CommandRecord::write_field`]).
+/// One field of a command's record, as one CPU setter writes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordField {
     /// The action ([`CommandRecord::action`]): a dispatch or a draw.
@@ -910,155 +801,7 @@ pub enum RecordField {
     ImageblockSize([u16; 2]),
 }
 
-impl CommandRecord {
-    /// Write `field` into the record `bytes` hold ([`COMMAND_BYTES`]), as `decode`, setting the
-    /// field and [`encode_into`](Self::encode_into) would, but touching no word the field does
-    /// not take: `bytes` then decode as what `encode_into` writes of the record
-    /// [`decode`](Self::decode) read from them with `field` set, and bytes `encode_into` wrote
-    /// stay what it writes. One setter's write, without decoding and encoding the rest. Refused,
-    /// leaving `bytes` unchanged: what `decode` refuses of `bytes`, what `encode_into` refuses of
-    /// the record with `field` set (an all-ones stride, a stage-in region beside a draw whose
-    /// arguments take its words, the first two threadgroup lengths beside an indexed patch
-    /// draw), and an index past the record's ([`RecordError::Index`]). Answers the bytes it may
-    /// have changed.
-    pub fn write_field(bytes: &mut [u8], field: RecordField) -> Result<Range<usize>, RecordError> {
-        let view = RecordView::new(bytes)?;
-        // The stage-in region and the first two lengths are read only for an action, which checks
-        // them: a setter of another field reads no more of the record than `RecordView::new` does.
-        let action = view.action();
-        let flagged = view.retained_pipeline().is_some() || view.kernel_pipeline();
-        let stage_in = |view: &RecordView<'_>| view.stage_in_region();
-        let lengths = |view: &RecordView<'_>| {
-            [0, 1].map(|index| view.threadgroup_memory_length(index).unwrap_or(0))
-        };
-        let word_bytes = |word: usize, words: usize| word * 4..(word + words) * 4;
-        match field {
-            RecordField::Barrier(barrier) => {
-                put_word(bytes, 1, u32::from(barrier));
-                Ok(word_bytes(1, 1))
-            }
-            RecordField::Pipeline(pipeline) => {
-                put_u64(bytes, 2, pipeline.get());
-                // A pipeline the CPU sets is reported, and not a kernel's.
-                if !flagged {
-                    return Ok(word_bytes(2, 2));
-                }
-                let state = layout::STATE as usize;
-                put_word(bytes, state / 4, 0);
-                Ok(8..state + 4)
-            }
-            RecordField::Buffer {
-                stage,
-                slot,
-                binding,
-            } => {
-                if slot >= BINDING_COUNT {
-                    return Err(RecordError::Index {
-                        index: slot,
-                        count: BINDING_COUNT,
-                    });
-                }
-                let (address, stride) = match binding {
-                    None => (0, 0),
-                    Some(binding) if binding.attribute_stride == Some(u64::MAX) => {
-                        return Err(RecordError::ReservedStride);
-                    }
-                    Some(binding) => (
-                        binding.address,
-                        binding.attribute_stride.unwrap_or(u64::MAX),
-                    ),
-                };
-                let word = HEADER_WORDS + (stage.index() * BINDING_COUNT + slot) * BUFFER_WORDS;
-                put_u64(bytes, word, address);
-                put_u64(bytes, word + 2, stride);
-                Ok(word_bytes(word, BUFFER_WORDS))
-            }
-            RecordField::ThreadgroupMemoryLength { index, length } => {
-                if index >= THREADGROUP_COUNT {
-                    return Err(RecordError::Index {
-                        index,
-                        count: THREADGROUP_COUNT,
-                    });
-                }
-                // An indexed patch draw's control-point index buffer takes the first two
-                // lengths' words: a length of 0 there is the record's already.
-                if matches!(action, Action::DrawIndexedPatches { .. }) && index < 2 {
-                    return match length {
-                        0 => Ok(0..0),
-                        _ => Err(RecordError::ThreadgroupMemoryLength),
-                    };
-                }
-                put_word(bytes, THREADGROUP_WORD + index, length);
-                Ok(word_bytes(THREADGROUP_WORD + index, 1))
-            }
-            RecordField::StageInRegion(region) => {
-                // A draw whose arguments take the stage-in region's words has none.
-                if action.takes_stage_in_words() {
-                    return match region {
-                        [0, 0, 0, 0, 0, 0] => Ok(0..0),
-                        _ => Err(RecordError::StageInRegion),
-                    };
-                }
-                let first = layout::STAGE_IN as usize / 4;
-                for (index, &value) in region.iter().enumerate() {
-                    put_word(bytes, first + index, value);
-                }
-                Ok(word_bytes(first, 6))
-            }
-            RecordField::ImageblockSize(size) => {
-                let at = layout::IMAGEBLOCK as usize;
-                for (index, value) in size.iter().enumerate() {
-                    bytes[at + 2 * index..at + 2 * index + 2].copy_from_slice(&value.to_le_bytes());
-                }
-                Ok(at..at + 4)
-            }
-            RecordField::Action(new) => {
-                let (stage_in, lengths) = (stage_in(&view), lengths(&view));
-                let wide = new.takes_stage_in_words();
-                if wide && stage_in != [0; 6] {
-                    return Err(RecordError::StageInRegion);
-                }
-                let control_point_indices = match new {
-                    Action::DrawIndexedPatches {
-                        control_point_index_buffer,
-                        ..
-                    } => Some(control_point_index_buffer),
-                    _ => None,
-                };
-                if control_point_indices.is_some() && lengths != [0; 2] {
-                    return Err(RecordError::ThreadgroupMemoryLength);
-                }
-                let (tag, arguments) = action_words(&new);
-                put_word(bytes, 0, tag);
-                let first = layout::ARGUMENTS as usize / 4;
-                for (index, value) in arguments.into_iter().enumerate() {
-                    put_word(bytes, first + index, value);
-                }
-                // The stage-in region keeps its words beside a dispatch or a draw of primitives;
-                // an indexed or patch draw's arguments took them, and leave it none.
-                if !wide {
-                    let stage_in_word = layout::STAGE_IN as usize / 4;
-                    for (index, &value) in stage_in.iter().enumerate() {
-                        put_word(bytes, stage_in_word + index, value);
-                    }
-                }
-                let mut end = (first + layout::DRAW_ARGUMENT_WORDS) * 4;
-                // The first two threadgroup lengths' words: the control-point index buffer of an
-                // indexed patch draw, else the lengths, which one took and leaves 0.
-                let taken = matches!(action, Action::DrawIndexedPatches { .. });
-                if let Some(address) = control_point_indices {
-                    put_u64(bytes, layout::CONTROL_POINT_INDICES as usize / 4, address);
-                    end = layout::CONTROL_POINT_INDICES as usize + 8;
-                } else if taken {
-                    put_word(bytes, THREADGROUP_WORD, lengths[0]);
-                    put_word(bytes, THREADGROUP_WORD + 1, lengths[1]);
-                    end = layout::THREADGROUP as usize + 8;
-                }
-                Ok(0..end)
-            }
-        }
-    }
-}
+impl CommandRecord {}
 
 fn require_length(bytes: &[u8]) -> Result<(), RecordError> {
     if bytes.len() == COMMAND_BYTES {
@@ -1229,64 +972,6 @@ fn arguments<const N: usize>(words: [u32; N]) -> [u32; layout::DRAW_ARGUMENT_WOR
     let mut all = [0; layout::DRAW_ARGUMENT_WORDS];
     all[..N].copy_from_slice(&words);
     all
-}
-
-impl CommandEncoderOperation {
-    /// The descriptor policy this operation's write requires of the header ([`Policy`]).
-    pub(crate) fn policy(self) -> Policy {
-        let family = |render: bool| if render { RENDER } else { COMPUTE };
-        let plain = |required| Policy {
-            required,
-            forbidden: 0,
-            any: 0,
-            binding: None,
-            dynamic_stride: false,
-            dropped_on: 0,
-        };
-        // A draw needs a render descriptor whose records hold its kind.
-        let draw = |kind: DrawKind| Policy {
-            any: kind.holders(),
-            ..plain(RENDER)
-        };
-        match self {
-            Self::Buffer { stage, .. } => Policy {
-                required: family(stage != BufferStage::Kernel),
-                forbidden: INHERIT_BUFFERS,
-                any: 0,
-                binding: Some(match stage {
-                    BufferStage::Kernel => 0,
-                    BufferStage::Vertex => 1,
-                    BufferStage::Fragment => 2,
-                    // A render descriptor's object and mesh counts take the bytes of the kernel
-                    // and threadgroup counts, which a compute descriptor's alone hold.
-                    BufferStage::Object => 0,
-                    BufferStage::Mesh => 3,
-                }),
-                dynamic_stride: matches!(stage, BufferStage::Kernel | BufferStage::Vertex),
-                dropped_on: 0,
-            },
-            // Every compute descriptor allows a dispatch kind, and its records hold either.
-            Self::Dispatch { .. } => plain(COMPUTE),
-            Self::Pipeline { render } => Policy {
-                forbidden: INHERIT_PIPELINE,
-                ..plain(family(render))
-            },
-            Self::Barrier { render, .. } => plain(family(render)),
-            Self::ThreadgroupMemory => Policy {
-                binding: Some(3),
-                ..plain(COMPUTE)
-            },
-            Self::Draw => Policy {
-                dropped_on: DRAW_MESH_THREADGROUPS | DRAW_MESH_THREADS,
-                ..draw(DrawKind::Primitives)
-            },
-            Self::DrawIndexed => draw(DrawKind::Indexed),
-            Self::DrawPatches | Self::DrawIndexedPatches => draw(DrawKind::Patches),
-            Self::DrawMesh { .. } => draw(DrawKind::Mesh),
-            Self::Reset { render } => plain(family(render)),
-            Self::StageInRegion | Self::ImageblockSize | Self::Copy => plain(COMPUTE),
-        }
-    }
 }
 
 #[cfg(test)]

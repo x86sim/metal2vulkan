@@ -2,16 +2,12 @@
 //!
 //! # Why this is recorded rather than carried
 //!
-//! The runtime lane `rotated_textures` checks every plane byte against a *rule* — where a pass's
-//! texel `(x, y)` lands at each rotation, and what a load leaves at the texels a draw does not
-//! reach. That rule was measured on an Apple M4 under macOS 27.0.1, a chip this tree no longer has,
-//! which makes it the weakest kind of row: it can never be checked against the oracle again.
-//!
-//! So the rule is **re-measured here**, on an Apple M3 Max under macOS 27.0.1 (26A434), and the
-//! cases record Metal's own plane bytes rather than the rule's prediction. The re-measurement
-//! reproduced the M4's rule exactly, all five rotations, every texel of an 8x4 frame, store and
-//! load alike (`probes/rotated_surface_planes.m`) — so the lane's numbers were right, and they are
-//! now a fact on the oracle instead of a number from a machine that is gone.
+//! A *rule* says where a pass's texel `(x, y)` lands at each rotation, and what a load leaves at
+//! the texels a draw does not reach. It was measured on an Apple M4 under macOS 27.0.1 and again
+//! on an Apple M3 Max under macOS 27.0.1 (26A434), which reproduced it exactly, all five
+//! rotations, every texel of an 8x4 frame, store and load alike
+//! (`probes/rotated_surface_planes.m`). The cases record Metal's own plane bytes rather than the
+//! rule's prediction.
 //!
 //! # What the Metal leg needs, and why it is private
 //!
@@ -34,35 +30,29 @@
 //! equal to (32) bytes
 //! ```
 //!
-//! for a 4x8 surface at its own tight stride behind an 8x4 texture — which is exactly the plane the
-//! lane this ports uses for a quarter turn. So **every plane here carries a stride of at least the
-//! frame's own row**, [`crate::surface::PlaneSpec::unsafe_stride`] refuses the rest, and both sides
-//! check it at the call rather than trusting a case body. Nothing in this module can end Metal's
-//! process, fault the GPU or hang it: one single-sampled pass a case, one triangle, no loop, and
-//! every byte written inside the surface's own allocation.
-//!
-//! That rule is also a **finding**, recorded in this stream's report: the lane passes with a plane
-//! stride Metal would assert on, so the runtime accepts a descriptor plain Metal refuses.
+//! for a 4x8 surface at its own tight stride behind an 8x4 texture, the tightest plane for a
+//! quarter turn. So **every plane here carries a stride of at least the frame's own row**,
+//! [`crate::surface::PlaneSpec::unsafe_stride`] refuses the rest, and both sides check it at the
+//! call rather than trusting a case body. Nothing in this module can end Metal's process, fault the
+//! GPU or hang it: one single-sampled pass a case, one triangle, no loop, and every byte written
+//! inside the surface's own allocation.
 //!
 //! # The shape
 //!
 //! Two questions a rotation, over two frames:
 //!
 //! - **store**: a pass that clears the frame and draws every texel of a source texture
-//!   whose texels name themselves, so each plane byte names the pass texel Metal stored there. That
-//!   is `stored_at` measured directly.
+//!   whose texels name themselves, so each plane byte names the pass texel Metal stored there.
 //! - **load**: the plane's texels each named with their own stored position, then a pass
 //!   that loads and draws only the top-left 8x4 pass texels. What the undrawn texels keep is the
-//!   answer, and at rotation 4 it is the one place our runtime is known to differ from Metal.
+//!   answer.
 //!
 //! The frames are 64x16, whose turned plane is 16x64 and so spans **two 32x32 plane tiles**, and
 //! 32x32, which is one tile. The two-tile frame is deliberate: measured here, at rotation 4 Metal
 //! mirrors the loaded texels left to right in the tile the draw reached (480 of 480 undrawn texels)
-//! and **keeps every texel of the tile it did not reach** (512 of 512), while the runtime mirrors
-//! every tile and announces `RotatedLoadTiles`. A one-tile frame cannot tell those apart, which is
-//! why the lane's own 32x32 test never did.
+//! and **keeps every texel of the tile it did not reach** (512 of 512). A one-tile frame cannot
+//! tell that from mirroring every tile.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Input, MetalSource, Side};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -70,8 +60,8 @@ use crate::render::{
 };
 use crate::surface::{plane_extent, PlaneSpec};
 use crate::transcript::{Node, Observed, Sites, Value};
+use crate::values::LoadAction;
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::{Degradation, LoadAction};
 
 use super::extended_range_targets::{fixture, fixture_inputs, not_read, program, shader_refs};
 
@@ -91,7 +81,7 @@ const RECT: &str = "tob_rect";
 /// drawn texel names the pass position it was drawn at.
 const READ: &str = "tob_read";
 
-/// The pass texels a partial draw covers, the lane's own corner.
+/// The pass texels a partial draw covers: a corner.
 const DRAWN: [u32; 2] = [8, 4];
 
 /// What a case asks of one rotation.
@@ -159,8 +149,7 @@ impl RotatedPlane {
     /// The padding is the point of the stride: a case asserts that the bytes between the rows
     /// stayed as they were, which needs rows that are wider than their texels. **The stride is at
     /// least the frame's own row**, which is the rule Metal asserts on
-    /// ([the module's header](self)); for a quarter turn that is wider than the plane's texels,
-    /// which is exactly the case the lane this ports got wrong.
+    /// ([the module's header](self)); for a quarter turn that is wider than the plane's texels.
     fn plane(&self) -> PlaneSpec {
         let plane = plane_extent(self.rotation, self.frame);
         let stride = (plane[0].max(self.frame[0])) * TEXEL + 16;
@@ -253,23 +242,6 @@ impl RotatedPlane {
         bands
     }
 
-    /// Whether the draw reaches any texel of the band starting at row `first`.
-    ///
-    /// Derived from where the draw's own pass texels are stored
-    /// ([`crate::surface::stored_at`]), so it is a structural answer rather than a band index
-    /// written down for one rotation.
-    fn band_is_reached(&self, first: u32, rows: u32) -> bool {
-        if self.ask == Ask::Store {
-            return true;
-        }
-        (0..DRAWN[1]).any(|y| {
-            (0..DRAWN[0]).any(|x| {
-                let [_, sy] = crate::surface::stored_at(self.rotation, self.frame, [x, y]);
-                sy >= first && sy < first + rows
-            })
-        })
-    }
-
     /// The layout one band of the plane is read under: its own rows at the plane's stride, so a
     /// diff names the plane texel that moved **and the gaps between the rows are compared** -- a
     /// case of this family asserts the bytes between the rows stayed as they were, which is half of
@@ -314,66 +286,6 @@ impl Case for RotatedPlane {
         // `respondsToSelector:` first. The rest is public: IOSurface is a public framework,
         // `newTextureWithDescriptor:iosurface:plane:` is public, and the pass is an ordinary one.
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // A load at rotation 4 is the one shape where the runtime differs from Metal, and it says
-        // so: Metal mirrors the loaded texels only in each 32x32 tile the draw reached, and the
-        // runtime mirrors every tile, announced once as `RotatedLoadTiles`.
-        //
-        // The allowance is only taken by the frame where the difference can actually appear. A
-        // 32x32 frame is one tile, so there is no unreached tile and nothing to loosen -- naming
-        // the allowance there would be a claim with no evidence, and the allowance machinery would
-        // rightly fail it if the notice did not fire.
-        // Every case of this family announces one notice Metal has no counterpart for: the runtime
-        // reads and renders a rotated texture through shadows (`ShadowedTexture`). Metal announces
-        // nothing, because Metal has no notices at all, so the notice set is loosened for the
-        // family -- and only the notice set, so every plane byte still compares exactly.
-        // The buffer every case reads its plane back through is `Shared`, which a device with no
-        // unified memory keeps in system memory because that is the only memory both sides can
-        // reach (`shared-in-system-memory`): the venue's memory model, not a rotation.
-        let mut allowances = vec![
-            crate::replay::notice_allowance(Degradation::ShadowedTexture.code()),
-            crate::replay::shared_memory_notice(),
-        ];
-        if self.ask == Ask::Load && self.rotation == 4 {
-            // The notice is announced wherever rotation 4 loads, whatever the frame, so its code
-            // is **declared** here for every such frame: Metal announces none, and a notice our
-            // side announces that the case names nowhere is a difference with nothing accounting
-            // for it. The declaration loosens no byte. It is not the tolerance below, which stays
-            // held to the bands where the difference can appear -- and that is why a 32x32 frame
-            // needs this line: it has no unreached band to loosen, and announced the notice all
-            // the same.
-            allowances.push(crate::replay::notice_allowance(
-                Degradation::RotatedLoadTiles.code(),
-            ));
-            // The one place the runtime is known to differ from Metal, and the allowance is held to
-            // exactly where it differs.
-            //
-            // MEASURED on this M3 Max, from Metal's own recorded plane bytes: a rotation-4 load
-            // leaves the loaded texels mirrored left to right in the 32x32 plane tile the draw
-            // reached (480 of 480 undrawn texels) and **keeps every texel of the tile it did not
-            // reach** (512 of 512). The runtime mirrors every tile and announces
-            // `RotatedLoadTiles`.
-            //
-            // So only the bands the draw does not reach are loosened. The reached band still
-            // compares byte for byte, which is where the mirror itself is checked, and a frame of
-            // one band (32x32) has nothing to loosen at all -- naming an allowance there would be a
-            // claim with no evidence.
-            allowances.extend(
-                self.bands()
-                    .iter()
-                    .filter(|&&(first, rows)| !self.band_is_reached(first, rows))
-                    .map(|&(first, _)| {
-                        crate::allowance::Allowance::new(
-                            format!("case/plane/rows-{first}"),
-                            crate::allowance::Loosening::Unchecked,
-                            crate::allowance::Justification::notice(Degradation::RotatedLoadTiles),
-                        )
-                    }),
-            );
-        }
-        allowances
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

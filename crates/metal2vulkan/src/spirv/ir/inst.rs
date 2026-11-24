@@ -58,8 +58,6 @@ pub enum BinOp {
     UDiv,
     SDiv,
     UMod,
-    SRem,
-    SMod,
     FAdd,
     FSub,
     FMul,
@@ -148,8 +146,6 @@ impl BinOp {
             BinOp::UDiv => Op::UDiv,
             BinOp::SDiv => Op::SDiv,
             BinOp::UMod => Op::UMod,
-            BinOp::SRem => Op::SRem,
-            BinOp::SMod => Op::SMod,
             BinOp::FAdd => Op::FAdd,
             BinOp::FSub => Op::FSub,
             BinOp::FMul => Op::FMul,
@@ -348,8 +344,6 @@ pub enum AtomicOp {
     And,
     Or,
     Xor,
-    /// `OpAtomicFAddEXT` (`SPV_EXT_shader_atomic_float_add`).
-    FAdd,
 }
 
 impl AtomicOp {
@@ -367,7 +361,6 @@ impl AtomicOp {
             AtomicOp::And => Op::AtomicAnd,
             AtomicOp::Or => Op::AtomicOr,
             AtomicOp::Xor => Op::AtomicXor,
-            AtomicOp::FAdd => Op::AtomicFAddEXT,
         }
     }
 }
@@ -725,6 +718,15 @@ pub enum GroupInst {
         dir: QuadDirection,
         dir_id: ConstId,
     },
+    /// `OpGroupNonUniformQuadAllKHR` (`SPV_KHR_quad_control`): whether a `bool` predicate holds
+    /// for every active invocation of the calling invocation's quad, helpers included. Like
+    /// [`GroupInst::QuadAny`], it has no execution scope operand.
+    QuadAll(Value),
+    /// `OpGroupNonUniformQuadAnyKHR` (`SPV_KHR_quad_control`): whether a `bool` predicate holds
+    /// for any active invocation of the calling invocation's quad, helpers included. The
+    /// instruction has no execution scope operand: its scope is the quad, and the serializer
+    /// writes no scope for it.
+    QuadAny(Value),
 }
 
 impl GroupInst {
@@ -738,7 +740,9 @@ impl GroupInst {
             | GroupInst::BroadcastFirst(v)
             | GroupInst::Ballot(v)
             | GroupInst::Arith { value: v, .. }
-            | GroupInst::QuadSwap { value: v, .. } => f(*v),
+            | GroupInst::QuadSwap { value: v, .. }
+            | GroupInst::QuadAll(v)
+            | GroupInst::QuadAny(v) => f(*v),
             GroupInst::BallotBitExtract {
                 ballot: a,
                 index: b,
@@ -760,7 +764,9 @@ impl GroupInst {
             | GroupInst::BroadcastFirst(v)
             | GroupInst::Ballot(v)
             | GroupInst::Arith { value: v, .. }
-            | GroupInst::QuadSwap { value: v, .. } => f(v),
+            | GroupInst::QuadSwap { value: v, .. }
+            | GroupInst::QuadAll(v)
+            | GroupInst::QuadAny(v) => f(v),
             GroupInst::BallotBitExtract {
                 ballot: a,
                 index: b,
@@ -790,7 +796,9 @@ impl GroupInst {
             | GroupInst::Ballot(_)
             | GroupInst::BallotBitExtract { .. }
             | GroupInst::Shuffle { .. }
-            | GroupInst::QuadBroadcast { .. } => {}
+            | GroupInst::QuadBroadcast { .. }
+            | GroupInst::QuadAll(_)
+            | GroupInst::QuadAny(_) => {}
         }
     }
 
@@ -811,6 +819,8 @@ impl GroupInst {
             GroupInst::Arith { op, .. } => op.to_spirv(),
             GroupInst::QuadBroadcast { .. } => Op::GroupNonUniformQuadBroadcast,
             GroupInst::QuadSwap { .. } => Op::GroupNonUniformQuadSwap,
+            GroupInst::QuadAll(_) => Op::GroupNonUniformQuadAllKHR,
+            GroupInst::QuadAny(_) => Op::GroupNonUniformQuadAnyKHR,
         }
     }
 }
@@ -1158,6 +1168,4 @@ pub enum ModelNeed {
     WorkgroupScope,
     /// The mesh execution model (`OpSetMeshOutputsEXT`).
     Mesh,
-    /// The geometry execution model (`OpEmitVertex`, `OpEndPrimitive`).
-    Geometry,
 }

@@ -1,9 +1,9 @@
 //! A minified 10-bit two-plane YCbCr texture's samples: where a linear footprint's rounding puts
 //! the switch.
 //!
-//! Ported from `runtime_lane/ycbcr_minify.rs`, which exists because of a consumer bug: a pass that
-//! samples a 3840 x 2160 `YCBCR10_420_2P` surface minified into a 1440 x 1080 target wrote rare
-//! ±1s in its red, green and blue. The lane sweeps, along each axis, 2,048 places where a
+//! This family exists because of a consumer bug: a pass that samples a 3840 x 2160
+//! `YCBCR10_420_2P` surface minified into a 1440 x 1080 target wrote rare ±1s in its red, green and
+//! blue. It sweeps, along each axis, 2,048 places where a
 //! footprint's rounding decides which side of a `1 / 256` step a sample reads — 64 places times 32
 //! steps, 17 consecutive `f32` coordinates each — and compares the whole band's results with
 //! plain Metal's.
@@ -25,13 +25,11 @@
 //!
 //! # The kernel is not the probe's, and the digests say it does not matter
 //!
-//! The lane samples through an AIR kernel it generates at run time; a case samples through the
-//! committed fixture `fpv_swizzled_reads`' `fpv_swz_sample`. Both do one plain `sample(s, uv)` of
-//! the same texture through the same sampler state and write one `float4` a job in job order, so
-//! the output bytes are the same program's observable output and the probe's digest is a digest of
-//! them. That is an argument, and the cases check it: both bands hash to exactly the probe's
-//! numbers, so the substitution is sound rather than assumed. A reader who changes the kernel's
-//! output shape breaks both digests at once, which is the right failure.
+//! A case samples through the committed fixture `fpv_swizzled_reads`' `fpv_swz_sample`: one plain
+//! `sample(s, uv)` of the texture through the sampler state, one `float4` a job in job order, so
+//! the output bytes are the program's observable output and the probe's digest is a digest of them.
+//! The cases check it: both bands hash to exactly the probe's numbers. A reader who changes the
+//! kernel's output shape breaks both digests at once, which is the right failure.
 //!
 //! # Why the band is a digest and a window, not 34,816 values
 //!
@@ -49,7 +47,6 @@
 //! 23.7 MiB shared buffer, which is the largest input in the suite and well inside the project's
 //! 500 MiB ceiling.
 
-use crate::allowance::Allowance;
 use crate::case::{
     made, Abort, Bindings, Case, Failure, Input, MetalSource, PlaneTexture, SamplerSpec, Side,
 };
@@ -256,13 +253,6 @@ impl Case for MinifyBand {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // One declaration and no tolerance: the buffer each band writes its minified samples into is `Shared`, which is
-        // what [`crate::replay::shared_memory_notice`] is for. It loosens the notices site alone,
-        // so every value this case reads still compares exactly.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let fixture = Fixture {
             name: SAMPLE_FIXTURE,
@@ -403,7 +393,7 @@ mod tests {
     /// Two cases, one an axis. The M4's two hashes differ, which is what says the two cases ask
     /// different questions.
     #[test]
-    fn the_two_bands_are_the_lanes_two_bands() {
+    fn the_two_bands_are_the_m4s_two_bands() {
         let cases = all();
         assert_eq!(cases.len(), 2);
         assert_eq!(cases[0].axis, 0);
@@ -489,8 +479,8 @@ mod tests {
         );
     }
 
-    /// The surface is the one the probe measured: the lane pins its SHA-256 under CoreVideo's own
-    /// layout, so a generator that drifts compares our samples against another surface's answer.
+    /// The surface is the one the probe measured: its SHA-256 under CoreVideo's own layout is
+    /// pinned, so a generator that drifts compares our samples against another surface's answer.
     #[test]
     fn the_surface_is_the_one_metal_sampled() {
         let bytes = surface_bytes();

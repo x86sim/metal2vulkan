@@ -215,98 +215,62 @@ fn narrow_members_move_as_bits_through_structs() {
     }
 }
 
-/// A select of a widened `half` against a value not held widened, merged by an `OpPhi` with
-/// another widened `half`, is the merge Metal's compiler does not fold (`narrow::moves_unfolded`),
-/// and so it is carried in a struct's member: a phi of structs, one built from the select by a
-/// construct or an insert, the other holding a widened `half` in the same member, and a phi of a
-/// member extracted from such a struct. Structs that hold the select and the widened `half` in
-/// different members, or the select beside a constant, merge nothing of it.
+/// A narrow vector the builder constructs of decoded lanes (`FunctionBuilder::vector_parts`), as a
+/// pulled attribute's fetch, a packed float's unpack and a chunked bitcast join them, is those
+/// lanes with their bits (`narrow::to_bits`): stored unchanged, every lane keeps its bits, a NaN's
+/// sign and payload and a signalling NaN included, through a construct of four decoded lanes, of
+/// two beside the constants `0` and `1.0` (a fetch's missing lanes), and through the parent's
+/// own load of a vector, which constructs it from its lanes. An encode of the device's widening
+/// would answer the interpreter's canonical NaN (`0x7E00`) instead.
 #[test]
-fn a_merge_of_a_select_is_followed_through_struct_members() {
-    use crate::spirv::builder::constructs::{ArmEnd, ArmFn, Merged};
-    use crate::spirv::ir::Type;
-    // How the arms hand the phi their values: (then, else) from the select `t`, the widened
-    // halves `h` and `g`, the constant `one` and a struct type of two `f32` members.
-    #[derive(Clone, Copy, Debug)]
-    enum Shape {
-        Plain,
-        Struct,
-        Inserted,
-        Extracted,
-        Apart,
-        Constant,
-    }
-    let f = half();
-    for (shape, unfolded) in [
-        (Shape::Plain, true),
-        (Shape::Struct, true),
-        (Shape::Inserted, true),
-        (Shape::Extracted, true),
-        (Shape::Apart, false),
-        (Shape::Constant, false),
-    ] {
-        let body = move |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
-            let (h, g) = (x[0], x[1]);
-            let f32_ = fb.value_ty(h)?;
-            let st = fb.module().ty(Type::Struct {
-                members: vec![f32_, f32_].into(),
-                layout: None,
-            })?;
-            let zero = const_of(fb, f32_, 0)?;
-            let one = const_of(fb, f32_, u64::from(1.0f32.to_bits()))?;
-            let c = fb.binary(BinOp::FOrdLessThan, h, g)?;
-            let d = fb.binary(BinOp::FOrdGreaterThan, h, one)?;
-            let then: ArmFn<'_, ()> = Box::new(move |fb, _| {
-                let t = fb.select(d, h, zero)?;
-                let v = match shape {
-                    Shape::Plain => t,
-                    Shape::Struct | Shape::Apart | Shape::Constant => {
-                        fb.composite_construct(st, &[t, one])?
-                    }
-                    Shape::Inserted => {
-                        let u = fb.undef(st)?;
-                        fb.composite_insert(t, u, &[0])?
-                    }
-                    Shape::Extracted => {
-                        let s = fb.composite_construct(st, &[t, one])?;
-                        fb.composite_extract(s, &[0])?
-                    }
-                };
-                Ok(ArmEnd::FallThrough(vec![v]))
-            });
-            let other: ArmFn<'_, ()> = Box::new(move |fb, _| {
-                let v = match shape {
-                    Shape::Plain | Shape::Extracted => g,
-                    Shape::Struct => fb.composite_construct(st, &[g, one])?,
-                    Shape::Inserted => {
-                        let u = fb.undef(st)?;
-                        fb.composite_insert(g, u, &[0])?
-                    }
-                    Shape::Apart => fb.composite_construct(st, &[one, g])?,
-                    Shape::Constant => fb.composite_construct(st, &[one, one])?,
-                };
-                Ok(ArmEnd::FallThrough(vec![v]))
-            });
-            let Merged(merged) = fb.if_(&mut (), c, then, Some(other))?;
-            let p = merged[0];
-            match shape {
-                Shape::Plain | Shape::Extracted => Ok(p),
-                // Both members out, so the widened `half` of either reaches the store.
-                _ => {
-                    let a = fb.composite_extract(p, &[0])?;
-                    let b = fb.composite_extract(p, &[1])?;
-                    fb.select(c, a, b)
-                }
-            }
-        };
-        let m = kernel_with(&[f, f], f, &body, true, false)
-            .unwrap_or_else(|e| panic!("{shape:?}: build: {e:?}"));
-        let budget = crate::budget::Budget::default();
-        let mut meter = crate::budget::Meter::new(&budget);
-        let got = super::super::narrow::moves_unfolded(&m, &mut meter)
-            .unwrap_or_else(|e| panic!("{shape:?}: {e:?}"));
-        assert_eq!(got, unfolded, "{shape:?}");
-    }
+fn a_constructed_narrow_vector_keeps_its_lanes_bits() {
+    let codes = [
+        0x7E01u64, 0xFE01, 0x7C01, 0xFDFF, 0x7C00, 0x8000, 0x0001, 0x3C00,
+    ];
+    let quads: Vec<Case> = (0..codes.len())
+        .map(|i| (0..4).map(|k| vec![codes[(i + k) % codes.len()]]).collect())
+        .collect();
+    let four = |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
+        let t = ops::ty(fb, vec(half(), 4))?;
+        fb.composite_construct(t, x)
+    };
+    check_accept(
+        "four decoded lanes",
+        &[half(); 4],
+        vec(half(), 4),
+        &four,
+        &quads,
+        &|c| Some(c.iter().map(|lane| lane[0]).collect()),
+        &|g, w| g == w,
+    );
+    let padded = |fb: &mut FunctionBuilder<'_>, x: &[Value]| -> BResult<Value> {
+        let zero = ops::fsplat(fb, float(32), 0.0)?;
+        let one = ops::fsplat(fb, float(32), 1.0)?;
+        let t = ops::ty(fb, vec(half(), 4))?;
+        fb.composite_construct(t, &[x[0], x[1], zero, one])
+    };
+    check_accept(
+        "two decoded lanes and the constants 0 and 1.0",
+        &[half(); 2],
+        vec(half(), 4),
+        &padded,
+        &quads.iter().map(|c| c[..2].to_vec()).collect::<Vec<_>>(),
+        &|c| Some(vec![c[0][0], c[1][0], 0, 0x3C00]),
+        &|g, w| g == w,
+    );
+    let loaded: Vec<Case> = quads
+        .iter()
+        .map(|c| vec![c.iter().map(|lane| lane[0]).collect()])
+        .collect();
+    check_accept(
+        "a loaded vector",
+        &[vec(half(), 4)],
+        vec(half(), 4),
+        &|_, x| Ok(x[0]),
+        &loaded,
+        &|c| Some(c[0].clone()),
+        &|g, w| g == w,
+    );
 }
 
 /// One half round trip through its format bits, `to_bits` then `from_bits` (their types and
@@ -2038,32 +2002,6 @@ fn fp8_to_integer_converts_every_pattern_as_its_value() {
     }
 }
 
-/// `k / d` is correctly rounded (the host's IEEE `f32` division) for every `k` in `[0, d]` of every
-/// normalized scale and the sRGB step scale 4095, and for every 97th `k` and both ends of the
-/// 16-bit scales.
-#[test]
-fn normalized_division_is_correctly_rounded() {
-    let u = int(32);
-    let s = float(32);
-    for d in [1u32, 3, 31, 63, 127, 255, 1023, 4095, 32767, 65535] {
-        let step = if d > 4095 { 97 } else { 1 };
-        let cases: Vec<Case> = (0..=u64::from(d))
-            .step_by(step)
-            .chain([u64::from(d) - 1, u64::from(d)])
-            .map(|k| vec![vec![k]])
-            .collect();
-        check(
-            &format!("k / {d}"),
-            &[u],
-            s,
-            &|fb, k| crate::lower::arith::exact_division::div_exact(fb, u, k[0], d),
-            &cases,
-            &|c| Some(vec![u64::from((arg(c, 0) as f32 / d as f32).to_bits())]),
-            false,
-        );
-    }
-}
-
 /// The value of a packed small-float field with a 5-bit exponent (bias 15) above `man` bits.
 fn small_float(field: u64, man: u32) -> f64 {
     let e = (field >> man) & 0x1F;
@@ -2153,53 +2091,37 @@ fn srgb_packs_read_no_table() {
 }
 
 /// A `half` `fadd`, `fsub` or `fmul` takes the device's 16-bit arithmetic, on one to four lanes,
-/// exactly where the profile has `shaderFloat16` and takes `DriverDeviation::MetalHalfArithmetic`
-/// (the MoltenVK captures alone, measured) or computes under the 16-bit float controls (by the
-/// Vulkan spec, with no fact; NVIDIA's profiles too, whose driver folds only the conversion's round
-/// trip); `fdiv`, `frem`, other formats, and a chunk wider than four lanes never do.
+/// exactly where the profile computes under the 16-bit float controls (by the Vulkan spec, with no
+/// fact; NVIDIA's profiles too, whose driver folds only the conversion's round trip); `fdiv`,
+/// `frem`, other formats, and a chunk wider than four lanes never do.
 #[test]
 fn half_arithmetic_on_the_device_follows_the_profile() {
-    use super::super::F16Basis;
-    use crate::error::DriverDeviation;
-    use crate::spirv::testing::is_moltenvk_capture;
-    let (mut measured, mut controlled) = (0, 0);
+    let mut controlled = 0;
     for (stem, p) in committed_profiles().expect("profiles") {
-        let float16 = p.fields().leaf.float16;
-        let fact = p.takes_driver_deviation(DriverDeviation::MetalHalfArithmetic) && float16;
-        assert_eq!(fact, is_moltenvk_capture(&stem), "{stem}");
         let controls = super::super::narrow::half_controls(&p);
-        let basis = match (fact, controls) {
-            (true, _) => Some(F16Basis::Measured),
-            (false, true) => Some(F16Basis::Controlled),
-            (false, false) => None,
-        };
         for op in [AirBin::FAdd, AirBin::FSub, AirBin::FMul] {
             for lanes in 1..=4 {
                 assert_eq!(
                     super::super::f16_arithmetic(&p, op, vec(half(), lanes)),
-                    basis,
+                    controls,
                     "{stem}: {op:?} on {lanes} lanes"
                 );
             }
             for f in [vec(half(), 8), float(32), bfloat(), float(64)] {
-                assert_eq!(
-                    super::super::f16_arithmetic(&p, op, f),
-                    None,
+                assert!(
+                    !super::super::f16_arithmetic(&p, op, f),
                     "{stem}: {op:?} on {f:?}"
                 );
             }
         }
         for op in [AirBin::FDiv, AirBin::FRem] {
-            assert_eq!(
-                super::super::f16_arithmetic(&p, op, half()),
-                None,
+            assert!(
+                !super::super::f16_arithmetic(&p, op, half()),
                 "{stem}: {op:?}"
             );
         }
-        measured += usize::from(basis == Some(F16Basis::Measured));
-        controlled += usize::from(basis == Some(F16Basis::Controlled));
+        controlled += usize::from(controls);
     }
-    assert!(measured >= 1, "the MoltenVK capture takes it, measured");
     assert!(
         controlled >= 2,
         "the float-controls profiles take it, by the spec"

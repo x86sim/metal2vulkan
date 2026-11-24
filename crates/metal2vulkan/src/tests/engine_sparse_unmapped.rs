@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{SparseTileMap, TileMapping};
 use crate::device::requirements::VkFeature;
 use crate::error::Error;
 use crate::library::FunctionArtifact;
@@ -25,12 +24,13 @@ use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{
-    Axis, CombinedSampler, PushField, ResourceKind, ResourceSlot, SamplerRef, SlotClass, SlotRef,
+    CombinedSampler, PushField, ResourceKind, ResourceSlot, SamplerRef, SlotClass, SlotRef,
     SpecKey, Stage,
 };
 use crate::pipeline::testing::{
     compile, link_and_validate, llvm_assemble, typed_module, AssembleError,
 };
+use crate::pipeline::tile_map;
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
@@ -91,16 +91,11 @@ fn texture_slot(index: u32) -> SlotRef {
 /// Resources of a dispatch of 1x1x1 threadgroups, `[[buffer(i)]]` holding `init[i]`.
 fn resources(plan: &Plan, init: &[Vec<u8>]) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -222,63 +217,30 @@ fn gather(component: u32) -> String {
     format!("@air.gather_texture_2d.v4f32(ptr addrspace(1) %t, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i32 {component}, i32 0)")
 }
 
-/// The `ConstantLanes` word of an `R32Float` texture made with `swizzle`.
+/// The `ConstantLanes` word of an `R32Float` texture made with `swizzle`: bit `lane` (0 red to 3
+/// alpha) where Metal reads the lane as a constant (a channel the format lacks, or a `Zero` or `One`
+/// swizzle), and bit `CONSTANT_ONES + lane` where that constant is 1.
 fn r32_lanes(swizzle: TextureSwizzleChannels) -> u64 {
     let present = crate::metal::format::channels(PixelFormat::R32Float).expect("channels");
-    u64::from(crate::metal::sampler::constant_lanes(present, swizzle))
-}
-
-/// The lanes Metal reads as constants are the channels a format lacks (red, green and blue 0,
-/// alpha 1) and the `Zero` and `One` swizzles, through the texture's swizzle; a format holding
-/// every channel has none under its own swizzle; a depth format states none.
-#[test]
-fn the_constant_lanes_are_the_channels_a_format_lacks_through_its_swizzle() {
-    use crate::metal::format::channels;
-    use crate::metal::sampler::constant_lanes;
-    use TextureSwizzle as T;
-    let s = TextureSwizzleChannels::new;
-    let id = TextureSwizzleChannels::DEFAULT;
-    let lanes = |pf: PixelFormat, sw: TextureSwizzleChannels| {
-        constant_lanes(channels(pf).expect("channels"), sw)
-    };
-    // R8: green and blue read 0, alpha 1.
-    assert_eq!(lanes(PixelFormat::R8Unorm, id), 0b1110 | 0b1000 << 4);
-    assert_eq!(lanes(PixelFormat::R32Float, id), 0b1110 | 0b1000 << 4);
-    assert_eq!(lanes(PixelFormat::BC4RUnorm, id), 0b1110 | 0b1000 << 4);
-    // RG: blue 0, alpha 1; RGB: alpha 1.
-    assert_eq!(lanes(PixelFormat::RG8Unorm, id), 0b1100 | 0b1000 << 4);
-    assert_eq!(lanes(PixelFormat::B5G6R5Unorm, id), 0b1000 | 0b1000 << 4);
-    assert_eq!(lanes(PixelFormat::ETC2RGB8, id), 0b1000 | 0b1000 << 4);
-    // A8: red, green and blue 0.
-    assert_eq!(lanes(PixelFormat::A8Unorm, id), 0b0111);
-    // Every channel: none, but a swizzle's constants.
-    assert_eq!(lanes(PixelFormat::RGBA8Unorm, id), 0);
-    assert_eq!(
-        lanes(
-            PixelFormat::RGBA8Unorm,
-            s(T::Red, T::Green, T::Zero, T::One)
-        ),
-        0b1100 | 0b1000 << 4
-    );
-    // Through a swizzle: each lane takes its source's constant.
-    assert_eq!(
-        lanes(
-            PixelFormat::R8Unorm,
-            s(T::Alpha, T::Alpha, T::Alpha, T::Alpha)
-        ),
-        0b1111 | 0b1111 << 4
-    );
-    assert_eq!(
-        lanes(PixelFormat::R8Unorm, s(T::Alpha, T::Red, T::Green, T::Blue)),
-        0b1101 | 0b0001 << 4
-    );
-    assert_eq!(
-        lanes(PixelFormat::A8Unorm, s(T::Alpha, T::Red, T::One, T::Alpha)),
-        0b0110 | 0b0100 << 4
-    );
-    assert_eq!(channels(PixelFormat::Depth32Float), None);
-    assert_eq!(channels(PixelFormat::Stencil8), None);
-    assert_eq!(channels(PixelFormat::Invalid), None);
+    let lanes = [swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha];
+    let mut word = 0;
+    for (lane, source) in (0u32..).zip(lanes) {
+        let constant = match source {
+            TextureSwizzle::Zero => Some(false),
+            TextureSwizzle::One => Some(true),
+            TextureSwizzle::Red => (!present[0]).then_some(false),
+            TextureSwizzle::Green => (!present[1]).then_some(false),
+            TextureSwizzle::Blue => (!present[2]).then_some(false),
+            TextureSwizzle::Alpha => (!present[3]).then_some(true),
+        };
+        if let Some(one) = constant {
+            word |= 1 << lane;
+            if one {
+                word |= 1 << (crate::metal::sampler::CONSTANT_ONES + lane);
+            }
+        }
+    }
+    word
 }
 
 /// On the interpreter: a nearest, clamp-to-edge pixel sampler's fetch of a 2x2 sparse `R32Float`
@@ -332,17 +294,7 @@ fn a_pixel_fetch_reads_metals_value_of_an_unmapped_texel() {
         if !images {
             continue;
         }
-        let mut map = SparseTileMap::new(
-            crate::metal::TextureType::Type2D,
-            [2, 2, 1],
-            1,
-            1,
-            [1; 3],
-            1,
-        )
-        .expect("tile map");
-        map.update(TileMapping::Map, 0, 0, [0; 3], [1, 2, 1])
-            .expect("map");
+        let map = tile_map::one_level_map([2, 2, 1], 1, [1; 3], |_, [x, _, _]| x == 0);
         // Each leg: the swizzle; the device's value of mapped texel `i`, its red `r` (`i + 1`)
         // in the lane the swizzle reads it and garbage in the lanes the format lacks; the
         // device's value of an unmapped texel; and what Metal reads from each.
@@ -396,7 +348,7 @@ fn a_pixel_fetch_reads_metals_value_of_an_unmapped_texel() {
                     index: 0,
                 }),
                 address: None,
-                bytes: map.to_bytes(),
+                bytes: map.clone(),
             });
             res.spec.insert(SpecKey::SparseTexture(texture_slot(0)), 1);
             res.spec

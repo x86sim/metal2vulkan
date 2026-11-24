@@ -7,20 +7,10 @@
 //! over 256 pages, each page a texture of its own holding its 256 codes, and both accesses run
 //! over every page.
 //!
-//! **Why this case exists, and what it adds to the lane it comes from.**
-//! `runtime_lane::depth_texel_reads` holds one 64-digit constant: the SHA-256 of 65,536 `float`s.
-//! Nothing in the tree holds the values. The lane's own test
-//! (`the_rule_is_metals_answer`) recomputes `c / 65535` for every code and asserts the digest, so
-//! the digest pins a **rule**, and the probe that tied the rule to Metal is gone. Two things
-//! follow, and both are why the port was worth doing rather than transcribing the digest:
-//!
-//! - The values **are** recoverable, and this case recovers them: record mode runs the two
-//!   accesses on native Metal and the recording holds all 131,072 `float`s. Where the lane could
-//!   only say "the digest differs", the case names the code — `element [row 0, 44731]` is code
-//!   44,731 — and says which access moved and by how many units in the last place.
-//! - A rule a digest pins is only as good as the digest. The recording replaces the rule with the
-//!   measurement, so a release that changes Metal's conversion shows as the codes that moved
-//!   rather than as one hex string that no longer matches anything.
+//! **Why this case records the values.** Record mode runs the two accesses on native Metal and the
+//! recording holds all 131,072 `float`s, so a difference names the code — `element [row 0, 44731]`
+//! is code 44,731 — and says which access moved and by how many units in the last place, and a
+//! release that changes Metal's conversion shows as the codes that moved.
 //!
 //! Every code compares exactly, and the two accesses are separate sites because they are separate
 //! questions: a device may fetch a depth texel one way and filter it another.
@@ -217,18 +207,11 @@ impl Case for DepthTexelReads {
         // The fixture's AIR asks for fast math, whose `fast-math-rewrites` the suite declares for
         // every case (`crate::replay::NATIVE_NOTES`); every one of the 131,072 words still
         // compares exactly.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
         //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // this case, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
+        // Its samples are through a runtime sampler slot, which the runtime's pipelines note
+        // as scaled (`crate::replay::pixel_sampler_scaling_notice` holds why, and the run it
+        // rests on).
+        vec![crate::replay::pixel_sampler_scaling_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -285,7 +268,7 @@ impl Case for DepthTexelReads {
             side.compute_pipeline(library, SAMPLE),
         )?;
         // `MTLSamplerDescriptor`'s defaults, which are the nearest, clamp-to-edge, normalized
-        // state the lane's probe sampled through.
+        // state the probe sampled through.
         let sampler = made(sites, "sampler", side.sampler(&SamplerSpec::new()))?;
 
         let mut output = Node::branch("output", Vec::new());
@@ -337,11 +320,11 @@ mod tests {
         }
     }
 
-    /// The rule the lane holds in place of Metal's values — every code as `c / 65535` correctly
-    /// rounded — hashes to the lane's own constant. The case is recorded from Metal rather than
-    /// from this, and this test is what lets the report say whether the two agree.
+    /// The rule — every code as `c / 65535` correctly rounded — hashes to the pinned constant.
+    /// The case is recorded from Metal rather than from this, and this test is what lets the
+    /// report say whether the two agree.
     #[test]
-    fn the_lanes_rule_hashes_to_the_lanes_constant() {
+    fn the_rule_hashes_to_the_pinned_constant() {
         let bytes: Vec<u8> = (0..CODES)
             .flat_map(|code| (code as f32 / 65535.0).to_le_bytes())
             .collect();

@@ -4,8 +4,9 @@
 //! requirements enable. A failure is a builder, requirement, or serializer bug.
 
 use super::{assert_spirv_valid, float, int, vec};
+use crate::spirv::builder::ops::arith::RemainderSign;
 use crate::spirv::builder::ops::group::GroupMode;
-use crate::spirv::builder::{FunctionBuilder, ModuleBuilder, ProductForm};
+use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::ids::{FuncId, TypeId, Value};
 use crate::spirv::ir::{
     AtomicOp, BinOp, Constant, Contraction, ConvOp, ExecMode, ExecModel, GlslOp, GroupArith,
@@ -209,8 +210,6 @@ fn binary_operations() {
                     UDiv,
                     SDiv,
                     UMod,
-                    SRem,
-                    SMod,
                     ShiftRightLogical,
                     ShiftRightArithmetic,
                     ShiftLeftLogical,
@@ -239,6 +238,20 @@ fn binary_operations() {
             }
             f.binary(ShiftLeftLogical, *u, *u8v)
                 .expect("mixed-width shift");
+            // The defined signed remainders, on each integer type and with each sign.
+            for (a, b) in [
+                (u, u),
+                (i, i),
+                (uv, uv),
+                (iv, iv),
+                (u64v, u64v),
+                (u16v, u16v),
+            ] {
+                for sign in [RemainderSign::Dividend, RemainderSign::Divisor] {
+                    f.signed_remainder(*a, *b, sign)
+                        .unwrap_or_else(|e| panic!("{sign:?}: {e}"));
+                }
+            }
             for (a, b) in [(u, u), (uv, uv)] {
                 for op in [IAddCarry, ISubBorrow, UMulExtended] {
                     f.binary(op, *a, *b)
@@ -287,23 +300,10 @@ fn binary_operations() {
 
 /// `NoContraction`: every float arithmetic opcode takes it, `spirv-val` accepts the decoration, and
 /// exactly the decorated results carry it; other opcodes refuse it. A multiply rounded on its own
-/// takes the module's [`ProductForm`]: an `OpFMul` decorated `NoContraction` by default, or
-/// `GLSL.std.450 Fma(a, b, -0.0)` decorated `NoContraction`, its addend the `-0.0` of its type,
-/// where the module's SPIR-V reaches Metal through SPIRV-Cross; a product of two values no
-/// constant gives is the `OpFMul` under [`ProductForm::PositiveZeroFactors`] too. An `Fma` built
-/// without the decoration stays undecorated, and no other `GLSL.std.450` instruction takes it.
+/// is an `OpFMul` decorated `NoContraction`. An `Fma` built without the decoration stays
+/// undecorated, and no other `GLSL.std.450` instruction takes it.
 #[test]
 fn no_contraction_decorates_float_arithmetic() {
-    for form in [
-        ProductForm::Multiply,
-        ProductForm::NegativeZeroFma,
-        ProductForm::PositiveZeroFactors,
-    ] {
-        no_contraction_under(form);
-    }
-}
-
-fn no_contraction_under(form: ProductForm) {
     use crate::spirv::error::{BuildError, OperandRule};
     let mut decorated = Vec::new();
     let mut plain = Vec::new();
@@ -312,7 +312,6 @@ fn no_contraction_under(form: ProductForm) {
     let m = compute(
         |t| vec![t.f32_, t.vec4, t.f16, t.f64_, t.u32_],
         |f, p, _| {
-            f.module().product_form(form);
             let [x, xv, h, d, u] = p else { unreachable!() };
             for a in [x, xv, h, d] {
                 for op in [BinOp::FAdd, BinOp::FSub, BinOp::FDiv, BinOp::FRem] {
@@ -389,51 +388,27 @@ fn no_contraction_under(form: ProductForm) {
     assert!(plain_fma.is_some());
     // Results are emitted in order, each operand's group holding its four decorated results,
     // its plain multiply, and (as an `OpFMul`) its multiply without contraction.
-    let group = match form {
-        ProductForm::Multiply | ProductForm::PositiveZeroFactors => 6,
-        ProductForm::NegativeZeroFma => 5,
-    };
-    let products = match form {
-        ProductForm::Multiply | ProductForm::PositiveZeroFactors => fused.len(),
-        ProductForm::NegativeZeroFma => 0,
-    };
-    assert_eq!(
-        arith.len(),
-        decorated.len() + plain.len() + products,
-        "{form:?}"
-    );
+    let group = 6;
+    assert_eq!(arith.len(), decorated.len() + plain.len() + fused.len());
     let plain_ids: Vec<u32> = arith
         .chunks(group)
         .filter_map(|c| c.get(4).copied())
         .collect();
     assert_eq!(plain_ids.len(), plain.len());
-    assert_eq!(targets.len(), decorated.len() + fused.len(), "{form:?}");
-    // Each multiply without contraction is, in the `Fma` form, one `Fma` decorated
-    // `NoContraction` whose addend is `-0.0`: the sign bit alone in its last word (`half`,
-    // `float`, `double`, and a `float` vector). The plain `Fma`, emitted last, is undecorated.
-    let (fused_fmas, plain_fmas) = fmas.split_at(fmas.len() - 1);
-    assert_eq!(fused_fmas.len(), fused.len() - products, "{form:?}");
-    let signs = [0x8000_0000u32, 0x8000_0000, 0x8000, 0x8000_0000];
-    for (&(r, addend), sign) in fused_fmas.iter().zip(signs) {
-        assert!(targets.contains(&r), "%{r} not decorated");
-        assert_eq!(constants.get(&addend), Some(&sign), "%{r}'s addend");
-    }
-    assert!(
-        !targets.contains(&plain_fmas[0].0),
-        "the plain Fma decorated"
-    );
-    if form != ProductForm::NegativeZeroFma {
-        // No `-0.0` addend at all: each multiply is the `OpFMul` after its group's plain one.
-        assert!(!constants
-            .values()
-            .any(|w| [0x8000_0000, 0x8000].contains(w)));
-        for c in arith.chunks(group).filter(|c| c.len() == group) {
-            assert!(targets.contains(&c[5]), "%{} not decorated", c[5]);
-        }
+    assert_eq!(targets.len(), decorated.len() + fused.len());
+    // The one `Fma`, the plain one, is undecorated.
+    assert_eq!(fmas.len(), 1);
+    assert!(!targets.contains(&fmas[0].0), "the plain Fma decorated");
+    // No `-0.0` addend at all: each multiply is the `OpFMul` after its group's plain one.
+    assert!(!constants
+        .values()
+        .any(|w| [0x8000_0000, 0x8000].contains(w)));
+    for c in arith.chunks(group).filter(|c| c.len() == group) {
+        assert!(targets.contains(&c[5]), "%{} not decorated", c[5]);
     }
     for t in &targets {
         assert!(
-            (arith.contains(t) && !plain_ids.contains(t)) || fused_fmas.iter().any(|f| f.0 == *t),
+            arith.contains(t) && !plain_ids.contains(t),
             "%{t} decorated"
         );
     }
@@ -562,8 +537,14 @@ fn device_places() {
             f.atomic(AtomicOp::IAdd, wide, Scope::Device, Semantics::RELAXED, one)
                 .expect("u64 atomic");
             let float = f.device_place(*addr, t.f32_).expect("f32 place");
-            f.atomic(AtomicOp::FAdd, float, Scope::Device, Semantics::RELAXED, *x)
-                .expect("float add");
+            f.atomic(
+                AtomicOp::Exchange,
+                float,
+                Scope::Device,
+                Semantics::RELAXED,
+                *x,
+            )
+            .expect("float exchange");
         },
     );
     assert_spirv_valid(m);

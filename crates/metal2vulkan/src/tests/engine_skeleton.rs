@@ -12,18 +12,15 @@
 //! visibly, a tool that rejects an engine fixture fails it.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
-use crate::device::requirements::VkFeature;
-use crate::device::{Device, DeviceDescription, DevicePolicy};
+use crate::device::DevicePolicy;
 use crate::error::{Error, InternalKind, Limit};
 use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::lower::select::LowerInputs;
-use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
+use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{
-    AccessSet, BufferForm, DescriptorView, PushLoc, SlotInterface, StageDescriptor, StageSpec,
-    Window,
+    AccessSet, BufferForm, PushLoc, SlotInterface, StageDescriptor, StageSpec, Window,
 };
 use crate::pipeline::link::{LinkInputs, LinkTable};
 use crate::pipeline::relocate::relocate;
@@ -38,7 +35,7 @@ use crate::spirv::testing::check_words_valid;
 use crate::vk;
 
 /// The M1 profiles.
-const M1_PROFILES: [&str; 3] = ["moltenvk-m3", "lunarg-desktop-baseline-2023", "vk12-floor"];
+const M1_PROFILES: [&str; 2] = ["moltenvk-m3", "runtime-floor"];
 
 /// `store_const` as opaque bitcode, or `None` (skipped visibly) without `llvm-as`.
 fn store_const() -> Option<Vec<u8>> {
@@ -79,11 +76,7 @@ fn check_artifact(a: &FunctionArtifact, what: &str) {
     };
     assert_eq!(b.access, AccessSet::WRITE, "{what}");
     assert_eq!(b.window, Window::Bounded { start: 0, len: 4 }, "{what}");
-    assert_eq!(
-        b.form,
-        BufferForm::Descriptor(DescriptorView::Storage),
-        "{what}"
-    );
+    assert_eq!(b.form, BufferForm::Descriptor, "{what}");
     assert_eq!(i.slots.len(), 1, "{what}");
     let placed: Vec<(PushField, PushLoc)> =
         i.push.fields.iter().map(|f| (f.field, f.loc)).collect();
@@ -110,14 +103,23 @@ fn check_artifact(a: &FunctionArtifact, what: &str) {
         )],
         "{what}"
     );
-    // The local size is the `WorkgroupSize` spec composite of `sx, sy, sz`, 4-byte `u32`
-    // constants defaulting to 1.
+    // The workgroup is the `WorkgroupSize` composite of its own plain constants, 4-byte `u32`
+    // constants defaulting to 1, beside the threadgroup's sides `sx, sy, sz` (defaulting to 1)
+    // and `DeepThreadgroup` (defaulting to false), of which this kernel's body reads no bit.
+    let unread = |key, default| StageSpec {
+        unread_bits: u64::from(u32::MAX),
+        ..StageSpec::new(key, 4, default)
+    };
     assert_eq!(
         i.spec,
         vec![
-            StageSpec::new(SpecKey::LocalSize(Axis::X), 4, 1),
-            StageSpec::new(SpecKey::LocalSize(Axis::Y), 4, 1),
-            StageSpec::new(SpecKey::LocalSize(Axis::Z), 4, 1)
+            unread(SpecKey::LocalSize(Axis::X), 1),
+            unread(SpecKey::LocalSize(Axis::Y), 1),
+            unread(SpecKey::LocalSize(Axis::Z), 1),
+            unread(SpecKey::DeepThreadgroup, 0),
+            StageSpec::new(SpecKey::WorkgroupSize(Axis::X), 4, 1),
+            StageSpec::new(SpecKey::WorkgroupSize(Axis::Y), 4, 1),
+            StageSpec::new(SpecKey::WorkgroupSize(Axis::Z), 4, 1),
         ],
         "{what}"
     );
@@ -146,12 +148,14 @@ fn check_artifact(a: &FunctionArtifact, what: &str) {
 fn store_const_passes_the_pipeline_on_every_m1_profile() {
     let Some(bitcode) = store_const() else { return };
     for stem in M1_PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a =
             compile(&bitcode, "store_const", &p).unwrap_or_else(|e| panic!("{stem}: compile: {e}"));
         check_artifact(&a, stem);
         let (table, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(table.spec.len(), 3, "{stem}");
+        // The threadgroup's seven: `LocalSize` X, Y and Z, `DeepThreadgroup`, and the `WorkgroupSize`
+        // composite's three parts.
+        assert_eq!(table.spec.len(), 7, "{stem}");
         let ops = opcodes(&words);
         for op in [
             crate::spv::Op::SpecConstantComposite,
@@ -164,32 +168,17 @@ fn store_const_passes_the_pipeline_on_every_m1_profile() {
     }
 }
 
-/// Without robust buffer access the store sits in the in-shader bounds check (a selection around
-/// it); with it, the store is bare. Both validate.
+/// The store sits in the in-shader bounds check (a selection around it), and validates.
 #[test]
-fn containment_without_robustness_guards_the_store() {
+fn containment_guards_the_store() {
     let Some(bitcode) = store_const() else { return };
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/vk12-floor.json");
-    let text = std::fs::read_to_string(path).expect("vk12-floor");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.features.remove(&VkFeature::RobustBufferAccess);
-    desc.features.remove(&VkFeature::RobustBufferAccess2);
-    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-    let p = dev.profile();
-    let a = compile(&bitcode, "store_const", p).expect("compile");
+    let p = profile("runtime-floor", DevicePolicy::RESIDENT_TABLES).expect("profile");
+    let a = compile(&bitcode, "store_const", &p).expect("compile");
     assert!(a.strategies.entries.contains_key("access.store.checked"));
-    let (_, words) = link_and_validate(&a, p).unwrap_or_else(|e| panic!("{e}"));
+    let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{e}"));
     let ops = opcodes(&words);
     assert!(ops.contains(&(crate::spv::Op::ArrayLength as u32)));
     assert!(ops.contains(&(crate::spv::Op::SelectionMerge as u32)));
-    let robust = profile("vk12-floor", DevicePolicy::default()).expect("profile");
-    let bare = compile(&bitcode, "store_const", &robust).expect("compile");
-    let (_, words) = link_and_validate(&bare, &robust).unwrap_or_else(|e| panic!("{e}"));
-    assert!(
-        !opcodes(&words).contains(&(crate::spv::Op::SelectionMerge as u32)),
-        "no selection with robustness"
-    );
 }
 
 /// Compilation is deterministic: equal artifacts (key, words, relocations, interface) and equal
@@ -198,7 +187,7 @@ fn containment_without_robustness_guards_the_store() {
 fn compilation_and_link_are_deterministic() {
     let Some(bitcode) = store_const() else { return };
     for stem in M1_PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a = compile(&bitcode, "store_const", &p).expect("compile");
         let b = compile(&bitcode, "store_const", &p).expect("compile");
         assert_eq!(a, b, "{stem}");
@@ -213,7 +202,7 @@ fn compilation_and_link_are_deterministic() {
 #[test]
 fn zeroed_relocation_slots_are_link_independent() {
     let Some(bitcode) = store_const() else { return };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(&bitcode, "store_const", &p).expect("compile");
     let slots: BTreeSet<usize> = a.module.relocs.iter().map(|(_, at)| *at as usize).collect();
     assert!(!slots.is_empty());
@@ -266,7 +255,7 @@ fn typed_and_opaque_bitcode_give_identical_spirv() {
         Err(AssembleError::Rejected(why)) => panic!("metal-as rejected store_const.air.ll: {why}"),
     };
     for stem in M1_PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a = compile(&opaque, "store_const", &p).expect("opaque");
         let b = compile(&typed, "store_const", &p).expect("typed");
         assert_eq!(a.module, b.module, "{stem}");
@@ -274,11 +263,11 @@ fn typed_and_opaque_bitcode_give_identical_spirv() {
     }
 }
 
-/// An estimate above the word cap is refused before emission.
+/// A module above the word cap is refused.
 #[test]
-fn an_over_estimate_is_refused_before_emission() {
+fn a_module_above_the_word_cap_is_refused() {
     let Some(bitcode) = store_const() else { return };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(&bitcode, "store_const", &p).expect("compile");
     let words = a.module.words.len() as u64;
     let r = compile_bitcode(
@@ -305,43 +294,6 @@ fn an_over_estimate_is_refused_before_emission() {
     assert!(ok.module.words.len() as u64 == words);
 }
 
-/// The word cap relies on `SizeEstimate` being an upper bound of the emitted module: on every M1
-/// profile the plan's estimate is at least the artifact's word count, and a cap equal to the
-/// estimate admits the compile.
-#[test]
-fn the_estimate_bounds_the_emitted_words() {
-    let Some(bitcode) = store_const() else { return };
-    for stem in M1_PROFILES {
-        let what = stem;
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
-        let plan = plan_bitcode(
-            &bitcode,
-            EntryRef::Name("store_const"),
-            &FunctionConstantValues::defaults(),
-            &p,
-            &LowerInputs::new(),
-            &mut meter(),
-        )
-        .unwrap_or_else(|e| panic!("{what}: plan: {e}"));
-        let a = compile_bitcode(
-            &bitcode,
-            EntryRef::Name("store_const"),
-            &FunctionConstantValues::defaults(),
-            &p,
-            &LowerInputs::new(),
-            &mut meter(),
-            plan.estimate.words,
-        )
-        .unwrap_or_else(|e| panic!("{what}: compile at the estimate: {e}"));
-        let words = a.module.words.len() as u64;
-        assert!(
-            plan.estimate.words >= words,
-            "{what}: estimate {} < emitted {words}",
-            plan.estimate.words
-        );
-    }
-}
-
 /// A loop kernel from the public fixtures (a counted loop between a buffer load and a buffer store)
 /// compiles once the access family lowers static-root loads and stores: its loop is the module's
 /// one loop, with no execution status, and the module passes L3.
@@ -355,7 +307,7 @@ fn a_loop_kernel_compiles() {
             return;
         }
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(&bitcode, "bounded_loop_word", &p).unwrap_or_else(|e| panic!("{e}"));
     assert!(!a.facts.contains(&RuntimeFact::ExecutionStatus));
     let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{e}"));
@@ -412,7 +364,7 @@ fn a_switch_on_a_dispatch_builtin_is_the_dispatch_familys() {
         }
         Err(e) => panic!("llvm-as rejected the inline kernel: {e:?}"),
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     // The dispatch family lowers the builtin: the selector is the dispatch family's value (a grid
     // builtin, so the kernel depends on the dispatch grid), and the module passes L3.
     let a = compile(&bitcode, "switch_on_gid", &p).expect("the dispatch family lowers it");
@@ -424,7 +376,7 @@ fn a_switch_on_a_dispatch_builtin_is_the_dispatch_familys() {
 /// is refused with a typed error that is never internal (honest intermediate commits).
 #[test]
 fn every_public_fixture_compiles_or_refuses_without_an_internal_error() {
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let mut files: Vec<_> = [fixtures_dir(), engine_dir()]
         .iter()
         .flat_map(|d| std::fs::read_dir(d).expect("fixtures"))

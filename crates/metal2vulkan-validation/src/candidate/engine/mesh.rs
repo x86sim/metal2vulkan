@@ -1,6 +1,5 @@
-//! Mesh cases of the engine candidate: an object or mesh case's draw (`case::MeshDraw`) mapped for
-//! the runtime's mesh path (`runtime_case::encoded_mesh`), as the Metal oracle draws it
-//! (`metal::platform`).
+//! Mesh cases of the engine candidate: an object or mesh case's draw (`case::MeshDraw`) mapped as
+//! the Metal oracle draws it (`metal::platform`).
 //!
 //! The case's own function binds the case's resources, mapped as a render case's own stage's are
 //! ([`graphics::stage_resources`]); each partner its draw names is a function of the case's own
@@ -14,20 +13,16 @@
 //!
 //! The compile worker compiles its pipeline device-free as the runtime compiles it
 //! ([`mesh_request`]): the oracle's descriptor ([`MeshTemplate`]) of its functions, each from the
-//! case's library or its companion's, for the bind shape of its own stage's resources
-//! ([`mesh_shape`]).
+//! case's library or its companion's (`Device::compile_mesh_pipeline`).
 
 use super::graphics::{self, ColorTarget, RenderFunction, RenderOutput, StageResources};
-use super::{
-    function_constants, require_case_families, resources, views_told_apart, BufferAddress,
-};
+use super::{function_constants, require_case_families, resources};
 use crate::acceptance::{MeshFunction, PipelineRequest, RequestFunction};
 use crate::case::{AuthoredCase, MeshGrid, OutputSelection, Stage};
 use crate::check::admission::{ExecutorError, NotSupported};
 use crate::companion::Companion;
 use crate::engine::RowSource;
 use crate::literal::LiteralResources;
-use metal2vulkan::bind::{BindShape, BindState, BoundBuffer};
 use metal2vulkan::error::{DescriptorError, Error, MetalAnswer};
 use metal2vulkan::library::FunctionConstantValues;
 use metal2vulkan::pipeline::Stage as ShaderStage;
@@ -241,55 +236,13 @@ impl MeshTemplate {
     }
 }
 
-/// The `BindShape` the runtime binds `mesh`'s draw with on a device that has device addresses
-/// exactly when `addressed`: its own stage's buffers at their synthetic guest addresses (and, when
-/// `addressed`, a host address), textures and samplers ([`graphics::stage_table`]); a partner
-/// binds none; telling the executor's view base alignment apart ([`views_told_apart`]), so its
-/// plan is the runtime's of the same binds. What the compile worker compiles the draw for
-/// (`variants::compile_mesh_for_shape`).
-/// A case whose own function takes an argument buffer, a command buffer or a pipeline state is not
-/// built here (`NotImplemented`).
-pub fn mesh_shape(mesh: &MeshCase, addressed: bool) -> Result<BindShape, ExecutorError> {
-    let mut state = BindState::default();
-    for (stage, function) in mesh.stages() {
-        let resources = &function.resources;
-        if !(resources.argument_buffer_buffers.is_empty()
-            && resources.argument_buffer_textures.is_empty()
-            && resources.argument_buffer_samplers.is_empty()
-            && resources.command_buffers.is_empty()
-            && resources.objects.is_empty())
-        {
-            return Err(NotSupported::NotImplemented(
-                "engine candidate: a device-free compile of a mesh draw whose function takes an \
-                 argument buffer"
-                    .into(),
-            )
-            .into());
-        }
-        let bound = |index: u32, length: u64| {
-            let address: BufferAddress = graphics::synthetic_address(stage, index);
-            BoundBuffer::Buffer {
-                length,
-                offset: 0,
-                gpu_address: address.guest,
-                device_address: addressed.then_some(address.guest),
-                attribute_stride: None,
-            }
-        };
-        let table = graphics::stage_table(stage, function, bound).map_err(ExecutorError::Failed)?;
-        state.stages.insert(stage, table);
-    }
-    Ok(views_told_apart(state).shape())
-}
-
-/// The compile request for `mesh`'s pipeline for the bind shape `shape`, and its libraries in
+/// The compile request for `mesh`'s pipeline, and its libraries in
 /// `PipelineRequest::libraries` order: `library`, the case's, then `companion`, its generated
 /// stages' source, where a stage is generated (`MeshCase::generated`). No function links any.
 pub fn mesh_request<'a>(
     library: &RowSource<'a>,
     companion: Option<RowSource<'a>>,
     mesh: &MeshCase,
-    shape: &BindShape,
 ) -> Result<(PipelineRequest, Vec<RowSource<'a>>), ExecutorError> {
     let function = |stage: ShaderStage, function: &RenderFunction| MeshFunction {
         library: usize::from(mesh.generated.contains(&stage)),
@@ -316,7 +269,6 @@ pub fn mesh_request<'a>(
             .as_ref()
             .map(|fragment| function(ShaderStage::Fragment, fragment)),
         template: MeshTemplate::of(mesh),
-        shape: Some(shape.clone()),
     };
     Ok((request, libraries))
 }

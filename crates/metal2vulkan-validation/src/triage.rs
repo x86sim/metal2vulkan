@@ -14,7 +14,7 @@ use std::path::Path;
 /// bumps it says what changed; this comment keeps no history.
 macro_rules! analyzer_version {
     () => {
-        "structural-triage-v82"
+        "structural-triage-v86"
     };
 }
 
@@ -168,6 +168,10 @@ pub struct AuthoringCapabilitySummary {
     /// [`Limit::Metal`]): closed without a Metal reference, and unresolved only when a tooling gap
     /// of their own keeps them open.
     pub metal_refused_sources: usize,
+    /// Classified sources the runtime refuses, typed (a requirement whose limit is
+    /// [`Limit::Runtime`]): closed without a candidate run, and unresolved only when a tooling gap
+    /// of their own keeps them open.
+    pub runtime_refused_sources: usize,
     pub requirements: BTreeMap<ToolingRequirement, usize>,
     /// The classified sources each executor cannot run, and whose limit stops it (an executor that
     /// no requirement stops is absent).
@@ -189,6 +193,9 @@ pub struct ExecutorStops {
     /// Those with a requirement whose limit is Metal's own ([`Limit::Metal`]): closed without a
     /// reference, unless a tooling gap of their own keeps them open.
     pub metal_refused: usize,
+    /// Those with a requirement whose limit is the runtime's typed refusal ([`Limit::Runtime`]):
+    /// closed without a candidate run, unless a tooling gap of their own keeps them open.
+    pub runtime_refused: usize,
 }
 
 impl AuthoringCapabilitySummary {
@@ -389,24 +396,29 @@ pub fn authoring_capability_summary(index: &Path) -> Result<AuthoringCapabilityS
             |row| row.get(0),
         )
         .map_err(|error| format!("count unresolved authoring-capability sources: {error}"))?;
-    let metal_limited = names(
-        &mut ToolingRequirement::ALL
-            .into_iter()
-            .filter(|requirement| requirement.limit() == Limit::Metal),
-    );
-    let metal_refused_sources = connection
-        .query_row(
-            &format!(
-                "SELECT count(*) FROM sources s JOIN triage_analysis t USING (air_sha256) \
-                 WHERE t.analyzer_abi=?1 \
-                   AND EXISTS (SELECT 1 FROM json_each(\
-                            t.result_json, '$.tooling_requirements') requirement \
-                        WHERE requirement.value IN ({metal_limited}))"
-            ),
-            [ANALYZER_ABI],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("count sources Metal cannot build: {error}"))?;
+    // The sources carrying a requirement whose limit is `limit`.
+    let limited = |limit: Limit, what: &str| {
+        let list = names(
+            &mut ToolingRequirement::ALL
+                .into_iter()
+                .filter(|requirement| requirement.limit() == limit),
+        );
+        connection
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM sources s JOIN triage_analysis t USING (air_sha256) \
+                     WHERE t.analyzer_abi=?1 \
+                       AND EXISTS (SELECT 1 FROM json_each(\
+                                t.result_json, '$.tooling_requirements') requirement \
+                            WHERE requirement.value IN ({list}))"
+                ),
+                [ANALYZER_ABI],
+                |row| row.get::<_, usize>(0),
+            )
+            .map_err(|error| format!("count sources {what}: {error}"))
+    };
+    let metal_refused_sources = limited(Limit::Metal, "Metal cannot build")?;
+    let runtime_refused_sources = limited(Limit::Runtime, "the runtime refuses")?;
     let mut executor_stops = BTreeMap::new();
     for executor in Executor::ALL {
         let stopping = |limit: Option<Limit>| {
@@ -426,11 +438,13 @@ pub fn authoring_capability_summary(index: &Path) -> Result<AuthoringCapabilityS
         let stops = connection
             .query_row(
                 &format!(
-                    "SELECT count(*), coalesce(sum({}), 0), coalesce(sum({}), 0) \
+                    "SELECT count(*), coalesce(sum({}), 0), coalesce(sum({}), 0), \
+                       coalesce(sum({}), 0) \
                      FROM sources s JOIN triage_analysis t USING (air_sha256) \
                      WHERE t.analyzer_abi=?1 AND {}",
                     with(stopping(Some(Limit::Tooling))),
                     with(stopping(Some(Limit::Metal))),
+                    with(stopping(Some(Limit::Runtime))),
                     with(stopping(None)),
                 ),
                 [ANALYZER_ABI],
@@ -439,6 +453,7 @@ pub fn authoring_capability_summary(index: &Path) -> Result<AuthoringCapabilityS
                         sources: row.get(0)?,
                         tooling_gap: row.get(1)?,
                         metal_refused: row.get(2)?,
+                        runtime_refused: row.get(3)?,
                     })
                 },
             )
@@ -506,6 +521,7 @@ pub fn authoring_capability_summary(index: &Path) -> Result<AuthoringCapabilityS
         classified_sources,
         unresolved_sources,
         metal_refused_sources,
+        runtime_refused_sources,
         requirements,
         executor_stops,
         unobserved_effects,
@@ -977,6 +993,7 @@ mod tests {
             classified_sources: classified,
             unresolved_sources: unresolved,
             metal_refused_sources: 0,
+            runtime_refused_sources: 0,
             requirements: BTreeMap::new(),
             executor_stops: BTreeMap::new(),
             unobserved_effects: BTreeMap::new(),
@@ -1211,14 +1228,18 @@ entry:
         );
         assert!(imageblock.sample_rate.is_empty() && rate_map.sample_rate.is_empty());
         assert!(sample_rate.tooling_requirements.is_empty());
-        // A row that operates on a `ulong` texture: described, and no executor's gap.
+        // A row that operates on a `ulong` texture: described, and the runtime's limit alone
+        // (`UlongTextureAtomic`), which the focused audit selects by the structure all the same.
         let mut ulong_row = source(include_str!(
             "../fixtures/public/engine/unk_ulong_atomics.ll"
         ));
         ulong_row.entry = "unk_ulong_atomic_rw".into();
         let ulong = classify(&ulong_row).unwrap();
         assert!(ulong.ulong_texture);
-        assert!(ulong.tooling_requirements.is_empty());
+        assert_eq!(
+            ulong.tooling_requirements,
+            [crate::requirement::ToolingRequirement::UlongTextureAtomic]
+        );
         assert!(!sample_rate.ulong_texture && !tile.ulong_texture);
         // A fragment function that reads a varying: described with the varying's declared type,
         // and no requirement selects it. The fragment functions above read none.
@@ -1394,6 +1415,7 @@ entry:
                         sources: 1,
                         tooling_gap: 1,
                         metal_refused: 0,
+                        runtime_refused: 0,
                     };
                     (executor, stops)
                 })
@@ -1404,7 +1426,9 @@ entry:
     /// A row is unresolved when a requirement stops an executor the census closes on (the Metal
     /// oracle or the engine's candidate), and each executor counts the rows it cannot run. A
     /// requirement whose limit is Metal's own stops every executor but closes its row, counted as
-    /// refused by Metal; a tooling gap beside it still keeps that row open.
+    /// refused by Metal; one whose limit is the runtime's typed refusal stops the candidate but
+    /// closes its row, counted as refused by the runtime; a tooling gap beside either still keeps
+    /// that row open.
     #[test]
     fn the_census_closes_on_the_metal_oracle_and_the_engine() {
         let scratch = ScratchDir::new("authoring-capability-executors").unwrap();
@@ -1415,7 +1439,8 @@ entry:
                 "CREATE TABLE sources (air_sha256 TEXT PRIMARY KEY, stage TEXT NOT NULL);\n\
                  INSERT INTO sources VALUES \
                     ('new-only', 'Fragment'), ('authoring', 'Vertex'), ('none', 'Kernel'), \
-                    ('metal-refused', 'Kernel'), ('metal-refused-and-gap', 'Kernel');",
+                    ('metal-refused', 'Kernel'), ('metal-refused-and-gap', 'Kernel'), \
+                    ('runtime-refused', 'Kernel'), ('runtime-refused-and-gap', 'Kernel');",
             )
             .unwrap();
         drop(connection);
@@ -1431,6 +1456,11 @@ entry:
             ToolingRequirement::KernelMinLodClamp,
             ToolingRequirement::RenderDeviceBufferArray,
         ]);
+        let runtime_refused = with(&[ToolingRequirement::SeqCstFence]);
+        let runtime_refused_and_gap = with(&[
+            ToolingRequirement::SeqCstFence,
+            ToolingRequirement::RenderDeviceBufferArray,
+        ]);
         write_cached(
             &index,
             [
@@ -1439,37 +1469,68 @@ entry:
                 ("none", &supported),
                 ("metal-refused", &metal_refused),
                 ("metal-refused-and-gap", &metal_refused_and_gap),
+                ("runtime-refused", &runtime_refused),
+                ("runtime-refused-and-gap", &runtime_refused_and_gap),
             ],
         )
         .unwrap();
         let summary = authoring_capability_summary(&index).unwrap();
-        assert_eq!(summary.classified_sources, 5);
-        assert_eq!(summary.unresolved_sources, 3);
+        assert_eq!(summary.classified_sources, 7);
+        assert_eq!(summary.unresolved_sources, 4);
         assert_eq!(summary.metal_refused_sources, 2);
-        let stops = |sources, tooling_gap, metal_refused| ExecutorStops {
+        assert_eq!(summary.runtime_refused_sources, 2);
+        let stops = |sources, tooling_gap, metal_refused, runtime_refused| ExecutorStops {
             sources,
             tooling_gap,
             metal_refused,
+            runtime_refused,
         };
         assert_eq!(
             summary.executor_stops,
             BTreeMap::from([
-                (Executor::MetalOracle, stops(3, 1, 2)),
-                (Executor::EngineCandidate, stops(4, 3, 2)),
+                (Executor::MetalOracle, stops(3, 1, 2, 0)),
+                (Executor::EngineCandidate, stops(6, 4, 2, 2)),
             ])
         );
         assert_eq!(
             summary.closure_gap().as_deref(),
-            Some("3 source(s) still have validation support gaps")
+            Some("4 source(s) still have validation support gaps")
         );
+    }
+
+    /// The owned fixture `rlm_runtime_limits` holds each shape of a requirement the runtime refuses
+    /// beside the same shape without it, as its device tests run them
+    /// (`candidate::tests::engine_compute`): the `acq_rel` fence carries no `seq_cst_fence`, which
+    /// `a4_device_fence`'s `seq_cst` fence carries; and the read of a texture buffer an argument
+    /// buffer holds carries what the same read of a 2D member carries, as the runtime makes both.
+    #[test]
+    fn the_runtime_limit_fixture_holds_each_shape_beside_its_pair() {
+        let engine = metal2vulkan_devtools::engine_dir();
+        let requirements = |name: &str, entry: &str| {
+            let air_ll = std::fs::read_to_string(engine.join(name)).unwrap();
+            classify(&SourceRow {
+                entry: entry.into(),
+                ..source(&air_ll)
+            })
+            .unwrap()
+            .tooling_requirements
+        };
+        let limits = "rlm_runtime_limits.ll";
+        assert_eq!(
+            requirements(limits, "rlm_member_texture_buffer"),
+            requirements(limits, "rlm_member_texture")
+        );
+        assert!(
+            !requirements(limits, "rlm_fence_acq_rel").contains(&ToolingRequirement::SeqCstFence)
+        );
+        assert!(requirements("a4_device_fence.ll", "a4_device_fence")
+            .contains(&ToolingRequirement::SeqCstFence));
     }
 
     #[test]
     fn indirect_command_fixtures_close_beside_another_observable_effect_or_through_replay() {
         fn fixture(name: &str) -> SourceRow {
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/public")
-                .join(name);
+            let path = metal2vulkan_devtools::fixtures_dir().join(name);
             let air_ll = std::fs::read_to_string(&path).unwrap();
             let (stage, entry) = crate::air::stage_entry_from_ll(&air_ll).unwrap();
             SourceRow {
@@ -1807,7 +1868,7 @@ entry:
         );
         // The build's fingerprints are the product's and the classifier's own sources, hashed as
         // below.
-        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_root = metal2vulkan_devtools::validation_dir();
 
         let inputs = env!("METAL2VULKAN_CLASSIFIER_INPUTS")
             .split(':')
@@ -1827,7 +1888,7 @@ entry:
             env!("METAL2VULKAN_PRODUCT_FINGERPRINT")
         );
         assert_eq!(
-            classifier(crate_root),
+            classifier(&crate_root),
             env!("METAL2VULKAN_CLASSIFIER_FINGERPRINT"),
             "the test hashes the classifier's sources the way the build does"
         );
@@ -1894,9 +1955,8 @@ entry:
             ),
             (
                 "src/executor_contract/depth_range.rs",
-                "the executors' depth-range rule over a case's depth bytes and the device's \
-                 VK_EXT_depth_range_unrestricted; classification reads no depth and opens no \
-                 device",
+                "the case checker's depth-range rule over a case's depth bytes; classification \
+                 reads no depth",
             ),
             (
                 "src/executor_contract/render_target_array.rs",
@@ -1919,7 +1979,7 @@ entry:
             ),
         ]);
         let dependencies =
-            super::classifier_inputs::dependencies(crate_root, &[], &inputs).unwrap();
+            super::classifier_inputs::dependencies(&crate_root, &[], &inputs).unwrap();
         let unlisted = dependencies
             .iter()
             .filter(|(file, _)| {
@@ -1949,8 +2009,6 @@ entry:
         write("metal2vulkan/build.rs", "fn main() {}\n");
         write("metal2vulkan/build_support.rs", "\n");
         write("metal2vulkan/src/lib.rs", "pub fn translate() {}\n");
-        write("metal2vulkan-runtime/Cargo.toml", "[package]\n");
-        write("metal2vulkan-runtime/src/lib.rs", "pub fn submit() {}\n");
         write("metal2vulkan-devtools/Cargo.toml", "[package]\n");
         write("metal2vulkan-devtools/src/lib.rs", "pub fn assemble() {}\n");
         for input in &inputs {
@@ -2005,17 +2063,6 @@ entry:
             "a dev-tools edit invalidates"
         );
         write("metal2vulkan-devtools/src/lib.rs", "pub fn assemble() {}\n");
-        assert_eq!(key(analyzer_version!()), current);
-        write(
-            "metal2vulkan-runtime/src/lib.rs",
-            "pub fn submit() { /* edited */ }\n",
-        );
-        assert_ne!(
-            key(analyzer_version!()),
-            current,
-            "a runtime edit invalidates"
-        );
-        write("metal2vulkan-runtime/src/lib.rs", "pub fn submit() {}\n");
         assert_eq!(key(analyzer_version!()), current);
         write(
             "metal2vulkan/src/lib.rs",
@@ -2261,6 +2308,11 @@ define void @{name}(ptr addrspace(2) %ab, ptr addrspace(1) %out) {{
                 .contains(&ToolingRequirement::MeshCompanion);
             let draw = classified.mesh_draw.expect("a mesh draw");
             assert_eq!(unresolved, !draw.missing.is_empty(), "{entry}");
+            // The engine's candidate draws no mesh render pipeline.
+            assert!(
+                (classified.tooling_requirements).contains(&ToolingRequirement::MeshRenderPipeline),
+                "{entry}"
+            );
             draw
         };
         assert_eq!(
@@ -2292,6 +2344,7 @@ define void @{name}(ptr addrspace(2) %ab, ptr addrspace(1) %out) {{
         );
         let fragment = classify(&entry_of("engine/mesh_draws.ll", "mesh_draws_fragment")).unwrap();
         assert_eq!(fragment.mesh_draw, None);
+        assert!(!(fragment.tooling_requirements).contains(&ToolingRequirement::MeshRenderPipeline));
     }
 
     /// A vertex function whose only effect is the indexed draw it encodes is observed by executing
@@ -2320,7 +2373,7 @@ define void @{name}(ptr addrspace(2) %ab, ptr addrspace(1) %out) {{
     /// A mesh function that sets no vertex or primitive and writes nothing (an empty body, or a
     /// primitive count alone, constant or read from its payload) has no effect a stage observes:
     /// its row draws with rasterization off and an empty observation, needs no stage, and carries
-    /// no requirement.
+    /// only the requirement every mesh row carries (`mesh_render_pipeline`).
     #[test]
     fn an_effect_free_mesh_row_needs_no_stage() {
         for (module, entry) in [
@@ -2343,7 +2396,11 @@ define void @{name}(ptr addrspace(2) %ab, ptr addrspace(1) %out) {{
             ),
         ] {
             let classified = classify(&entry_of(module, entry)).unwrap();
-            assert_eq!(classified.tooling_requirements, [], "{entry}");
+            assert_eq!(
+                classified.tooling_requirements,
+                [ToolingRequirement::MeshRenderPipeline],
+                "{entry}"
+            );
             let draw = classified.mesh_draw.expect("a mesh draw");
             assert!(draw.missing.is_empty(), "{entry}: {:?}", draw.missing);
         }
@@ -2426,12 +2483,8 @@ entry:
     /// The row of entry `entry` of the committed public module `name`: the module's text, standing
     /// for that entry.
     fn entry_of(name: &str, entry: &str) -> SourceRow {
-        let air_ll = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/public")
-                .join(name),
-        )
-        .unwrap();
+        let air_ll =
+            std::fs::read_to_string(metal2vulkan_devtools::fixtures_dir().join(name)).unwrap();
         let declared = crate::air::module_entries(&air_ll)
             .unwrap()
             .into_iter()
@@ -2480,12 +2533,8 @@ entry:
             ("engine/fragment_rog.ll", "rog_loop"),
             ("engine/fragment_discard_msl22.ll", "discard_loop"),
         ] {
-            let text = std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/public")
-                    .join(module),
-            )
-            .unwrap();
+            let text = std::fs::read_to_string(metal2vulkan_devtools::fixtures_dir().join(module))
+                .unwrap();
             let entries = crate::air::module_entries(&text).unwrap();
             assert!(entries.len() > 1, "{module}");
             for entry in entries {
@@ -2559,7 +2608,7 @@ entry:
     /// projection keeps only the entry's.
     #[test]
     fn the_product_reflects_each_projection_as_its_entry_in_the_module() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/public");
+        let root = metal2vulkan_devtools::fixtures_dir();
         let without_static_samplers = |mut interface: crate::air::reflect::ShaderInterface| {
             interface
                 .bindings

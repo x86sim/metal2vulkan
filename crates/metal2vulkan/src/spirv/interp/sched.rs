@@ -71,8 +71,8 @@ pub(super) struct Prog<'m> {
     /// The length of each runtime descriptor array of images (a set-1 heap array), by its first
     /// bound image: its consecutive images of the slot.
     image_arrays: HashMap<u32, u64>,
-    /// The length of each descriptor array of buffers (a set-1 heap array of storage buffers), by
-    /// its first bound buffer: its consecutive buffers of the slot.
+    /// The length of each descriptor array of buffers, by its first bound buffer: its consecutive
+    /// buffers of the slot.
     buffer_arrays: HashMap<u32, u64>,
     layout: FrameLayout,
     /// The encoded initializer of each `Private` global, by global, filled by the first
@@ -1180,7 +1180,7 @@ pub(super) fn run(
         bufs,
         push: Region::new(
             MemoryKind::PushConstant,
-            super::specialized_push(m, &res.spec, res.push),
+            super::tail_push(m, res.push),
             false,
         ),
         images,

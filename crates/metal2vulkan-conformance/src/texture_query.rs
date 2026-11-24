@@ -5,10 +5,7 @@
 //! exactly the shape a conformance case wants — the whole descriptor space is reachable from the
 //! CPU, every answer is two numbers, and the whole family can be re-measured on the oracle as often
 //! as anybody asks.
-//!
-//! It is also the family whose numbers were, until now, held by a comment: `runtime_lane`'s
-//! `heap_metal_sizes` carries tables of what an Apple M4 answered, with nothing mechanical tying
-//! them to a Metal run. A case over this type takes the answer from Metal.
+
 //!
 //! The vocabulary is Metal's own enumerations as the translator's public API names them, so a value
 //! a case writes reaches `MTLTextureType`, `MTLPixelFormat` and `MTLTextureUsage` by its raw
@@ -72,14 +69,11 @@ impl Storage {
 /// reads.
 ///
 /// `allowGPUOptimizedContents` is a field, and was not always: it is left at Metal's default, on,
-/// everywhere but the one family that is **about** it
-/// ([`crate::cases::texture_descriptor_pairs`]), because with it off the runtime announces
-/// `optimized-depth-stencil-texture` on MoltenVK for a depth or stencil texture, and a case whose
-/// subject is Metal's arithmetic should not carry a device's announcement as well. That is why the
-/// family that turns it off states a **colour** format in every such row, and why the field
-/// fingerprints and names itself only where it is off — a descriptor that leaves it at Metal's
-/// default fingerprints exactly as it did before the field existed, so every recording taken
-/// before it stays the answer to the inputs it was taken from.
+/// everywhere but the one family that is **about** it ([`crate::cases::texture_descriptor_pairs`]),
+/// which states a **colour** format in every such row. The field fingerprints and names itself only
+/// where it is off — a descriptor that leaves it at Metal's default fingerprints exactly as it did
+/// before the field existed, so every recording taken before it stays the answer to the inputs it
+/// was taken from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeapTextureQuery {
     pub texture_type: TextureType,
@@ -330,3 +324,16 @@ impl SizeAndAlign {
         ])
     }
 }
+
+/// `docs/API.md` section 10's entry for the runtime's answer to
+/// `heapTextureSizeAndAlignWithDescriptor:`: the device's own size and alignment, not Metal's.
+///
+/// Each case that records the answer of a query at `case/<query>/size-and-align` names it at
+/// `case/<query>/size-and-align/Ok/*`, `Unchecked`: the two numbers are not compared with Metal's,
+/// and the runtime's side holds each to a property instead, answering the failure where it does not
+/// hold (the alignment a power of two; a Private query's texture placed at `align` in a heap of
+/// `align + size` bytes, and its first slice read back where the runtime moves the format's bytes).
+/// A refusal is not an answer, so a site where one side answers and the other refuses still
+/// diverges.
+pub const DEVICE_OWN_SIZES: &str =
+    "the-runtime-s-heap-texture-size-and-alignment-are-the-device-s-own";

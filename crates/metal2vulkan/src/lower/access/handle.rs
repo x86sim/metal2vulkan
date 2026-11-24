@@ -110,15 +110,58 @@ pub fn absent_param_value(
 pub enum HandleOperand {
     Value(ValueId),
     Const(u32),
+    /// The null handle of an argument buffer's sampler under the identity domains: the nil
+    /// resource ID, a `uvec2` of zeros ([`emit_identity_sampler`]).
+    NullId,
 }
 
 impl HandleOperand {
-    /// The `u32` handle index in the open block.
+    /// The handle in the open block: a `u32` handle index, or for [`HandleOperand::NullId`] the
+    /// `uvec2` nil resource ID.
     pub fn emit(self, cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
         match self {
             HandleOperand::Value(v) => cx.operand(fb, v),
             HandleOperand::Const(k) => k32(fb, k),
+            HandleOperand::NullId => {
+                let ty = id_type(fb.module())?;
+                let zero = fb
+                    .module()
+                    .constant(crate::spirv::ir::Constant::Null { ty })?;
+                fb.module().const_value(zero)
+            }
         }
+    }
+}
+
+/// The `uvec2` of a resource ID, low word first.
+fn id_type(mb: &mut ModuleBuilder) -> BResult<crate::spirv::ids::TypeId> {
+    use crate::spirv::ir::Type as SType;
+    let u = mb.ty(SType::Int {
+        width: 32,
+        signed: false,
+    })?;
+    mb.ty(SType::Vector { elem: u, len: 2 })
+}
+
+/// The representation of an argument buffer's sampler handle under the identity domains: its
+/// resource ID, a `uvec2` ([`emit_identity_sampler`]).
+const IDENTITY_SAMPLER_ID: DemoteTy = DemoteTy::Vector {
+    elem: crate::spirv::ids::ScalarTy::Int { bits: 32 },
+    len: 2,
+};
+
+/// Whether handle value `v` is an argument buffer's sampler under the identity domains, held as
+/// its resource ID ([`IDENTITY_SAMPLER_ID`]).
+fn identity_sampler(cx: &SelectCx<'_>, v: Value) -> bool {
+    super::identity(cx.profile) && handles::heap_handle(cx.memory, v) == Some(HandleClass::Sampler)
+}
+
+/// The representation of handle word `v` ([`is_word`]): an argument buffer's sampler's resource
+/// ID under the identity domains ([`IDENTITY_SAMPLER_ID`]), every other word's handle index.
+pub fn word_repr(cx: &SelectCx<'_>, v: Value) -> DemoteTy {
+    match member_word(&cx.families.access, v) {
+        Some(HandleClass::Sampler) if super::identity(cx.profile) => IDENTITY_SAMPLER_ID,
+        _ => DemoteTy::HandleIndex,
     }
 }
 
@@ -375,6 +418,9 @@ pub fn lowered_pointer(cx: &SelectCx<'_>, v: Value) -> Result<Option<DemoteTy>, 
     if super::phis::incoming(cx, v)?.is_some_and(|i| i.constant) {
         return Err(refuse());
     }
+    if identity_sampler(cx, v) {
+        return Ok(Some(IDENTITY_SAMPLER_ID));
+    }
     Ok(Some(DemoteTy::HandleIndex))
 }
 
@@ -616,6 +662,16 @@ pub fn select(
                 c => operand(cx, *c)?,
             };
             let (t, f) = match (result, array) {
+                // An argument buffer's sampler under the identity domains is its resource ID, so
+                // its null operand is the nil ID.
+                (Some(class), _) if identity_sampler(cx, here) => {
+                    let id = |v: Value| match handle_operand(cx, v, class)? {
+                        HandleOperand::Const(NULL_HANDLE) => Ok(HandleOperand::NullId),
+                        HandleOperand::Const(_) => Err(refuse()),
+                        op => Ok(op),
+                    };
+                    (id(*t)?, id(*f)?)
+                }
                 (Some(class), _) => (
                     handle_operand(cx, *t, class)?,
                     handle_operand(cx, *f, class)?,
@@ -783,10 +839,16 @@ fn lookup(
                 return Err(refuse());
             }
             IdLoad::Static(super::access_with_leaf(
-                cx, ptr, None, leaf, targets, null, None,
+                cx, ptr, None, leaf, targets, null, false,
             )?)
         }
     };
+    // Under the identity domains a texture's or a sampler's resource ID is its handle: its index
+    // is the element of the set-1 arrays (`emit_identity_handle`, `emit_identity_sampler`), and no
+    // table is searched.
+    if super::identity(cx.profile) {
+        return Ok(access);
+    }
     let ids = if legal::holds_wide(cx.profile) {
         HandleIds::Words
     } else {
@@ -939,6 +1001,7 @@ pub fn emit(
             fb.binary(BinOp::IAdd, base, delta)?
         }
         HandleStrategy::Lookup(a) | HandleStrategy::SamplerLookup(a) => {
+            let identity = cx.plan.families.access.identity;
             let id = match a.as_ref() {
                 IdLoad::Static(a) => {
                     let p = cx.operand(fb, a.ptr)?;
@@ -950,6 +1013,13 @@ pub fn emit(
             let Some(id) = id else {
                 return Err(cx.fail("a resource-id load without a value"));
             };
+            match s {
+                HandleStrategy::SamplerLookup(_) if identity => {
+                    return emit_identity_sampler(cx, fb, vid, id);
+                }
+                _ if identity => return emit_identity_handle(cx, fb, vid, id),
+                _ => {}
+            }
             let table = match s {
                 HandleStrategy::SamplerLookup(_) => cx.decl.families.access.sampler_table,
                 _ => cx.decl.families.access.handle_table,
@@ -966,6 +1036,68 @@ pub fn emit(
         }
     };
     cx.define(vid, r);
+    Ok(())
+}
+
+/// Under the identity domains, the handle of a texture whose resource ID `id` (`uvec2`, low word
+/// first) an argument buffer holds (`docs/RESOURCE-ID.md`), defining `vid`: the id's index masked
+/// below the set-1 image arrays' length (`pipeline::link::IDENTITY_TEXTURES`, a power of two), the
+/// element of those arrays (0, nil, the null descriptor), with the word's missing-alpha bit
+/// (`TextureWord::OUT_OF_BOUNDS_ALPHA_ONE`) moved to `HANDLE_ALPHA_ONE` where the function's
+/// handles carry it (`memory::handles::Lookup::Flagged`'s `alpha`). The program writes the ID, so
+/// the mask keeps any value it holds inside the arrays: a bad ID reads the element at its masked
+/// index. The admission allows no other form (`select::identity_admits`).
+fn emit_identity_handle(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    vid: ValueId,
+    id: SValue,
+) -> BResult<()> {
+    use crate::metal::resource_word::TextureWord;
+    let low = fb.composite_extract(id, &[0])?;
+    let mask = k32(fb, crate::pipeline::link::IDENTITY_TEXTURES - 1)?;
+    let index = fb.binary(BinOp::BitwiseAnd, low, mask)?;
+    let h = match cx.plan.families.access.lookup() {
+        handles::Lookup::Element => index,
+        handles::Lookup::Flagged { alpha: true, .. } => {
+            let word = fb.composite_extract(id, &[1])?;
+            let shift = handles::HANDLE_ALPHA_ONE.trailing_zeros()
+                - TextureWord::OUT_OF_BOUNDS_ALPHA_ONE.trailing_zeros();
+            let shift = k32(fb, shift)?;
+            let moved = fb.binary(BinOp::ShiftLeftLogical, word, shift)?;
+            let bit = k32(fb, handles::HANDLE_ALPHA_ONE)?;
+            let alpha = fb.binary(BinOp::BitwiseAnd, moved, bit)?;
+            fb.binary(BinOp::BitwiseOr, index, alpha)?
+        }
+        other => {
+            return Err(cx.fail(format!("an identity handle of the {other:?} form")));
+        }
+    };
+    cx.define(vid, h);
+    Ok(())
+}
+
+/// Under the identity domains, the handle of a sampler whose resource ID `id` (`uvec2`, low word
+/// first) an argument buffer holds (`docs/RESOURCE-ID.md`), defining `vid`: the ID itself, its index
+/// replaced by 0 (the default sampler) where it is not below the set-1 sampler arrays' length
+/// (`pipeline::link::IDENTITY_SAMPLERS`), and its word as the program wrote it. The program writes
+/// the ID, so the guard keeps any index it holds inside the arrays: a bad ID samples through
+/// element 0 by its word's fields.
+fn emit_identity_sampler(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    vid: ValueId,
+    id: SValue,
+) -> BResult<()> {
+    let low = fb.composite_extract(id, &[0])?;
+    let word = fb.composite_extract(id, &[1])?;
+    let length = k32(fb, crate::pipeline::link::IDENTITY_SAMPLERS)?;
+    let within = fb.binary(BinOp::ULessThan, low, length)?;
+    let zero = k32(fb, 0)?;
+    let index = fb.select(within, low, zero)?;
+    let ty = id_type(fb.module())?;
+    let h = fb.composite_construct(ty, &[index, word])?;
+    cx.define(vid, h);
     Ok(())
 }
 

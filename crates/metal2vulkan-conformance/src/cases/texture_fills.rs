@@ -1,4 +1,4 @@
-//! Metal's private texture fills, ported from `runtime_lane::texture_fills`.
+//! Metal's private texture fills.
 //!
 //! The probes (`tfl.swift`, `tfl3.swift` and `tfl4.swift`, an Apple M4 under macOS 27.0.1): a
 //! private 2D or 2D array texture of the case's extent, levels and slices, every byte of every
@@ -7,26 +7,23 @@
 //! texture at byte 0 of a shared placement heap of Metal's size, every byte of the heap set to
 //! `0xEE` through a buffer over it, and the heap's changed bytes read back.
 //!
-//! **One case per format**, which is the port's one real gain over the lane. The lane walks the 50
-//! formats in one test and, where the device holds no texture of one, prints a line and
-//! `continue`s to the next format — so a format the venue cannot make leaves the test green with
-//! nothing compared and nothing counted. Here the venue's typed refusal stops that format's case
+//! **One case per format** of the 50, so the venue's typed refusal stops that format's case
 //! alone, and the suite counts it as [`LacksFeature`](crate::verdict::Verdict::LacksFeature):
 //! neither a pass nor a failure, and visible in the matrix. That matters on lavapipe, which holds
 //! no texture of several of these formats.
 //!
-//! **The fidelity is the lane's and no better**: Metal's answer per format is the 16-hex-digit
-//! digest of its 20 cases' lines, each line `<case> <answer>` where the answer is itself the digest
-//! of that case's read-back lines. The probes kept the outer digest alone, so the case's site is
-//! digest-only and the suite reports it as such. A difference names the format and no more — the
-//! same reach the lane has, because a digest of digests is all anybody wrote down. Porting it does
-//! not make it sharper; recording the per-case digests would, and that needs the probe run again.
+//! **The fidelity is a digest's**: Metal's answer per format is the 16-hex-digit digest of its 20
+//! cases' lines, each line `<case> <answer>` where the answer is itself the digest of that case's
+//! read-back lines. The probes kept the outer digest alone, so the case's site is digest-only and
+//! the suite reports it as such. A difference names the format and no more, because a digest of
+//! digests is all anybody wrote down; recording the per-case digests would make it sharper, and
+//! that needs the probe run again.
 //!
 //! Metal's answer is **carried** and re-recording is **forbidden**: Metal fills a texture through
 //! private API. The digests were measured on **an Apple M4**, not on this M3 Max, which the
 //! recording's provenance says in words.
 
-use crate::allowance::{Allowance, Justification, Loosening};
+use crate::allowance::Allowance;
 use crate::case::{answered, made, Abort, Case, Failure, Input, MetalSource, Side};
 use crate::replay::{notice_allowance, NOTICES_SITE};
 use crate::transcript::{
@@ -36,8 +33,8 @@ use crate::work::{Plane, Rect, Resource, Step, Storage, TextureSpec, Work};
 
 /// Where the carried values were measured.
 const MEASURED_IN: &str =
-    "runtime_lane::texture_fills, from the probes tfl.swift, tfl3.swift and tfl4.swift (an Apple \
-     M4, macOS 27.0.1) -- another chip than this round's oracle";
+    "the probes tfl.swift, tfl3.swift and tfl4.swift (an Apple M4, macOS 27.0.1) -- another chip \
+     than this round's oracle";
 
 /// Why record mode must not run these cases on Metal.
 const NO_PUBLIC_CALL: &str =
@@ -499,14 +496,14 @@ fn digest(lines: &[String]) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     /// A private texture of the device's memory, or a two-plane format in a heap of `heap` bytes.
-    Lane { heap: u64 },
+    Table { heap: u64 },
     /// A two-plane texture of its own memory, 8 texels wide (`tfl4.swift`).
     Own,
 }
 
-/// Each lane-table case's name, in [`FORMATS`] order: a case names itself with a static string, so
+/// Each table case's name, in [`FORMATS`] order: a case names itself with a static string, so
 /// nothing is allocated to answer [`Case::name`].
-const LANE_NAMES: [&str; 50] = [
+const TABLE_NAMES: [&str; 50] = [
     "texture-fills-10",
     "texture-fills-12",
     "texture-fills-13",
@@ -573,16 +570,15 @@ pub struct TextureFills {
     metal: &'static str,
 }
 
-/// Every ported case: one per format of the lane's table, and one per format of the own-memory
-/// two-plane table.
+/// Every case: one per format of the table, and one per format of the own-memory two-plane table.
 pub fn all() -> Vec<TextureFills> {
     let mut cases: Vec<TextureFills> = FORMATS
         .iter()
-        .zip(LANE_NAMES)
+        .zip(TABLE_NAMES)
         .map(|(&(raw, heap, metal), name)| TextureFills {
             name,
             raw,
-            family: Family::Lane { heap },
+            family: Family::Table { heap },
             metal,
         })
         .collect();
@@ -604,7 +600,7 @@ impl TextureFills {
     /// The cases the family runs.
     fn cases(&self) -> &'static [&'static str] {
         match self.family {
-            Family::Lane { .. } => &CASES,
+            Family::Table { .. } => &CASES,
             Family::Own => &OWN_CASES,
         }
     }
@@ -621,7 +617,7 @@ impl TextureFills {
             let p =
                 probe(self.raw, name, self.wide()).map_err(|why| Failure::named("BadCase", why))?;
             match self.family {
-                Family::Lane { heap } if heap > 0 => {
+                Family::Table { heap } if heap > 0 => {
                     let done = side.work(&heap_work(self.raw, &p, heap, zeros))?;
                     // A texture of more levels or slices: its fill writes the heap's bytes at
                     // level 0's rows, which `two_plane_heap_fills.rs` checks byte for byte.
@@ -631,7 +627,7 @@ impl TextureFills {
                     let read = done.reads.first().cloned().unwrap_or_default();
                     Ok(Some(digest(&[heap_changed(&read)])))
                 }
-                Family::Lane { .. } | Family::Own => {
+                Family::Table { .. } | Family::Own => {
                     // Metal makes no 4:2:2 texture of more than one level or slice.
                     if matches!(self.raw, 240 | 241) && (p.levels > 1 || p.slices > 1) {
                         return Ok(None);
@@ -713,45 +709,20 @@ impl Case for TextureFills {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        let mut allowances = Vec::new();
+        // What this work announces on a device that needs it: a block-compressed texture's device
+        // decode, announced where the runtime makes it (`compressed-texel-decode`). Metal
+        // announces none, so the notices site differs on such a device, and the difference is
+        // justified where it fired. A float depth's denormals are the device's own answer, which
+        // the suite declares for every case (`crate::replay::NATIVE_NOTES`). A 32-bit float
+        // depth (`Depth32Float`, and the depth of `Depth32Float_Stencil8`) takes its `0xEE` bytes
+        // by copies from a buffer, which carry the note of an upload into one
+        // (`restricted-depth-upload`): those bytes are a depth below 0, which Metal keeps and a
+        // device that clamps does not, so the note loosens the notices site alone and the digest
+        // still decides. The format's own digest still compares.
+        use crate::degradation::Degradation as D;
+        let mut allowances = vec![notice_allowance(D::CompressedTexelDecode.code())];
         if matches!(self.raw, 252 | 260) {
-            // A 32-bit float depth's patterns may be depth outside [0, 1]
-            // (`Depth32Float_Stencil8`'s are). Where the device's uploads announce that it may
-            // store such a value clamped, the format's bytes are not Metal's to match: the lane
-            // skips the format there, and here the digest goes unchecked, named, counted and
-            // reported, with that notice as the justification.
-            allowances.push(Allowance::new(
-                format!("case/{}", site(self.raw)),
-                Loosening::Unchecked,
-                Justification::Degradation(
-                    metal2vulkan_runtime::Degradation::RestrictedDepthUpload
-                        .code()
-                        .to_owned(),
-                ),
-            ));
-        }
-        // What this work announces on a device that needs it, which is the lane's own list: a
-        // fill of a color packed where fills ignore the color, a carried texture's twin, a
-        // two-plane texture shadowed in a heap's bytes and a mipmapped one whose later levels lie
-        // apart from the shadow, the combined format's clamp, and shared storage in system memory.
-        // Metal announces none of them, so the notices site differs on such a device, and the
-        // difference is justified where one of these fired. A fill and its read-back by copies
-        // move a carried texture's blocks and read no twin, so its precision
-        // (`decoded-texel-precision`, announced at a command's first read of the twin) is not
-        // among them. A BC texture's device decode and a float depth's denormals are the device's
-        // own answers, which the suite declares for every case (`crate::replay::NATIVE_NOTES`).
-        // The format's own digest still compares, and only the 32-bit float depth formats' go
-        // unchecked, above.
-        use metal2vulkan_runtime::Degradation as D;
-        for kind in [
-            D::UnpackedFillColor,
-            D::ShadowedTexture,
-            D::HeapTwoPlaneLayout,
-            D::RestrictedDepthUpload,
-            D::CarriedDecodedTwin,
-            D::SharedInSystemMemory,
-        ] {
-            allowances.push(notice_allowance(kind.code()));
+            allowances.push(notice_allowance(D::RestrictedDepthUpload.code()));
         }
         allowances
     }
@@ -799,11 +770,10 @@ impl Case for TextureFills {
 
 /// The two cases whose whole changed run this family measures on Metal itself.
 ///
-/// `two_plane_case`'s formatter cut each run at 64 bytes and wrote `...({n})`, and exactly two
-/// cases of the whole lane reach it: `b5` of 550 and of 551, whose texture is 7 by 5 texels, so the
-/// fill's rows (16 bytes each, level 0's `4 w` rounded down to 16) overlap into **one 92-byte run**
-/// and 28 of its bytes were in no comparison. Metal's bytes there had never been measured: the
-/// probes printed the same truncation the lane did.
+/// The probes' formatter cut each run at 64 bytes and wrote `...({n})`, and exactly two cases reach
+/// it: `b5` of 550 and of 551, whose texture is 7 by 5 texels, so the fill's rows (16 bytes each,
+/// level 0's `4 w` rounded down to 16) overlap into **one 92-byte run** and 28 of its bytes are
+/// past the cut.
 ///
 /// These two cases measure them. Each runs the same program the family's `b5` row runs — a 7 by 5
 /// `RGB10A8_2P_XR10` (or its sRGB twin) at byte 0 of a shared placement heap of the probes' size,
@@ -815,8 +785,8 @@ const HEAP_FILL_RUNS: [(&str, u32); 2] = [
     ("texture-fills-heap-run-551-b5", 551),
 ];
 
-/// The case name of [`HEAP_FILL_RUNS`]: the one case of the lane's twenty whose run is long enough
-/// to have been elided.
+/// The case name of [`HEAP_FILL_RUNS`]: the one case of the twenty whose run is long enough to be
+/// elided.
 const HEAP_FILL_CASE: &str = "b5";
 
 /// The heap's bytes these cases place their texture in, as the probes sized it.
@@ -880,19 +850,6 @@ impl Case for TwoPlaneHeapFill {
     /// is measured on this chip instead of carried from somebody's terminal.
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    /// What the work announced on MoltenVK, measured: the two-plane texture is shadowed in the
-    /// heap's bytes, which is the whole point of the case. Metal announces nothing, so the notices
-    /// site differs and this is what names it; every byte of the heap still compares exactly.
-    fn allowances(&self) -> Vec<Allowance> {
-        // The second is the venue's own: the buffer this case reads the filled planes back
-        // through is `Shared`, which a device with no unified memory keeps in system memory
-        // because that is the only memory both sides can reach.
-        vec![
-            notice_allowance(metal2vulkan_runtime::Degradation::ShadowedTexture.code()),
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {

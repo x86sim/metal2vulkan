@@ -112,6 +112,7 @@ budget SPIRV_WORDS const
 budget STANDARD_DEADLINE const
 budget Spent struct(O)
 budget TYPE_COUNT const
+budget WHOLE_UNIT const
 budget WORK_UNITS const
 budget map_bytes fn
 budget output_blocks_cap fn
@@ -271,6 +272,7 @@ graph PostDomTree use(dom::PostDomTree)
 graph Sccs use(scc::Sccs)
 intrinsics AbsentAccess use(stage::AbsentAccess)
 intrinsics AccelerationStructure use(objects::AccelerationStructure)
+intrinsics Access use(texture::Access)
 intrinsics AccessKind use(atomic::AccessKind)
 intrinsics AgxOp use(llvm::AgxOp)
 intrinsics AgxSpace use(llvm::AgxSpace)

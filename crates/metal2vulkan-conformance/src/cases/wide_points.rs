@@ -15,10 +15,10 @@
 //! centre on each axis and `0 <= z <= w`, and Vulkan culls one whose centre leaves the clip volume
 //! at `w`, so these rows are exactly where the two part.
 //!
-//! The case records what Metal wrote, not the lane's table: record mode runs every draw on native
-//! Metal. The lane's own table (`PROBE_9`) and its fitted rule (`metal_pixels`) are a cross-check
-//! this module's tests apply to the recorded coverages, so the port says whether the two agree
-//! instead of copying one into the other.
+//! The case records what Metal wrote: record mode runs every draw on native Metal. A probe's table
+//! (`PROBE_9`) and a fitted rule (`metal_pixels`) are a cross-check this module's tests apply to
+//! the recorded coverages, so the case says whether the two agree instead of copying one into the
+//! other.
 //!
 //! **All 294 draws go into one command buffer**: a pass a row and a blit a row, the blits writing
 //! one row of a single read-back buffer each, so the whole case costs one commit and one wait
@@ -39,7 +39,8 @@
 //! no index buffer.
 
 use crate::allowance::Allowance;
-use crate::case::{call, made, Abort, Case, Failure, Input, MetalSource, Side};
+use crate::case::{call, drawn_or_refused, made, Abort, Case, Failure, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -48,7 +49,6 @@ use crate::render::{
 };
 use crate::transcript::{Digest, Negative, Node, Observed, Sites, Value};
 use metal2vulkan::metal::{PixelFormat, PrimitiveType};
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture the vertex function lives in.
 const POSITIONS: Fixture = Fixture {
@@ -210,19 +210,10 @@ impl Case for WidePoints {
         // handling and says so. Measured: lavapipe announces it here and MoltenVK does not, so the
         // case reads `announced` on lavapipe and `exact` on MoltenVK. No other notice fired for
         // this case on either venue, and a tolerance no run justifies is not carried.
-        //
-        // The positions and the read-back are `Shared`, and a device with no unified memory keeps
-        // a `Shared` allocation in system memory because that is the only memory both sides can
-        // reach (`shared-in-system-memory`). That is the venue's memory model, not this case's
-        // point.
         [Degradation::DevicePointSize]
             .into_iter()
             .map(|kind| crate::replay::notice_allowance(kind.code()))
-            .chain([
-                // The positions and the read-back are `Shared`
-                // ([`crate::replay::shared_memory_notice`]).
-                crate::replay::shared_memory_notice(),
-            ])
+            .chain([])
             .collect()
     }
 
@@ -362,19 +353,14 @@ impl Case for WidePoints {
             let first = at * TARGET_BYTES as usize;
             let target_bytes = &bytes[first..first + TARGET_BYTES as usize];
             written.extend(written_words(target_bytes));
-            let mut row = Node::branch(name, Vec::new()).with(Node::leaf(
+            // A row whose pass or read our side refused has no coverage: Metal's encoder calls
+            // answer nothing, so the refusal is the row's answer and compares as one.
+            let refused = (outcome.refusal(2 * at)).or_else(|| outcome.refusal(2 * at + 1));
+            let row = Node::branch(name, Vec::new()).with(Node::leaf(
                 "coverage",
                 Observed::value(coverage(target_bytes)),
             ));
-            // What each of the row's two pieces of work answered, which is `None` on Metal's side:
-            // a piece of ours that refuses compares against Metal answering and reads as a refusal
-            // rather than a divergence.
-            for (piece, what) in [(2 * at, "pass"), (2 * at + 1, "read")] {
-                if let Some(Some(failure)) = outcome.refused.get(piece) {
-                    row = row.with(Node::leaf(what, Observed::value(failure.recorded())));
-                }
-            }
-            sites.push(row);
+            sites.push(drawn_or_refused(row, refused));
         }
         written.sort();
         written.dedup();
@@ -382,7 +368,13 @@ impl Case for WidePoints {
         // function writes opaque white and nothing blends, so this is one word, and a draw that
         // wrote another colour or a partial coverage value moves this site rather than hiding
         // inside a coverage set that happens to match.
-        sites.leaf("written-words", Observed::value(Value::set(written)));
+        // A roll-up over a row our side did not draw has no answer either: the first refusal is
+        // its answer.
+        let first_refused = (0..2 * rows.len()).find_map(|piece| outcome.refusal(piece));
+        sites.push(drawn_or_refused(
+            Node::leaf("written-words", Observed::value(Value::set(written))),
+            first_refused,
+        ));
         Ok(())
     }
 }
@@ -392,13 +384,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// No pixel drawn, in the lane's table.
+    /// No pixel drawn, in the probe's table.
     const NONE: u8 = u8::MAX;
 
-    /// The pixel the lane's own Metal probe stored, `8 x + y`, through each viewport at each
-    /// offset along `x`, then along `y`; [`NONE`] where it drew none. Copied from
-    /// `runtime_lane::wide_points::PROBE_9` to be checked against the recording, never to stand in
-    /// for it.
+    /// The pixel a Metal probe stored, `8 x + y`, through each viewport at each offset along `x`,
+    /// then along `y`; [`NONE`] where it drew none. Checked against the recording, never to stand
+    /// in for it.
     const PROBE_9: [[[u8; 17]; 2]; 7] = [
         [
             [
@@ -465,7 +456,7 @@ mod tests {
         ],
     ];
 
-    /// The pixels `(x, y)` the lane's fitted rule keeps of a point of `size` at the clip-space
+    /// The pixels `(x, y)` the fitted rule keeps of a point of `size` at the clip-space
     /// `(x, y, z, w)` through `viewport` in an 8 by 8 target: Metal keeps the point while its
     /// centre lies within `1.5 w` on each axis and `0 <= z <= w`, and covers the pixels whose
     /// centres its square `[c - s/2, c + s/2)` reaches, inside the pixels the viewport overlaps.
@@ -516,10 +507,10 @@ mod tests {
         pixels.iter().map(|(x, y)| format!("{x},{y}")).collect()
     }
 
-    /// The lane's table is its own fitted rule's, row for row: the two expectations the lane
-    /// carried agree before either is compared with Metal's bytes.
+    /// The probe's table is the fitted rule's, row for row: the two expectations agree before
+    /// either is compared with Metal's bytes.
     #[test]
-    fn the_lane_s_table_is_its_own_fitted_rule_s() {
+    fn the_probes_table_is_the_fitted_rules() {
         let mut checked = 0usize;
         for (at, viewport) in VIEWPORTS.iter().enumerate() {
             for (axis, codes) in PROBE_9[at].iter().enumerate() {
@@ -554,12 +545,11 @@ mod tests {
         assert_eq!(named.len(), rows.len());
     }
 
-    /// Every coverage Metal recorded holds exactly the pixels the lane's fitted rule keeps.
+    /// Every coverage Metal recorded holds exactly the pixels the fitted rule keeps.
     ///
-    /// This is the cross-check the port owes the lane: the lane carried a probe's table and a rule,
-    /// the case carries Metal's coverages, and this says whether they agree — over the rows the
-    /// table never reached as well, since the rule covers those. It reads the recording, so it runs
-    /// where there is no GPU.
+    /// The case carries Metal's coverages, and this says whether they agree with the rule — over
+    /// the rows the table never reached as well, since the rule covers those. It reads the
+    /// recording, so it runs where there is no GPU.
     #[test]
     fn metal_s_recorded_coverages_hold_the_fitted_rule_s_pixels() {
         let case = WidePoints;
@@ -602,7 +592,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{} of {checked} recorded coverages differ from the lane's fitted rule",
+            "{} of {checked} recorded coverages differ from the fitted rule",
             differ.len()
         );
     }

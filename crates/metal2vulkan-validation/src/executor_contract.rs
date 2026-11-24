@@ -8,6 +8,7 @@ pub mod out_of_bounds;
 pub mod rate_map;
 pub mod render_target_array;
 pub mod sample_rate;
+pub mod seq_cst_fence;
 pub mod sparse;
 pub mod stage_inputs;
 pub mod tessellation;
@@ -15,9 +16,10 @@ pub mod tessellation;
 pub use depth_stencil::{depth_stencil_test, DepthStencilTest, DrawDepthStencil};
 
 use crate::air::reflect::{
-    ResourceKind, ShaderInterface, ShaderStage, TextureDimension,
-    TextureFormat as ReflectedTextureFormat,
+    ResourceKind, ShaderInterface, ShaderStage, TextureFormat as ReflectedTextureFormat,
 };
+use crate::case::indirect_commands::{CommandDescriptor, RenderDraws};
+use crate::case::out_of_bounds::OutOfBoundsResource;
 use crate::case::{
     AuthoredCase, DeviceBufferArrayResource, OutputSelection, Primitive, Stage, TextureFormat,
     ThreadgroupMemoryResource,
@@ -153,7 +155,8 @@ fn encoder_operation_is_executable(operation: crate::air::calls::CommandEncoderO
 }
 
 /// The requirements a module's `air.*` calls state by their names alone: an implicit imageblock
-/// texture whose format no literal names, and an indirect command no executor encodes.
+/// texture whose format no literal names, an indirect command no executor encodes, and a 64-bit
+/// texture atomic, which the runtime refuses ([`calls_ulong_texture_atomic`]).
 pub fn unsupported_air_requirements(
     calls: &BTreeMap<String, usize>,
 ) -> BTreeSet<ToolingRequirement> {
@@ -170,7 +173,24 @@ pub fn unsupported_air_requirements(
     }) {
         requirements.insert(ToolingRequirement::IndirectCommandBuffer);
     }
+    if calls_ulong_texture_atomic(calls) {
+        requirements.insert(ToolingRequirement::UlongTextureAtomic);
+    }
     requirements
+}
+
+/// Whether the module calls an atomic on a Metal `ulong` texture (`atomic_min` or `atomic_max`,
+/// the only ones Apple's compiler takes of one): a [`ulong_texture_calls`] call whose operation is
+/// an atomic, which the translator lowers to a 64-bit image atomic
+/// ([`ToolingRequirement::UlongTextureAtomic`]).
+pub fn calls_ulong_texture_atomic(calls: &BTreeMap<String, usize>) -> bool {
+    use metal2vulkan_air::intrinsics::{AirIntrinsic, TexOp};
+    ulong_texture_calls(calls).any(|name| {
+        matches!(
+            AirIntrinsic::parse(name),
+            Some(AirIntrinsic::Texture(texture)) if matches!(texture.op, TexOp::Atomic(_))
+        )
+    })
 }
 
 /// The module's `air.*` texture operations on a Metal `ulong` texture: those the product's
@@ -238,21 +258,24 @@ pub fn indirect_command_requirement(
         .then_some(ToolingRequirement::IndirectCommandBuffer)
 }
 
-/// Whether replaying the commands a module encodes observes them. Both executors execute a case's
-/// compute commands and its render commands after its producer: a kernel's dispatch or a vertex or
-/// fragment function's draw, never a tile function's (a render pass's tile dispatch, whose commands
-/// neither models). So the stage is one of those, every operation it encodes is a compute or a
-/// render command's, and one of them selects what a replayed command writes: a kernel buffer, a
-/// dispatch, or a compute pipeline for a replayed dispatch; a vertex buffer, a draw, or a render
-/// pipeline for a replayed draw, whose template is a rasterization-disabled vertex function, an
-/// indexed draw, whose indices are the vertex IDs that template writes by, or a patch draw or an
+/// Whether replaying the commands a module encodes observes them. The Metal oracle executes a
+/// case's compute commands and its render commands after its producer: a kernel's dispatch or a
+/// vertex or fragment function's draw, never a tile function's (a render pass's tile dispatch,
+/// whose commands it does not model). So the stage is one of those, every operation it encodes is a
+/// compute or a render command's, and one of them selects what a replayed command writes: a kernel
+/// buffer, a dispatch, or a compute pipeline for a replayed dispatch; a vertex buffer, a draw, or a
+/// render pipeline for a replayed draw, whose template is a rasterization-disabled vertex function,
+/// an indexed draw, whose indices are the vertex IDs that template writes by, or a patch draw or an
 /// indexed patch draw, whose patches, instances and factors are the domain points a
 /// rasterization-disabled post-tessellation template writes by; an object or mesh buffer or a mesh
 /// draw, whose grid and threadgroups are the positions a rasterization-disabled mesh template
 /// writes by, for a replayed mesh draw; a reset, which leaves a command the host encoded running
 /// nothing; and a copy, which makes a command the one it copies. A barrier, a threadgroup length,
 /// a stage-in region, an imageblock size, or a fragment buffer alone changes no value a replayed
-/// command writes unless its template reads it, which the module does not decide.
+/// command writes unless its template reads it, which the module does not decide. The engine's
+/// candidate executes no command: every indirect command buffer a case holds carries a requirement
+/// that stops it, a runtime limit or, for the shape the runtime builds,
+/// [`ToolingRequirement::IndirectIndexedDraws`] ([`case_requirements`]).
 fn replay_observes_commands(
     calls: &BTreeMap<String, usize>,
     reflection: Option<&ShaderInterface>,
@@ -629,14 +652,6 @@ pub fn unsupported_reflection_requirements(
             requirements.insert(ToolingRequirement::KernelStageInputLiteral);
         }
         if let Some(shape) = binding.texture_shape {
-            if shape.dimension == TextureDimension::Buffer
-                && !matches!(
-                    binding.kind,
-                    ResourceKind::Texture | ResourceKind::StorageImage
-                )
-            {
-                requirements.insert(ToolingRequirement::TextureBufferLiteral);
-            }
             if shape.storage_format.is_some_and(|format| {
                 !matches!(
                     format,
@@ -679,16 +694,23 @@ pub fn unsupported_reflection_requirements(
 ///
 /// The Metal oracle: a compute kernel that samples with a `min_lod_clamp`, whose pipeline Apple's
 /// compiler cannot build ([`min_lod_clamp::kernel_min_lod_clamp_requirement`]).
+///
+/// The engine's candidate again: a sequentially consistent fence, which the runtime refuses
+/// ([`seq_cst_fence::seq_cst_fence_requirement`]).
 pub fn unsupported_source_requirements(
     source_ll: &str,
     reflection: &ShaderInterface,
 ) -> BTreeSet<ToolingRequirement> {
     let mut requirements = unsupported_reflection_requirements(reflection);
     requirements.extend(engine_source_requirements(reflection));
+    requirements.extend(mesh::mesh_pipeline_requirement(reflection));
     requirements.extend(rate_map::rate_map_placement_requirement(
         source_ll, reflection,
     ));
     requirements.extend(min_lod_clamp::kernel_min_lod_clamp_requirement(
+        source_ll, reflection,
+    ));
+    requirements.extend(seq_cst_fence::seq_cst_fence_requirement(
         source_ll, reflection,
     ));
     let calls = air_call_counts(source_ll);
@@ -710,20 +732,21 @@ pub fn unsupported_source_requirements(
 ///   checker requires authored as a device-buffer array);
 /// - [`ToolingRequirement::RenderAccelerationStructure`]: a vertex or fragment function's
 ///   acceleration-structure or intersection-function-table argument (the checker requires every
-///   bound one).
+///   bound one);
+/// - [`ToolingRequirement::RenderFunctionTable`]: a vertex or fragment function's
+///   visible-function-table argument, which the runtime's render pipeline state does not read.
 ///
 /// A post-tessellation vertex function is none of them: the candidate draws its patches as the
 /// oracle does (`tessellation`); nor is a fragment function's color input, whose render target the
-/// candidate attaches as the input attachment the plan reads, nor its explicit imageblock, whose
-/// cells the candidate holds in the storage image the plan's imageblock write names, defined as the
-/// oracle's initializer defines them; nor is an argument-buffer member holding a compute or render
-/// pipeline state, which the candidate writes into its owner as an opaque id that no translated
-/// pipeline reads; nor a kernel's implicit imageblock attachments, which the candidate runs as the
-/// oracle's tile pipeline over the render area's tiles. The engine's other gaps are a case's
-/// choice, not the source's ([`case_requirements`]): an argument-buffer intersection-function table
-/// (the checker does not require one), a linked intersection function (the case's acceleration
-/// structures are opaque triangles, which call none), and a vertex case's depth/stencil
-/// attachment or a rasterization-disabled vertex case's render targets.
+/// candidate attaches as the input attachment the plan reads; nor is an argument-buffer member
+/// holding a compute or render pipeline state, which the candidate writes into its owner as an
+/// opaque id that no translated pipeline reads. The engine's other gaps are a case's choice, not
+/// the source's ([`case_requirements`]): an argument-buffer intersection-function table (the
+/// checker does not require one), a linked intersection function (the case's acceleration
+/// structures are opaque triangles, which call none), a vertex case's depth/stencil attachment or
+/// a rasterization-disabled vertex case's render targets, and the families the runtime builds no
+/// call for: a kernel's function table, imageblock, acceleration structure or stage inputs, and a
+/// fragment function's imageblock among them.
 pub fn engine_source_requirements(reflection: &ShaderInterface) -> BTreeSet<ToolingRequirement> {
     let render = matches!(
         reflection.stage,
@@ -740,6 +763,8 @@ pub fn engine_source_requirements(reflection: &ShaderInterface) -> BTreeSet<Tool
                 .as_deref()
                 .is_some_and(crate::air::meta::is_device_buffer_array_type_name)
     });
+    let function_table = (reflection.bindings.iter())
+        .any(|binding| binding.kind == ResourceKind::VisibleFunctionTable);
     let acceleration_structure = reflection.bindings.iter().any(|binding| {
         matches!(
             binding.kind,
@@ -757,6 +782,10 @@ pub fn engine_source_requirements(reflection: &ShaderInterface) -> BTreeSet<Tool
             render && acceleration_structure,
             ToolingRequirement::RenderAccelerationStructure,
         ),
+        (
+            render && function_table,
+            ToolingRequirement::RenderFunctionTable,
+        ),
     ]
     .into_iter()
     .filter_map(|(present, requirement)| present.then_some(requirement))
@@ -767,9 +796,20 @@ pub fn engine_source_requirements(reflection: &ShaderInterface) -> BTreeSet<Tool
 /// engine's candidate refuses before it maps a case. The source's families are
 /// [`engine_source_requirements`]'s and an object function's threadgroup memory
 /// ([`mesh::mesh_requirements`]); each of them a case authors is also named here, so a case that
-/// was checked against an older reflection is refused all the same.
+/// was checked against an older reflection is refused all the same. A depth outside `[0, 1]` the
+/// case gives a depth image is the runtime's limit on every device
+/// ([`depth_range::depth_range_requirement`]), and so are an indexed draw past its index buffer
+/// (its out-of-bounds target, [`ToolingRequirement::IndexBufferPastEnd`]) and a depth/stencil
+/// attachment of both aspects ([`ToolingRequirement::SeparateDepthStencil`]). So are the families
+/// the runtime builds no call for, or refuses at creation on every device: a kernel's explicit
+/// imageblock, acceleration structure or stage inputs, a sparse texture, a
+/// fragment function's imageblock, a rasterization-rate map, a vertex buffer's dynamic stride, an indirect command buffer of any form but kernel-encoded indexed
+/// draws that inherit the pipeline state and bind their own buffers (its compute commands, its
+/// other draw types, its other inheritance, or a command the host encodes), and a pipeline state
+/// an argument buffer holds.
 pub fn case_requirements(case: &AuthoredCase) -> BTreeSet<ToolingRequirement> {
     let render = matches!(case.stage, Stage::Vertex | Stage::Fragment);
+    let kernel = case.stage == Stage::Kernel;
     let drawn = render || case.stage.is_mesh_pipeline_stage();
     let linked = |entries: &[crate::case::IntersectionFunctionTableEntry]| {
         entries.iter().any(|entry| {
@@ -805,6 +845,10 @@ pub fn case_requirements(case: &AuthoredCase) -> BTreeSet<ToolingRequirement> {
             ToolingRequirement::RenderAccelerationStructure,
         ),
         (
+            render && !case.visible_function_tables.is_empty(),
+            ToolingRequirement::RenderFunctionTable,
+        ),
+        (
             case.stage == Stage::Vertex && case.depth_stencil.is_some(),
             ToolingRequirement::VertexDepthStencilAttachment,
         ),
@@ -812,11 +856,125 @@ pub fn case_requirements(case: &AuthoredCase) -> BTreeSet<ToolingRequirement> {
             case.is_rasterization_disabled_vertex() && !case.render_targets.is_empty(),
             ToolingRequirement::RasterizationDisabledRenderTarget,
         ),
+        (
+            case.out_of_bounds.iter().any(|declaration| {
+                declaration
+                    .targets
+                    .iter()
+                    .any(|target| target.resource == OutOfBoundsResource::IndexBuffer)
+            }),
+            ToolingRequirement::IndexBufferPastEnd,
+        ),
+        (
+            render
+                && case.depth_stencil.as_ref().is_some_and(|attachment| {
+                    attachment.initial_depth_b64.is_some()
+                        && attachment.initial_stencil_b64.is_some()
+                }),
+            ToolingRequirement::SeparateDepthStencil,
+        ),
+        (
+            kernel
+                && (case.imageblock.as_ref())
+                    .is_some_and(|imageblock| imageblock.implicit_coverage.is_some()),
+            ToolingRequirement::KernelImageblock,
+        ),
+        (
+            case.fragment_imageblock.is_some(),
+            ToolingRequirement::FragmentImageblock,
+        ),
+        (
+            case.textures.iter().any(|texture| texture.sparse.is_some()),
+            ToolingRequirement::SparseTexture,
+        ),
+        (
+            kernel
+                && (!case.acceleration_structures.is_empty()
+                    || !case.intersection_function_tables.is_empty()),
+            ToolingRequirement::KernelAccelerationStructure,
+        ),
+        (
+            kernel
+                && (!case.kernel_stage_inputs.is_empty()
+                    || case
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.stage_in_region.is_some())),
+            ToolingRequirement::KernelStageInput,
+        ),
+        (
+            case.render_pass_rate_map.is_some()
+                || case
+                    .buffers
+                    .iter()
+                    .any(|buffer| buffer.rasterization_rate_map.is_some())
+                || case
+                    .argument_buffer_buffers
+                    .iter()
+                    .any(|buffer| buffer.rasterization_rate_map.is_some()),
+            ToolingRequirement::RasterizationRateMap,
+        ),
+        (
+            case.vertex_inputs.iter().any(|input| input.dynamic_stride),
+            ToolingRequirement::DynamicVertexStride,
+        ),
+        (
+            case.command_buffers
+                .iter()
+                .any(|buffer| matches!(buffer.descriptor, CommandDescriptor::Compute { .. })),
+            ToolingRequirement::IndirectComputeCommands,
+        ),
+        (
+            case.command_buffers.iter().any(|buffer| {
+                matches!(&buffer.descriptor, CommandDescriptor::Render { draws, .. }
+                    if *draws != INDEXED_DRAWS_ALONE)
+            }),
+            ToolingRequirement::IndirectDrawTypes,
+        ),
+        (
+            case.command_buffers.iter().any(|buffer| {
+                matches!(buffer.descriptor, CommandDescriptor::Render { .. })
+                    && (!buffer.inherit_pipeline_state || buffer.inherit_buffers)
+            }),
+            ToolingRequirement::IndirectCommandInheritance,
+        ),
+        (
+            case.command_buffers
+                .iter()
+                .any(|buffer| !buffer.commands.is_empty()),
+            ToolingRequirement::HostEncodedIndirectCommands,
+        ),
+        (
+            !case.pipeline_states.is_empty(),
+            ToolingRequirement::ArgumentBufferPipelineState,
+        ),
+        (
+            case.command_buffers.iter().any(|buffer| {
+                matches!(&buffer.descriptor, CommandDescriptor::Render { draws, .. }
+                    if *draws == INDEXED_DRAWS_ALONE)
+                    && buffer.inherit_pipeline_state
+                    && !buffer.inherit_buffers
+                    && buffer.commands.is_empty()
+            }),
+            ToolingRequirement::IndirectIndexedDraws,
+        ),
     ]
     .into_iter()
     .filter_map(|(present, requirement)| present.then_some(requirement))
+    .chain(depth_range::depth_range_requirement(case))
     .collect()
 }
+
+/// The one draw type the runtime's indirect command buffer holds: indexed draws alone
+/// ([`ToolingRequirement::IndirectDrawTypes`] for any other).
+const INDEXED_DRAWS_ALONE: RenderDraws = RenderDraws {
+    primitives: false,
+    indexed: true,
+    patches: false,
+    indexed_patches: false,
+    mesh_threadgroups: false,
+    mesh_threads: false,
+};
 
 /// Every requirement of `case` against its source: what the source's structure raises
 /// ([`unsupported_source_requirements`]), what its mesh draw needs ([`mesh::mesh_requirements`]),
@@ -843,7 +1001,9 @@ pub fn checked_requirements(
 
 /// Why the executor pair cannot evidence a case with `requirements`, or `None`: one that stops the
 /// Metal oracle leaves no observation to compare with, and one that stops the candidate leaves
-/// nothing to compare. A case both run is checkable. A requirement whose limit is Metal's own is
+/// nothing to compare, but for a requirement whose cases stay Metal-qualified
+/// ([`ToolingRequirement::qualifies_on_metal`]): such a case is checkable on Metal alone, and the
+/// candidate refuses it. A case both run is checkable. A requirement whose limit is Metal's own is
 /// named as such: no tooling can give the oracle that case.
 pub fn evidence_gap(requirements: &BTreeSet<ToolingRequirement>) -> Option<String> {
     fn joined(requirements: impl IntoIterator<Item = ToolingRequirement>) -> String {
@@ -853,12 +1013,6 @@ pub fn evidence_gap(requirements: &BTreeSet<ToolingRequirement>) -> Option<Strin
             .collect::<Vec<_>>()
             .join(",")
     }
-    let names = |executor| {
-        joined(ToolingRequirement::stopping(
-            requirements.iter().copied(),
-            executor,
-        ))
-    };
     let (metal_limit, tooling): (Vec<_>, Vec<_>) =
         ToolingRequirement::stopping(requirements.iter().copied(), Executor::MetalOracle)
             .into_iter()
@@ -880,7 +1034,11 @@ pub fn evidence_gap(requirements: &BTreeSet<ToolingRequirement>) -> Option<Strin
         return Some(metal.join("; "));
     }
     let candidate = Executor::EngineCandidate;
-    let stopped = names(candidate);
+    let stopped = joined(
+        ToolingRequirement::stopping(requirements.iter().copied(), candidate)
+            .into_iter()
+            .filter(|requirement| !requirement.qualifies_on_metal()),
+    );
     (!stopped.is_empty()).then(|| format!("{candidate}: {stopped} (the candidate is stopped)"))
 }
 
@@ -904,8 +1062,9 @@ pub fn require_executor(
 /// These are not shader-translation gaps: they mean the validation harness cannot yet construct
 /// an observable experiment for an otherwise reflected interface. A vertex function's effect is
 /// its position, a writable resource, or the commands it encodes where replaying them observes
-/// them ([`CommandsOnly::Replayed`]): both executors draw it with rasterization off and then
-/// execute those commands, as a kernel's are, and a case of it must execute them
+/// them ([`CommandsOnly::Replayed`]): the Metal oracle draws it with rasterization off and then
+/// executes those commands, as a kernel's are (the engine's candidate executes none: every
+/// indirect command buffer stops it, [`case_requirements`]), and a case of it must execute them
 /// ([`require_reflection`]). Their contents stay an [`UnobservedEffect`]. A vertex function with
 /// none of these raises [`ToolingRequirement::VertexSideEffectObservation`].
 pub fn unsupported_observation_requirements(
@@ -1657,9 +1816,12 @@ mod tests {
                 mesh_buffers: vec![],
             },
         )));
+        // The executed compute commands are the runtime's limit alone, no reflection gap.
         assert_eq!(
             require_reflection(&executing, encoding_only, &reflection, "test executor"),
-            Ok(BTreeSet::new())
+            Ok(BTreeSet::from([
+                ToolingRequirement::IndirectComputeCommands
+            ]))
         );
 
         let vertex = crate::air::reflect::interface_from_vertex(
@@ -1696,7 +1858,9 @@ mod tests {
         executing_vertex.command_buffers = executing.command_buffers.clone();
         assert_eq!(
             require_reflection(&executing_vertex, indexed, &vertex, "test executor"),
-            Ok(BTreeSet::new())
+            Ok(BTreeSet::from([
+                ToolingRequirement::IndirectComputeCommands
+            ]))
         );
         // Commands no replay observes leave the vertex function without an observed effect: a
         // fragment buffer alone, which no replayed command reads.
@@ -1904,12 +2068,20 @@ mod tests {
             assert!(!requirement(&ll), "{modeled}");
         }
 
-        // The executors' shared gate supplies authored command-buffer and pipeline handles.
+        // The executors' shared gate supplies authored command-buffer and pipeline handles; a
+        // buffer of compute commands is the runtime's limit alone, so the Metal oracle runs it.
+        let engine_only = |case: &AuthoredCase| {
+            let requirements = case_requirements(case);
+            assert!(requirements.contains(&ToolingRequirement::IndirectComputeCommands));
+            for requirement in requirements {
+                assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+            }
+        };
         let mut authored = case();
         authored.command_buffers.push(command_buffer(None));
         assert!(require_case(&authored, "test executor").is_ok());
-        assert!(case_requirements(&authored).is_empty());
-        // Host-encoded or executed commands are no executor's gap.
+        engine_only(&authored);
+        // Host-encoded or executed commands are no authoring gap.
         let mut host = command_buffer(None);
         host.commands
             .push(crate::case::indirect_commands::HostCommand {
@@ -1936,7 +2108,7 @@ mod tests {
         ] {
             let mut authored = case();
             authored.command_buffers.push(resource);
-            assert!(case_requirements(&authored).is_empty());
+            engine_only(&authored);
         }
     }
 
@@ -2076,8 +2248,9 @@ mod tests {
     }
 
     /// Each texture operation on a `ulong` texel, in every shape the public fixtures spell, is a
-    /// `ulong` texture call, and no executor's gap. The same operations on a 32-bit texel are no
-    /// `ulong` texture call.
+    /// `ulong` texture call; a read or a write is no executor's gap, and an atomic is the runtime's
+    /// ([`ToolingRequirement::UlongTextureAtomic`]). The same operations on a 32-bit texel are no
+    /// `ulong` texture call and no gap.
     #[test]
     fn ulong_texture_operations_are_named_by_their_texel() {
         let fixtures = [
@@ -2100,12 +2273,18 @@ mod tests {
                     .count()
             );
             operations += ulong.len();
-            assert!(unsupported_air_requirements(&calls).is_empty());
+            let atomic = ulong.iter().any(|name| name.contains("atomic_"));
+            assert_eq!(calls_ulong_texture_atomic(&calls), atomic);
+            assert_eq!(
+                unsupported_air_requirements(&calls),
+                BTreeSet::from_iter(atomic.then_some(ToolingRequirement::UlongTextureAtomic))
+            );
             let narrow = calls
                 .keys()
                 .map(|name| (name.replace(".u.v4i64", ".u.v4i32"), 1))
                 .collect::<BTreeMap<_, _>>();
             assert!(!calls_ulong_texture(&narrow));
+            assert!(unsupported_air_requirements(&narrow).is_empty());
         }
         // The distinct operations the two modules spell: reads, writes, and atomic minima and
         // maxima of the six shapes, the 2D ones at 32- and 16-bit coordinates.
@@ -2685,6 +2864,11 @@ entry:
                 "intersection_function_table<triangle_data>",
                 ToolingRequirement::RenderAccelerationStructure,
             ),
+            (
+                ResourceKind::VisibleFunctionTable,
+                "visible_function_table<WordOp>",
+                ToolingRequirement::RenderFunctionTable,
+            ),
         ] {
             let mut binding = buffer.clone();
             binding.kind = kind;
@@ -2758,56 +2942,15 @@ entry:
             assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
         };
 
-        let mut pipelines = kernel.clone();
-        pipelines
-            .pipeline_states
-            .push(crate::case::indirect_commands::PipelineResource {
-                buffer_binding: 0,
-                field_offset: 8,
-                token: 1,
-                air_sha256: "33".repeat(32),
-                case_id: "44".repeat(32),
-            });
-        // A pipeline-state literal is an opaque id in its owner.
-        assert!(case_requirements(&pipelines).is_empty());
-
+        // A tile function's implicit imageblock is the runtime's limit; an explicit one, whose
+        // size the run sets, is none.
         let mut tile = kernel.clone();
         tile.imageblock = Some(ImageblockResource {
             dimensions: [1, 1],
             implicit_coverage: Some(ImplicitImageblockCoverage::FullSingleSample),
         });
-        // The candidate runs a tile function over any grid of tiles: one tile of one thread per
-        // cell, a render area of more than one tile, a threadgroup that is not the tile's, or a
-        // tile past 2x2.
-        for (dimensions, grid, threads) in [
-            ([1, 1], [1, 1, 1], [1, 1, 1]),
-            ([2, 2], [2, 2, 1], [2, 2, 1]),
-            ([1, 1], [2, 1, 1], [1, 1, 1]),
-            ([1, 1], [1, 1, 1], [2, 1, 1]),
-            ([1, 1], [1, 1, 2], [1, 1, 1]),
-            ([1, 2], [1, 2, 1], [1, 2, 1]),
-            ([4, 4], [4, 4, 1], [4, 4, 1]),
-            ([16, 16], [16, 16, 1], [16, 16, 1]),
-        ] {
-            let mut grid_case = tile.clone();
-            grid_case.imageblock.as_mut().unwrap().dimensions = dimensions;
-            grid_case.dispatch = Some(Dispatch {
-                grid,
-                threads_per_threadgroup: threads,
-                stage_in_region: None,
-            });
-            assert!(
-                case_requirements(&grid_case).is_empty(),
-                "{dimensions:?} {grid:?} {threads:?}"
-            );
-        }
-        // An explicit imageblock is no tile function.
+        only(&tile, ToolingRequirement::KernelImageblock);
         tile.imageblock.as_mut().unwrap().implicit_coverage = None;
-        tile.dispatch = Some(Dispatch {
-            grid: [2, 1, 1],
-            threads_per_threadgroup: [1, 1, 1],
-            stage_in_region: None,
-        });
         assert!(case_requirements(&tile).is_empty());
 
         let opaque = IntersectionFunctionTableEntry::OpaqueTriangle {
@@ -2844,14 +2987,34 @@ entry:
             primitive_triangles_b64: None,
             child_references: vec![0],
         }];
-        assert!(case_requirements(&traced).is_empty());
+        only(&traced, ToolingRequirement::KernelAccelerationStructure);
         let mut linking = traced.clone();
         linking.intersection_function_tables = vec![table(linked)];
-        only(&linking, ToolingRequirement::LinkedIntersectionFunction);
+        assert_eq!(
+            case_requirements(&linking),
+            BTreeSet::from([
+                ToolingRequirement::LinkedIntersectionFunction,
+                ToolingRequirement::KernelAccelerationStructure
+            ])
+        );
 
         let mut fragment = traced.clone();
         fragment.stage = Stage::Fragment;
         only(&fragment, ToolingRequirement::RenderAccelerationStructure);
+        // A kernel's function table is no limit (the runtime makes and binds it); a vertex or
+        // fragment function's is the runtime's.
+        let mut tabled = kernel.clone();
+        tabled.visible_function_tables = vec![crate::case::FunctionTableResource {
+            binding: 1,
+            size: 1,
+            entries: Vec::new(),
+        }];
+        assert!(case_requirements(&tabled).is_empty());
+        for stage in [Stage::Vertex, Stage::Fragment] {
+            let mut drawn = tabled.clone();
+            drawn.stage = stage;
+            only(&drawn, ToolingRequirement::RenderFunctionTable);
+        }
         let mut arrays = kernel.clone();
         arrays.device_buffer_arrays = vec![device_buffer_array(0, 1, &[0])];
         assert!(case_requirements(&arrays).is_empty());
@@ -2874,6 +3037,34 @@ entry:
         vertex.stage = Stage::Vertex;
         vertex.vertex_observation = Some(VertexObservation::Position);
         assert!(case_requirements(&vertex).is_empty());
+        // An indexed draw past its index buffer is the runtime's limit; a vertex fetch past its
+        // vertex buffer is no requirement.
+        let past = |resource, form| {
+            let mut past = vertex.clone();
+            past.out_of_bounds = Some(crate::case::out_of_bounds::OutOfBounds {
+                targets: vec![crate::case::out_of_bounds::OutOfBoundsTarget {
+                    resource,
+                    form,
+                    reach_before: 0,
+                    reach_after: 8,
+                }],
+                reads: Vec::new(),
+            });
+            past
+        };
+        use crate::case::out_of_bounds::ContainmentForm;
+        only(
+            &past(
+                OutOfBoundsResource::IndexBuffer,
+                ContainmentForm::IndexBuffer,
+            ),
+            ToolingRequirement::IndexBufferPastEnd,
+        );
+        assert!(case_requirements(&past(
+            OutOfBoundsResource::AttributeBuffer { location: 0 },
+            ContainmentForm::VertexInput
+        ))
+        .is_empty());
         vertex.depth_stencil = Some(DepthStencilResource {
             dimensions: [1, 1],
             initial_depth_b64: Some("AAAAAA==".into()),
@@ -2881,6 +3072,97 @@ entry:
             state: None,
         });
         only(&vertex, ToolingRequirement::VertexDepthStencilAttachment);
+        // A fragment case's attachment of one aspect runs; of both, the oracle's two textures in
+        // one pass, it is the runtime's limit.
+        let mut aspects = kernel.clone();
+        aspects.stage = Stage::Fragment;
+        aspects.depth_stencil = vertex.depth_stencil.clone();
+        assert!(case_requirements(&aspects).is_empty());
+        if let Some(attachment) = &mut aspects.depth_stencil {
+            attachment.initial_stencil_b64 = Some("qw==".into());
+        }
+        only(&aspects, ToolingRequirement::SeparateDepthStencil);
+        // What the runtime builds no call for, or refuses at creation: a sparse texture, a
+        // kernel's stage inputs or stage-in region, a vertex buffer's dynamic stride, a fragment
+        // function's imageblock and a rasterization-rate map. A bound texture buffer it makes.
+        let texture = |texture_type| TextureResource {
+            binding: 0,
+            role: ResourceRole::Input,
+            texture_type,
+            format: TextureFormat::Rgba32Float,
+            dimensions: [1, 1, 1],
+            sample_count: 1,
+            bytes_b64: Some("AAAAAAAAAAAAAAAAAAAAAA==".into()),
+            initial_bytes_b64: None,
+            sparse: None,
+            mip_levels: 1,
+        };
+        let mut textured = kernel.clone();
+        textured.textures = vec![texture(TextureType::D2)];
+        assert!(case_requirements(&textured).is_empty());
+        textured.textures = vec![texture(TextureType::Buffer)];
+        assert!(case_requirements(&textured).is_empty());
+        textured.textures = vec![TextureResource {
+            sparse: Some(crate::case::sparse::SparseTextureResource {
+                mappings: Vec::new(),
+            }),
+            ..texture(TextureType::D2)
+        }];
+        only(&textured, ToolingRequirement::SparseTexture);
+        let input = |dynamic_stride| crate::case::AttributeInput {
+            location: 0,
+            format: crate::case::AttributeFormat::Float,
+            stride: 4,
+            dynamic_stride,
+            bytes_b64: "AAAAAA==".into(),
+        };
+        let mut staged = kernel.clone();
+        staged.kernel_stage_inputs = vec![input(false)];
+        only(&staged, ToolingRequirement::KernelStageInput);
+        let mut region = kernel.clone();
+        region.dispatch = Some(Dispatch {
+            grid: [1, 1, 1],
+            threads_per_threadgroup: [1, 1, 1],
+            stage_in_region: Some(crate::case::indirect_commands::HostStageInRegion {
+                origin: [0, 0, 0],
+                size: [1, 1, 1],
+            }),
+        });
+        only(&region, ToolingRequirement::KernelStageInput);
+        let mut fetched = kernel.clone();
+        fetched.stage = Stage::Vertex;
+        fetched.vertex_observation = Some(VertexObservation::Position);
+        fetched.vertex_inputs = vec![input(false)];
+        assert!(case_requirements(&fetched).is_empty());
+        fetched.vertex_inputs = vec![input(true)];
+        only(&fetched, ToolingRequirement::DynamicVertexStride);
+        let mut blocked = kernel.clone();
+        blocked.stage = Stage::Fragment;
+        blocked.fragment_imageblock = Some(FragmentImageblockResource {
+            dimensions: [1, 1],
+            members: Vec::new(),
+        });
+        only(&blocked, ToolingRequirement::FragmentImageblock);
+        let map = crate::case::RateMapLiteral {
+            screen_size: [1, 1],
+            layers: vec![crate::case::RateMapLayerLiteral {
+                horizontal: vec![crate::case::RateSample(1.0)],
+                vertical: vec![crate::case::RateSample(1.0)],
+            }],
+        };
+        let mut mapped = kernel.clone();
+        mapped.stage = Stage::Fragment;
+        mapped.render_pass_rate_map = Some(map.clone());
+        only(&mapped, ToolingRequirement::RasterizationRateMap);
+        let mut mapped = kernel.clone();
+        mapped.buffers = vec![BufferResource {
+            binding: 0,
+            role: ResourceRole::Input,
+            bytes_b64: None,
+            initial_bytes_b64: None,
+            rasterization_rate_map: Some(map),
+        }];
+        only(&mapped, ToolingRequirement::RasterizationRateMap);
         let mut disabled = kernel.clone();
         disabled.stage = Stage::Vertex;
         disabled.render_targets.push(RenderTargetResource {
@@ -2893,6 +3175,83 @@ entry:
             &disabled,
             ToolingRequirement::RasterizationDisabledRenderTarget,
         );
+        // What the runtime builds of an indirect command buffer: kernel-encoded indexed draws that
+        // inherit the pipeline state and bind their own buffers, which the engine's candidate does
+        // not map. Its compute commands, its other draw types, its other inheritance and a command
+        // the host encodes are each the runtime's limit, and so is a pipeline state an argument
+        // buffer holds.
+        use crate::case::indirect_commands::{CommandDescriptor, HostCommand, RenderDraws};
+        let indexed = crate::case::indirect_commands::CommandBufferResource {
+            inherit_pipeline_state: true,
+            descriptor: CommandDescriptor::Render {
+                draws: INDEXED_DRAWS_ALONE,
+                max_vertex_buffer_bind_count: 1,
+                max_fragment_buffer_bind_count: 0,
+                max_object_buffer_bind_count: 0,
+                max_mesh_buffer_bind_count: 0,
+                support_dynamic_attribute_stride: false,
+            },
+            ..command_buffer(None)
+        };
+        let mut encoding = kernel.clone();
+        encoding.command_buffers = vec![indexed.clone()];
+        only(&encoding, ToolingRequirement::IndirectIndexedDraws);
+        encoding.command_buffers = vec![command_buffer(None)];
+        only(&encoding, ToolingRequirement::IndirectComputeCommands);
+        for draws in [
+            RenderDraws::default(),
+            RenderDraws {
+                patches: true,
+                ..INDEXED_DRAWS_ALONE
+            },
+            RenderDraws {
+                indexed: false,
+                mesh_threads: true,
+                ..INDEXED_DRAWS_ALONE
+            },
+        ] {
+            let mut drawn = indexed.clone();
+            if let CommandDescriptor::Render { draws: allowed, .. } = &mut drawn.descriptor {
+                *allowed = draws;
+            }
+            encoding.command_buffers = vec![drawn];
+            only(&encoding, ToolingRequirement::IndirectDrawTypes);
+        }
+        for (inherit_pipeline_state, inherit_buffers) in [(false, false), (true, true)] {
+            encoding.command_buffers =
+                vec![crate::case::indirect_commands::CommandBufferResource {
+                    inherit_pipeline_state,
+                    inherit_buffers,
+                    ..indexed.clone()
+                }];
+            only(&encoding, ToolingRequirement::IndirectCommandInheritance);
+        }
+        encoding.command_buffers = vec![crate::case::indirect_commands::CommandBufferResource {
+            commands: vec![HostCommand {
+                index: 0,
+                action: None,
+                barrier: false,
+                pipeline: None,
+                buffers: Vec::new(),
+                threadgroup_memory_lengths: Vec::new(),
+                stage_in_region: None,
+                vertex_buffers: Vec::new(),
+                fragment_buffers: Vec::new(),
+            }],
+            ..indexed
+        }];
+        only(&encoding, ToolingRequirement::HostEncodedIndirectCommands);
+        let mut holding = kernel.clone();
+        holding
+            .pipeline_states
+            .push(crate::case::indirect_commands::PipelineResource {
+                buffer_binding: 0,
+                field_offset: 0,
+                token: 1,
+                air_sha256: "33".repeat(32),
+                case_id: "44".repeat(32),
+            });
+        only(&holding, ToolingRequirement::ArgumentBufferPipelineState);
 
         // The engine's candidate draws a tessellation in any authored state.
         let mut patches = vertex.clone();
@@ -2974,6 +3333,19 @@ entry:
                 "kernel_min_lod_clamp (Metal cannot build the case's pipeline, so it has no \
                  reference); indirect_command_buffer (the Metal oracle cannot run the case)"
             )
+        );
+
+        // A mesh render pipeline's case stays Metal-qualified: the checker takes it, and the
+        // candidate refuses it. Beside a requirement that stops the candidate outright, only that
+        // one is named.
+        assert_eq!(evidence_gap(&set(&[R::MeshRenderPipeline])), None);
+        assert_eq!(
+            evidence_gap(&set(&[R::MeshRenderPipeline, R::RenderDeviceBufferArray])).as_deref(),
+            Some("engine_candidate: render_device_buffer_array (the candidate is stopped)")
+        );
+        assert_eq!(
+            require_executor(&set(&[R::MeshRenderPipeline]), Executor::EngineCandidate),
+            Err(set(&[R::MeshRenderPipeline]))
         );
 
         let requirements = set(&[R::RenderDeviceBufferArray]);

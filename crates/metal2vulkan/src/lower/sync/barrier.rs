@@ -57,7 +57,7 @@ use crate::air::intrinsics::{
 use crate::air::ir::{Callee, Inst, InstId, InstKind, Value, ValueId};
 use crate::device::requirements::VkFeature;
 use crate::device::subgroup::{OpBits, SimdClass, Tier};
-use crate::error::{Capability, Error, Feature, LowerFamily, Unsupported};
+use crate::error::{Capability, DiagName, Error, Feature, LowerFamily, Unsupported};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::{FamilyPlans, Plan, SelectCx};
 use crate::lower::strategy::{FamilyStrategy, Strategy};
@@ -224,9 +224,15 @@ pub struct BarrierPlan {
     /// placement proved the whole threadgroup reaches together
     /// (`uniform::Uniformity::under_barriers`), so, though tangled, none depends on how subgroups
     /// reconverge, as the emulated tier's exchanges between workgroup barriers in workgroup-uniform
-    /// control flow do not. A program's barrier is not among them: it keeps the profile's
-    /// reconvergence.
+    /// control flow do not. A program's barrier is not among them: it is in [`threadgroup`].
+    ///
+    /// [`threadgroup`]: Self::threadgroup
     pub uniform_placed: std::collections::BTreeSet<ValueId>,
+    /// Every threadgroup barrier, the program's and the lockstep pass's. Metal requires every
+    /// thread of the threadgroup to execute each, the same number of times, so its invocations
+    /// reach it together wherever SPIR-V reconverges them: everywhere but a loop a back edge
+    /// re-enters from inside a selection (`lower::simd::reentry`).
+    pub threadgroup: std::collections::BTreeSet<ValueId>,
     /// `lower::simd::lockstep` inserted a simdgroup barrier: the simd class takes it at
     /// [`lockstep_class`], once the program's own operations have set theirs.
     pub lockstep_simdgroup: bool,
@@ -424,8 +430,11 @@ fn select_barrier(
         require_seq_cst(cx)?;
     }
     cx.tangled.insert(id);
-    if origin != Origin::Program && scope == Scope::Workgroup {
-        cx.families.barrier.uniform_placed.insert(id);
+    if scope == Scope::Workgroup {
+        cx.families.barrier.threadgroup.insert(id);
+        if origin != Origin::Program {
+            cx.families.barrier.uniform_placed.insert(id);
+        }
     }
     Ok(BarrierStrategy::Barrier(Barrier {
         scope,
@@ -482,11 +491,22 @@ pub const SEQ_CST_WORDS: u32 = 48;
 /// (`dispatch::KernelDecl::rows_may_split`), its constants, and the selection around the barrier.
 pub const ROWS_GUARD_WORDS: u32 = 40;
 
+/// The form a sequentially consistent fence is refused as under the identity domains
+/// ([`require_seq_cst`]).
+pub(crate) const SEQ_CST_FORM: &str = "a sequentially consistent fence";
+
 /// What a sequentially consistent fence needs ([`seq_cst_order`]): the command buffer's
 /// `ExecutionStatus` word (`absent::state_status`), and the stage's atomics; a device without them
-/// refuses the fence as `SeqCstFence`, naming what it needs.
+/// refuses the fence as `SeqCstFence`, naming what it needs. The identity domains reach no such
+/// word: under them the fence is refused as `IdentityDomains`, not implemented, naming
+/// [`SEQ_CST_FORM`].
 pub fn require_seq_cst(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     use crate::lower::access::absent::{state_status, status_short, StatusBinding, StatusShort};
+    if crate::lower::access::identity(cx.profile) {
+        return Err(Unsupported::not_implemented(Feature::IdentityDomains)
+            .naming(DiagName::new(SEQ_CST_FORM))
+            .into());
+    }
     if let Some(StatusShort::Stores(f)) = status_short(cx) {
         return Err(Unsupported::needs(Feature::SeqCstFence, Capability::Feature(f)).into());
     }
@@ -571,6 +591,7 @@ fn select_derivative(
         (DerivativeOp::Fwidth, false) => DerivOp::Fwidth,
     };
     cx.tangled.insert(id);
+    cx.derivatives.insert(id);
     Ok(BarrierStrategy::Derivative(Deriv { op, value }))
 }
 

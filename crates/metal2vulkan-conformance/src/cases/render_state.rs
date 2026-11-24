@@ -40,7 +40,6 @@
 //! viewport inside its target, which `every_box_lies_inside_its_target` holds with no device
 //! asked.
 
-use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, Case, Failure, Handle, Input, MetalSource, SamplerSpec, Side, TextureRole,
     TextureSpec,
@@ -57,7 +56,6 @@ use crate::transcript::{
 use metal2vulkan::metal::{
     CullMode, PixelFormat, PrimitiveType, SamplerAddressMode, TriangleFillMode, Winding,
 };
-use metal2vulkan_runtime::Degradation;
 
 /// The format every target here carries: a `float` stored as it is, so the whole expectation is
 /// arithmetic rather than a rounding rule.
@@ -531,19 +529,6 @@ impl Case for Boxes {
         RUNS
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Nothing is loosened. A `RGBA32Float` texel is the `float4` a fragment function
-        // returned, so what each draw saw is an exact answer or it is a bug; there is no
-        // normalized conversion here and no arithmetic of the shader's -- `tob_solid` returns its
-        // binding and `tob_read` reads a texel at integer coordinates, neither of which can take a
-        // device's float bounds.
-        //
-        // One notice is declared, and it is the venue's and not this case's: the buffer the pass
-        // reads its target back through is `Shared`, which a device with no unified memory keeps
-        // in system memory because that is the only memory both sides can reach.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shader_refs()
     }
@@ -733,34 +718,6 @@ impl Case for Facing {
         RUNS
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // No value is loosened, for the reason `render-state-boxes` states: every texel this case
-        // reads compared exactly. What is declared is one notice, and this case's own shape is
-        // what provokes it.
-        //
-        // **Metal's triangle fill mode is encoder state and Vulkan's polygon mode is pipeline
-        // state**, so the draw after `setTriangleFillMode:MTLTriangleFillModeLines` needs a
-        // pipeline the pass had not made, and a draw whose pipeline is being made cannot record
-        // into an instance that recorded inline: it records into a new render pass instance after
-        // it (`metal2vulkan_runtime`'s `render/inline_first.rs`, counted as that crate's
-        // `work_counts::Split::PendingPipeline`). A mid-pass fill-mode change therefore splits the
-        // Vulkan render pass, which is work Metal does not do, and the runtime announces it.
-        //
-        // Measured on an Apple M3 Max (macOS 27.0.1, build 26A434), under the exact policy and
-        // under the runtime's own defaults alike: our leg announces
-        // `metal2vulkan-degrade-render-pass-split` once, its notice naming a pass of one color
-        // attachment in two instances, while every texel this case reads and every other field of
-        // its transcript compared exactly. The declaration loosens no value -- it says the
-        // announcement is this case's -- so the case still fails on any byte that moves.
-        //
-        // The notice the venue's own memory model provokes for the `Shared` read-back buffer is
-        // declared beside it.
-        vec![
-            crate::replay::notice_allowance(Degradation::RenderPassSplit.code()),
-            crate::replay::shared_memory_notice(),
-        ]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shader_refs()
     }
@@ -925,12 +882,6 @@ impl Case for UnreadSlots {
         RUNS
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Nothing loosened, for the reason `render-state-boxes` states, and the one notice the
-        // venue's own memory model provokes for the `Shared` read-back buffer.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shader_refs()
     }
@@ -1006,7 +957,6 @@ impl Case for UnreadSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allowance::Justification;
     use crate::transcript::Transcript;
     use std::collections::BTreeSet;
 
@@ -1386,23 +1336,8 @@ mod tests {
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
-            // Every case declares the notice the venue's own memory model provokes for the
-            // `Shared` read-back buffer, and exactly one -- the facing case -- declares the pass
-            // split besides. No value of any case is loosened, so every declaration sits at the
-            // notices site.
-            let declared = case.allowances();
-            for allowance in &declared {
-                assert!(allowance.path.starts_with("case/notices"), "{allowance:?}");
-            }
-            let codes: Vec<&Justification> =
-                declared.iter().map(|held| &held.justified_by).collect();
-            let shared =
-                Justification::Degradation(Degradation::SharedInSystemMemory.code().to_owned());
-            let split = Justification::Degradation(Degradation::RenderPassSplit.code().to_owned());
-            match case.name() {
-                "render-state-facing" => assert_eq!(codes, vec![&split, &shared]),
-                _ => assert_eq!(codes, vec![&shared], "{}", case.name()),
-            }
+            // No value of any case is loosened, and no case declares a notice.
+            assert!(case.allowances().is_empty(), "{}", case.name());
         }
     }
 }

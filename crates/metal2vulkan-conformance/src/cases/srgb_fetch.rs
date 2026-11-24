@@ -9,42 +9,46 @@
 //! round trip -- decode `c / 255`, halve, encode, round -- in **15 of its 256 codes, each by
 //! exactly one** (`tests::the_table_is_not_the_textbook_round_trip` pins which codes, so a later
 //! tidying of the table into the formula fails). Metal's own decode and encode are what the
-//! recording holds; the table is the lane's measurement of them, kept here as the cross-check.
+//! recording holds; the table is a measurement of them, kept here as the cross-check.
 //!
-//! The pass, as the probe this ports drew it: a 64² `BGRA8Unorm_sRGB` or `RGBA8Unorm_sRGB` target
-//! holding in texel `i` the memory bytes `i`, `37 i + i / 256`, `101 i + 7 (i / 256)`, `i / 16`,
-//! each mod 256, so every byte takes every value. The pass loads and stores it and draws
-//! `fetch_ordered` one, two or three times, every channel written, no blending. Each draw reads
-//! what the last one stored, so `N` draws apply the one-draw map `N` times.
+//! The pass, as the probe drew it: a 64² `BGRA8Unorm_sRGB` or `RGBA8Unorm_sRGB` target holding in
+//! texel `i` the memory bytes `i`, `37 i + i / 256`, `101 i + 7 (i / 256)`, `i / 16`, each mod 256,
+//! so every byte takes every value. The pass loads and stores it and draws `fetch_ordered` one, two
+//! or three times, every channel written, no blending. Each draw reads what the last one stored, so
+//! `N` draws apply the one-draw map `N` times.
 //!
-//! A fourth row attaches a `Depth32Float_Stencil8` attachment, cleared to 1.0 by a pass before it
-//! and loaded, under a depth state of `Always` without writes, and draws three times. Its answer
-//! is the three-draw answer: a depth test that drops no fragment changes nothing. **It is here for
-//! a second reason** -- its pipeline is the first in the suite to declare a depth and a stencil
-//! format beside a colour answer that could move if the declaration were wrong, which is the field
-//! our side was not forwarding at all until this round.
+//! A fourth row attaches a `Depth32Float_Stencil8` texture as its depth and its stencil
+//! attachment, cleared to 1.0 and 0 by a pass before it and loaded, under a depth state of `Always`
+//! without writes and no stencil test, and draws three times. Its answer is the three-draw answer:
+//! a depth test that drops no fragment changes nothing. **It is here for a second reason** -- its
+//! pipeline is the first in the suite to declare a depth and a stencil format beside a colour
+//! answer that could move if the declaration were wrong. Metal's validation stops a pipeline that
+//! declares a stencil format in a pass with no stencil texture ("For stencil attachment, the
+//! renderPipelineState pixelFormat must be MTLPixelFormatInvalid, as no texture is set"), so the
+//! texture is the stencil attachment too.
 //!
-//! Not ported: the multisampled rows, and the two depth-`Less` rows whose earlier pass writes 0.25
+//! Not cases: the multisampled rows, and the two depth-`Less` rows whose earlier pass writes 0.25
 //! into the target's left half under a colour mask of no channel. Those need a half-extent draw and
-//! a per-half expectation; they are the next commit in this family, not this one.
+//! a per-half expectation.
 //!
 //! Nothing here can fault a GPU: at most four render passes of at most three triangles each over a
 //! 64² target, no loop in the fixture, and one blit a row.
 
 use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
-    ColorState, PassColor, PassDepth, Plane, ReadAt, RenderPass, RenderPipelineSpec, RenderStep,
-    RenderWork, StageFunction, TargetSpec,
+    ColorState, PassColor, PassDepth, PassStencil, Plane, ReadAt, RenderPass, RenderPipelineSpec,
+    RenderStep, RenderWork, StageFunction, TargetSpec,
 };
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::StoreAction;
 use metal2vulkan::metal::state::DepthStencilDescriptor;
 use metal2vulkan::metal::{CompareFunction, PixelFormat};
-use metal2vulkan_runtime::{Degradation, StoreAction};
 
 /// The fixture the vertex function comes from, and the function.
 const VERTEX_FIXTURE: &str = "rt6_resolves";
@@ -72,6 +76,9 @@ const DEPTH_STENCIL: PixelFormat = PixelFormat::Depth32FloatStencil8;
 
 /// The depth the row's earlier pass clears to, which `Always` ignores.
 const DEPTH_CLEAR: f64 = 1.0;
+
+/// The stencil the row's earlier pass clears to, which no stencil test reads.
+const STENCIL_CLEAR: u32 = 0;
 
 /// The memory bytes every target starts at, in memory order.
 fn initial() -> Vec<u8> {
@@ -174,7 +181,7 @@ fn fixture(name: &'static str, entry: &'static str) -> Fixture {
 
 impl SrgbFetch {
     /// The target: shared, because its codes go in through `replaceRegion:`, and a shader also
-    /// reads it, as the lane's does.
+    /// reads it.
     fn target_spec(&self) -> TargetSpec {
         TargetSpec::read(self.format, [SIDE, SIDE]).shared()
     }
@@ -214,36 +221,15 @@ impl Case for SrgbFetch {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // The notice set alone, never a texel: how a venue reaches the attachment is a route, and
-        // a route that costs more announces itself -- a scratch image through the pixel interlock
-        // (MoltenVK), a performance notice. Every byte compares exactly, which is the owner's rule
-        // for this family.
-        //
-        // A third route the same pass takes on lavapipe: an attachment it does not store back is
-        // Vulkan's `DONT_CARE` where the driver is measured to leave the earlier texels there,
-        // announced as `dont-care-store`. Measured on both rows of this module and on neither row
-        // of `super::fetch_ordered`, so it is named here and not there. It says nothing about the
-        // texels either -- every byte still compares exactly.
+        // The notice set alone, never a texel: every byte compares exactly, which is the owner's
+        // rule for this family.
         //
         // A venue with neither ordered fetch form reads the input attachment ordered between draws
         // alone, announced `unordered-fetch-within-draw`; each draw is one fullscreen triangle,
         // which overlaps itself nowhere, so every byte still compares exactly.
-        [
-            Degradation::FetchThroughScratch,
-            Degradation::DontCareStore,
-            Degradation::UnorderedFetchWithinDraw,
-        ]
-        .iter()
-        .map(|notice| crate::replay::notice_allowance(notice.code()))
-        .chain([
-            // The buffer each pass reads its target back through is `Shared`
-            // ([`crate::replay::shared_memory_notice`]).
-            crate::replay::shared_memory_notice(),
-            // Each draw after the first fetches in the pixel interlock what the one before
-            // wrote there ([`crate::replay::interlocked_split_notice`]).
-            crate::replay::interlocked_split_notice(),
-        ])
-        .collect()
+        vec![crate::replay::notice_allowance(
+            Degradation::UnorderedFetchWithinDraw.code(),
+        )]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -299,6 +285,7 @@ impl Case for SrgbFetch {
             &[
                 DEPTH_STENCIL.as_raw().to_le_bytes().to_vec(),
                 DEPTH_CLEAR.to_bits().to_le_bytes().to_vec(),
+                STENCIL_CLEAR.to_le_bytes().to_vec(),
             ]
             .concat(),
         ));
@@ -367,8 +354,9 @@ impl Case for SrgbFetch {
             }
             let mut pass = RenderPass::clearing(vec![PassColor::loaded(target)]).drawing(steps);
             if row.depth {
-                // The depth attachment is cleared and stored by a pass of its own first, so the
-                // drawing pass loads a depth it did not clear -- which is how the probe drew it.
+                // The depth and stencil attachments are cleared and stored by a pass of its own
+                // first, so the drawing pass loads what it did not clear -- which is how the probe
+                // drew its depth.
                 let depth = made(
                     sites,
                     &format!("target/{at}/depth"),
@@ -376,11 +364,16 @@ impl Case for SrgbFetch {
                 )?;
                 work.push(RenderWork::Pass(
                     RenderPass::clearing(Vec::new())
-                        .with_depth(PassDepth::cleared(depth, DEPTH_CLEAR)),
+                        .with_depth(PassDepth::cleared(depth, DEPTH_CLEAR))
+                        .with_stencil(PassStencil::cleared(depth, STENCIL_CLEAR)),
                 ));
                 let mut loaded = PassDepth::cleared(depth, DEPTH_CLEAR);
-                loaded.load = metal2vulkan_runtime::LoadAction::Load;
-                pass = pass.with_depth(loaded.stored(StoreAction::DontCare));
+                loaded.load = crate::values::LoadAction::Load;
+                let mut stencil = PassStencil::cleared(depth, STENCIL_CLEAR);
+                stencil.load = crate::values::LoadAction::Load;
+                pass = pass
+                    .with_depth(loaded.stored(StoreAction::DontCare))
+                    .with_stencil(stencil.stored(StoreAction::DontCare));
             }
             work.push(RenderWork::Pass(pass));
             let texels = made(

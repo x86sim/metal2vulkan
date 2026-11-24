@@ -53,9 +53,10 @@ values GroupNonUniformFMul GroupNonUniformSMin GroupNonUniformUMin GroupNonUnifo
 values GroupNonUniformSMax GroupNonUniformUMax GroupNonUniformFMax GroupNonUniformBitwiseAnd
 values GroupNonUniformBitwiseOr GroupNonUniformBitwiseXor GroupNonUniformLogicalAnd
 values GroupNonUniformLogicalOr GroupNonUniformLogicalXor GroupNonUniformQuadBroadcast
-values GroupNonUniformQuadSwap TerminateInvocation FmaKHR TypeRayQueryKHR RayQueryInitializeKHR
+values GroupNonUniformQuadSwap GroupNonUniformQuadAllKHR GroupNonUniformQuadAnyKHR TerminateInvocation
+values FmaKHR TypeRayQueryKHR RayQueryInitializeKHR
 values RayQueryConfirmIntersectionKHR RayQueryProceedKHR RayQueryGetIntersectionTypeKHR
-values EmitVertex EndPrimitive EmitMeshTasksEXT SetMeshOutputsEXT TypeAccelerationStructureKHR BeginInvocationInterlockEXT
+values EmitMeshTasksEXT SetMeshOutputsEXT TypeAccelerationStructureKHR BeginInvocationInterlockEXT
 values EndInvocationInterlockEXT DemoteToHelperInvocation IsHelperInvocationEXT
 values RayQueryGetIntersectionTKHR RayQueryGetIntersectionInstanceCustomIndexKHR
 values RayQueryGetIntersectionInstanceIdKHR
@@ -72,7 +73,7 @@ values *
 
 enum ExecutionModel
 from_u32 test
-values Vertex TessellationControl TessellationEvaluation Geometry Fragment GLCompute TaskEXT MeshEXT
+values Vertex TessellationControl TessellationEvaluation Fragment GLCompute TaskEXT MeshEXT
 test-values *
 
 enum AddressingModel
@@ -87,8 +88,7 @@ values OriginUpperLeft EarlyFragmentTests DepthReplacing DepthGreater DepthLess 
 values Quads OutputVertices OutputPoints SubgroupUniformControlFlowKHR SignedZeroInfNanPreserve
 values StencilRefReplacingEXT RequireFullQuadsKHR OutputLinesEXT OutputPrimitivesEXT
 values DerivativeGroupLinearKHR OutputTrianglesEXT PixelInterlockOrderedEXT
-values SampleInterlockOrderedEXT MaximallyReconvergesKHR InputPoints InputLines Invocations
-values OutputLineStrip OutputTriangleStrip DenormPreserve RoundingModeRTE PostDepthCoverage
+values MaximallyReconvergesKHR DenormPreserve RoundingModeRTE
 test-values ContractionOff FPFastMathDefault
 
 enum StorageClass
@@ -97,9 +97,6 @@ values StorageBuffer PhysicalStorageBuffer TaskPayloadWorkgroupEXT
 
 enum Dim
 values D1 D2 D3 Cube Buffer SubpassData
-
-enum FPEncoding
-values Float8E4M3EXT Float8E5M2EXT
 
 enum ImageFormat
 values *

@@ -1,1158 +1,2521 @@
-use crate::memory::{
-    candidates, dma_buf_attempts, dma_buf_candidates, dma_buf_class_order, fd_buffer_types,
-    host_cached, host_cached_placement, host_image_types, host_incoherent, kept_budget,
-    overflow_candidates, placement_order, pooled_block_bytes, worked_first, MemoryClass, Pool,
-    BLOCK_BYTES, KEPT_EMPTY_BLOCKS, KEPT_EMPTY_BYTES, KEPT_EMPTY_FOR,
-};
-use ash::vk;
-use std::time::Instant;
+//! Memory blocks and buffers: the plan of a zero fill, a block's length and alignment, the idle
+//! clock; and, under a device cfg, on every device of the cfg's kind, that the device makes an
+//! allocation of each class as it is made and the next only while a class holds no wholly free
+//! unit, that a class idle past the idle age keeps one wholly free unit and no other,
+//! that blocks are handed out and buffers view them, zeroed from their `zero_from` (a Private
+//! buffer's fill ahead of a copy into it in the next command buffer), that the consumer's hook
+//! maps each allocation before any block of it goes out and a take whose allocation it does not
+//! map is refused, that a block given back is a free range at once, its bytes as written, the
+//! first fit of a later take, that each idle allocation is freed at its idle age, under steady
+//! commits too, that seeded takes and releases of mixed lengths all return, that a Private range
+//! is zeroed when the consumer asks, that the runtime zeroes what it is asked over bytes written
+//! outside its buffers, and that
+//! teardown frees everything with the gauges at zero.
 
-fn ty(flags: vk::MemoryPropertyFlags) -> vk::MemoryType {
-    vk::MemoryType {
-        property_flags: flags,
-        heap_index: 0,
-    }
-}
+use crate::fill::{plan, Plan};
+use crate::memory::{base_align, idle_due, round, IDLE_AGE_NANOS};
+use crate::{Error, Limit};
 
 #[test]
-fn classes_pick_their_memory_types_best_first() {
-    use vk::MemoryPropertyFlags as P;
-    let types = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::HOST_VISIBLE | P::HOST_COHERENT),
-        ty(P::DEVICE_LOCAL | P::HOST_VISIBLE | P::HOST_COHERENT),
-        ty(P::HOST_VISIBLE | P::HOST_CACHED),
+fn a_zero_fill_fills_whole_words_and_copies_the_bytes_outside_them() {
+    let fill = |fill: Option<(u64, u64)>, copies: &[(u64, u64)]| Plan {
+        fill,
+        copies: copies.to_vec(),
+    };
+    let cases = [
+        // Whole words: one fill.
+        ((0, 256), fill(Some((0, 256)), &[])),
+        ((4096, 4100), fill(Some((4096, 4100)), &[])),
+        // Words inside, with bytes before and after them.
+        (
+            (4097, 4110),
+            fill(Some((4100, 4108)), &[(4097, 4100), (4108, 4110)]),
+        ),
+        ((1, 8), fill(Some((4, 8)), &[(1, 4)])),
+        ((0, 7), fill(Some((0, 4)), &[(4, 7)])),
+        // No whole word inside: one copy, at most 6 bytes.
+        ((1, 7), fill(None, &[(1, 7)])),
+        ((5, 7), fill(None, &[(5, 7)])),
+        ((4099, 4100), fill(None, &[(4099, 4100)])),
+        ((3, 3), fill(None, &[])),
     ];
-    let all = 0b1111;
-    // Shared needs host-visible coherent memory and prefers host-cached, then device-local (the
-    // cached type here is not coherent).
-    assert_eq!(candidates(&types, all, MemoryClass::Shared, false), [2, 1]);
-    // Private needs device-local memory and avoids host-visible.
-    assert_eq!(candidates(&types, all, MemoryClass::Private, false), [0, 2]);
-    // Only the types the resource allows.
-    assert_eq!(candidates(&types, 0b0011, MemoryClass::Shared, false), [1]);
-    assert!(candidates(&types, 0b1000, MemoryClass::Private, false).is_empty());
-    // A device with only unified memory (lavapipe, Apple GPUs' shared types): both classes use it.
-    let unified = [ty(P::DEVICE_LOCAL | P::HOST_VISIBLE | P::HOST_COHERENT)];
-    assert_eq!(candidates(&unified, 1, MemoryClass::Shared, false), [0]);
-    assert_eq!(candidates(&unified, 1, MemoryClass::Private, false), [0]);
-    // Memoryless prefers lazily allocated memory, which no other class uses.
-    let tiler = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | P::LAZILY_ALLOCATED),
-        ty(P::DEVICE_LOCAL | P::HOST_VISIBLE | P::HOST_COHERENT),
-    ];
-    assert_eq!(
-        candidates(&tiler, 0b111, MemoryClass::Memoryless, false),
-        [1, 0, 2]
-    );
-    assert_eq!(
-        candidates(&tiler, 0b111, MemoryClass::Private, false),
-        [0, 2]
-    );
-    // Without lazily allocated memory, as `Private`.
-    assert_eq!(
-        candidates(&types, all, MemoryClass::Memoryless, false),
-        [0, 2]
-    );
-}
-
-/// An import of a dma-buf tries its class's order (the class's types first, then every other
-/// type the dma-buf and what is bound in it take that the runtime may allocate and that is
-/// neither protected nor lazily allocated, in Vulkan's order), but the system-memory types the
-/// host maps (host-visible, not device-local) last. With an RTX 3090's types (NVIDIA's
-/// 620.70.06), whose udmabuf lists types 0 and 4, a `Shared` import tries type 0, system memory
-/// with no property flag, which that driver imports a udmabuf as, before type 4, the class's,
-/// whose refused import breaks the device's exportable device-local allocations. Each form of an
-/// import tries the other types before any form tries a system-memory type the host maps. Where
-/// the types are all device-local (ANV's on an Iris Xe) or all host-mapped system memory (RADV's
-/// for a udmabuf), the class's order stands.
-#[test]
-fn dma_buf_imports_try_the_system_memory_types_the_host_maps_last() {
-    use vk::MemoryPropertyFlags as P;
-    let host = P::HOST_VISIBLE | P::HOST_COHERENT;
-    let nvidia = [
-        ty(P::empty()),
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL | host),
-    ];
-    assert_eq!(
-        dma_buf_class_order(&nvidia, 0x11, MemoryClass::Shared, false),
-        [4, 0]
-    );
-    assert_eq!(
-        dma_buf_candidates(&nvidia, 0x11, MemoryClass::Shared, false),
-        [0, 4]
-    );
-    // The class's own order first, the others after it in Vulkan's; then the system-memory types
-    // the host maps (3 and 4) after the rest, each group in that order.
-    assert_eq!(
-        dma_buf_class_order(&nvidia, 0x3f, MemoryClass::Shared, false),
-        [4, 5, 3, 0, 1, 2]
-    );
-    assert_eq!(
-        dma_buf_candidates(&nvidia, 0x3f, MemoryClass::Shared, false),
-        [5, 0, 1, 2, 4, 3]
-    );
-    let private = dma_buf_class_order(&nvidia, 0x3f, MemoryClass::Private, false);
-    let (others, mapped): (Vec<u32>, Vec<u32>) =
-        private.iter().partition(|&&index| index != 3 && index != 4);
-    assert_eq!(
-        dma_buf_candidates(&nvidia, 0x3f, MemoryClass::Private, false),
-        [others, mapped].concat()
-    );
-    assert!(dma_buf_candidates(&nvidia, 0, MemoryClass::Shared, false).is_empty());
-    // A buffer's import, dedicated to nothing and then to the buffer: both forms as type 0
-    // before either as type 4.
-    let ranked = dma_buf_candidates(&nvidia, 0x11, MemoryClass::Shared, false);
-    assert_eq!(
-        dma_buf_attempts(&nvidia, &ranked, &[false, true]),
-        [(false, 0), (true, 0), (false, 4), (true, 4)]
-    );
-    // Where every type the dma-buf lists is device-local (ANV's on an Iris Xe: 0x1, 0x7, 0xf,
-    // unified) or host-mapped system memory (RADV's for a udmabuf on a discrete GPU), the
-    // class's order and the forms' stand.
-    let anv = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | host),
-        ty(P::DEVICE_LOCAL | host | P::HOST_CACHED),
-    ];
-    let gtt = [
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(P::DEVICE_LOCAL | host),
-        ty(host | P::HOST_CACHED),
-    ];
-    for (types, allowed, unified) in [(&anv[..], 0b111, true), (&gtt[..], 0b1010, false)] {
-        for class in [
-            MemoryClass::Shared,
-            MemoryClass::WriteCombined,
-            MemoryClass::Private,
-            MemoryClass::Managed,
-        ] {
-            let ranked = dma_buf_candidates(types, allowed, class, unified);
-            assert_eq!(
-                ranked,
-                dma_buf_class_order(types, allowed, class, unified),
-                "{class:?}"
+    for ((offset, end), expected) in cases {
+        let got = plan(offset, end);
+        assert_eq!(got, expected, "{offset}..{end}");
+        for &(start, end) in &got.copies {
+            assert!(
+                end - start <= 6,
+                "a copy of {start}..{end} passes the zero source"
             );
-            let forms: Vec<(bool, u32)> = [false, true]
-                .into_iter()
-                .flat_map(|dedicated| ranked.iter().map(move |&index| (dedicated, index)))
-                .collect();
-            assert_eq!(dma_buf_attempts(types, &ranked, &[false, true]), forms);
         }
     }
-    // Never a protected, lazily allocated or AMD device-coherent type.
-    let others = [
-        ty(P::PROTECTED),
-        ty(P::DEVICE_LOCAL | P::LAZILY_ALLOCATED),
-        ty(P::DEVICE_LOCAL | P::DEVICE_COHERENT_AMD),
-        ty(host),
-    ];
-    assert_eq!(
-        dma_buf_candidates(&others, 0b1111, MemoryClass::Shared, false),
-        [3]
-    );
 }
 
-/// The form and type the device's last import of a kind succeeded as go first, the others keep
-/// their order and stay tried: NVIDIA's udmabuf types ranked 4, 0, its imports succeeding as 0
-/// alone (620.70.06), and a buffer's imports of scattered pages refused dedicated to nothing and
-/// taken dedicated to the buffer (615.71.09).
+/// A block's length is the length asked (at least 1) rounded up to the granule, within the
+/// device's longest allocation and buffer.
 #[test]
-fn a_dma_buf_import_tries_the_form_and_type_its_kind_last_imported_as_first() {
-    assert_eq!(worked_first(vec![4, 0], Some(0)), [0, 4]);
+fn a_block_is_the_length_rounded_up_to_the_granule_within_the_device() {
+    let max = 4 << 30;
+    let granule = 64 << 10;
+    assert_eq!(round(0, granule, max).unwrap(), granule);
+    assert_eq!(round(1, granule, max).unwrap(), granule);
+    assert_eq!(round(257 << 20, granule, max).unwrap(), 257 << 20);
     assert_eq!(
-        worked_first(vec![4, 5, 3, 0, 1, 2], Some(3)),
-        [3, 4, 5, 0, 1, 2]
+        round((256 << 20) + 1, granule, max).unwrap(),
+        (256 << 20) + granule
     );
-    assert_eq!(worked_first(vec![4, 0], Some(4)), [4, 0]);
-    // A type the dma-buf or its resource does not take is not added.
-    assert_eq!(worked_first(vec![4, 0], Some(7)), [4, 0]);
-    assert_eq!(worked_first(vec![4, 0], None), [4, 0]);
-    assert!(worked_first(Vec::<u32>::new(), Some(0)).is_empty());
-    // A buffer's attempts, dedicated to nothing in each type and then dedicated to the buffer.
-    let buffer = vec![(false, 3), (false, 0), (true, 3), (true, 0)];
-    assert_eq!(
-        worked_first(buffer.clone(), Some((true, 0))),
-        [(true, 0), (false, 3), (false, 0), (true, 3)]
-    );
-    assert_eq!(
-        worked_first(buffer, Some((false, 0))),
-        [(false, 0), (false, 3), (true, 3), (true, 0)]
-    );
-    // A shared import has no dedicated form to put first.
-    assert_eq!(
-        worked_first(vec![(false, 3), (false, 0)], Some((true, 0))),
-        [(false, 3), (false, 0)]
-    );
-}
-
-/// A class that requires device-local memory (`Private`, `Memoryless`) overflows, where none of
-/// its own types has room, into every other type the resource takes that is neither device-local,
-/// lazily allocated nor AMD's device-coherent memory, those the host does not map first and
-/// otherwise in Vulkan's order. The host-visible classes, whose own candidates already take every
-/// coherent type the host maps, overflow into none, and no class does on a device whose every
-/// type is device-local.
-#[test]
-fn device_local_classes_overflow_into_system_memory() {
-    use vk::MemoryPropertyFlags as P;
-    let host = P::HOST_VISIBLE | P::HOST_COHERENT;
-    let types = [
-        ty(host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(P::empty()),
-        ty(P::DEVICE_LOCAL | host),
-        ty(host | P::HOST_CACHED | P::DEVICE_UNCACHED_AMD),
-        ty(P::DEVICE_LOCAL | P::LAZILY_ALLOCATED),
-    ];
-    let all = (1 << types.len()) - 1;
-    for class in [MemoryClass::Private, MemoryClass::Memoryless] {
-        assert_eq!(
-            overflow_candidates(&types, all, class, false),
-            [3, 0, 2],
-            "{class:?}"
-        );
-        // Only the types the resource takes.
-        assert_eq!(
-            overflow_candidates(&types, 0b0101, class, false),
-            [0, 2],
-            "{class:?}"
-        );
-        assert!(
-            overflow_candidates(&types, 0b111_0010, class, false).is_empty(),
-            "{class:?}"
-        );
+    assert_eq!(round(max, granule, max).unwrap(), max);
+    assert_eq!(round(1, 128 << 10, max).unwrap(), 128 << 10);
+    for (len, reported) in [(max + 1, max + granule), (u64::MAX, u64::MAX)] {
+        match round(len, granule, max) {
+            Err(Error::Limit(Limit::BlockLen { len, max: limit })) => {
+                assert_eq!((len, limit), (reported, max))
+            }
+            other => panic!("{len} bytes: {other:?}"),
+        }
     }
-    for class in [
-        MemoryClass::Shared,
-        MemoryClass::WriteCombined,
-        MemoryClass::Managed,
+}
+
+/// A block's first byte lies at a multiple of its length rounded up to a power of two, at most
+/// 2 MiB, and at least its buffer's alignment and the granule.
+#[test]
+fn a_block_starts_at_its_length_rounded_to_a_power_of_two_up_to_2_mib() {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    let granule = 64 * KIB;
+    for (len, alignment, expected) in [
+        (64 * KIB, 256, 64 * KIB),
+        (192 * KIB, 256, 256 * KIB),
+        (MIB, 256, MIB),
+        (3 * MIB, 256, 2 * MIB),
+        (16 * MIB, 256, 2 * MIB),
+        (16 * MIB, 4 * MIB, 4 * MIB),
+        (64 * KIB, 128 * KIB, 128 * KIB),
     ] {
-        assert!(
-            overflow_candidates(&types, all, class, false).is_empty(),
-            "{class:?}"
-        );
-    }
-    let unified = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL | P::LAZILY_ALLOCATED),
-    ];
-    for class in [MemoryClass::Private, MemoryClass::Memoryless] {
-        assert!(
-            overflow_candidates(&unified, 0b111, class, true).is_empty(),
-            "{class:?}"
-        );
+        assert_eq!(base_align(len, alignment, granule), expected, "{len}");
     }
 }
 
-/// A `Private` placement walks the device-local types before any it overflows into, and asks each
-/// type's pool alone for a kept dedicated block: with the memory types of an RTX 5080 Laptop GPU
-/// (NVIDIA 615.71.09, resizable BAR: type 1 device-local, type 4 device-local and host-visible,
-/// types 0, 2 and 3 system memory, 3 host-cached), whose buffers may take every type, kept
-/// 256 MiB dedicated blocks of types 1 and 3 (a two-copy `Managed` pair's device copy and host
-/// copy, released) give a 256 MiB `Private` placement the type-1 block, and the type-3 block only
-/// once no device-local type is left to try.
+/// The idle clock: what became idle is due once the idle age has passed, and before then names
+/// the host time it becomes due.
 #[test]
-fn a_private_placement_takes_a_kept_block_of_a_device_local_type_first() {
-    use vk::MemoryPropertyFlags as P;
-    let host = P::HOST_VISIBLE | P::HOST_COHERENT;
-    let types = [
-        ty(P::empty()),
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL | host),
-    ];
-    let all = 0b1_1111;
-    assert_eq!(
-        placement_order(&types, all, MemoryClass::Private, false),
-        [(1, false), (4, false), (0, true), (2, true), (3, true)]
-    );
-    // One pool per memory type, as `Memory` keeps them; a kept 256 MiB block in types 1 and 3.
-    const BYTES: u64 = 256 << 20;
-    let start = Instant::now();
-    let mut pools: Vec<Pool<u32>> = (0..types.len()).map(|_| Pool::default()).collect();
-    for type_index in [1, 3] {
-        let pool = &mut pools[type_index];
-        let block = pool.add(BYTES, true, type_index as u32, BYTES);
-        assert_eq!(
-            pool.release(block, (0, BYTES), start, u64::MAX, |_| true),
-            None
-        );
-    }
-    // `place`'s walk of the kept blocks: each type's pool in the placement's order.
-    let mut take = |allowed: u32| {
-        placement_order(&types, allowed, MemoryClass::Private, false)
-            .into_iter()
-            .find_map(|(type_index, overflowing)| {
-                let pool = &mut pools[type_index as usize];
-                let block = pool.place_dedicated(BYTES)?;
-                Some((*pool.payload(block)?, overflowing))
-            })
+fn the_idle_clock_is_due_at_the_idle_age() {
+    let since = 1_000;
+    let due = since + IDLE_AGE_NANOS;
+    assert_eq!(idle_due(since, since), Some(due));
+    assert_eq!(idle_due(since, due - 1), Some(due));
+    assert_eq!(idle_due(since, due), None);
+    assert_eq!(idle_due(since, u64::MAX), None);
+    assert_eq!(idle_due(u64::MAX, 0), Some(u64::MAX), "no overflow");
+}
+
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod on_device {
+    use crate::device::lock;
+    use crate::memory::IDLE_AGE_NANOS;
+    use crate::tests::command::on_device::finished;
+    use crate::tests::compute::on_device::{add, WORDS};
+    use crate::tests::devices_of_the_cfgs_kind;
+    use crate::{
+        AllocationId, AllocationInfo, Block, BlockId, BlockInfo, BlockMappings, Buffer,
+        CommandBufferStatus, ComputePipelineState, Device, DeviceOptions, DispatchType, Error,
+        ExportHandle, Gauges, Limit, MemoryClass, Metrics, PixelFormat, Refusal, TextureDescriptor,
+        TextureType, MAX_BUFFER_LENGTH,
     };
-    assert_eq!(take(all), Some((1, false)), "the device-local block");
-    assert_eq!(
-        take(all),
-        Some((3, true)),
-        "the system-memory block, overflowing, once no device-local block is kept"
-    );
-    assert_eq!(take(all), None);
-}
+    use ash::vk;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-/// `Shared` memory prefers a host-cached coherent type, then a device-local one, with unified
-/// memory or without; `WriteCombined` memory is `Shared` with unified memory and prefers a
-/// device-local type without. A cached type that is not coherent is neither.
-#[test]
-fn shared_memory_follows_the_cpu_cache_mode_and_unified_memory() {
-    use vk::MemoryPropertyFlags as P;
-    let host = P::HOST_VISIBLE | P::HOST_COHERENT;
-    let (shared, combined) = (MemoryClass::Shared, MemoryClass::WriteCombined);
-    // RADV on a Radeon 780M: the cached type is not device-local.
-    let radv = [
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(P::DEVICE_LOCAL | host),
-        ty(host | P::HOST_CACHED),
-    ];
-    for unified in [true, false] {
-        assert_eq!(candidates(&radv, 0b1111, shared, unified), [3, 2, 1]);
+    /// The runtime's own allocations besides the pool's, which the block-maker thread makes as
+    /// its first work: the zero source, the parameter ring's first block and the staging region.
+    const INTERNALS: u64 = 3;
+
+    /// Of [`INTERNALS`], those `Metrics::blocks_made` counts: the zero source and the ring's
+    /// block.
+    const INTERNAL_BLOCKS: u64 = 2;
+
+    /// The consumer's hooks as a test sees them: each allocation mapped, as the runtime described
+    /// it and the thread the map ran on, and each unmap, the thread it ran on and the
+    /// allocation's first byte read through the mapping the consumer was told of. While `refuse`
+    /// is set, it maps nothing.
+    #[derive(Default)]
+    struct Hook {
+        mapped: Mutex<Vec<Mapped>>,
+        unmapped: Mutex<Vec<Unmapped>>,
+        refuse: AtomicBool,
     }
-    assert_eq!(candidates(&radv, 0b1111, combined, true), [3, 2, 1]);
-    assert_eq!(candidates(&radv, 0b1111, combined, false), [2, 1, 3]);
-    // ANV on an Iris Xe: every type is device-local.
-    let anv = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | host),
-        ty(P::DEVICE_LOCAL | host | P::HOST_CACHED),
-    ];
-    for unified in [true, false] {
-        assert_eq!(candidates(&anv, 0b111, shared, unified), [2, 1]);
+
+    #[derive(Clone, Debug)]
+    struct Mapped {
+        allocation: AllocationId,
+        class: MemoryClass,
+        len: u64,
+        gpu_address: u64,
+        contents: Option<usize>,
+        thread: Option<String>,
+        /// Whether its make began no later than the map, and took time.
+        timed: bool,
     }
-    assert_eq!(candidates(&anv, 0b111, combined, true), [2, 1]);
-    assert_eq!(candidates(&anv, 0b111, combined, false), [1, 2]);
-    // NVIDIA on an RTX 3090 (resizable BAR): system memory, cached or not, and BAR memory.
-    let nvidia = [
-        ty(P::empty()),
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL | host),
-    ];
-    assert_eq!(candidates(&nvidia, 0b11_1111, shared, false), [4, 5, 3]);
-    assert_eq!(candidates(&nvidia, 0b11_1111, combined, false), [5, 3, 4]);
-    // A cached type that is not coherent is never taken.
-    let incoherent = [
-        ty(P::DEVICE_LOCAL | host),
-        ty(P::HOST_VISIBLE | P::HOST_CACHED),
-    ];
-    for class in [shared, combined] {
-        for unified in [true, false] {
-            assert_eq!(candidates(&incoherent, 0b11, class, unified), [0]);
+
+    #[derive(Clone, Debug)]
+    struct Unmapped {
+        allocation: AllocationId,
+        thread: Option<String>,
+        first: Option<u8>,
+    }
+
+    impl BlockMappings for Hook {
+        fn map(&self, allocation: &AllocationInfo) -> bool {
+            if self.refuse.load(Relaxed) {
+                return false;
+            }
+            lock(&self.mapped).push(Mapped {
+                allocation: allocation.id,
+                class: allocation.class,
+                len: allocation.len,
+                gpu_address: allocation.gpu_address,
+                contents: allocation.contents.map(|c| c.as_ptr() as usize),
+                thread: thread::current().name().map(str::to_string),
+                timed: allocation.make_start <= crate::host_time() && allocation.make_nanos > 0,
+            });
+            true
+        }
+
+        fn unmap(&self, allocation: AllocationId) {
+            let contents = (lock(&self.mapped).iter())
+                .find(|mapped| mapped.allocation == allocation)
+                .and_then(|mapped| mapped.contents);
+            let first = contents.map(|address| {
+                // SAFETY: the runtime keeps the memory mapped until this returns.
+                unsafe { (address as *const u8).read_volatile() }
+            });
+            lock(&self.unmapped).push(Unmapped {
+                allocation,
+                thread: thread::current().name().map(str::to_string),
+                first,
+            });
         }
     }
-    // `Managed` does not depend on unified memory; `Private` and `Memoryless` do where a type is
-    // not device-local (`unified_private_memory_takes_the_system_heap_first`).
-    assert_eq!(
-        candidates(&radv, 0b1111, MemoryClass::Managed, true),
-        candidates(&radv, 0b1111, MemoryClass::Managed, false),
-    );
-}
 
-/// With unified memory, `Private` and `Memoryless` memory take the types that are not
-/// device-local first, host-invisible, then uncached, then cached, and the device-local ones after
-/// (`Memoryless` a lazily allocated one before all), never a protected or AMD device-coherent one;
-/// without unified memory, or where every type the resource takes is device-local, as before.
-#[test]
-fn unified_private_memory_takes_the_system_heap_first() {
-    use vk::MemoryPropertyFlags as P;
-    let (private, memoryless) = (MemoryClass::Private, MemoryClass::Memoryless);
-    // RADV (Mesa 26.2.4) on a Radeon 780M: device-local 0, 1, 3 and 4 (3 and 4 host-visible),
-    // system memory 2 (uncached) and 5 and 6 (cached), protected 7 to 12 (11 and 12 not
-    // device-local), AMD device-coherent 13 to 16.
-    let radv: Vec<vk::MemoryType> = [
-        0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6, 0xc7,
-        0xce,
-    ]
-    .iter()
-    .map(|&flags| ty(P::from_raw(flags)))
-    .collect();
-    let all = (1 << radv.len()) - 1;
-    for class in [private, memoryless] {
-        assert_eq!(
-            candidates(&radv, all, class, true),
-            [2, 5, 6, 0, 1, 3, 4],
-            "{class:?}"
-        );
-        // Only the types the resource takes: device-local alone, as before.
-        assert_eq!(
-            candidates(&radv, 0b1_1011, class, true),
-            [0, 1, 3, 4],
-            "{class:?}"
-        );
-        assert_eq!(
-            candidates(&radv, 0b10_0001, class, true),
-            [5, 0],
-            "{class:?}"
-        );
-        assert!(
-            overflow_candidates(&radv, all, class, true).is_empty(),
-            "{class:?}"
-        );
+    impl Hook {
+        fn mapped(&self) -> Vec<Mapped> {
+            lock(&self.mapped).clone()
+        }
+
+        fn unmapped(&self) -> Vec<Unmapped> {
+            lock(&self.unmapped).clone()
+        }
+
+        /// The block's allocation was mapped before the block went out, as the runtime described
+        /// it: its class, the block inside it, at the allocation's address and mapping plus the
+        /// block's offset.
+        fn assert_mapped(&self, name: &str, block: &BlockInfo) {
+            let mapped = self.mapped();
+            let allocation = (mapped.iter())
+                .find(|mapped| mapped.allocation == block.allocation)
+                .unwrap_or_else(|| {
+                    panic!("{name}: block {:?} of an allocation not mapped", block.id)
+                });
+            assert_eq!(allocation.class, block.class, "{name}");
+            assert!(
+                allocation.timed,
+                "{name}: {allocation:?}'s make, before its map"
+            );
+            assert!(
+                block.offset + block.len <= allocation.len,
+                "{name}: block {:?} at {} of {} bytes in {} bytes",
+                block.id,
+                block.offset,
+                block.len,
+                allocation.len
+            );
+            assert_eq!(
+                (
+                    block.gpu_address,
+                    block.contents.map(|c| c.as_ptr() as usize)
+                ),
+                (
+                    Some(allocation.gpu_address + block.offset),
+                    allocation.contents.map(|c| c + block.offset as usize)
+                ),
+                "{name}: block {:?}'s address and mapping",
+                block.id
+            );
+        }
     }
-    // Without unified memory, device-local first and system memory as overflow.
-    assert_eq!(candidates(&radv, 0b111_1111, private, false), [0, 1, 3, 4]);
-    assert_eq!(
-        overflow_candidates(&radv, 0b111_1111, private, false),
-        [2, 5, 6]
-    );
-    // A lazily allocated type before all for `Memoryless`, never for `Private`.
-    let tiler = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | P::LAZILY_ALLOCATED),
-        ty(P::HOST_VISIBLE | P::HOST_COHERENT),
-    ];
-    assert_eq!(candidates(&tiler, 0b111, memoryless, true), [1, 2, 0]);
-    assert_eq!(candidates(&tiler, 0b111, private, true), [2, 0]);
-    // Every type device-local (ANV, MoltenVK, lavapipe): as before.
-    let anv = [
-        ty(P::DEVICE_LOCAL),
-        ty(P::DEVICE_LOCAL | P::HOST_VISIBLE | P::HOST_COHERENT),
-    ];
-    assert_eq!(candidates(&anv, 0b11, private, true), [0, 1]);
-}
 
-/// The memory types whose blocks of the runtime's own buffers are allocated exportable as a
-/// dma-buf (`memory.rs`'s "Buffers in exportable blocks"): with unified memory,
-/// those of a heap that is not device-local, where the device exports such memory from a pooled
-/// block; else none, and why.
-#[test]
-fn own_buffer_blocks_are_exportable_in_a_unified_device_s_system_heap() {
-    use vk::MemoryPropertyFlags as P;
-    // RADV (Mesa 26.2.4) on a Radeon 780M: heap 0 device-local, heap 1 system memory; types as
-    // in `unified_private_memory_takes_the_system_heap_first`, each in the heap its flags say.
-    let flags = [
-        0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6, 0xc7,
-        0xce,
-    ];
-    let properties = |flags: &[u32], heaps: &[vk::MemoryHeapFlags]| {
-        let mut properties = vk::PhysicalDeviceMemoryProperties {
-            memory_type_count: flags.len() as u32,
-            memory_heap_count: heaps.len() as u32,
-            ..Default::default()
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A Shared block's bytes.
+    fn bytes(block: &BlockInfo) -> &'static mut [u8] {
+        let contents = block.contents.expect("a Shared block's contents");
+        // SAFETY: the mapping spans the block, which the test holds while it uses the slice.
+        unsafe { std::slice::from_raw_parts_mut(contents.as_ptr(), block.len as usize) }
+    }
+
+    /// The `VkBuffer` commands reach a held block through, its allocation's, and the offset of the
+    /// block's first byte in it.
+    fn vk_buffer(device: &Device, block: BlockId) -> (vk::Buffer, u64) {
+        device.block(block).expect("a held block").memory.range(0)
+    }
+
+    /// Transfers the test records on the runtime's queue, each waited for, with every earlier
+    /// write visible to it and its writes visible to the host.
+    struct Gpu {
+        device: Device,
+        pool: vk::CommandPool,
+        command: vk::CommandBuffer,
+        fence: vk::Fence,
+    }
+
+    impl Gpu {
+        fn new(device: &Device) -> Gpu {
+            let raw = device.raw();
+            let pool =
+                vk::CommandPoolCreateInfo::default().queue_family_index(raw.queue_family_index);
+            // SAFETY: the device is live; the objects are destroyed in `drop`.
+            unsafe {
+                let pool = raw.device.create_command_pool(&pool, None).expect("a pool");
+                let command = raw
+                    .device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                    .expect("a command buffer")[0];
+                let fence = raw
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .expect("a fence");
+                Gpu {
+                    device: device.clone(),
+                    pool,
+                    command,
+                    fence,
+                }
+            }
+        }
+
+        fn run(&self, record: impl FnOnce(&ash::Device, vk::CommandBuffer)) {
+            let raw = self.device.raw();
+            let device = raw.device;
+            let command = self.command;
+            let barrier = |dst_stage, dst_access| {
+                let barrier = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)];
+                // SAFETY: the command buffer is recording.
+                unsafe {
+                    device.cmd_pipeline_barrier2(
+                        command,
+                        &vk::DependencyInfo::default().memory_barriers(&barrier),
+                    )
+                };
+            };
+            // SAFETY: the pool and fence are this test's; each run waits for its work.
+            unsafe {
+                device
+                    .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+                    .expect("a reset");
+                device
+                    .begin_command_buffer(
+                        command,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .expect("a begin");
+            }
+            barrier(
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            );
+            record(device, command);
+            barrier(vk::PipelineStageFlags2::HOST, vk::AccessFlags2::HOST_READ);
+            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
+            let submit = vk::SubmitInfo2::default().command_buffer_infos(&commands);
+            // SAFETY: as above; the queue is held while it is used.
+            unsafe {
+                device.end_command_buffer(command).expect("an end");
+                self.device
+                    .with_runtime_queue(|queue| device.queue_submit2(queue, &[submit], self.fence))
+                    .expect("a submit");
+                device
+                    .wait_for_fences(&[self.fence], true, u64::MAX)
+                    .expect("the transfer completes");
+                device.reset_fences(&[self.fence]).expect("a fence reset");
+            }
+        }
+
+        /// Fills `size` bytes from `offset` of the block that `(buffer, base)` reaches
+        /// ([`vk_buffer`]).
+        fn fill(&self, (buffer, base): (vk::Buffer, u64), offset: u64, size: u64, word: u32) {
+            // SAFETY: recorded in `run`; the range is in the block and word-aligned.
+            self.run(|device, command| unsafe {
+                device.cmd_fill_buffer(command, buffer, base + offset, size, word)
+            });
+        }
+    }
+
+    impl Drop for Gpu {
+        fn drop(&mut self) {
+            let raw = self.device.raw();
+            // SAFETY: no work of the test is pending.
+            unsafe {
+                raw.device.destroy_fence(self.fence, None);
+                raw.device.destroy_command_pool(self.pool, None);
+            }
+        }
+    }
+
+    fn device_with(hook: &Arc<Hook>, physical: &crate::PhysicalDevice, name: &str) -> Device {
+        let options = DeviceOptions {
+            block_mappings: Some(Arc::clone(hook) as Arc<dyn BlockMappings>),
+            ..DeviceOptions::default()
         };
-        for (at, &flags) in flags.iter().enumerate() {
-            let flags = P::from_raw(flags);
-            let heap = u32::from(!flags.contains(P::DEVICE_LOCAL) && heaps.len() > 1);
-            properties.memory_types[at] = vk::MemoryType {
-                property_flags: flags,
-                heap_index: heap,
-            };
-        }
-        for (at, &flags) in heaps.iter().enumerate() {
-            properties.memory_heaps[at] = vk::MemoryHeap {
-                size: 1 << 33,
-                flags,
-            };
-        }
-        properties
-    };
-    let local = vk::MemoryHeapFlags::DEVICE_LOCAL;
-    let radv = properties(&flags, &[local, vk::MemoryHeapFlags::empty()]);
-    let system = 1 << 2 | 1 << 5 | 1 << 6 | 1 << 11 | 1 << 12 | 1 << 14 | 1 << 16;
-    assert_eq!(fd_buffer_types(&radv, true, Ok(())), Ok(system));
-    // Where the device exports no such memory from a pooled block, none, for its reason.
-    let refused = "refused";
-    assert_eq!(fd_buffer_types(&radv, true, Err(refused)), Err(refused));
-    // Without unified memory (a discrete GPU's system heap), none.
-    assert!(fd_buffer_types(&radv, false, Ok(())).is_err());
-    // Every heap device-local (ANV, lavapipe, MoltenVK): none.
-    let anv = properties(&[0x1, 0x7], &[local]);
-    assert!(fd_buffer_types(&anv, true, Ok(())).is_err());
-}
+        let device =
+            Device::new(physical, options).unwrap_or_else(|error| panic!("{name}: {error}"));
+        device.core().pool.await_internals();
+        device
+    }
 
-/// The device's verdicts decide whether the runtime's buffers lie in blocks allocated exportable
-/// (`in_place.rs`'s `blocks_take`): the first move of the image that takes the place of the
-/// device's linear image there must pass for both row ends, and the class must pass wherever
-/// plain pooled memory passed; a pending verdict that decides it leaves them in plain blocks
-/// meanwhile.
-#[test]
-fn exportable_blocks_take_what_plain_blocks_take() {
-    use crate::in_place::{blocks_take, Access, BlocksTake, PagesClass, RowEnds, Verdict};
-    // Every verdict of a class, but those `except` gives.
-    let all = |class: PagesClass, verdict: Verdict| {
-        move |of: PagesClass,
-              access: Access,
-              rows: RowEnds,
-              except: &[(Access, RowEnds, Verdict)]| {
-            match of == class {
-                true => (except.iter())
-                    .find(|(a, r, _)| *a == access && *r == rows)
-                    .map_or(verdict, |(_, _, v)| *v),
-                false => Verdict::Unchecked,
-            }
+    /// The matrix's leak records: each kind's live count after the device dropped.
+    fn print_gauges_at_drop(test: &str, gauges: Gauges) {
+        for (kind, value) in [("buffers", gauges.buffers), ("blocks", gauges.blocks)] {
+            println!("M2V-MATRIX gauge {test}/{kind}@drop {value}");
         }
-    };
-    let take = |plain: Verdict, exportable: Verdict, except: &[(Access, RowEnds, Verdict)]| {
-        blocks_take(PagesClass::FdBlocks, |class, access, rows| match class {
-            PagesClass::Pooled => all(PagesClass::Pooled, plain)(class, access, rows, &[]),
-            PagesClass::FdBlocks => {
-                all(PagesClass::FdBlocks, exportable)(class, access, rows, except)
-            }
-            _ => Verdict::Unchecked,
-        })
-    };
-    use Verdict::{Failed, Passed, Pending, Unchecked};
-    assert_eq!(take(Passed, Passed, &[]), BlocksTake::Take);
-    // Plain pooled memory unchecked (no DRM_FORMAT_MOD_LINEAR images): the first move decides.
-    assert_eq!(take(Unchecked, Passed, &[]), BlocksTake::Take);
-    assert_eq!(take(Unchecked, Pending, &[]), BlocksTake::Pending);
-    assert_eq!(take(Pending, Passed, &[]), BlocksTake::Pending);
-    let (reads, on) = (Access::Reads, RowEnds::OnLines);
-    assert_eq!(
-        take(Unchecked, Passed, &[(reads, on, Failed)]),
-        BlocksTake::Refused(reads, on)
-    );
-    assert_eq!(
-        take(Unchecked, Passed, &[(reads, on, Unchecked)]),
-        BlocksTake::Refused(reads, on)
-    );
-    // An access plain memory passed and the class did not.
-    let renders = (Access::Renders, RowEnds::InLines);
-    assert_eq!(
-        take(Passed, Passed, &[(renders.0, renders.1, Failed)]),
-        BlocksTake::Refused(renders.0, renders.1)
-    );
-    // One plain memory did not pass either: nothing lost.
-    assert_eq!(
-        take(Failed, Passed, &[(renders.0, renders.1, Failed)]),
-        BlocksTake::Take
-    );
-}
+    }
 
-/// No class takes a device-coherent or device-uncached type of `VK_AMD_device_coherent_memory`,
-/// whose allocation needs a feature the runtime does not enable, even where it is the only type
-/// the resource allows or ranks best by its other properties.
-#[test]
-fn no_class_takes_amd_device_coherent_memory() {
-    use vk::MemoryPropertyFlags as P;
-    let host = P::HOST_VISIBLE | P::HOST_COHERENT;
-    let amd = P::DEVICE_COHERENT_AMD | P::DEVICE_UNCACHED_AMD;
-    // RADV on a Radeon 780M lists them after its other types; here they come first as well.
-    let types = [
-        ty(P::DEVICE_LOCAL | host | P::HOST_CACHED | amd),
-        ty(P::DEVICE_LOCAL),
-        ty(host),
-        ty(P::DEVICE_LOCAL | host),
-        ty(host | P::HOST_CACHED),
-        ty(P::DEVICE_LOCAL | amd),
-        ty(P::DEVICE_LOCAL | host | P::DEVICE_COHERENT_AMD),
-        ty(host | P::HOST_CACHED | P::DEVICE_UNCACHED_AMD),
-    ];
-    let all = (1 << types.len()) - 1;
-    for unified in [false, true] {
-        for class in [
-            MemoryClass::Shared,
-            MemoryClass::WriteCombined,
-            MemoryClass::Private,
-            MemoryClass::Managed,
-            MemoryClass::Memoryless,
-        ] {
-            let picked = candidates(&types, all, class, unified);
-            assert!(!picked.is_empty(), "{class:?}");
-            for index in picked {
-                assert!(
-                    !types[index as usize].property_flags.intersects(amd),
-                    "{class:?} took type {index}"
+    /// Every allocation the hook mapped was unmapped exactly once by the end, and no other.
+    fn assert_each_unmapped_once(name: &str, hook: &Hook) {
+        let mut unmapped: Vec<AllocationId> =
+            hook.unmapped().iter().map(|u| u.allocation).collect();
+        unmapped.sort_unstable();
+        let mut mapped: Vec<AllocationId> = hook.mapped().iter().map(|m| m.allocation).collect();
+        mapped.sort_unstable();
+        assert_eq!(unmapped, mapped, "{name}: the allocations unmapped");
+    }
+
+    /// A buffer of exactly [`MAX_BUFFER_LENGTH`] (2 GiB) is made in a Private block of that
+    /// length, and one a byte longer is refused with a typed refusal, before its range is looked
+    /// at; with the block released and the device dropped, every gauge is zero. A device whose
+    /// largest block or memory is smaller skips the 2 GiB buffer visibly.
+    #[test]
+    fn a_buffer_of_2_gib_is_made_and_a_longer_one_refused() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(
+            !devices.is_empty(),
+            "the loader lists no device of this cfg's kind"
+        );
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let counters = device.counters();
+            let block = match device.take_block(MemoryClass::Private, MAX_BUFFER_LENGTH) {
+                Ok(block) => block,
+                Err(
+                    error @ (Error::Limit(Limit::BlockLen { .. })
+                    | Error::Vulkan {
+                        result:
+                            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                            | vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+                        ..
+                    }),
+                ) => {
+                    eprintln!("SKIPPED: {name}: no Private block of 2 GiB: {error}");
+                    continue;
+                }
+                Err(error) => panic!("{name}: {error}"),
+            };
+            assert_eq!(block.len, MAX_BUFFER_LENGTH, "{name}");
+            let buffer = device
+                .new_buffer(block.id, 0, MAX_BUFFER_LENGTH, None)
+                .expect("a buffer of 2 GiB");
+            assert_eq!(
+                (Some(buffer.gpu_address()), buffer.length()),
+                (block.gpu_address, MAX_BUFFER_LENGTH),
+                "{name}"
+            );
+            match device.new_buffer(block.id, 0, MAX_BUFFER_LENGTH + 1, None) {
+                Err(Error::Refused(Refusal::BufferTooLong { length, max })) => {
+                    assert_eq!((length, max), (MAX_BUFFER_LENGTH + 1, MAX_BUFFER_LENGTH))
+                }
+                other => panic!("{name}: a buffer of 2 GiB and a byte: {:?}", other.err()),
+            }
+            assert_eq!(
+                counters.gauges().buffers,
+                1,
+                "{name}: only the 2 GiB buffer"
+            );
+            drop(buffer);
+            device.release_block(block).expect("a release");
+            drop(device);
+            let gauges = counters.gauges();
+            print_gauges_at_drop("buffer_2_gib", gauges);
+            assert_eq!(gauges, Gauges::default(), "{name}: gauges after teardown");
+            println!("memory: {name}: a buffer of 2 GiB made, 2 GiB and a byte refused");
+        }
+    }
+
+    /// Blocks of both classes are handed out, buffers view them, a zeroed buffer zeroes exactly
+    /// its bytes from its `zero_from`, counted as the buffer's bytes and not the block's, the
+    /// refusals are Metal's, each block's allocation was mapped through the hook before the block
+    /// went out, a block longer than an allocation has an allocation of its own, a released block
+    /// lives until its last buffer is gone and its allocation is then idle, its bytes as written,
+    /// and freed at its idle age after the hook's unmap on the block-maker thread, still mapped;
+    /// and teardown unmaps and frees the rest on the dropping thread, with every gauge at zero.
+    #[test]
+    fn every_device_hands_out_blocks_and_buffers_and_frees_them_through_the_hook() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(
+            !devices.is_empty(),
+            "the loader lists no device of this cfg's kind"
+        );
+        let this_thread = thread::current().name().map(str::to_string);
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let gpu = Gpu::new(&device);
+
+            // A new Shared block, mapped.
+            let shared = device
+                .take_block(MemoryClass::Shared, MemoryClass::Shared.block_len())
+                .expect("a Shared block");
+            assert_eq!(
+                (shared.class, shared.len),
+                (MemoryClass::Shared, MemoryClass::Shared.block_len())
+            );
+            assert!(
+                shared.gpu_address.is_some_and(|address| address != 0),
+                "{name}: a Shared block's address"
+            );
+            let host = bytes(&shared);
+
+            // A new Private block, unmapped.
+            let private = device
+                .take_block(MemoryClass::Private, MemoryClass::Private.block_len())
+                .expect("a Private block");
+            assert_eq!(
+                (private.class, private.len, private.contents),
+                (MemoryClass::Private, MemoryClass::Private.block_len(), None)
+            );
+            assert!(
+                private.gpu_address.is_some_and(|address| address != 0),
+                "{name}: a Private block's address"
+            );
+            assert_ne!(private.id, shared.id);
+            hook.assert_mapped(name, &shared);
+            hook.assert_mapped(name, &private);
+
+            // Buffers are views: the block's address and mapping plus the offset.
+            let view = device
+                .new_buffer(shared.id, 4096, 256, None)
+                .expect("a Shared buffer");
+            let base = shared.contents.unwrap().as_ptr() as usize;
+            assert_eq!(
+                view.gpu_address(),
+                shared.gpu_address.expect("a taken block's address") + 4096
+            );
+            assert_eq!(
+                view.contents().map(|c| c.as_ptr() as usize),
+                Some(base + 4096)
+            );
+            assert_eq!(
+                (view.block(), view.offset(), view.length()),
+                (shared.id, 4096, 256)
+            );
+            let whole = device
+                .new_buffer(private.id, 0, MemoryClass::Private.block_len(), None)
+                .expect("a Private buffer");
+            assert_eq!(
+                (Some(whole.gpu_address()), whole.contents()),
+                (private.gpu_address, None)
+            );
+            let clone = view.clone();
+            let live = counters.gauges();
+            assert_eq!(live.buffers, 2, "{name}: a clone is the same buffer");
+            assert!(live.blocks >= INTERNALS + 2, "{name}: {live:?}");
+            assert!(counters.metrics().blocks_made >= INTERNAL_BLOCKS + 2);
+            drop(clone);
+            assert_eq!(counters.gauges().buffers, 2);
+
+            // A zeroed buffer zeroes exactly its bytes from its `zero_from`, counted as the
+            // buffer's bytes: in a Shared block through the mapping, in a Private one by a fill of
+            // its whole words and copies of the bytes beside them.
+            for zero_from in [Some(0), Some(3), Some(7), Some(9), None] {
+                host[..8192].fill(0xFF);
+                let before = counters.metrics().bytes_zeroed;
+                let zeroed = device
+                    .new_buffer(shared.id, 4097, 7, zero_from)
+                    .expect("a zeroed Shared buffer");
+                let from = 4097 + zero_from.unwrap_or(7).min(7) as usize;
+                for (index, &byte) in host[..8192].iter().enumerate() {
+                    let inside = (from..4104).contains(&index);
+                    assert_eq!(
+                        byte,
+                        if inside { 0 } else { 0xFF },
+                        "{name}: {zero_from:?}, Shared byte {index}"
+                    );
+                }
+                assert_eq!(
+                    counters.metrics().bytes_zeroed - before,
+                    (4104 - from) as u64,
+                    "{name}: {zero_from:?}, the Shared bytes zeroed"
+                );
+                drop(zeroed);
+            }
+            // A zeroed Private range is filled ahead of the next command buffer committed, whose
+            // commands see the fill.
+            let queue = device.new_command_queue(1).expect("a queue");
+            for (offset, length, zero_from) in [
+                (4097, 13, 0),
+                (8001, 2, 0),
+                (4096, 64, 0),
+                (4099, 1, 0),
+                (1, 8000, 0),
+                (4096, 64, 5),
+                (4097, 13, 12),
+                (1, 8000, 4000),
+            ] {
+                gpu.fill(vk_buffer(&device, private.id), 0, 8192, u32::MAX);
+                let before = counters.metrics().bytes_zeroed;
+                let zeroed = device
+                    .new_buffer(private.id, offset, length, Some(zero_from))
+                    .expect("a zeroed Private buffer");
+                assert_eq!(
+                    counters.metrics().bytes_zeroed - before,
+                    length - zero_from,
+                    "{name}: {offset}+{length} from {zero_from}, the Private bytes zeroed"
+                );
+                let ((from, src_offset), (to, dst_offset)) = (
+                    vk_buffer(&device, private.id),
+                    vk_buffer(&device, shared.id),
+                );
+                let copy = queue.command_buffer().expect("a command buffer");
+                copy.record_for_test(&[], |device, command| {
+                    let region = [vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size: 8192,
+                    }];
+                    // SAFETY: the command buffer is recording; both blocks are held and span the
+                    // region.
+                    unsafe { device.cmd_copy_buffer(command, from, to, &region) };
+                })
+                .expect("a copy");
+                copy.commit().expect("a commit");
+                copy.wait_until_completed()
+                    .expect("a wait outside a scheduled handler");
+                assert_eq!(copy.status(), CommandBufferStatus::Completed, "{name}");
+                let range = (offset + zero_from) as usize..(offset + length) as usize;
+                for (index, &byte) in host[..8192].iter().enumerate() {
+                    let expected = if range.contains(&index) { 0 } else { 0xFF };
+                    assert_eq!(
+                        byte, expected,
+                        "{name}: {offset}+{length} from {zero_from}, Private byte {index}"
+                    );
+                }
+                drop(zeroed);
+            }
+
+            // Metal's refusals, and the device's limit.
+            assert!(matches!(
+                device.new_buffer(shared.id, 0, 0, None),
+                Err(Error::Refused(Refusal::EmptyBuffer))
+            ));
+            // Past 2 GiB, whatever the block: the length is refused before the range.
+            for length in [MAX_BUFFER_LENGTH + 1, u64::MAX] {
+                match device.new_buffer(shared.id, 0, length, None) {
+                    Err(Error::Refused(Refusal::BufferTooLong { length: l, max })) => {
+                        assert_eq!((l, max), (length, MAX_BUFFER_LENGTH), "{name}")
+                    }
+                    other => panic!("{name}: a buffer of {length}: {:?}", other.err()),
+                }
+            }
+            let shared_len = MemoryClass::Shared.block_len();
+            for (offset, length) in [(shared_len - 4, 8), (u64::MAX, 2), (shared_len, 1)] {
+                match device.new_buffer(shared.id, offset, length, None) {
+                    Err(Error::Refused(Refusal::BufferPastBlock {
+                        offset: o,
+                        length: l,
+                        block_len,
+                    })) => assert_eq!((o, l, block_len), (offset, length, shared_len)),
+                    other => panic!("{name}: {offset}+{length}: {:?}", other.err()),
+                }
+            }
+            assert!(matches!(
+                device.take_block(MemoryClass::Shared, u64::MAX),
+                Err(Error::Limit(Limit::BlockLen { len: u64::MAX, .. }))
+            ));
+
+            // A block longer than an allocation: an allocation of its own length, rounded up to
+            // the granule.
+            let asked = 2 * MemoryClass::Shared.block_len() + 1;
+            let long = device
+                .take_block(MemoryClass::Shared, asked)
+                .expect("a long block");
+            assert!(
+                long.len >= asked && long.len.is_multiple_of(64 << 10),
+                "{name}: a long block of {} bytes",
+                long.len
+            );
+            hook.assert_mapped(name, &long);
+            assert_eq!(long.offset, 0, "{name}: the first block of its allocation");
+            let long_allocation = long.allocation;
+            let long_host = bytes(&long);
+            long_host[0] = 0x5A;
+            let last_view: Buffer = device
+                .new_buffer(long.id, 0, 16, None)
+                .expect("a buffer of the long block");
+
+            // Released, it lives while its buffer does, then its allocation is idle.
+            let long_id = long.id;
+            device.release_block(long).expect("a release");
+            assert!(matches!(
+                device.new_buffer(long_id, 0, 16, None),
+                Err(Error::NoSuchBlock(id)) if id == long_id
+            ));
+            assert!(
+                hook.unmapped().is_empty(),
+                "{name}: unmapped with a buffer alive"
+            );
+            // SAFETY: the buffer keeps the block mapped.
+            let first = unsafe { last_view.contents().unwrap().as_ptr().read_volatile() };
+            assert_eq!(first, 0x5A);
+            drop(last_view);
+            wait_until("the long block given back", || core.pool.holds(long_id));
+            assert!(
+                hook.unmapped().is_empty(),
+                "{name}: unmapped as it went idle"
+            );
+
+            // At its idle age, the block-maker thread frees its allocation through the hook,
+            // still mapped, its bytes as written.
+            wait_until("the long block's unmap", || !hook.unmapped().is_empty());
+            let unmapped = hook.unmapped();
+            assert_eq!(unmapped.len(), 1, "{name}: {unmapped:?}");
+            assert_eq!(unmapped[0].allocation, long_allocation);
+            assert_eq!(unmapped[0].thread.as_deref(), Some("m2v-blocks"));
+            assert_eq!(
+                unmapped[0].first,
+                Some(0x5A),
+                "{name}: unmapped while still mapped, its bytes as written"
+            );
+
+            // Teardown unmaps the rest on this thread, and frees every block.
+            drop((view, whole, gpu, queue));
+            drop(device);
+            let gauges = counters.gauges();
+            print_gauges_at_drop("blocks_teardown", gauges);
+            assert_eq!(gauges, Gauges::default(), "{name}: gauges after teardown");
+            assert_each_unmapped_once(name, &hook);
+            for unmapped in &hook.unmapped()[1..] {
+                assert_eq!(unmapped.thread, this_thread, "{name}: {unmapped:?}");
+            }
+            println!(
+                "memory: {name}: blocks and buffers; metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// The device's making makes one allocation of each class before it returns, before the
+    /// block-maker thread started, each wholly free, so the thread makes none. In each class, a
+    /// take of a byte, a range of the first, leaves the class no wholly free unit: the block-maker
+    /// thread makes the next, off the taker's thread. Once it has, a take of a whole unit, 16 MiB,
+    /// lands in it and allocates nothing on this thread, counted at its class's take site as one
+    /// take landed ahead of its 16 MiB and no allocation, and the block-maker thread makes the
+    /// next in turn. The small take, in the class's first allocation, is not counted landed ahead.
+    /// Under a rule that made an allocation only once the class's free bytes ran low, the small
+    /// take would set nothing off and the 16 MiB take would allocate on its own thread.
+    #[test]
+    fn every_device_makes_a_class_s_next_allocation_once_it_holds_no_wholly_free_unit() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let core = device.core();
+            core.pool.await_internals();
+            let counters = device.counters();
+            let before = counters.metrics();
+            let made = before.blocks_made;
+            let len = MemoryClass::Shared.block_len();
+            assert!(
+                core.pool.stocked(MemoryClass::Private) && core.pool.stocked(MemoryClass::Shared),
+                "{name}: the first allocations as the device returns"
+            );
+            let gauges = counters.gauges();
+            assert_eq!(
+                (
+                    gauges.blocks,
+                    gauges.shared_idle_bytes,
+                    gauges.private_idle_bytes
+                ),
+                (INTERNALS + 2, len, len),
+                "{name}: the internals and the first allocations"
+            );
+            // Each class's take site, whose allocations and takes landed ahead count apart.
+            let site = |metrics: &Metrics, class: MemoryClass| match class {
+                MemoryClass::Shared => metrics.shared_take_allocations,
+                MemoryClass::Private => metrics.private_take_allocations,
+            };
+            let mut held = Vec::new();
+            for (at, class) in [MemoryClass::Shared, MemoryClass::Private]
+                .into_iter()
+                .enumerate()
+            {
+                let start = counters.metrics();
+                let small = (device.take_block(class, 1))
+                    .unwrap_or_else(|error| panic!("{name}: a small {class:?} block: {error}"));
+                // The class's first allocation, made in the device's making, is not one the
+                // block-maker thread made ahead while the class held no wholly free unit.
+                assert_eq!(
+                    site(&counters.metrics(), class),
+                    site(&start, class),
+                    "{name}: the small {class:?} take landed in the class's first allocation"
+                );
+                // The block-maker thread makes the next unit. The wait is bounded and asserts
+                // nothing, so a rule that makes none fails at the whole take below, which then
+                // allocates on this thread.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !core.pool.stocked(class) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let ahead = counters.metrics();
+                let whole = (device.take_block(class, len))
+                    .unwrap_or_else(|error| panic!("{name}: a {class:?} block of 16 MiB: {error}"));
+                let taken = counters.metrics();
+                let (was, now) = (site(&ahead, class), site(&taken, class));
+                assert_eq!(
+                    (
+                        taken.consumer_allocations - ahead.consumer_allocations,
+                        now.count - was.count,
+                        now.takes_ahead - was.takes_ahead,
+                        now.takes_ahead_bytes - was.takes_ahead_bytes,
+                    ),
+                    (0, 0, 1, len),
+                    "{name}: the 16 MiB {class:?} take did not land in the unit made ahead, \
+                     {} allocations made ahead after the small take",
+                    ahead.blocks_made - start.blocks_made
+                );
+                assert_eq!(whole.offset, 0, "{name}: a wholly free {class:?} unit");
+                let next = made + 2 * (at as u64 + 1);
+                wait_until("the class's next allocation", || {
+                    counters.metrics().blocks_made == next && core.pool.stocked(class)
+                });
+                held.push((small, whole));
+            }
+            let metrics = counters.metrics();
+            assert_eq!(
+                (
+                    metrics.block_bytes_made - before.block_bytes_made,
+                    metrics.consumer_allocations
+                ),
+                (4 * len, before.consumer_allocations),
+                "{name}: two allocations of 16 MiB a class, all off this thread"
+            );
+            assert!(
+                metrics.maker_allocation_nanos > before.maker_allocation_nanos,
+                "{name}: the block-maker thread's allocation time"
+            );
+            drop(held);
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            println!(
+                "memory: {name}: the next allocation made once no unit is wholly free, a 16 MiB \
+                 take on this thread allocated nothing; metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// A block given back is a free range of its allocation at once, its bytes as written, and the
+    /// first fit of a later take: a Shared block of 16 MiB, the device's first Shared allocation
+    /// whole, is written and given back once the next allocation is made ahead of need; then of
+    /// two takes of 16 MiB the first lands in the first block's bytes, a new number at its address
+    /// and mapping, its bytes as written, and the second in that next allocation. Both are takes
+    /// from free ranges: neither allocates nor calls the hook. A Private block the GPU wrote,
+    /// given back, holds the GPU's bytes when a take of its length lands there again, the first
+    /// fit; a buffer zeroed over a range of them reads zero there, ahead of the next command buffer
+    /// committed, and nowhere else.
+    #[test]
+    fn every_device_takes_given_back_bytes_as_written_at_the_first_fit() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let len = MemoryClass::Shared.block_len();
+            let first = (device.take_block(MemoryClass::Shared, len))
+                .unwrap_or_else(|error| panic!("{name}: a Shared block: {error}"));
+            assert_eq!(first.offset, 0, "{name}: the first Shared allocation whole");
+            let info = *first;
+            let host = bytes(&first);
+            host[0] = 0x5A;
+            host[host.len() - 1] = 0x5A;
+            // The class's free bytes ran out: the block-maker thread makes the next allocation.
+            wait_until("the next Shared allocation", || {
+                core.pool.allocations(MemoryClass::Shared).len() == 2
+            });
+            let next = core.pool.allocations(MemoryClass::Shared)[1].0;
+            device.release_block(first).expect("a release");
+            wait_until("the block given back", || core.pool.holds(info.id));
+            let before = counters.metrics();
+            let again = (device.take_block(MemoryClass::Shared, len))
+                .unwrap_or_else(|error| panic!("{name}: a block: {error}"));
+            assert_eq!(
+                (
+                    again.allocation,
+                    again.offset,
+                    again.gpu_address,
+                    again.contents
+                ),
+                (info.allocation, 0, info.gpu_address, info.contents),
+                "{name}: the given-back bytes, the first fit"
+            );
+            assert_ne!(again.id, info.id, "{name}: each take is a new number");
+            let host = bytes(&again);
+            assert_eq!(
+                (host[0], host[host.len() - 1]),
+                (0x5A, 0x5A),
+                "{name}: the given-back bytes, as written"
+            );
+            let second = (device.take_block(MemoryClass::Shared, len))
+                .unwrap_or_else(|error| panic!("{name}: a block: {error}"));
+            assert_eq!(
+                (second.allocation, second.offset),
+                (next, 0),
+                "{name}: the allocation made ahead of need, next"
+            );
+            let after = counters.metrics();
+            assert_eq!(
+                (
+                    after.takes_from_free_ranges - before.takes_from_free_ranges,
+                    after.consumer_allocations - before.consumer_allocations,
+                    after.allocations_mapped_on_takes - before.allocations_mapped_on_takes,
+                ),
+                (2, 0, 0),
+                "{name}: two takes from free ranges, with no allocation and no hook"
+            );
+            assert!(hook.unmapped().is_empty(), "{name}: {:?}", hook.unmapped());
+
+            // A Private block written by the GPU and given back holds the GPU's bytes when a take
+            // lands there again; a buffer zeroed over a range of them reads zero there, ahead of
+            // the next command buffer committed, and nowhere else.
+            let gpu = Gpu::new(&device);
+            let private_len = MemoryClass::Private.block_len();
+            let private = (device.take_block(MemoryClass::Private, private_len))
+                .unwrap_or_else(|error| panic!("{name}: a Private block: {error}"));
+            let private_info = *private;
+            gpu.fill(vk_buffer(&device, private.id), 0, private_len, u32::MAX);
+            device.release_block(private).expect("a release");
+            wait_until("the Private block given back", || {
+                core.pool.holds(private_info.id)
+            });
+            let back = (device.take_block(MemoryClass::Private, private_len))
+                .unwrap_or_else(|error| panic!("{name}: the Private bytes again: {error}"));
+            assert_eq!(
+                (back.allocation, back.gpu_address),
+                (private_info.allocation, private_info.gpu_address),
+                "{name}: the given-back Private bytes, the first fit"
+            );
+            let zeroed = (device.new_buffer(back.id, 4096, 4096, Some(0)))
+                .unwrap_or_else(|error| panic!("{name}: a zeroed Private buffer: {error}"));
+            host[..3 * 4096].fill(0x11);
+            let queue = device.new_command_queue(1).expect("a queue");
+            let ((from, src_offset), (to, dst_offset)) =
+                (vk_buffer(&device, back.id), vk_buffer(&device, again.id));
+            let copy = queue.command_buffer().expect("a command buffer");
+            copy.record_for_test(&[], |device, command| {
+                let region = [vk::BufferCopy {
+                    src_offset,
+                    dst_offset,
+                    size: 3 * 4096,
+                }];
+                // SAFETY: the command buffer is recording; both blocks are held and span the
+                // region.
+                unsafe { device.cmd_copy_buffer(command, from, to, &region) };
+            })
+            .expect("a copy");
+            copy.commit().expect("a commit");
+            copy.wait_until_completed()
+                .expect("a wait outside a scheduled handler");
+            assert_eq!(copy.status(), CommandBufferStatus::Completed, "{name}");
+            for (index, &byte) in host[..3 * 4096].iter().enumerate() {
+                let expected = if (4096..8192).contains(&index) {
+                    0
+                } else {
+                    0xFF
+                };
+                assert_eq!(
+                    byte, expected,
+                    "{name}: the Private bytes taken again, byte {index}"
                 );
             }
-            assert!(
-                candidates(&types, 0b1110_0001, class, unified).is_empty(),
-                "{class:?}"
+            drop((zeroed, copy, queue));
+            drop((second, again, back, gpu));
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            assert_each_unmapped_once(name, &hook);
+            println!(
+                "memory: {name}: given-back bytes taken as written at the first fit; metrics {:?}",
+                counters.metrics()
             );
         }
     }
-}
 
-/// A texture's image with host-transfer usage takes host-cached coherent memory of its class
-/// (`Private`) where the device has it among the image's types, else, with unified memory,
-/// host-cached `Shared` memory where the device has it among them, else the class's memory as any
-/// image does (a copy through a submission could queue behind the program's work), never a type
-/// the host maps without coherence (ANV's cached type on Arrow Lake-S). On the memory types and
-/// host-transfer image memory type bits measured, the RTX 3090 has none, so its images take
-/// resizable BAR, and the Radeon 780M (unified) takes its host-cached
-/// system memory, type 5, where it took RADV's uncached device-local type before. MoltenVK's shared
-/// type on Apple GPUs (`MVK_VK_MEMORY_TYPE_METAL_SHARED` with `DEVICE_LOCAL`, MoltenVK 1.4.1) and
-/// lavapipe's one type are host-cached and device-local; a device with both kinds of device-local
-/// host-visible memory takes the cached one where `Private`'s ranking alone would take the first.
-#[test]
-fn host_transfer_images_prefer_host_cached_memory() {
-    let types = |raw: &[u32]| -> Vec<vk::MemoryType> {
-        raw.iter()
-            .map(|&flags| ty(vk::MemoryPropertyFlags::from_raw(flags)))
+    /// The consumer's hook maps each allocation of the pool before any block of it goes out, on
+    /// the thread that made it, counted where it ran: each class's first in the device's making,
+    /// on the thread that made the device; one a take that no free range fits makes, inside the
+    /// take, on the taker's thread; one made ahead of need, on the block-maker thread. While the
+    /// hook maps nothing, a take that no free range fits is refused with
+    /// `Limit::AllocationNotMapped`, its allocation freed and counted, the gauges as they were;
+    /// once it maps again, the same take is a block. Teardown unmaps each allocation mapped once,
+    /// and never the one refused.
+    #[test]
+    fn every_device_maps_each_allocation_before_its_blocks_go_out_and_refuses_one_not_mapped() {
+        const MIB: u64 = 1 << 20;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        let this_thread = thread::current().name().map(str::to_string);
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let made = hook.mapped();
+            assert_eq!(
+                (made.iter())
+                    .map(|m| (m.class, m.len, m.contents.is_some(), m.thread.clone()))
+                    .collect::<Vec<_>>(),
+                [(MemoryClass::Private, false), (MemoryClass::Shared, true)]
+                    .map(|(class, mapped)| (class, class.block_len(), mapped, this_thread.clone())),
+                "{name}: each class's first allocation, mapped in the device's making"
+            );
+            let metrics = counters.metrics();
+            assert_eq!(
+                (
+                    metrics.allocations_mapped,
+                    metrics.allocations_mapped_on_takes,
+                    metrics.allocation_map_refusals
+                ),
+                (2, 0, 0),
+                "{name}"
+            );
+
+            // A take that no free range fits: its allocation mapped inside it, on its thread.
+            let taker = device.clone();
+            let long = (thread::Builder::new().name("m2v-test-taker".to_string()))
+                .spawn(move || taker.take_block(MemoryClass::Shared, 24 * MIB))
+                .expect("a thread")
+                .join()
+                .expect("the taker")
+                .unwrap_or_else(|error| panic!("{name}: a block of 24 MiB: {error}"));
+            hook.assert_mapped(name, &long);
+            let mapped = hook.mapped();
+            assert_eq!(
+                (
+                    mapped.len(),
+                    mapped[2].allocation,
+                    mapped[2].len,
+                    mapped[2].thread.as_deref()
+                ),
+                (3, long.allocation, 24 * MIB, Some("m2v-test-taker")),
+                "{name}: the take's allocation, mapped on the taker's thread"
+            );
+
+            // A take that breaks the class's only wholly free unit: the block-maker thread makes
+            // and maps the next allocation, ahead of need.
+            let low = (device.take_block(MemoryClass::Shared, 12 * MIB))
+                .unwrap_or_else(|error| panic!("{name}: a block of 12 MiB: {error}"));
+            hook.assert_mapped(name, &low);
+            wait_until("the allocation made ahead", || {
+                hook.mapped().len() == 4 && core.pool.stocked(MemoryClass::Shared)
+            });
+            let ahead = hook.mapped()[3].clone();
+            assert_eq!(
+                (ahead.class, ahead.len, ahead.thread.as_deref()),
+                (
+                    MemoryClass::Shared,
+                    MemoryClass::Shared.block_len(),
+                    Some("m2v-blocks")
+                ),
+                "{name}: the allocation made ahead of need"
+            );
+            let metrics = counters.metrics();
+            assert_eq!(
+                (
+                    metrics.allocations_mapped,
+                    metrics.allocations_mapped_on_takes
+                ),
+                (3, 1),
+                "{name}"
+            );
+
+            // While the hook maps nothing, a take that no free range fits is refused, and its
+            // allocation freed.
+            hook.refuse.store(true, Relaxed);
+            let gauges = counters.gauges();
+            let before = counters.metrics();
+            match device.take_block(MemoryClass::Shared, 40 * MIB) {
+                Err(Error::Limit(Limit::AllocationNotMapped {
+                    class: MemoryClass::Shared,
+                    len,
+                })) => assert_eq!(len, 40 * MIB, "{name}"),
+                other => panic!(
+                    "{name}: a take not mapped: {:?}",
+                    other.map(|block| block.id)
+                ),
+            }
+            let after = counters.metrics();
+            assert_eq!(
+                (
+                    after.allocation_map_refusals - before.allocation_map_refusals,
+                    after.consumer_allocations - before.consumer_allocations,
+                    after.allocations_mapped_on_takes - before.allocations_mapped_on_takes
+                ),
+                (1, 1, 0),
+                "{name}: the take's allocation made, not mapped, and freed"
+            );
+            let refused = counters.gauges();
+            assert_eq!(
+                (refused.blocks, refused.shared_idle_bytes),
+                (gauges.blocks, gauges.shared_idle_bytes),
+                "{name}: the gauges as they were"
+            );
+            hook.refuse.store(false, Relaxed);
+            let mapped = (device.take_block(MemoryClass::Shared, 40 * MIB))
+                .unwrap_or_else(|error| panic!("{name}: a block of 40 MiB: {error}"));
+            hook.assert_mapped(name, &mapped);
+            drop((long, low, mapped));
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            assert_each_unmapped_once(name, &hook);
+            println!(
+                "memory: {name}: each allocation mapped before its blocks went out, one not mapped \
+                 refused; metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// A long block given back is a free range of its long allocation at once, which the next take
+    /// of its length lands in: a Shared block of 64 MiB, which takes an allocation of its own, is
+    /// taken, given a zeroed buffer, and given back 20 times in a row, each take straight after
+    /// the give-back before. Only the first take allocates; the other 19 are long reuses, the
+    /// allocation's bytes counted as long reused while a block of a later take is in it, and
+    /// nothing is freed.
+    #[test]
+    fn every_device_takes_a_long_block_given_back_again_at_once() {
+        const LEN: u64 = 64 << 20;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let counters = device.counters();
+            let before = counters.metrics();
+            let mut made = Vec::new();
+            for round in 0..20 {
+                let allocations = counters.metrics().consumer_allocations;
+                let block = (device.take_block(MemoryClass::Shared, LEN))
+                    .unwrap_or_else(|error| panic!("{name}: round {round}: {error}"));
+                let reused = counters.gauges().shared_long_reused_bytes;
+                assert_eq!(
+                    reused,
+                    if round == 0 { 0 } else { LEN },
+                    "{name}: round {round}: the long allocation's bytes, reused"
+                );
+                let buffer = (device.new_buffer(block.id, 0, LEN, Some(0)))
+                    .unwrap_or_else(|error| panic!("{name}: round {round}: {error}"));
+                drop(buffer);
+                device.release_block(block).expect("a release");
+                made.push(counters.metrics().consumer_allocations - allocations);
+            }
+            let after = counters.metrics();
+            assert_eq!(
+                (made[0], made.iter().skip(1).sum::<u64>()),
+                (1, 0),
+                "{name}: allocations each take made: {made:?}"
+            );
+            assert_eq!(
+                (
+                    after.shared_long_reuses - before.shared_long_reuses,
+                    after.allocations_freed - before.allocations_freed
+                ),
+                (19, 0),
+                "{name}: takes of the long allocation after its first, and allocations freed"
+            );
+            assert_eq!(
+                counters.gauges().shared_long_reused_bytes,
+                0,
+                "{name}: no block in it"
+            );
+            drop(device);
+            assert_each_unmapped_once(name, &hook);
+        }
+    }
+
+    /// Checks each free of `frees` (when its allocation became idle, when its free began and
+    /// ended) began at its idle age or after, and after the free before it ended: one at a time.
+    /// How long past its idle age a free begins is a time, which this suite does not judge: the
+    /// harness's own rows `idle_frees` and `idle_frees_under_commits` judge it, each alone.
+    fn assert_freed_at_the_idle_age(name: &str, frees: &[(u64, u64, u64)]) {
+        let mut ended = 0;
+        for (index, &(since, began, end)) in frees.iter().enumerate() {
+            let due = since + IDLE_AGE_NANOS;
+            assert!(
+                began >= due,
+                "{name}: free {index} began {} us idle",
+                (began - since) / 1000
+            );
+            assert!(
+                began >= ended && end >= began,
+                "{name}: free {index} began {} us before the free before it ended",
+                ended.saturating_sub(began) / 1000
+            );
+            ended = end;
+        }
+    }
+
+    /// Each idle allocation is freed at its idle age, oldest first: four Shared blocks of 16 MiB,
+    /// taken beside a small block once the block-maker thread made each one's allocation ahead,
+    /// and given back, leave their allocations idle beside the one made ahead after them, the
+    /// class's reserve, the oldest idle age gauge no older than the first give-back. A take of
+    /// their length right then lands in the oldest, the first fit, counted in the bucket of its
+    /// idle time, and holds it for 300 ms: the other three are freed at their idle age, one at a
+    /// time, after the hook's unmap of each, on the block-maker thread. Given back again, the
+    /// first is freed at its idle age from then, and so is the small block's allocation once its
+    /// block is given back. The reserve, the last made, stays past the idle age, unweighed: the
+    /// oldest idle age gauge reads 0. Nothing commits.
+    #[test]
+    fn every_device_frees_each_idle_allocation_at_its_idle_age() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let len = MemoryClass::Shared.block_len();
+            let small = (device.take_block(MemoryClass::Shared, 1))
+                .unwrap_or_else(|error| panic!("{name}: a small block: {error}"));
+            let taken: Vec<Block> = (0..4)
+                .map(|_| {
+                    wait_until("a Shared unit made ahead", || {
+                        core.pool.stocked(MemoryClass::Shared)
+                    });
+                    (device.take_block(MemoryClass::Shared, len))
+                        .unwrap_or_else(|error| panic!("{name}: a block: {error}"))
+                })
+                .collect();
+            wait_until("the reserve made ahead", || {
+                core.pool.stocked(MemoryClass::Shared)
+            });
+            let four: Vec<AllocationId> = taken.iter().map(|block| block.allocation).collect();
+            let ids: Vec<BlockId> = taken.iter().map(|block| block.id).collect();
+            let small_id = small.id;
+            let before = counters.metrics();
+            let releasing = crate::host_time();
+            for block in taken {
+                device.release_block(block).expect("a release");
+            }
+            wait_until("the four given back", || {
+                ids.iter().all(|&id| core.pool.holds(id))
+            });
+            let gauges = counters.gauges();
+            let read = crate::host_time();
+            assert_eq!(
+                (gauges.shared_idle_bytes, gauges.shared_reserve_bytes),
+                (5 * len, len),
+                "{name}: four idle and the reserve"
+            );
+            assert!(
+                gauges.shared_idle_age_nanos > 0
+                    && gauges.shared_idle_age_nanos <= read - releasing,
+                "{name}: the oldest idle age, {} us, {} us after the first give-back",
+                gauges.shared_idle_age_nanos / 1000,
+                (read - releasing) / 1000
+            );
+
+            // The oldest taken again: its idle time ends, counted by how long it was idle. The
+            // take must come within the idle age of the give-back, which the test's own clock
+            // reads state: past it, the block-maker may have freed the allocation.
+            let again = (device.take_block(MemoryClass::Shared, len))
+                .unwrap_or_else(|error| panic!("{name}: a block: {error}"));
+            let taken = crate::host_time();
+            assert!(
+                taken - releasing < IDLE_AGE_NANOS,
+                "{name}: this test's thread took the block {} us after the give-back, past the \
+                 idle age: the test, not the runtime, was late",
+                (taken - releasing) / 1000
+            );
+            assert_eq!(
+                (again.allocation, again.offset),
+                (four[0], 0),
+                "{name}: the first fit, the oldest"
+            );
+            let reuses = counters.metrics().idle_reuses_by_age;
+            let new = |at: usize| reuses[at] - before.idle_reuses_by_age[at];
+            let ages = 0..=reuse_bucket(taken - releasing);
+            assert_eq!(
+                (
+                    ages.clone().map(new).sum::<u64>(),
+                    (0..7).map(new).sum::<u64>()
+                ),
+                (1, 1),
+                "{name}: taken again at most {} us idle, buckets {ages:?}: {reuses:?}",
+                (taken - releasing) / 1000
+            );
+
+            // The other three freed at their idle age, oldest first.
+            wait_until("three idle Shared allocations freed", || {
+                core.pool.frees().len() == 3 && !core.submit_calls.freeing()
+            });
+            assert_freed_at_the_idle_age(name, &core.pool.frees());
+            let unmapped = hook.unmapped();
+            assert_eq!(unmapped.len(), 3, "{name}: {unmapped:?}");
+            for (unmapped, allocation) in unmapped.iter().zip(&four[1..]) {
+                assert_eq!(unmapped.allocation, *allocation, "{name}: the oldest first");
+                assert_eq!(unmapped.thread.as_deref(), Some("m2v-blocks"), "{name}");
+            }
+            thread::sleep(Duration::from_millis(250));
+            assert_eq!(
+                core.pool.frees().len(),
+                3,
+                "{name}: the block taken again is not freed while held"
+            );
+
+            // Given back again: freed at its idle age from now.
+            let released = crate::host_time();
+            device.release_block(again).expect("a release");
+            wait_until("the fourth freed", || {
+                core.pool.frees().len() == 4 && !core.submit_calls.freeing()
+            });
+            let frees = core.pool.frees();
+            assert!(
+                frees[3].0 >= released,
+                "{name}: the fourth's idle time starts at its second give-back"
+            );
+            assert_freed_at_the_idle_age(name, &frees[3..]);
+            assert_eq!(hook.unmapped()[3].allocation, four[0], "{name}: the first");
+
+            // The small block's allocation freed at its idle age too; the reserve kept past it,
+            // unweighed.
+            device.release_block(small).expect("a release");
+            wait_until("the small block given back", || core.pool.holds(small_id));
+            wait_until("the small block's allocation freed", || {
+                core.pool.frees().len() == 5 && !core.submit_calls.freeing()
+            });
+            thread::sleep(Duration::from_nanos(2 * IDLE_AGE_NANOS));
+            assert_eq!(
+                core.pool.frees().len(),
+                5,
+                "{name}: no free past the small block's: the reserve stays"
+            );
+            let gauges = counters.gauges();
+            assert_eq!(
+                (
+                    gauges.blocks,
+                    gauges.shared_idle_bytes,
+                    gauges.shared_idle_age_nanos
+                ),
+                (INTERNALS + 2, len, 0),
+                "{name}: the reserve of each class, kept and unweighed"
+            );
+            let metrics = counters.metrics();
+            let freed = |at: usize| metrics.idle_frees_by_age[at] - before.idle_frees_by_age[at];
+            assert_eq!(
+                (
+                    metrics.allocations_freed - before.allocations_freed,
+                    freed(0)
+                ),
+                (5, 0),
+                "{name}: five frees, none before the idle age: {:?}",
+                metrics.idle_frees_by_age
+            );
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            assert_each_unmapped_once(name, &hook);
+            println!(
+                "memory: {name}: idle allocations freed at their idle age, frees {:?}; metrics {:?}",
+                free_times(&frees),
+                counters.metrics()
+            );
+        }
+    }
+
+    /// A class idle past the idle age holds one wholly free unit and no other: in each class,
+    /// three blocks of 16 MiB, each taken once the block-maker thread made its unit ahead, leave
+    /// the class four units, three in use and the reserve made after them. Given back, the three
+    /// are freed at their idle age; the reserve, the last made, stays, unweighed, and nothing more
+    /// is made or freed past the idle age. Nothing commits.
+    #[test]
+    fn every_device_keeps_one_wholly_free_unit_per_class_once_idle() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        const CLASSES: [MemoryClass; 2] = [MemoryClass::Private, MemoryClass::Shared];
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let unit = MemoryClass::Shared.block_len();
+            let mut blocks = Vec::new();
+            for class in CLASSES {
+                for _ in 0..3 {
+                    wait_until("a unit made ahead", || core.pool.stocked(class));
+                    blocks.push(
+                        (device.take_block(class, unit))
+                            .unwrap_or_else(|error| panic!("{name}: a {class:?} block: {error}")),
+                    );
+                }
+                wait_until("the reserve made ahead", || core.pool.stocked(class));
+            }
+            let whole = |class: MemoryClass| {
+                (core.pool.allocations(class).into_iter())
+                    .filter(|&(_, len, live, free)| len == unit && live == 0 && free == len)
+                    .count()
+            };
+            for class in CLASSES {
+                assert_eq!(
+                    (core.pool.allocations(class).len(), whole(class)),
+                    (4, 1),
+                    "{name}: {class:?}: three units in use and the reserve"
+                );
+            }
+            let made = counters.metrics().blocks_made;
+            let ids: Vec<BlockId> = blocks.iter().map(|block| block.id).collect();
+            for block in blocks {
+                device.release_block(block).expect("a release");
+            }
+            wait_until("the six given back", || {
+                ids.iter().all(|&id| core.pool.holds(id))
+            });
+            for class in CLASSES {
+                assert_eq!(whole(class), 4, "{name}: {class:?}: four wholly free units");
+            }
+            wait_until("six idle allocations freed", || {
+                core.pool.frees().len() == 6 && !core.submit_calls.freeing()
+            });
+            assert_freed_at_the_idle_age(name, &core.pool.frees());
+            thread::sleep(Duration::from_nanos(2 * IDLE_AGE_NANOS));
+            let gauges = counters.gauges();
+            for class in CLASSES {
+                let allocations = core.pool.allocations(class);
+                assert_eq!(
+                    (allocations.len(), whole(class)),
+                    (1, 1),
+                    "{name}: {class:?}: one wholly free unit and no other: {allocations:?}"
+                );
+            }
+            assert_eq!(
+                (
+                    core.pool.frees().len() as u64,
+                    counters.metrics().blocks_made - made
+                ),
+                (6, 0),
+                "{name}: nothing more freed or made past the idle age"
+            );
+            assert_eq!(
+                (
+                    gauges.shared_reserve_bytes,
+                    gauges.private_reserve_bytes,
+                    gauges.shared_idle_age_nanos,
+                    gauges.private_idle_age_nanos
+                ),
+                (unit, unit, 0, 0),
+                "{name}: each class's reserve, unweighed"
+            );
+            let frees = core.pool.frees();
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            assert_each_unmapped_once(name, &hook);
+            println!(
+                "memory: {name}: one wholly free unit per class once idle, frees {:?}; metrics {:?}",
+                free_times(&frees),
+                counters.metrics()
+            );
+        }
+    }
+
+    /// An allocation a take longer than the unit made for itself is never the reserve: a Shared
+    /// block of 64 MiB, given back, leaves its allocation idle with free bytes, newer than the
+    /// class's first one, and nothing else of the class live. The long allocation is freed at its
+    /// idle age, and the class keeps its unit allocation as its reserve, unweighed. Nothing
+    /// commits.
+    #[test]
+    fn every_device_frees_a_long_allocation_whose_block_s_bytes_are_free_at_its_idle_age() {
+        const MIB: u64 = 1 << 20;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let unit = MemoryClass::Shared.block_len();
+            let long = (device.take_block(MemoryClass::Shared, 64 * MIB))
+                .unwrap_or_else(|error| panic!("{name}: a block of 64 MiB: {error}"));
+            let allocation = long.allocation;
+            device.release_block(long).expect("a release");
+            wait_until("the long allocation freed", || {
+                core.pool.frees().len() == 1 && !core.submit_calls.freeing()
+            });
+            let unmapped = hook.unmapped();
+            assert_eq!(
+                unmapped.iter().map(|u| u.allocation).collect::<Vec<_>>(),
+                [allocation],
+                "{name}: the long allocation unmapped, and no other"
+            );
+            thread::sleep(Duration::from_nanos(2 * IDLE_AGE_NANOS));
+            let gauges = counters.gauges();
+            assert_eq!(
+                (
+                    gauges.blocks,
+                    gauges.shared_idle_bytes,
+                    gauges.shared_reserve_bytes,
+                    gauges.shared_idle_age_nanos
+                ),
+                (INTERNALS + 2, unit, unit, 0),
+                "{name}: one unit allocation of each class, the Shared one the reserve"
+            );
+            assert_eq!(
+                core.pool.frees().len(),
+                1,
+                "{name}: no second free: the reserve stays"
+            );
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            assert_each_unmapped_once(name, &hook);
+            println!(
+                "memory: {name}: a long allocation with free bytes freed at its idle age; \
+                 metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// A lost device's report places an address in the pool's allocation the idle rule freed: a
+    /// Shared block of 64 MiB, an allocation of its own, given back with nothing in flight and
+    /// freed at its idle age, is the one range that holds an address in it, freed with nothing in
+    /// flight and none waited for; a live block's allocation holds an address in it, live; and an
+    /// exported block, where the device exports a handle, is the one live range that holds an
+    /// address in it, by its number.
+    #[test]
+    fn every_device_places_an_address_in_an_allocation_freed_at_its_idle_age() {
+        const MIB: u64 = 1 << 20;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        let at = |address| crate::FaultAddress {
+            kind: vk::DeviceFaultAddressTypeEXT::READ_INVALID,
+            address,
+            precision: 0x1000,
+        };
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let live = (device.take_block(MemoryClass::Shared, MIB))
+                .unwrap_or_else(|error| panic!("{name}: a block of 1 MiB: {error}"));
+            let long = (device.take_block(MemoryClass::Shared, 64 * MIB))
+                .unwrap_or_else(|error| panic!("{name}: a block of 64 MiB: {error}"));
+            let (allocation, address) = (
+                long.allocation,
+                long.gpu_address.expect("a taken block's address"),
+            );
+            device.release_block(long).expect("a release");
+            wait_until("the long allocation freed", || {
+                core.pool.frees().len() == 1 && !core.submit_calls.freeing()
+            });
+            let freed = core
+                .spans
+                .place(&at(address + 32 * MIB), crate::host_time());
+            let holders: Vec<_> = (freed.holders.iter())
+                .map(|range| {
+                    let free = range.freed.map(|free| (free.in_flight, free.waited_for));
+                    (range.kind, range.address, range.len, free)
+                })
+                .collect();
+            let kind = crate::RangeKind::Allocation(allocation, MemoryClass::Shared);
+            assert_eq!(
+                holders,
+                [(kind, address, 64 * MIB, Some((0, None)))],
+                "{name}: the freed allocation alone, nothing in flight at its free: {freed}"
+            );
+            let held = core.spans.place(
+                &at(live.gpu_address.expect("a taken block's address")),
+                crate::host_time(),
+            );
+            let kind = crate::RangeKind::Allocation(live.allocation, MemoryClass::Shared);
+            assert!(
+                matches!(held.holders.as_slice(),
+                    [range] if range.kind == kind && range.freed.is_none()),
+                "{name}: the live block's allocation, live: {held}"
+            );
+            device.release_block(live).expect("a release");
+            let exported = (ExportHandle::ALL.into_iter())
+                .find_map(|handle| device.new_exported_block(handle, MIB).ok());
+            if let Some((exported, _export)) = exported {
+                let buffer = (device.new_buffer(exported.id, 0, MIB, None)).expect("a buffer");
+                let place =
+                    (core.spans).place(&at(buffer.gpu_address() + 0x2000), crate::host_time());
+                let kind = crate::RangeKind::Export(exported.id);
+                // The live range comes first; a freed one at the same addresses, as the long
+                // allocation's where the driver gives its addresses again, follows it.
+                assert!(
+                    matches!(place.holders.as_slice(), [range, rest @ ..]
+                        if range.kind == kind && range.freed.is_none()
+                            && rest.iter().all(|range| range.freed.is_some())),
+                    "{name}: the exported block, by its number, the one live range: {place}"
+                );
+                println!("memory: {name}: {place}");
+            }
+            drop(device);
+            assert_each_unmapped_once(name, &hook);
+            println!("memory: {name}: {freed}; {held}");
+        }
+    }
+
+    /// The bucket of [`Metrics::idle_reuses_by_age`](crate::Metrics::idle_reuses_by_age) an idle
+    /// time of `nanos` counts in: the runtime's upper bounds, 50, 100, 250, 500, 1000 and
+    /// 2000 ms.
+    fn reuse_bucket(nanos: u64) -> usize {
+        ([50, 100, 250, 500, 1000, 2000].iter())
+            .position(|&ms: &u64| nanos < ms * 1_000_000)
+            .unwrap_or(6)
+    }
+
+    /// Each free's idle time when it began and its length, in microseconds.
+    fn free_times(frees: &[(u64, u64, u64)]) -> Vec<(u64, u64)> {
+        (frees.iter())
+            .map(|&(since, began, end)| ((began - since) / 1000, (end - began) / 1000))
             .collect()
-    };
-    let private = MemoryClass::Private;
-    // The class the image takes and the types it may lie in, best first.
-    let picked = |types: &[vk::MemoryType], allowed: u32, unified: bool| {
-        let (class, taken) =
-            host_cached_placement(types, allowed, private, unified).unwrap_or((private, allowed));
-        (class, candidates(types, taken, class, unified))
-    };
-    // NVIDIA 615.71.09 on an RTX 3090: a host-transfer image may lie in types 3 to 5.
-    let nvidia = types(&[0x0, 0x1, 0x1, 0x6, 0xe, 0x7]);
-    assert_eq!(host_cached(&nvidia), 0b1_0000);
-    assert_eq!(
-        host_cached_placement(&nvidia, 0b11_1000, private, false),
-        None
-    );
-    assert_eq!(picked(&nvidia, 0b11_1000, false), (private, vec![5]));
-    // RADV (Mesa 26.2.4) on a Radeon 780M: types 2, 3, 5 and the AMD device-coherent 14 to 16.
-    let radv = types(&[
-        0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6, 0xc7,
-        0xce,
-    ]);
-    let allowed = 0b1_1100_0000_0010_1100;
-    assert_eq!(picked(&radv, allowed, true), (private, vec![5]));
-    // The same memory on a device without unified memory: its device-local uncached type.
-    assert_eq!(host_cached_placement(&radv, allowed, private, false), None);
-    assert_eq!(picked(&radv, allowed, false), (private, vec![3]));
-    // An image that may lie in no host-cached type keeps its class's memory.
-    assert_eq!(picked(&radv, 0b1000, true), (private, vec![3]));
-    // MoltenVK on an Apple GPU: private, shared (device-local and host-cached), memoryless.
-    let moltenvk = types(&[0x1, 0xf, 0x11]);
-    assert_eq!(host_cached(&moltenvk), 0b010);
-    assert_eq!(picked(&moltenvk, 0b111, true), (private, vec![1]));
-    // lavapipe: one type, device-local and host-cached.
-    assert_eq!(picked(&types(&[0xf]), 1, true), (private, vec![0]));
-    // Device-local host-visible memory both uncached (listed first) and cached.
-    let both = types(&[0x1, 0x7, 0xf]);
-    assert_eq!(candidates(&both, 0b110, private, true), [1, 2]);
-    assert_eq!(picked(&both, 0b110, true), (private, vec![2]));
-    // ANV (Mesa 26.2.4) on Arrow Lake-S's Xe-LPG (0x7d67), which shares no cache with the host:
-    // coherent write-combined types 0 and 3, cached type 1 without coherence, protected type 2.
-    // No type is host-cached and coherent, so the image takes its class's memory, without the
-    // incoherent type (`placed_image` strips it): the coherent type 0 first.
-    let arl = types(&[0x7, 0xb, 0x21, 0x7]);
-    assert_eq!(host_cached(&arl), 0);
-    assert_eq!(host_incoherent(&arl), 0b0010);
-    assert_eq!(host_cached_placement(&arl, 0b1011, private, true), None);
-    let coherent = 0b1011 & !host_incoherent(&arl);
-    assert_eq!(picked(&arl, coherent, true), (private, vec![0, 3]));
-    // Every device above lists only coherent host-visible types.
-    for listed in [nvidia, radv, moltenvk, types(&[0xf]), both] {
-        assert_eq!(host_incoherent(&listed), 0);
     }
-}
 
-/// A texture's image with host-transfer usage takes its class's own memory types alone, never one
-/// the class overflows into past full device-local memory (`overflow_candidates`): where none of
-/// them has room, the placement fails and the image is made without the usage
-/// (`Device::host_placed_image`), which lies in device-local memory where a type of it has room
-/// and overflows only where none has. On an RTX 3090 without resizable BAR (NVIDIA 620.70.06) the
-/// one device-local type such an image takes, 5, lies in the 246 MiB BAR heap that every
-/// process's devices share; the system memory types 3 and 4 it also allows are those its class
-/// overflows into (`device-memory-overflow`), while the image without the usage takes type 1, in
-/// the 24 GiB device-local heap. Where the class has a type the host caches, those alone; never
-/// an incoherent one.
-#[test]
-fn host_transfer_images_take_no_type_their_class_overflows_into() {
-    let types = |raw: &[u32]| -> Vec<vk::MemoryType> {
-        raw.iter()
-            .map(|&flags| ty(vk::MemoryPropertyFlags::from_raw(flags)))
+    /// Steady commits hold no idle allocation, and a submission during a free is counted. A
+    /// command buffer is committed every 2 ms; 0.5 seconds in, a Shared block of 16 MiB that fills
+    /// an allocation is given back, which leaves the class two wholly free units, one too many:
+    /// the one made ahead last stays, the class's reserve; a second is given back once the first
+    /// free ended and the Shared idle bytes were seen back at the made-ahead amount, one too many
+    /// in turn; the commits stop once the second free ended. Each free
+    /// begins after the give-back that set it off, at its idle age or after, one at a time, while
+    /// the commits go on, and once they stop the Shared idle bytes are the made-ahead amount they
+    /// were before. Then the free a third give-back sets off is held open: a command buffer
+    /// committed with a fill during it is counted as a submission during a free, and one committed
+    /// once the free ended is not.
+    #[test]
+    fn every_device_frees_idle_allocations_at_their_idle_age_under_steady_commits() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let core = device.core();
+            let counters = device.counters();
+            let queue = device.new_command_queue(1).expect("a queue");
+            let len = MemoryClass::Shared.block_len();
+            let target = (device.take_block(MemoryClass::Private, 4096))
+                .unwrap_or_else(|error| panic!("{name}: a block: {error}"));
+            let buffer = (device.new_buffer(target.id, 0, 256, None)).expect("a buffer");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            command_buffer.commit().expect("a commit");
+            command_buffer
+                .wait_until_completed()
+                .expect("a wait outside a scheduled handler");
+            let mut blocks: Vec<Block> = (0..3)
+                .map(|_| {
+                    (device.take_block(MemoryClass::Shared, len))
+                        .unwrap_or_else(|error| panic!("{name}: a block: {error}"))
+                })
+                .collect();
+            wait_until("the Shared reserve", || {
+                core.pool.stocked(MemoryClass::Shared)
+            });
+            let made_ahead = counters.gauges().shared_idle_bytes;
+            assert_eq!(made_ahead, len, "{name}: one Shared allocation made ahead");
+            let before = counters.metrics();
+
+            // Commits every 2 ms: a block given back 0.5 seconds in, the second once the first's
+            // free ended, until the second's free ended.
+            let started = Instant::now();
+            let mut given = Vec::new();
+            let mut between = None;
+            let mut commits = 0;
+            let ended =
+                |count: usize| core.pool.frees().len() == count && !core.submit_calls.freeing();
+            while !(given.len() == 2 && ended(2)) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "{name}: the frees"
+                );
+                if given.is_empty() && started.elapsed() >= Duration::from_millis(500) {
+                    given.push(crate::host_time());
+                    device.release_block(blocks.remove(0)).expect("a release");
+                } else if given.len() == 1 && ended(1) {
+                    between = Some(counters.gauges().shared_idle_bytes);
+                    given.push(crate::host_time());
+                    device.release_block(blocks.remove(0)).expect("a release");
+                }
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                command_buffer.commit().expect("a commit");
+                commits += 1;
+                thread::sleep(Duration::from_millis(2));
+            }
+            let stopped = crate::host_time();
+            let frees = core.pool.frees();
+            assert_eq!(frees.len(), 2, "{name}: both freed during the commits");
+            assert_freed_at_the_idle_age(name, &frees);
+            for ((_, began, end), given) in frees.iter().zip(&given) {
+                assert!(
+                    began >= given && *end < stopped,
+                    "{name}: freed after the give-back that set it off, while the commits went on"
+                );
+            }
+            assert_eq!(
+                (between, counters.gauges().shared_idle_bytes),
+                (Some(made_ahead), made_ahead),
+                "{name}: the idle bytes back to the made-ahead amount"
+            );
+            let steady = counters.metrics();
+            println!(
+                "memory: {name}: {commits} commits, {} of them during the frees; frees {:?}",
+                steady.submissions_during_frees - before.submissions_during_frees,
+                free_times(&frees)
+            );
+
+            // A free held open: a submission during it is counted, one after it is not.
+            let fill = |buffer: &crate::Buffer| {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let (to, at) = vk_buffer(&device, target.id);
+                command_buffer
+                    .record_for_test(&[buffer], |device, command| {
+                        // SAFETY: the command buffer is recording; the block is held.
+                        unsafe { device.cmd_fill_buffer(command, to, at, 256, 7) };
+                    })
+                    .expect("a fill");
+                command_buffer.commit().expect("a commit");
+                command_buffer
+                    .wait_until_completed()
+                    .expect("a wait outside a scheduled handler");
+            };
+            core.submit_calls.hold_frees(true);
+            device.release_block(blocks.remove(0)).expect("a release");
+            wait_until("a free held open", || core.submit_calls.freeing());
+            fill(&buffer);
+            assert_eq!(
+                counters.metrics().submissions_during_frees,
+                steady.submissions_during_frees + 1,
+                "{name}: the submission during the free"
+            );
+            core.submit_calls.hold_frees(false);
+            wait_until("the third freed", || {
+                core.pool.frees().len() == 3 && !core.submit_calls.freeing()
+            });
+            fill(&buffer);
+            assert_eq!(
+                counters.metrics().submissions_during_frees,
+                steady.submissions_during_frees + 1,
+                "{name}: the submission after the free"
+            );
+            drop((buffer, target, queue));
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+            println!(
+                "memory: {name}: frees at the idle age under steady commits; metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// A copy's staging buffer of its own goes to the block-maker thread, which frees it in its
+    /// form of every free: with that thread's frees held open, a copy larger than the staging
+    /// region goes through a buffer of its own into a texture, carried by a command buffer's
+    /// submission. Once it completed, the buffer is given back and its free is held open on that
+    /// thread, its memory still a block: a submission made then is counted as one during a free,
+    /// with its time, and once the frees go on, the buffer's memory is freed.
+    #[test]
+    fn every_device_frees_a_copy_s_staging_buffer_on_the_block_maker_thread() {
+        use crate::staging::REGION_LEN;
+        use crate::{IndexClass, Region};
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let core = device.core();
+            let counters = device.counters();
+            device
+                .grant_indices(IndexClass::Texture, 4096, 8)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            core.pool.await_internals();
+            let queue = device.new_command_queue(1).expect("a queue");
+            let target = (device.take_block(MemoryClass::Private, 4096))
+                .unwrap_or_else(|error| panic!("{name}: a block: {error}"));
+            let buffer = (device.new_buffer(target.id, 0, 256, None)).expect("a buffer");
+            let fill = || {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let (to, at) = vk_buffer(&device, target.id);
+                command_buffer
+                    .record_for_test(&[&buffer], |device, command| {
+                        // SAFETY: the command buffer is recording; the block is held.
+                        unsafe { device.cmd_fill_buffer(command, to, at, 256, 7) };
+                    })
+                    .expect("a fill");
+                command_buffer.commit().expect("a commit");
+                command_buffer
+                    .wait_until_completed()
+                    .expect("a wait outside a scheduled handler");
+            };
+            // 2304 texels square of RGBA8Unorm, 21,233,664 bytes: larger than the region.
+            let side = 2304;
+            let d =
+                TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, side, side);
+            let texture = (device.new_texture(&d, Some(4096)))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let bytes = vec![0x5A_u8; (side * side * 4) as usize];
+            let len = bytes.len() as u64;
+            core.submit_calls.hold_frees(true);
+            let whole = Region {
+                origin: [0; 3],
+                size: [side, side, 1],
+            };
+            texture
+                .replace_region(
+                    whole,
+                    0,
+                    0,
+                    crate::HostBytes::from(&bytes[..]),
+                    u64::from(side * 4),
+                    len,
+                )
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                counters.gauges().staging_bytes,
+                REGION_LEN + len,
+                "{name}: a staging buffer of its own"
+            );
+            // The command buffer whose submission carries the copy.
+            fill();
+            wait_until("the staging buffer's free held open", || {
+                counters.gauges().staging_bytes == REGION_LEN && core.submit_calls.freeing()
+            });
+            let held = counters.gauges();
+            let before = counters.metrics();
+            fill();
+            assert_eq!(
+                counters.metrics().submissions_during_frees,
+                before.submissions_during_frees + 1,
+                "{name}: the submission during the staging buffer's free"
+            );
+            wait_until("the submission's time during the free", || {
+                counters.metrics().submit_call_nanos_during_frees
+                    > before.submit_call_nanos_during_frees
+            });
+            assert_eq!(
+                counters.gauges().blocks,
+                held.blocks,
+                "{name}: the staging buffer's memory, its free held open"
+            );
+            core.submit_calls.hold_frees(false);
+            wait_until("the staging buffer's memory freed", || {
+                counters.gauges().blocks == held.blocks - 1 && !core.submit_calls.freeing()
+            });
+            drop((texture, buffer, target, queue));
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+        }
+    }
+
+    /// Seeded takes and releases of mixed lengths across both classes, with the block-maker
+    /// thread running: every take and release returns within a minute, every block's allocation
+    /// was mapped before the take returned it, every allocation mapped is unmapped once by the
+    /// end, on the block-maker thread or the dropping one, and every gauge reads zero after
+    /// teardown.
+    #[test]
+    fn every_device_returns_every_seeded_take_and_release_of_mixed_lengths() {
+        use std::sync::mpsc::RecvTimeoutError;
+        const OPS: usize = 300;
+        /// The most live bytes of a class the run keeps: past it, it releases.
+        const MOST: u64 = 192 << 20;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        let this_thread = thread::current().name().map(str::to_string);
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let counters = device.counters();
+            let worker = device.clone();
+            let mappings = Arc::clone(&hook);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let run = thread::spawn(move || -> Result<Vec<BlockId>, String> {
+                const MIB: u64 = 1 << 20;
+                let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let lens = [64 << 10, MIB, 3 * MIB, 16 * MIB, 20 * MIB, 40 * MIB];
+                let index = |class: MemoryClass| usize::from(class == MemoryClass::Shared);
+                let mut live: Vec<Block> = Vec::new();
+                let mut bytes = [0u64; 2];
+                let mut handed = Vec::new();
+                for op in 0..OPS {
+                    let full = bytes.iter().any(|&bytes| bytes > MOST);
+                    if !live.is_empty() && (full || next() % 3 == 0) {
+                        let block = live.swap_remove((next() % live.len() as u64) as usize);
+                        bytes[index(block.class)] -= block.len;
+                        (worker.release_block(block)).map_err(|error| format!("{op}: {error}"))?;
+                    } else {
+                        let class = match next() % 2 {
+                            0 => MemoryClass::Shared,
+                            _ => MemoryClass::Private,
+                        };
+                        let len = lens[(next() % lens.len() as u64) as usize];
+                        let block = (worker.take_block(class, len))
+                            .map_err(|error| format!("{op}: {class:?} {len}: {error}"))?;
+                        if !(mappings.mapped().iter()).any(|m| m.allocation == block.allocation) {
+                            return Err(format!(
+                                "{op}: {class:?} {len}: its allocation not mapped"
+                            ));
+                        }
+                        bytes[index(class)] += block.len;
+                        handed.push(block.id);
+                        live.push(block);
+                    }
+                    if sender.send(op).is_err() {
+                        break;
+                    }
+                }
+                drop(live);
+                drop(worker);
+                Ok(handed)
+            });
+            for op in 0..OPS {
+                match receiver.recv_timeout(Duration::from_secs(60)) {
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("{name}: operation {op} did not return within a minute")
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let mut handed = (run.join())
+                .expect("the run's thread")
+                .unwrap_or_else(|error| panic!("{name}: operation {error}"));
+            drop(device);
+            assert_eq!(
+                counters.gauges(),
+                Gauges::default(),
+                "{name}: gauges after teardown"
+            );
+            handed.sort_unstable();
+            handed.dedup();
+            assert_each_unmapped_once(name, &hook);
+            for unmapped in hook.unmapped() {
+                assert!(
+                    unmapped.thread.as_deref() == Some("m2v-blocks")
+                        || unmapped.thread == this_thread,
+                    "{name}: unmapped on {:?}",
+                    unmapped.thread
+                );
+            }
+            println!(
+                "memory: {name}: {OPS} seeded takes and releases, {} blocks; metrics {:?}",
+                handed.len(),
+                counters.metrics()
+            );
+        }
+    }
+
+    /// With the device's `maxMemoryAllocationCount` answered as the first two allocations', the
+    /// zero source's and the ring block's (`Device::open`), the count is reached once the
+    /// block-maker thread made those two: its staging region is refused, and so is its next
+    /// Private allocation once a texture's block takes the first one whole. Past the count, a
+    /// texture longer than an allocation, whose block takes an allocation of its own, and the
+    /// staging region the first copy makes where the block-maker thread made none are
+    /// `Limit::MemoryAllocations` with the device's count, refused before the driver is called,
+    /// the gauges unchanged; textures placed in the texture block still come and go; and every
+    /// gauge reads zero after teardown.
+    #[test]
+    fn every_device_refuses_an_allocation_past_its_count() {
+        use crate::{IndexClass, PixelFormat, Region, TextureDescriptor, TextureType};
+        const MAX: u32 = INTERNAL_BLOCKS as u32 + 2;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::open(physical, DeviceOptions::default(), |limits| {
+                limits.max_memory_allocation_count = MAX;
+            })
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let counters = device.counters();
+            device.core().pool.await_internals();
+            let gauges = counters.gauges();
+            assert_eq!(
+                (gauges.blocks, gauges.staging_bytes),
+                (u64::from(MAX), 0),
+                "{name}: the first allocations, the zero source and the ring's block, no region"
+            );
+            device
+                .grant_indices(IndexClass::Texture, 4096, 16)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let d = TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, 4, 4);
+            let first = (device.new_texture(&d, Some(4096)))
+                .unwrap_or_else(|error| panic!("{name}: the first texture: {error}"));
+            // Three layers of 4096 x 4096 RGBA16Float, 384 MiB: longer than an allocation.
+            let mut large = TextureDescriptor::new(
+                TextureType::Type2DArray,
+                PixelFormat::RGBA16Float,
+                4096,
+                4096,
+            );
+            large.array_length = 3;
+            match device.new_texture(&large, Some(4097)) {
+                Err(Error::Limit(Limit::MemoryAllocations { max: MAX })) => {}
+                Err(error) => panic!("{name}: a long texture past the count: {error}"),
+                Ok(_) => panic!("{name}: a long texture past the count was made"),
+            }
+            let gauges = counters.gauges();
+            assert_eq!(
+                (gauges.blocks, gauges.textures, gauges.descriptor_slots),
+                (u64::from(MAX), 1, 1),
+                "{name}: after the refused texture"
+            );
+            let whole = Region {
+                origin: [0; 3],
+                size: [4, 4, 1],
+            };
+            match first.replace_region(whole, 0, 0, crate::HostBytes::from(&[0x5A; 64][..]), 16, 64)
+            {
+                Err(Error::Limit(Limit::MemoryAllocations { max: MAX })) => {}
+                other => panic!("{name}: the staging region past the count: {other:?}"),
+            }
+            assert_eq!(
+                counters.gauges().blocks,
+                u64::from(MAX),
+                "{name}: after the refused staging region"
+            );
+            // Placed in the texture block: no allocation.
+            let placed: Vec<_> = (4097..4105)
+                .map(|index| {
+                    (device.new_texture(&d, Some(index)))
+                        .unwrap_or_else(|error| panic!("{name}: texture {index}: {error}"))
+                })
+                .collect();
+            assert_eq!(counters.gauges().blocks, u64::from(MAX), "{name}");
+            drop(placed);
+            drop(first);
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+            print_gauges_at_drop("memory_allocation_count", counters.gauges());
+            println!("memory: {name}: refused past {MAX} allocations");
+        }
+    }
+
+    /// A zeroed Private buffer's fill goes ahead of the next command buffer committed, before a
+    /// copy that command buffer makes into the buffer: each copied range holds the copy, the rest
+    /// of the buffer from its `zero_from` reads zero, a copy into the bytes before `zero_from`
+    /// holds as well, and the block's bytes outside the buffer are as they were. A `zero_from` at
+    /// the length zeroes nothing. A texture placed in a block zeroes nothing.
+    #[test]
+    fn every_device_fills_a_zeroed_private_buffer_before_a_copy_into_it_in_the_next_command_buffer()
+    {
+        use crate::IndexClass;
+        const LEN: u64 = 4096;
+        const AT: u64 = 1024;
+        const SPAN: u64 = 2 * AT + LEN;
+        // The copies' source, at 64 KiB in the Shared block: a pattern with no zero byte.
+        const SOURCE: u64 = 64 << 10;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let counters = device.counters();
+            let gpu = Gpu::new(&device);
+            let queue = device.new_command_queue(1).expect("a queue");
+            let private = (device
+                .take_block(MemoryClass::Private, MemoryClass::Private.block_len()))
+            .unwrap_or_else(|error| panic!("{name}: a Private block: {error}"));
+            let shared = (device.take_block(MemoryClass::Shared, MemoryClass::Shared.block_len()))
+                .unwrap_or_else(|error| panic!("{name}: a Shared block: {error}"));
+            let host = bytes(&shared);
+            let source = SOURCE as usize..(SOURCE + LEN) as usize;
+            for (index, byte) in host[source].iter_mut().enumerate() {
+                *byte = (index % 251) as u8 + 1;
+            }
+            let (to_private, to_shared) = (
+                vk_buffer(&device, private.id),
+                vk_buffer(&device, shared.id),
+            );
+            let ((private_buffer, private_base), (shared_buffer, shared_base)) =
+                (to_private, to_shared);
+            // Each case: the buffer's `zero_from`, and the ranges of it copied into.
+            for (zero_from, copies) in [
+                (0, vec![(100, 300)]),
+                (1000, vec![(0, 1000)]),
+                (1000, vec![(0, 1000), (2000, 2100)]),
+                (LEN, vec![(0, LEN)]),
+            ] {
+                gpu.fill(to_private, 0, SPAN, u32::MAX);
+                let before = counters.metrics().bytes_zeroed;
+                let buffer = (device.new_buffer(private.id, AT, LEN, Some(zero_from)))
+                    .unwrap_or_else(|error| panic!("{name}: a zeroed Private buffer: {error}"));
+                assert_eq!(
+                    counters.metrics().bytes_zeroed - before,
+                    LEN - zero_from,
+                    "{name}: from {zero_from}, the bytes zeroed"
+                );
+                let regions: Vec<vk::BufferCopy> = (copies.iter())
+                    .map(|&(start, end)| vk::BufferCopy {
+                        src_offset: shared_base + SOURCE + start,
+                        dst_offset: private_base + AT + start,
+                        size: end - start,
+                    })
+                    .collect();
+                let back = [vk::BufferCopy {
+                    src_offset: private_base,
+                    dst_offset: shared_base,
+                    size: SPAN,
+                }];
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                command_buffer
+                    .record_for_test(&[&buffer], |device, command| {
+                        let barrier = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+                        let dependency = vk::DependencyInfo::default().memory_barriers(&barrier);
+                        // SAFETY: the command buffer is recording; both blocks are held and span
+                        // the regions.
+                        unsafe {
+                            device.cmd_copy_buffer(
+                                command,
+                                shared_buffer,
+                                private_buffer,
+                                &regions,
+                            );
+                            device.cmd_pipeline_barrier2(command, &dependency);
+                            device.cmd_copy_buffer(command, private_buffer, shared_buffer, &back);
+                        }
+                    })
+                    .expect("the copies");
+                command_buffer.commit().expect("a commit");
+                command_buffer
+                    .wait_until_completed()
+                    .expect("a wait outside a scheduled handler");
+                assert_eq!(
+                    command_buffer.status(),
+                    CommandBufferStatus::Completed,
+                    "{name}"
+                );
+                for (index, &byte) in host[..SPAN as usize].iter().enumerate() {
+                    let expected = match (index as u64).checked_sub(AT).filter(|&at| at < LEN) {
+                        None => 0xFF,
+                        Some(at)
+                            if copies
+                                .iter()
+                                .any(|&(start, end)| (start..end).contains(&at)) =>
+                        {
+                            (at % 251) as u8 + 1
+                        }
+                        Some(at) if at >= zero_from => 0,
+                        Some(_) => 0xFF,
+                    };
+                    assert_eq!(
+                        byte, expected,
+                        "{name}: from {zero_from}, copies {copies:?}, byte {index}"
+                    );
+                }
+                drop(buffer);
+            }
+
+            // A texture placed in a block zeroes nothing.
+            device
+                .grant_indices(IndexClass::Texture, 4096, 1)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let before = counters.metrics().bytes_zeroed;
+            let d = TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, 64, 64);
+            let texture = (device.new_texture(&d, Some(4096)))
+                .unwrap_or_else(|error| panic!("{name}: a texture: {error}"));
+            assert_eq!(
+                counters.metrics().bytes_zeroed,
+                before,
+                "{name}: a texture placed in a block"
+            );
+            drop((texture, gpu, queue, private, shared));
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+            println!(
+                "memory: {name}: zeroed Private buffers filled before copies into them; metrics {:?}",
+                counters.metrics()
+            );
+        }
+    }
+
+    /// The add kernel over `a`, `b` and `out`, committed on `queue` and waited for.
+    fn add_into(
+        name: &str,
+        queue: &crate::CommandQueue,
+        state: &ComputePipelineState,
+        [a, b, out]: [&Buffer; 3],
+    ) {
+        let command_buffer = queue.command_buffer().expect("a command buffer");
+        let mut encoder =
+            (command_buffer.compute_command_encoder(DispatchType::Serial)).expect("an encoder");
+        encoder.set_compute_pipeline_state(state).expect("a state");
+        encoder.set_buffer(Some(a), 0, 0).expect("a buffer");
+        encoder.set_buffer(Some(b), 0, 1).expect("a buffer");
+        encoder.set_buffer(Some(out), 0, 2).expect("a buffer");
+        (encoder.dispatch_threads([WORDS as u32, 1, 1], [16, 1, 1])).expect("a dispatch");
+        encoder.end_encoding();
+        command_buffer.commit().expect("a commit");
+        finished(name, &command_buffer);
+        assert_eq!(command_buffer.error(), None, "{name}");
+    }
+
+    /// A Shared buffer's words.
+    fn words(buffer: &Buffer) -> Vec<u32> {
+        let contents = buffer.contents().expect("a Shared buffer").cast::<u32>();
+        // SAFETY: the buffer is alive and holds `WORDS` words, and its work completed.
+        (0..WORDS)
+            .map(|index| unsafe { contents.as_ptr().add(index).read_volatile() })
             .collect()
-    };
-    let private = MemoryClass::Private;
-    let nvidia = types(&[0x0, 0x1, 0x1, 0x6, 0xe, 0x7]);
-    // Allowed: system memory (3, 4) and the BAR heap (5). The image takes 5 alone: nothing it
-    // could overflow into.
-    let (class, taken, cached) = host_image_types(&nvidia, 0b11_1000, private, false);
-    assert_eq!((class, taken, cached), (private, 0b10_0000, false));
-    assert!(overflow_candidates(&nvidia, taken, class, false).is_empty());
-    // What the allowed types alone would overflow into.
-    assert_eq!(
-        overflow_candidates(&nvidia, 0b11_1000, private, false),
-        [3, 4]
-    );
-    // The image without the usage (an optimal depth image there: types 0 and 1) lies in the
-    // device-local type 1 and overflows into 0 only where 1 has no room.
-    assert_eq!(candidates(&nvidia, 0b11, private, false), [1]);
-    assert_eq!(overflow_candidates(&nvidia, 0b11, private, false), [0]);
-    // Allowed system memory alone: no type at all, so the placement fails before any allocation.
-    assert_eq!(
-        host_image_types(&nvidia, 0b1_1000, private, false),
-        (private, 0, false)
-    );
-    // RADV on a discrete GPU (the 780M's types without unified memory): its device-local types
-    // alone, the host-cached system type 5 left out.
-    let radv = types(&[
-        0x1, 0x1, 0x6, 0x7, 0x7, 0xe, 0xe, 0x21, 0x21, 0x21, 0x21, 0x20, 0x20, 0xc1, 0xc6, 0xc7,
-        0xce,
-    ]);
-    let allowed = 0b1_1100_0000_0010_1100;
-    let (class, taken, cached) = host_image_types(&radv, allowed, private, false);
-    assert_eq!((class, taken, cached), (private, 0b1000, false));
-    assert!(overflow_candidates(&radv, taken, class, false).is_empty());
-    // With unified memory nothing overflows, and the host-cached type stays the image's.
-    assert_eq!(
-        host_image_types(&radv, allowed, private, true),
-        (private, 0b10_0000, true)
-    );
-    // A device-local type the host caches, beside a cached system one: the device-local one alone.
-    let cached_both = types(&[0x1, 0xe, 0xf]);
-    assert_eq!(
-        host_image_types(&cached_both, 0b111, private, false),
-        (private, 0b100, true)
-    );
-    // ANV on Arrow Lake-S: the incoherent cached type 1 stays out.
-    let arl = types(&[0x7, 0xb, 0x21, 0x7]);
-    assert_eq!(
-        host_image_types(&arl, 0b1011, private, true),
-        (private, 0b1001, false)
-    );
-}
-
-/// The memory log's line for a large pooled placement names what it is, its class where placed,
-/// its bytes and where it lies, in the words of the block's own lines (`memory_log.rs`).
-#[test]
-fn the_memory_log_names_a_placement_s_kind_class_and_place() {
-    use crate::memory_log::placement_line;
-    use ash::vk::Handle;
-    let memory = vk::DeviceMemory::from_raw(0xabc0);
-    let placed = placement_line(
-        "placed",
-        16 << 20,
-        Some(MemoryClass::Private),
-        true,
-        (memory, 0x200_0000, 0),
-    );
-    assert_eq!(
-        placed,
-        "metal2vulkan: memory: placed a Private image of 16777216 bytes at offset 0x2000000 of \
-         memory 0xabc0 of type 0"
-    );
-    let returned = placement_line("returned", 4 << 20, None, false, (memory, 0, 2));
-    assert_eq!(
-        returned,
-        "metal2vulkan: memory: returned a buffer of 4194304 bytes at offset 0x0 of memory 0xabc0 \
-         of type 2"
-    );
-}
-
-/// The memory log's line for a copy of the caller's host pages names the copy, the caller's
-/// pointer and length, and the copy's host address, each range's end too (`memory_log.rs`).
-#[test]
-fn the_memory_log_names_a_copy_s_pages_and_where_it_is_held() {
-    use crate::memory_log::copied_line;
-    let made = copied_line("made", 3, (0x7ff1_4c40_0000, 0x20_0000), 0x7f00_0000_1000);
-    assert_eq!(
-        made,
-        "metal2vulkan: memory: copy 3 made: the caller's pages at 0x7ff14c400000 to \
-         0x7ff14c600000 (2097152 bytes), held at 0x7f0000001000 to 0x7f0000201000"
-    );
-    let gone = copied_line("gone", 3, (0x1000, 16), 0x2000);
-    assert_eq!(
-        gone,
-        "metal2vulkan: memory: copy 3 gone: the caller's pages at 0x1000 to 0x1010 (16 bytes), \
-         held at 0x2000 to 0x2010"
-    );
-}
-
-/// Pooled blocks take placements until full; a block that empties is kept while fewer than
-/// `KEPT_EMPTY_BLOCKS` empty ones are, and freed past that, so a working set that dips by a block
-/// and comes back makes and frees none. Freed slots are reused.
-#[test]
-fn pooled_blocks_place_until_full_and_two_empty_blocks_are_kept() {
-    assert_eq!(KEPT_EMPTY_BLOCKS, 2);
-    let now = Instant::now();
-    let mut pool: Pool<&str> = Pool::default();
-    assert_eq!(pool.place(16, 16), None, "no block yet");
-    let first = pool.add(256, false, "first", 100);
-    assert_eq!(pool.place(100, 64), Some((first, 128)));
-    assert_eq!(pool.place(100, 64), None, "full");
-    let second = pool.add(256, false, "second", 200);
-    let third = pool.add(256, false, "third", 256);
-    assert_ne!(first, second);
-    assert_eq!(pool.blocks(), 3);
-    // Emptying the first block keeps it, and the second likewise: two empty blocks are kept.
-    assert_eq!(pool.release(first, (0, 100), now, 0, |_| false), None);
-    assert_eq!(pool.release(first, (128, 100), now, 0, |_| false), None);
-    assert_eq!(pool.release(second, (0, 200), now, 0, |_| false), None);
-    assert_eq!(pool.blocks(), 3);
-    // Emptying the third while two are kept frees it, as a pooled block that emptied.
-    assert_eq!(
-        pool.release(third, (0, 256), now, 0, |_| false),
-        Some(("third", false))
-    );
-    assert_eq!(pool.blocks(), 2);
-    // The kept blocks serve the next requests, the first-made first; the freed slot is reused.
-    assert_eq!(pool.place(256, 1), Some((first, 0)));
-    assert_eq!(pool.place(256, 1), Some((second, 0)));
-    let fourth = pool.add(256, false, "fourth", 1);
-    assert_eq!(fourth, third, "the freed slot is reused");
-    assert_eq!(pool.turnover(), (4, 1));
-    let mut drained: Vec<&str> = pool.drain().collect();
-    drained.sort_unstable();
-    assert_eq!(drained, ["first", "fourth", "second"]);
-    assert_eq!(pool.blocks(), 0);
-}
-
-/// A place reads zero only in a block allocated zero-initialized and only past every range
-/// placed in that block before: the bytes no resource used since the driver zeroed them. A
-/// range given back and placed again, or a gap below the furthest range placed, is not fresh,
-/// however long the block stays; a block that emptied keeps what was placed in it.
-#[test]
-fn a_place_reads_zero_only_past_every_range_placed_in_a_zeroed_block() {
-    let now = Instant::now();
-    let mut pool: Pool<&str> = Pool::default();
-    let zeroed = pool.add_as(256, false, "zeroed", 64, true);
-    assert_eq!(pool.place_fresh(64, 64), Some((zeroed, 64, true)));
-    assert_eq!(pool.place_fresh(32, 1), Some((zeroed, 128, true)));
-    // The first range back, and placed again: it held a resource.
-    assert_eq!(pool.release(zeroed, (0, 64), now, 0, |_| false), None);
-    assert_eq!(pool.place_fresh(16, 1), Some((zeroed, 0, false)));
-    // Past the furthest range placed, fresh again; the gap left below it is not.
-    assert_eq!(pool.place_fresh(32, 64), Some((zeroed, 192, true)));
-    assert_eq!(pool.place_fresh(16, 1), Some((zeroed, 16, false)));
-    assert_eq!(pool.place_fresh(16, 1), Some((zeroed, 32, false)));
-    // Emptied whole and kept, the block keeps what was placed in it.
-    for (offset, size) in [(16, 16), (32, 16), (64, 64), (128, 32), (192, 32), (0, 16)] {
-        assert_eq!(
-            pool.release(zeroed, (offset, size), now, 0, |_| false),
-            None
-        );
     }
-    assert_eq!(pool.place_fresh(224, 1), Some((zeroed, 0, false)));
-    assert_eq!(pool.place_fresh(32, 1), Some((zeroed, 224, true)));
-    // A block not allocated zero-initialized holds no fresh place.
-    let plain = pool.add(256, false, "plain", 0);
-    assert_eq!(pool.place_fresh(64, 1), Some((plain, 0, false)));
-}
 
-/// A kept empty block beyond its pool's one goes once it stayed empty for `KEPT_EMPTY_FOR`, the
-/// one emptied earliest first, and never the last kept one; a placement in a kept block makes it
-/// a block in use again. Every kept block goes where the caller takes them (a block of the type
-/// failing to be made).
-#[test]
-fn a_kept_empty_block_beyond_one_goes_after_its_quiet_period() {
-    let start = Instant::now();
-    let later = start + KEPT_EMPTY_FOR;
-    let mut pool: Pool<&str> = Pool::default();
-    let first = pool.add(256, false, "first", 256);
-    let second = pool.add(256, false, "second", 256);
-    assert_eq!(pool.release(first, (0, 256), start, 0, |_| false), None);
-    assert_eq!(
-        pool.stale(later, true),
-        None,
-        "one kept block stays, however long"
-    );
-    assert_eq!(
-        pool.release(second, (0, 256), start + KEPT_EMPTY_FOR / 2, 0, |_| false),
-        None
-    );
-    assert_eq!(
-        pool.stale(later - KEPT_EMPTY_FOR / 4, true),
-        None,
-        "neither stayed empty so long"
-    );
-    assert_eq!(
-        pool.stale(later, true),
-        Some("first"),
-        "the earliest emptied goes first"
-    );
-    assert_eq!(
-        pool.stale(later + KEPT_EMPTY_FOR, true),
-        None,
-        "the last kept block stays"
-    );
-    assert_eq!(pool.blocks(), 1);
-    // Placed in again, a kept block is no longer empty, and emptied again it starts anew.
-    let third = pool.add(256, false, "third", 256);
-    assert_eq!(pool.place(256, 1), Some((second, 0)));
-    let at = later + KEPT_EMPTY_FOR;
-    assert_eq!(pool.release(second, (0, 256), at, 0, |_| false), None);
-    assert_eq!(pool.release(third, (0, 256), at, 0, |_| false), None);
-    assert_eq!(pool.stale(at + KEPT_EMPTY_FOR / 2, true), None);
-    let mut taken = pool.take_kept();
-    taken.sort_unstable();
-    assert_eq!(taken, ["second", "third"]);
-    assert_eq!(pool.blocks(), 0);
-    assert_eq!(pool.turnover(), (3, 3));
-}
+    /// A zero fill the consumer asks of a Private block ([`Device::zero_block_range`]): a block a
+    /// kernel wrote, given back, and its bytes taken again, holds the kernel's words; a fill of its
+    /// first half reads zero to a kernel of the next command buffer, the rest as the first kernel
+    /// wrote it, counted once with its bytes. A range past the block, a Shared block and a block
+    /// the consumer does not hold are refused, and a fill of no bytes does nothing.
+    #[test]
+    fn every_device_zeroes_a_range_of_a_private_block_ahead_of_the_next_commit() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let hook = Arc::new(Hook::default());
+            let device = device_with(&hook, physical, name);
+            let core = device.core();
+            let counters = device.counters();
+            let len = (WORDS * 4) as u64;
+            let shared = (device.take_block(MemoryClass::Shared, 3 * len))
+                .unwrap_or_else(|error| panic!("{name}: a Shared block: {error}"));
+            let buffer = |block: BlockId, at: u64| {
+                (device.new_buffer(block, at, len, Some(0)))
+                    .unwrap_or_else(|error| panic!("{name}: a buffer: {error}"))
+            };
+            let (ones, zero, out) = (
+                buffer(shared.id, 0),
+                buffer(shared.id, len),
+                buffer(shared.id, 2 * len),
+            );
+            let contents = ones.contents().expect("a Shared buffer").cast::<u32>();
+            for index in 0..WORDS {
+                // SAFETY: the buffer is alive and holds `WORDS` words, and no GPU work uses it.
+                unsafe { (contents.as_ptr().add(index)).write_volatile(index as u32 + 1) };
+            }
+            let state = add(&device);
+            let queue = device.new_command_queue(2).expect("a queue");
 
-/// In a pool that keeps no room for the runtime's own resources, the last kept empty block goes
-/// too once it stayed empty for `KEPT_EMPTY_FOR`; in one that keeps room it stays. Each pool says
-/// when its next kept block may go (`Pool::stale_at`, what the device's idle sweep waits for), and
-/// nothing where none may go but at a change; a block added empty and never placed in stays.
-#[test]
-fn a_pool_without_room_lets_its_last_kept_block_go() {
-    let start = Instant::now();
-    let mut pool: Pool<&str> = Pool::default();
-    assert_eq!(pool.stale_at(false), None, "nothing kept");
-    let only = pool.add(256, false, "only", 256);
-    let fresh = pool.add(256, false, "fresh", 0);
-    assert_eq!(
-        pool.stale_at(false),
-        None,
-        "a block added empty is kept as long as it stays so"
-    );
-    assert_eq!(pool.release(only, (0, 256), start, 0, |_| false), None);
-    assert_eq!(pool.stale_at(false), Some(start + KEPT_EMPTY_FOR));
-    assert_eq!(
-        pool.stale(start + KEPT_EMPTY_FOR / 2, false),
-        None,
-        "not yet"
-    );
-    assert_eq!(pool.stale(start + KEPT_EMPTY_FOR, false), Some("only"));
-    assert_eq!(pool.stale_at(false), None);
-    // The block added empty, placed in and emptied: the last kept one of a pool with room stays.
-    assert_eq!(pool.place(256, 1), Some((fresh, 0)));
-    let at = start + KEPT_EMPTY_FOR;
-    assert_eq!(pool.release(fresh, (0, 256), at, 0, |_| false), None);
-    assert_eq!(pool.stale_at(true), None, "the room stays");
-    assert_eq!(pool.stale(at + 2 * KEPT_EMPTY_FOR, true), None);
-    assert_eq!(pool.stale_at(false), Some(at + KEPT_EMPTY_FOR));
-    assert_eq!(pool.stale(at + KEPT_EMPTY_FOR, false), Some("fresh"));
-    assert_eq!(pool.blocks(), 0);
-    assert_eq!(pool.turnover(), (2, 2));
-}
+            let private = (device.take_block(MemoryClass::Private, len))
+                .unwrap_or_else(|error| panic!("{name}: a Private block: {error}"));
+            let first = *private;
+            let target = (device.new_buffer(first.id, 0, len, None))
+                .unwrap_or_else(|error| panic!("{name}: a Private buffer: {error}"));
+            add_into(name, &queue, &state, [&ones, &zero, &target]);
+            drop(target);
+            device.release_block(private).expect("a release");
+            wait_until("the Private block given back", || core.pool.holds(first.id));
+            let again = (device.take_block(MemoryClass::Private, len))
+                .unwrap_or_else(|error| panic!("{name}: the Private bytes again: {error}"));
+            assert_eq!(
+                again.gpu_address, first.gpu_address,
+                "{name}: the given-back bytes, the first fit"
+            );
+            let id = again.id;
 
-#[test]
-fn dedicated_blocks_take_no_other_placement_and_free_with_their_resource() {
-    let mut pool: Pool<u32> = Pool::default();
-    let dedicated = pool.add(1000, true, 7, 1000);
-    assert_eq!(pool.place(1, 1), None, "a dedicated block is never shared");
-    // Freed as dedicated, which its caller counts apart from a pooled block that emptied.
-    assert_eq!(
-        pool.release(dedicated, (0, 1000), Instant::now(), 0, |_| false),
-        Some((7, true))
-    );
-    assert_eq!(pool.blocks(), 0);
-}
+            let before = counters.metrics();
+            device
+                .zero_block_range(id, 0, len / 2)
+                .unwrap_or_else(|error| panic!("{name}: a zero fill: {error}"));
+            device
+                .zero_block_range(id, len, 0)
+                .unwrap_or_else(|error| panic!("{name}: a zero fill of no bytes: {error}"));
+            let after = counters.metrics();
+            assert_eq!(
+                (
+                    after.block_zero_fills - before.block_zero_fills,
+                    after.block_zero_fill_bytes - before.block_zero_fill_bytes,
+                ),
+                (1, len / 2),
+                "{name}: the fills counted"
+            );
+            let source = (device.new_buffer(id, 0, len, None))
+                .unwrap_or_else(|error| panic!("{name}: a Private buffer: {error}"));
+            add_into(name, &queue, &state, [&source, &zero, &out]);
+            let expected: Vec<u32> = (0..WORDS as u32)
+                .map(|index| {
+                    if index < WORDS as u32 / 2 {
+                        0
+                    } else {
+                        index + 1
+                    }
+                })
+                .collect();
+            assert_eq!(
+                words(&out),
+                expected,
+                "{name}: zero in the range, as written past it"
+            );
 
-/// Past its two kept empty pooled blocks, a pool keeps a block that empties where its bytes fit
-/// in what its heap's budget has to spare, and frees it where they do not; the bytes it keeps
-/// follow every block that empties, fills or goes.
-#[test]
-fn a_block_past_the_two_is_kept_where_the_heap_s_budget_spares_its_bytes() {
-    let now = Instant::now();
-    let mut pool: Pool<&str> = Pool::default();
-    let blocks = ["first", "second", "third", "fourth"].map(|name| pool.add(256, false, name, 256));
-    assert_eq!(pool.kept_bytes(), 0);
-    for &block in &blocks[..2] {
-        assert_eq!(pool.release(block, (0, 256), now, 0, |_| false), None);
+            let past = device.zero_block_range(id, again.len - 4, 8);
+            assert!(
+                matches!(
+                    past,
+                    Err(Error::Refused(Refusal::ZeroRangePastBlock { offset, length: 8, block_len }))
+                        if offset == again.len - 4 && block_len == again.len
+                ),
+                "{name}: {past:?}"
+            );
+            let overflow = device.zero_block_range(id, u64::MAX, 2);
+            assert!(
+                matches!(
+                    overflow,
+                    Err(Error::Refused(Refusal::ZeroRangePastBlock { .. }))
+                ),
+                "{name}: {overflow:?}"
+            );
+            let host = device.zero_block_range(shared.id, 0, 4);
+            assert!(
+                matches!(
+                    host,
+                    Err(Error::Refused(Refusal::ZeroRangeShared { block })) if block == shared.id
+                ),
+                "{name}: {host:?}"
+            );
+            let gone = shared.id;
+            drop((ones, zero, out, source));
+            device.release_block(shared).expect("a release");
+            let missing = device.zero_block_range(gone, 0, 4);
+            assert!(
+                matches!(missing, Err(Error::NoSuchBlock(block)) if block == gone),
+                "{name}: {missing:?}"
+            );
+            println!(
+                "memory: {name}: a zero fill of a Private block ahead of the next commit; metrics {:?}",
+                counters.metrics()
+            );
+            drop((again, queue, state));
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+        }
     }
-    assert_eq!(pool.kept_bytes(), 512, "two kept whatever the budget");
-    // The third's bytes fit in the spare: kept. The fourth's do not: freed.
-    assert_eq!(pool.release(blocks[2], (0, 256), now, 256, |_| false), None);
-    assert_eq!(pool.kept_bytes(), 768);
-    assert_eq!(
-        pool.release(blocks[3], (0, 256), now, 255, |_| false),
-        Some(("fourth", false))
-    );
-    assert_eq!(pool.kept_bytes(), 768);
-    // A placement in a kept block takes its bytes out of the kept ones.
-    assert_eq!(pool.place(16, 1), Some((blocks[0], 0)));
-    assert_eq!(pool.kept_bytes(), 512);
-    // A block added empty is kept as it is added.
-    pool.add(128, false, "fifth", 0);
-    assert_eq!(pool.kept_bytes(), 640);
-    let mut taken = pool.take_kept();
-    taken.sort_unstable();
-    assert_eq!(taken, ["fifth", "second", "third"]);
-    assert_eq!(pool.kept_bytes(), 0);
-}
 
-/// A heap's budget of kept empty blocks is an eighth of it, at most `KEPT_EMPTY_BYTES`; with
-/// unified memory, one budget of an eighth of every heap: a Radeon 780M's (RADV) two heaps of
-/// system memory, 5660 and 11319 MiB, keep 707 and 1414 MiB apart, and 2 GiB as one.
-#[test]
-fn unified_memory_keeps_one_budget_for_its_heaps() {
-    const MIB: u64 = 1 << 20;
-    let radeon = [5660 * MIB, 11319 * MIB];
-    assert_eq!(kept_budget(&radeon, 0, false), 5660 * MIB / 8);
-    assert_eq!(kept_budget(&radeon, 1, false), 11319 * MIB / 8);
-    for heap in 0..2 {
-        assert_eq!(kept_budget(&radeon, heap, true), KEPT_EMPTY_BYTES);
+    /// Zero fills of one upload that meet the same bytes are ordered: a new Private buffer
+    /// zeroed, released before any commit, and a second one zeroed over its first half (a place
+    /// taken again before a commit, as a player's pool takes it) takes one barrier before its
+    /// fill; a third zeroed over other bytes takes none, and a range
+    /// [`Device::zero_block_range`] zeroes over the third's bytes takes one again. The upload then
+    /// runs, under the validation layer, and the device tears down to zero gauges.
+    #[test]
+    fn every_device_orders_zero_fills_of_the_same_bytes_in_one_upload() {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let core = device.core();
+            let counters = device.counters();
+            let len = (WORDS * 4) as u64;
+            let private = (device.take_block(MemoryClass::Private, 2 * len))
+                .unwrap_or_else(|error| panic!("{name}: a Private block: {error}"));
+            let zeroed = |at: u64, length: u64| {
+                (device.new_buffer(private.id, at, length, Some(0)))
+                    .unwrap_or_else(|error| panic!("{name}: a zeroed buffer: {error}"))
+            };
+            let barriers = || counters.metrics().barriers;
+            let before = barriers();
+            drop(zeroed(0, len));
+            assert_eq!(
+                barriers() - before,
+                0,
+                "{name}: a first fill takes no barrier"
+            );
+            let again = zeroed(0, len / 2);
+            assert_eq!(
+                barriers() - before,
+                1,
+                "{name}: a fill of bytes the upload filled takes a barrier first"
+            );
+            let other = zeroed(len, len);
+            assert_eq!(
+                barriers() - before,
+                1,
+                "{name}: a fill of other bytes takes none"
+            );
+            (device.zero_block_range(private.id, len, 4))
+                .unwrap_or_else(|error| panic!("{name}: a zero fill: {error}"));
+            assert_eq!(
+                barriers() - before,
+                2,
+                "{name}: a range zeroed over the last fill's bytes takes a barrier first"
+            );
+            let value = core.work.flush();
+            (core.done.wait(core, value)).unwrap_or_else(|error| panic!("{name}: {error}"));
+            println!(
+                "memory: {name}: zero fills of the same bytes in one upload ordered; metrics {:?}",
+                counters.metrics()
+            );
+            drop((again, other));
+            device.release_block(private).expect("a release");
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+        }
     }
-    // A discrete card's heaps are apart: an RTX 5080 Laptop GPU's 16 GiB of VRAM keeps the cap.
-    let discrete = [16 << 30, 47 << 30];
-    assert_eq!(kept_budget(&discrete, 0, false), KEPT_EMPTY_BYTES);
-    // One heap of 4 GiB, unified or not: an eighth.
-    assert_eq!(kept_budget(&[4 << 30], 0, true), 512 * MIB);
-    assert_eq!(kept_budget(&[4 << 30], 0, false), 512 * MIB);
-}
 
-/// A pooled block is `BLOCK_BYTES` in every heap of 1 GiB or more, and in a
-/// smaller heap the largest power of two within a sixteenth of it, so between a 32nd and a 16th of
-/// it, at least 1 MiB; never past the device's largest allocation. An RTX 2080's 246 MiB
-/// device-local host-visible heap (no Resizable BAR) takes blocks of 8 MiB, a 256 MiB one 16 MiB.
-#[test]
-fn a_pooled_block_is_at_most_a_sixteenth_of_a_small_heap() {
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    let largest = 4 * GIB;
-    // Heaps of 1 GiB or more: an RTX 2080's 8 GiB of VRAM and 21.87 GiB of system memory, a
-    // Radeon 780M's (RADV) 11.05 and 5.53 GiB.
-    let large = [GIB, 8 * GIB, 23_483_563_008, 11_319 * MIB, 5_660 * MIB];
-    for heap in large {
-        assert_eq!(
-            pooled_block_bytes(heap, largest),
-            BLOCK_BYTES,
-            "a heap of {heap} bytes"
-        );
-    }
-    assert_eq!(pooled_block_bytes(257_949_696, largest), 8 * MIB);
-    assert_eq!(pooled_block_bytes(256 * MIB, largest), 16 * MIB);
-    assert_eq!(pooled_block_bytes(GIB - 1, largest), 32 * MIB);
-    // The least block, of a heap below 16 MiB.
-    assert_eq!(pooled_block_bytes(16 * MIB - 1, largest), MIB);
-    assert_eq!(pooled_block_bytes(0, largest), MIB);
-    // Never past the largest allocation.
-    assert_eq!(pooled_block_bytes(8 * GIB, 32 * MIB), 32 * MIB);
-    // The bound over the small heaps from 16 MiB.
-    for heap in (16 * MIB..GIB).step_by((3 * MIB + 4096) as usize) {
-        let block = pooled_block_bytes(heap, largest);
-        assert!(block.is_power_of_two(), "a heap of {heap} bytes: {block}");
-        assert!(
-            block * 16 <= heap && block * 32 > heap,
-            "a heap of {heap} bytes: {block}"
-        );
-        assert!(block < BLOCK_BYTES, "a heap of {heap} bytes: {block}");
-    }
-}
+    /// The runtime zeroes what the consumer asks over bytes it cannot see written: the consumer's
+    /// writes through a new Shared block's mapping, outside every buffer, then a buffer zeroed
+    /// over some of them, read zero there and as written elsewhere; a new Private block's bytes
+    /// written by a copy outside every buffer, then zeroed by `zero_block_range`, read zero to a
+    /// kernel. Each zeroing is counted whole, on every device.
+    #[test]
+    fn every_device_zeroes_what_it_is_asked_over_bytes_written_outside_its_buffers() {
+        const BLOCK: u64 = 4 << 20;
+        let len = (WORDS * 4) as u64;
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let counters = device.counters();
+            let gpu = Gpu::new(&device);
+            let state = add(&device);
+            let queue = device.new_command_queue(1).expect("a queue");
+            let words_block = (device.take_block(MemoryClass::Shared, 2 * len))
+                .unwrap_or_else(|error| panic!("{name}: a Shared block: {error}"));
+            let ones = (device.new_buffer(words_block.id, 0, len, Some(0)))
+                .unwrap_or_else(|error| panic!("{name}: a buffer: {error}"));
+            let out = (device.new_buffer(words_block.id, len, len, None))
+                .unwrap_or_else(|error| panic!("{name}: a buffer: {error}"));
+            let contents = ones.contents().expect("a Shared buffer").cast::<u32>();
+            for index in 0..WORDS {
+                // SAFETY: the buffer is alive and holds `WORDS` words, and no GPU work uses it.
+                unsafe { (contents.as_ptr().add(index)).write_volatile(index as u32 + 1) };
+            }
 
-/// A dedicated block that empties is kept where its bytes fit in the heap's spare and its memory
-/// may take another placement; the next dedicated placement it fits takes it whole (at most a
-/// quarter shorter than the block), the shortest such first, and none shares it. A kept dedicated
-/// block goes once it stayed empty for `KEPT_EMPTY_FOR`, though it is the pool's only kept one.
-#[test]
-fn a_kept_dedicated_block_takes_the_next_dedicated_placement_it_fits() {
-    let start = Instant::now();
-    let mut pool: Pool<&str> = Pool::default();
-    let long = pool.add(1000, true, "long", 1000);
-    let short = pool.add(800, true, "short", 800);
-    let import = pool.add(1000, true, "import", 1000);
-    // Not reusable (an import, a buffer's dedicated allocation): freed as before.
-    assert_eq!(
-        pool.release(import, (0, 1000), start, 4000, |_| false),
-        Some(("import", true))
-    );
-    // Past the spare: freed.
-    assert_eq!(
-        pool.release(short, (0, 800), start, 799, |_| true),
-        Some(("short", true))
-    );
-    let short = pool.add(800, true, "short", 800);
-    assert_eq!(pool.release(short, (0, 800), start, 4000, |_| true), None);
-    assert_eq!(pool.release(long, (0, 1000), start, 4000, |_| true), None);
-    assert_eq!(pool.kept_bytes(), 1800);
-    assert_eq!(
-        pool.place(1, 1),
-        None,
-        "a kept dedicated block takes no pooled placement"
-    );
-    assert_eq!(
-        pool.place_dedicated(1001),
-        None,
-        "longer than every kept block"
-    );
-    assert_eq!(
-        pool.place_dedicated(790),
-        Some(short),
-        "the shortest that fits"
-    );
-    assert_eq!(
-        pool.place_dedicated(790),
-        None,
-        "the long one is past a quarter longer"
-    );
-    assert_eq!(pool.place_dedicated(800), Some(long));
-    assert_eq!(pool.kept_bytes(), 0);
-    assert_eq!(pool.release(long, (0, 800), start, 4000, |_| true), None);
-    assert_eq!(
-        pool.stale(start + KEPT_EMPTY_FOR / 2, true),
-        None,
-        "not yet"
-    );
-    assert_eq!(pool.stale(start + KEPT_EMPTY_FOR, true), Some("long"));
-    assert_eq!(pool.kept_bytes(), 0);
-    assert_eq!(pool.turnover(), (0, 0), "no pooled block came or went");
-}
+            // Shared: written through the mapping, no buffer there yet.
+            let shared = (device.take_block(MemoryClass::Shared, BLOCK))
+                .unwrap_or_else(|error| panic!("{name}: a Shared block: {error}"));
+            let host = bytes(&shared);
+            host.fill(0x5A);
+            let before = counters.metrics().bytes_zeroed;
+            let zeroed = (device.new_buffer(shared.id, 4096, 8192, Some(0)))
+                .unwrap_or_else(|error| panic!("{name}: a zeroed buffer: {error}"));
+            for (index, &byte) in host.iter().enumerate() {
+                let inside = (4096..4096 + 8192).contains(&index);
+                assert_eq!(
+                    byte,
+                    if inside { 0 } else { 0x5A },
+                    "{name}: Shared byte {index} after the consumer's write and a zeroed buffer"
+                );
+            }
+            assert_eq!(
+                counters.metrics().bytes_zeroed - before,
+                8192,
+                "{name}: the Shared bytes zeroed"
+            );
 
-/// A pool has room for a placement where a pooled block holds a free range that long at the
-/// largest alignment asked of the pool so far; a dedicated block's room counts for none.
-#[test]
-fn room_is_a_pooled_block_s_free_range_at_the_largest_alignment_asked() {
-    let mut pool: Pool<u32> = Pool::default();
-    assert!(!pool.has_room(1), "no block yet");
-    pool.add(1000, true, 1, 10);
-    assert!(
-        !pool.has_room(1),
-        "a dedicated block's free bytes are no room"
-    );
-    let block = pool.add(256, false, 2, 0);
-    assert!(pool.has_room(256), "an empty block");
-    assert_eq!(pool.place(8, 1), Some((block, 0)));
-    assert!(pool.has_room(248) && !pool.has_room(249));
-    // A placement aligned to 64 asks the pool's later room at 64: 192 bytes from offset 64.
-    assert_eq!(pool.place(8, 64), Some((block, 64)));
-    assert!(pool.has_room(128) && !pool.has_room(129));
-    assert_eq!(
-        pool.release(block, (64, 8), Instant::now(), 0, |_| false),
-        None
-    );
-    assert!(pool.has_room(192) && !pool.has_room(193));
-}
-
-#[test]
-fn buffers_are_placed_at_the_largest_linear_image_alignment() {
-    use crate::buffer::{placed, LINEAR_IMAGE_ALIGNMENT};
-    let requirements = |alignment| vk::MemoryRequirements {
-        size: 100,
-        alignment,
-        memory_type_bits: 0b101,
-    };
-    // Each linear-image alignment measured divides it (RADV, NVIDIA, lavapipe, MoltenVK).
-    for measured in [256, 128, 64, 16] {
-        assert!(LINEAR_IMAGE_ALIGNMENT.is_multiple_of(measured));
-    }
-    // A smaller alignment is raised to it, a larger one is kept, and the size takes whole units
-    // of the alignment; the memory types are kept.
-    for (alignment, placed_at) in [(1, 256), (16, 256), (256, 256), (4096, 4096)] {
-        let placed = placed(requirements(alignment));
-        assert_eq!(placed.alignment, placed_at);
-        assert_eq!((placed.size, placed.memory_type_bits), (placed_at, 0b101));
-    }
-}
-
-/// Buffers shorter than their placement's alignment, placed one after another, leave no gap:
-/// each starts where the last ended, so the block's free ranges stay one and the pool's
-/// first-fit search does not walk a gap per buffer placed before (65,537 buffers of 16 bytes
-/// took 201 s to make on lavapipe, each later one longer).
-#[test]
-fn short_buffers_are_placed_without_gaps() {
-    use crate::buffer::placed;
-    let mut pool: Pool<()> = Pool::default();
-    let block = pool.add(1 << 20, false, (), 0);
-    let mut end = 0;
-    for length in [16, 1, 100, 255, 256, 257, 16, 4000] {
-        let requirements = placed(vk::MemoryRequirements {
-            size: length,
-            alignment: 16,
-            memory_type_bits: 1,
-        });
-        let (at, offset) = pool
-            .place(requirements.size, requirements.alignment)
-            .unwrap();
-        assert_eq!((at, offset), (block, end), "{length} bytes");
-        end = offset + requirements.size;
+            // Private: written by a copy, no buffer there.
+            let private = (device.take_block(MemoryClass::Private, BLOCK))
+                .unwrap_or_else(|error| panic!("{name}: a Private block: {error}"));
+            gpu.fill(vk_buffer(&device, private.id), 0, private.len, 0xA5A5_A5A5);
+            let before = counters.metrics().block_zero_fill_bytes;
+            device
+                .zero_block_range(private.id, 0, len)
+                .unwrap_or_else(|error| panic!("{name}: a zero fill: {error}"));
+            assert_eq!(
+                counters.metrics().block_zero_fill_bytes - before,
+                len,
+                "{name}: the Private bytes filled"
+            );
+            let source = (device.new_buffer(private.id, 0, len, None))
+                .unwrap_or_else(|error| panic!("{name}: a Private buffer: {error}"));
+            add_into(name, &queue, &state, [&source, &ones, &out]);
+            let expected: Vec<u32> = (1..=WORDS as u32).collect();
+            assert_eq!(
+                words(&out),
+                expected,
+                "{name}: a kernel reads the zero fill over the copy's bytes"
+            );
+            println!(
+                "memory: {name}: zeroes what it is asked over bytes written outside its buffers; metrics {:?}",
+                counters.metrics()
+            );
+            drop((zeroed, source, ones, out, gpu, queue, state));
+            drop((shared, private, words_block));
+            drop(device);
+            wait_until("the teardown", || counters.gauges() == Gauges::default());
+        }
     }
 }

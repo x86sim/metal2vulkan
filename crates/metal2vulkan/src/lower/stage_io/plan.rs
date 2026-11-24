@@ -9,21 +9,18 @@ use crate::air::abi::{
 };
 use crate::air::intrinsics::{AirIntrinsic, Fragment as AirFragment, InterpolateAt};
 use crate::air::ir::{ArgIdx, Callee, InstKind, Type, TypeId as AirTypeId, Value};
-use crate::device::profile::DriverWorkaround;
 use crate::device::requirements::{VkExtension, VkFeature, VkLimit, VkProperty};
-use crate::error::{Attachment, Capability, DriverDeviation, Error, Feature, Unsupported};
+use crate::error::{Attachment, Capability, Error, Feature, Unsupported};
 use crate::lower::arith::legal::{form_on, refuse_bfloat_color, refuse_int64_interface};
-use crate::lower::arith::{FloatFmt, Form, Held};
+use crate::lower::arith::{Form, Held};
 use crate::lower::select::SelectCx;
 use crate::lower::stage_io::{
-    fetch, not_lowered, AmplifiedOutput, Compensation, DepthClamp, IoObject, MergedRead,
-    MergedValue, PlannedOutput, PlannedParam, Returned, RotatedSecond, Source, StageIoPlan,
+    fetch, not_lowered, AmplifiedOutput, DepthClamp, IoObject, MergedRead, MergedValue,
+    PlannedOutput, PlannedParam, Returned, RotatedSecond, Source, StageIoPlan,
 };
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::lower_inputs::{
-    FactorLane, RotatedBlendForm, VertexFetch, ViewportCompensation,
-};
+use crate::pipeline::lower_inputs::{FactorLane, VertexFetch};
 use crate::pipeline::stage_io::{
     DepthMode, Interpolation, IoNumeric, IoRole, IoType, IoVariable, Sampling, StageBuiltin,
 };
@@ -94,7 +91,7 @@ pub enum Place {
     Spread(u32),
     /// A read of this many (1 to 3) leading lanes of Metal's three barycentric weights, of a
     /// variable whose first two lanes are the first two weights of the primitive as drawn
-    /// (`BaryCoordKHR`, or the `float2` of `IoRole::Barycentric`): `1 - (x + y)` of the first
+    /// (`BaryCoordKHR`): `1 - (x + y)` of the first
     /// two is Metal's third weight (see `input_builtin`). Where `rotated`
     /// (`LoweringInputs::rotated_weights`), the primitive is a triangle drawn with Metal's last
     /// vertex first, `(c, a, b)` for Metal's `(a, b, c)`, so Metal's first two weights are the
@@ -202,25 +199,12 @@ fn user(
     ty: IoType,
     deco: IoDecor,
 ) -> Result<usize, Error> {
-    declare(sp, key, dir, ty, deco, false)
-}
-
-/// [`user`], declared with 16-bit `float` lanes where `half` (`IoObject::User::half`).
-fn declare(
-    sp: &mut StageIoPlan,
-    key: VaryingKey,
-    dir: IoDir,
-    ty: IoType,
-    deco: IoDecor,
-    half: bool,
-) -> Result<usize, Error> {
     let o = IoObject::User {
         key: key.clone(),
         dir,
         numeric: ty.numeric,
         components: ty.components,
         deco,
-        half,
     };
     // One key per direction: a second, different declaration of the same key is not a Metal
     // interface.
@@ -287,13 +271,6 @@ fn int_scalar(f: Form) -> Result<(), Error> {
         (Held::Int { container: 32, .. }, 1) => Ok(()),
         _ => Err(not_lowered()),
     }
-}
-
-/// The [`io_form`] of AIR type `ty`, which must be [`int_scalar`].
-pub(super) fn int_scalar_form(cx: &SelectCx<'_>, ty: AirTypeId) -> Result<Form, Error> {
-    let f = io_form(cx, ty)?;
-    int_scalar(f)?;
-    Ok(f)
 }
 
 /// A `float`-lane builtin read into or written from a float of `lanes` lanes.
@@ -452,11 +429,9 @@ fn interpolant(cx: &mut SelectCx<'_>, b: &ParamBinding, v: &Varying) -> Result<(
     }
     // The center read's pixel form, as a center varying's.
     let at_center = center && cx.inputs.multisampled;
-    let by_device = at_center && device_reads_center_varyings_at_pixel(cx);
-    let at_pixel = at_center && !by_device && interpolation_functions(cx);
+    let at_pixel = at_center && interpolation_functions(cx);
     let sp = &mut cx.families.stage_io;
-    sp.interface.varyings_at_pixel |= at_pixel || by_device;
-    sp.center_varyings_by_device |= by_device;
+    sp.interface.varyings_at_pixel |= at_pixel;
     let object = user(sp, key.clone(), IoDir::Input, io_type(f), deco)?;
     push_var(
         &mut sp.interface.inputs,
@@ -487,10 +462,9 @@ fn interpolant(cx: &mut SelectCx<'_>, b: &ParamBinding, v: &Varying) -> Result<(
 /// return, the interpolant's: every use of the parameter must be the interpolant operand of an
 /// `air.interpolate_*` call, all of one result type. Any other use (a `select` or `phi` choosing
 /// the interpolant at run time, a store, a call, another operand) is not lowered
-/// (`Feature::PullModelInterpolation`), and neither is a sample or offset read on a driver whose
-/// interpolation reads garbage where some of the quad's invocations have left the control flow
-/// (`DriverWorkaround::InterpolationNeedsTheWholeQuad`) outside the function's first block or
-/// after a discard there, where some may have.
+/// (`Feature::PullModelInterpolation`). A sample or offset read outside the function's first
+/// block, or after a discard there, where some of the quad's invocations may have left the control
+/// flow, is not lowered on any device (`Feature::DivergentInterpolation`).
 pub(super) fn interpolant_reads(
     cx: &SelectCx<'_>,
     param: u32,
@@ -498,11 +472,6 @@ pub(super) fn interpolant_reads(
     let arg = Value::Arg(ArgIdx::new(param));
     let refused =
         || -> Error { Unsupported::not_implemented(Feature::PullModelInterpolation).into() };
-    let whole_quad = cx
-        .profile
-        .fields()
-        .workarounds
-        .contains(&DriverWorkaround::InterpolationNeedsTheWholeQuad);
     let first_block_end = cx.body.blocks.values().next().map(|b| b.end);
     let mut discarded = false;
     let mut reads = BTreeSet::new();
@@ -536,15 +505,10 @@ pub(super) fn interpolant_reads(
         if uses != 1 {
             return Err(refused());
         }
-        if whole_quad
-            && matches!(i.at, InterpolateAt::Sample | InterpolateAt::Offset)
+        if matches!(i.at, InterpolateAt::Sample | InterpolateAt::Offset)
             && (discarded || first_block_end.is_none_or(|end| id >= end))
         {
-            return Err(Unsupported::driver_defect(
-                Feature::PullModelInterpolation,
-                DriverWorkaround::InterpolationNeedsTheWholeQuad,
-            )
-            .into());
+            return Err(Unsupported::not_implemented(Feature::DivergentInterpolation).into());
         }
         if ty.is_some_and(|t| t != inst.ty) {
             return Err(refused());
@@ -556,18 +520,6 @@ pub(super) fn interpolant_reads(
         Some(ty) => Ok((reads, ty)),
         None => Err(cx.invariant("an interpolant planned without a read")),
     }
-}
-
-/// Whether the device reads a center-sampled varying of a multisampled pipeline at the pixel
-/// center in every fragment invocation, a sample-rate one's included, as Metal does
-/// (`VkProperty::MetalCenterVaryings`, the measured `DriverDeviation::MetalCenterVaryings`): the
-/// varying's read as it is is then its pixel form.
-fn device_reads_center_varyings_at_pixel(cx: &SelectCx<'_>) -> bool {
-    cx.profile
-        .fields()
-        .enabled
-        .properties
-        .contains(&VkProperty::MetalCenterVaryings)
 }
 
 /// Whether the entry may read lane 2 or 3 (z or w) of vector parameter `param`: anything but an
@@ -612,8 +564,7 @@ fn reads_depth_lanes(cx: &SelectCx<'_>, param: u32) -> bool {
 /// y, and a center-sampled float varying where the profile has interpolation functions whose
 /// `InterpolateAtOffset` reads from the center ([`Source::PixelCenter`]). That holds for a
 /// pixel-rate function too: Vulkan evaluates its undecorated input at an implementation-defined
-/// position in the pixel. A device that reads such a varying at the pixel center itself, as Metal
-/// does (`VkProperty::MetalCenterVaryings`), reads it as it is, and that read is its pixel form.
+/// position in the pixel.
 pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
     let ty = param_ty(cx, b)?;
     let frag = cx.profile.fields().fragment;
@@ -675,22 +626,25 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
             }
             // Fixed-function input: the format is link-time state, and so is what the device's
             // conversion of it may answer otherwise than Metal's fetch, which link notes on the
-            // pipeline's vertex stage (`pipeline::link::vertex::fixed_function_notes`).
+            // pipeline's vertex stage (`pipeline::link::vertex::fixed_function_notes`). A signed
+            // format's variable is declared `int` (`VertexFetch::SignedFixedFunction`), its bits
+            // read by `OpBitcast`.
+            let mut ty = io_type(f);
+            if entry == Some(VertexFetch::SignedFixedFunction) {
+                if f.is_float() {
+                    return Err(not_lowered());
+                }
+                ty.numeric = IoNumeric::Sint;
+            }
             let key = VaryingKey::attribute(index);
             let sp = &mut cx.families.stage_io;
-            let object = user(
-                sp,
-                key.clone(),
-                IoDir::Input,
-                io_type(f),
-                IoDecor::default(),
-            )?;
+            let object = user(sp, key.clone(), IoDir::Input, ty, IoDecor::default())?;
             push_var(
                 &mut sp.interface.inputs,
                 IoVariable {
                     key,
                     role: IoRole::Attribute { index },
-                    ty: io_type(f),
+                    ty,
                 },
             );
             Link {
@@ -757,14 +711,11 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
                         ..
                     }
                 );
-            // Where the device reads a center varying at the pixel center in every invocation,
-            // as Metal does, the read as it is is the pixel form; elsewhere it is
-            // `InterpolateAtOffset` at offset 0 where that reads from the center.
-            let by_device = center && device_reads_center_varyings_at_pixel(cx);
-            at_pixel = center && !by_device && interpolation_functions(cx);
+            // A center varying's pixel form is `InterpolateAtOffset` at offset 0 where that reads
+            // from the center.
+            at_pixel = center && interpolation_functions(cx);
             let sp = &mut cx.families.stage_io;
-            sp.interface.varyings_at_pixel |= at_pixel || by_device;
-            sp.center_varyings_by_device |= by_device;
+            sp.interface.varyings_at_pixel |= at_pixel;
             let object = user(sp, key.clone(), IoDir::Input, io_type(f), deco)?;
             push_var(
                 &mut sp.interface.inputs,
@@ -870,9 +821,7 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
         // (`IoRole::PrimitiveId`) on a device that cannot declare a fragment `PrimitiveId`
         // (neither `geometryShader` nor `tessellationShader`), where the vertex function computes
         // the primitive each vertex provokes, and under `LoweringInputs::primitive_id_varying`
-        // behind an emulated post-tessellation vertex function, which writes its patch's position:
-        // Metal's primitive id behind the tessellator, while Vulkan's `PrimitiveId` without a
-        // tessellation stage counts the draw's triangles.
+        // behind a vertex function compiled under it.
         (ParamRole::Builtin(Builtin::PrimitiveId), Stage::Fragment)
             if !declarable(cx, B::PrimitiveId) || cx.inputs.primitive_id_varying =>
         {
@@ -953,67 +902,27 @@ pub fn param(cx: &mut SelectCx<'_>, b: &ParamBinding) -> Result<(), Error> {
         {
             return draw_base(cx, b, ty, DrawBase::Instance);
         }
-        // Without `fragmentShaderBarycentric`, the weights are the `float2` varying of their form
-        // that the pipeline's synthesized geometry stage writes (`IoRole::Barycentric`,
-        // `link::geometry`): `(1, 0)`, `(0, 1)` and `(0, 0)` at the primitive's vertices in its
-        // order, whose interpolation is Metal's first two weights, read at the pixel center as a
-        // center varying is.
-        (ParamRole::Builtin(Builtin::BarycentricCoord(i)), Stage::Fragment)
+        // Without `fragmentShaderBarycentric` the weights have no form: the device's builtin is
+        // the one way to read them.
+        (ParamRole::Builtin(Builtin::BarycentricCoord(_)), Stage::Fragment)
             if !frag.barycentric =>
         {
-            refuse_int64_interface(cx.entry, ty)?;
-            let f = form_on(cx.entry, cx.profile, ty)?;
-            let (perspective, place) = barycentric_read(*i, f, cx.inputs.rotated_weights)?;
-            if !frag.geometry_shader {
-                return Err(Unsupported::needs_any_of(
-                    Feature::Barycentrics,
-                    vec![
-                        vec![Capability::Feature(VkFeature::FragmentShaderBarycentric)],
-                        vec![Capability::Feature(VkFeature::GeometryShader)],
-                    ],
-                )
-                .into());
-            }
-            let interp = Interpolation::Smooth {
-                sampling: Sampling::Center,
-                perspective,
-            };
-            note_device_interpolation(cx, interp);
-            let center = cx.inputs.multisampled;
-            let by_device = center && device_reads_center_varyings_at_pixel(cx);
-            at_pixel = center && !by_device && interpolation_functions(cx);
-            let sp = &mut cx.families.stage_io;
-            sp.interface.varyings_at_pixel |= at_pixel || by_device;
-            sp.center_varyings_by_device |= by_device;
-            let object = barycentric_weights(sp, perspective)?;
-            note_rotated_weights(cx, place);
-            Link {
-                object,
-                place,
-                form: f,
-            }
+            return Err(Unsupported::needs(
+                Feature::Barycentrics,
+                Capability::Feature(VkFeature::FragmentShaderBarycentric),
+            )
+            .into());
+        }
+        // `[[sample_mask, post_depth_coverage]]`: Vulkan's one form, `SampleMask` read under
+        // `VK_EXT_post_depth_coverage`, is an extension no runtime enables, and no other form is
+        // built.
+        (ParamRole::Builtin(Builtin::PostDepthCoverage), _) => {
+            return Err(Unsupported::not_implemented(Feature::PostDepthCoverage).into());
         }
         (ParamRole::Builtin(bi), _) => {
             refuse_int64_interface(cx.entry, ty)?;
             let f = form_on(cx.entry, cx.profile, ty)?;
             let (spirv, shape, place, contract, enabler) = input_builtin(cx, *bi, f, frag)?;
-            // `[[sample_mask, post_depth_coverage]]`: `SampleMask` read after the early depth and
-            // stencil tests, which the entry declares (the AIR decode requires them), through
-            // `VK_EXT_post_depth_coverage`.
-            if *bi == Builtin::PostDepthCoverage {
-                let ext = VkExtension::ExtPostDepthCoverage;
-                if !cx.profile.fields().enabled.extensions.contains(&ext) {
-                    return Err(Unsupported::needs(
-                        Feature::PostDepthCoverage,
-                        Capability::Extension(ext),
-                    )
-                    .into());
-                }
-                let modes = &mut cx.families.stage_io.modes;
-                if !modes.contains(&ExecMode::PostDepthCoverage) {
-                    modes.push(ExecMode::PostDepthCoverage);
-                }
-            }
             if matches!(
                 contract,
                 StageBuiltin::BaseVertex | StageBuiltin::BaseInstance
@@ -1183,7 +1092,7 @@ fn zeroed_output(
 
 /// Plan output `index` of a vertex function compiled under `LoweringInputs::amplification_draws`
 /// that writes no such index: stored as the amplification's offset below its count push field
-/// ([`AmplifiedOutput`]) where [`index_store`] stores it, to its builtin or its selected index.
+/// ([`AmplifiedOutput`]) where [`index_store`] stores it, to its builtin.
 /// Metal renders the amplification through the slice or viewport its offset names, the first at or
 /// past the count (a Metal probe on the M3 Max and an M4).
 fn amplified_output(cx: &mut SelectCx<'_>, index: AmplifiedIndex) -> Result<(), Error> {
@@ -1203,7 +1112,7 @@ fn amplified_output(cx: &mut SelectCx<'_>, index: AmplifiedIndex) -> Result<(), 
             PushField::ViewportCount,
         ),
     };
-    let store = index_store(cx, raw, true, true)?;
+    let store = index_store(cx, raw, true)?;
     if store == IndexStore::Nowhere {
         return Ok(());
     }
@@ -1213,10 +1122,7 @@ fn amplified_output(cx: &mut SelectCx<'_>, index: AmplifiedIndex) -> Result<(), 
     cx.push.insert(offset);
     cx.push.insert(below);
     let sp = &mut cx.families.stage_io;
-    let object = match store {
-        IndexStore::Selected => selected_index(sp, raw)?,
-        _ => builtin(sp, spirv, IoDir::Output, Shape::U32, contract),
-    };
+    let object = builtin(sp, spirv, IoDir::Output, Shape::U32, contract);
     sp.amplified.push(AmplifiedOutput {
         link: Link {
             object,
@@ -1245,7 +1151,7 @@ fn amplified_output(cx: &mut SelectCx<'_>, index: AmplifiedIndex) -> Result<(), 
 /// first vertex. So does a draw replay's of one draw per command (`replay_bindings`), whose
 /// buffers are in the slot table at its push: its draws' indices are their own. A function that
 /// writes its own viewport or slice index, and one under another field that moves its indices or
-/// position (`amplification_draws`, `viewport_compensation`), or that runs behind the
+/// position (`amplification_draws`), or that runs behind the
 /// tessellator, is `NotImplemented(RasterizationRateMap)`: the runtime draws those region by
 /// region. A device that cannot store `ViewportIndex` from a vertex function,
 /// read `DrawIndex` or take several viewports refuses it, naming the three features. A function
@@ -1263,11 +1169,7 @@ fn region_viewport(
         )
     });
     let tessellated = matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) });
-    if indexed
-        || tessellated
-        || i.amplification_draws.is_some()
-        || i.viewport_compensation.is_some()
-    {
+    if indexed || tessellated || i.amplification_draws.is_some() {
         return Err(Unsupported::not_implemented(Feature::RasterizationRateMap).into());
     }
     let f = cx.profile.fields();
@@ -1376,41 +1278,6 @@ fn writes_layer(cx: &SelectCx<'_>) -> bool {
         .any(|o| matches!(o.role, OutputRole::RenderTargetArrayIndex))
 }
 
-/// Whether a fragment function's first output of form `form` to the rotated attachment
-/// `attachment`, whose blend takes the form `blend` (`LoweringInputs::rotated_blends`), writes
-/// Metal's blue premultiplied by Metal's alpha (`RotatedBlendForm::Premultiplied`), recording
-/// the form in the function's interface. Its blend reads Metal's source alpha from a second
-/// output (`LoweringInputs::rotated_factors`'s lane 3), else the inputs are no pipeline's. Apple's
-/// blend multiplies an `f32` source exactly as the function does; another float format rounds the
-/// product apart, and a blend in none of the measured forms (`RotatedBlendForm::Unmeasured`) may
-/// round apart: each records `PrecisionNote::RotatedBlendRounding`.
-fn rotated_blend_form(
-    cx: &mut SelectCx<'_>,
-    attachment: u32,
-    blend: RotatedBlendForm,
-    form: Form,
-) -> Result<bool, Error> {
-    let premultiplied = match blend {
-        RotatedBlendForm::Premultiplied => {
-            let lanes = cx.inputs.rotated_factors.get(&attachment);
-            if lanes.is_none_or(|l| l[3] != FactorLane::Output(3)) {
-                return Err(not_lowered());
-            }
-            if form.float_fmt() != Some(FloatFmt::F32) {
-                cx.precision.insert(PrecisionNote::RotatedBlendRounding);
-            }
-            true
-        }
-        RotatedBlendForm::Unmeasured => {
-            cx.precision.insert(PrecisionNote::RotatedBlendRounding);
-            false
-        }
-    };
-    let sp = &mut cx.families.stage_io;
-    sp.interface.rotated_blends.insert(attachment, blend);
-    Ok(premultiplied)
-}
-
 /// The second output a fragment function writes beside its first output, the returned field
 /// `field` of form `form`, to the rotated attachment `attachment`
 /// (`LoweringInputs::rotated_factors`): an output variable of dual-source index 1 there, of the
@@ -1483,13 +1350,11 @@ fn push_var(list: &mut Vec<IoVariable>, v: IoVariable) {
 /// Whether the fragment function reads the varying `key` per primitive: its mesh render
 /// pipeline's mesh function writes it per primitive (`LoweringInputs::primitive_varyings`). The
 /// stage interface lists it (`StageIo::primitive_inputs`), and the declaration decorates it
-/// `PerPrimitiveEXT`, or, on a device that emulates mesh functions, reads it flat alone
-/// (`StageIoPlan::flat_primitive_inputs`).
+/// `PerPrimitiveEXT`.
 fn read_per_primitive(cx: &mut SelectCx<'_>, key: &VaryingKey) -> bool {
     if !cx.inputs.primitive_varyings.contains(key) {
         return false;
     }
-    cx.families.stage_io.flat_primitive_inputs = crate::lower::mesh::emulates(cx.profile);
     let keys = &mut cx.families.stage_io.interface.primitive_inputs;
     if let Err(at) = keys.binary_search(key) {
         keys.insert(at, key.clone());
@@ -1526,46 +1391,30 @@ enum RawIndex {
 enum IndexStore {
     /// To its builtin, `Layer` or `ViewportIndex`.
     Builtin,
-    /// To its selected index (`IoRole::SelectedLayer`, `IoRole::SelectedViewport`), which the
-    /// pipeline's synthesized geometry stage stores to the builtin from the primitive's first
-    /// vertex (`pipeline::link::geometry`).
-    Selected,
     /// Nowhere: a viewport index on a device without `multiViewport`, whose draws have one
     /// viewport (the runtime refuses more), so Metal's index selects viewport 0 whatever it is,
     /// the viewport Vulkan uses where no stage writes `ViewportIndex`.
     Nowhere,
 }
 
-/// Where a vertex function on `cx`'s profile stores index `index`, which it writes the same at
-/// every vertex of a primitive where `uniform` ([`uniform_index`]): to its selected index where
-/// the function stores another there ([`StageIoPlan::indices_selected`]), and otherwise where
-/// [`own_index_store`] puts it.
+/// Where a vertex function on `cx`'s profile stores index `index`: to its builtin, as the function
+/// writes it, where the profile enables `shaderOutputLayer` (`shaderOutputViewportIndex` for a
+/// viewport index), and nowhere, a viewport index on a profile without `multiViewport`. Otherwise
+/// refused as needing the output feature, as `VertexAmplification` for an index the function
+/// stores from the amplification's offset alone (`amplification`), else as `LayeredRendering`.
+///
+/// Metal and Vulkan ask the same of the value: "You must return the same value of
+/// `[[render_target_array_index]]` for every vertex in a primitive. If values differ, the behavior
+/// and value passed to the fragment function are undefined." (the Metal Shading Language
+/// specification, and the same of `[[viewport_array_index]]`); a stage that writes `Layer` must
+/// "write the same value to Layer for all vertices of a given primitive"
+/// (VUID-VkPipelineShaderStageCreateInfo-stage-02596), and the same of `ViewportIndex`
+/// (VUID-VkPipelineShaderStageCreateInfo-stage-02597). A function that keeps Metal's rule keeps
+/// Vulkan's with the index stored as written; where it breaks it, Metal gives no answer, and the
+/// slice or viewport is the device's choice.
 fn index_store(
     cx: &SelectCx<'_>,
     index: RawIndex,
-    uniform: bool,
-    amplification: bool,
-) -> Result<IndexStore, Error> {
-    match own_index_store(cx, index, uniform, amplification)? {
-        IndexStore::Builtin if cx.families.stage_io.indices_selected => Ok(IndexStore::Selected),
-        store => Ok(store),
-    }
-}
-
-/// Where a vertex function on `cx`'s profile stores index `index` taken alone. Vulkan takes a
-/// primitive's `Layer` and `ViewportIndex` only where every vertex of it stores the same, Metal
-/// the primitive's first vertex's whatever the others store. So: to its builtin where the profile
-/// enables `shaderOutputLayer` (`shaderOutputViewportIndex` for a viewport index) and the function
-/// writes the index the same at every vertex of a primitive (`uniform`), or the profile takes
-/// `DriverDeviation::MetalFirstVertexIndices`; nowhere, a viewport index on a profile without
-/// `multiViewport`; else to its selected index where the profile enables `geometryShader`.
-/// Otherwise refused, as `VertexAmplification` for an index the function stores from the
-/// amplification's offset alone (`amplification`), else as `LayeredRendering`: one written alike
-/// needing the output feature or `geometryShader`, one not needing `geometryShader`.
-fn own_index_store(
-    cx: &SelectCx<'_>,
-    index: RawIndex,
-    uniform: bool,
     amplification: bool,
 ) -> Result<IndexStore, Error> {
     let f = cx.profile.fields();
@@ -1576,10 +1425,7 @@ fn own_index_store(
             VkFeature::ShaderOutputViewportIndex,
         ),
     };
-    let first_vertex = cx
-        .profile
-        .takes_driver_deviation(DriverDeviation::MetalFirstVertexIndices);
-    if native && (uniform || first_vertex) {
+    if native {
         return Ok(IndexStore::Builtin);
     }
     if matches!(index, RawIndex::Viewport)
@@ -1587,99 +1433,11 @@ fn own_index_store(
     {
         return Ok(IndexStore::Nowhere);
     }
-    if f.fragment.geometry_shader {
-        return Ok(IndexStore::Selected);
-    }
-    let geometry = vec![Capability::Feature(VkFeature::GeometryShader)];
-    let needs = match uniform {
-        true => vec![vec![Capability::Feature(output)], geometry],
-        false => vec![geometry],
-    };
     Err(match amplification {
-        true => Unsupported::needs_any_of(Feature::VertexAmplification, needs),
-        false => Unsupported::needs_any_of(Feature::LayeredRendering, needs),
+        true => Unsupported::needs(Feature::VertexAmplification, Capability::Feature(output)),
+        false => Unsupported::needs(Feature::LayeredRendering, Capability::Feature(output)),
     }
     .into())
-}
-
-/// Whether vertex function `cx` writes index `index` the same at every vertex of a primitive
-/// (its raw varying is among `StageIo::uniform_outputs`).
-fn uniform_index(cx: &SelectCx<'_>, index: RawIndex) -> bool {
-    let key = match index {
-        RawIndex::Layer => VaryingKey::render_target_array_index(),
-        RawIndex::Viewport => VaryingKey::viewport_index(),
-    };
-    (cx.families.stage_io.interface.uniform_outputs)
-        .binary_search(&key)
-        .is_ok()
-}
-
-/// Whether vertex function `cx`, with outputs `outputs`, drawn under `amplified` (`None` where it
-/// returns nothing), stores one of the slice and viewport indices it stores to its selected index
-/// ([`own_index_store`]). The pipeline's geometry stage then stores both builtins, and a vertex
-/// function's own would not reach the rasterizer past it, so it stores every one there
-/// ([`StageIoPlan::indices_selected`]). An index it writes and stores is uniform as written; one
-/// it stores from the amplification's offset alone is uniform; a slice it writes in a pass of one
-/// layer is stored nowhere. A refusal is left to the output that stores the index.
-fn indices_selected(
-    cx: &SelectCx<'_>,
-    outputs: &[OutputBinding],
-    amplified: Option<crate::pipeline::lower_inputs::AmplificationDraws>,
-) -> bool {
-    let writes = |role: fn(&OutputRole) -> bool| outputs.iter().any(|o| role(&o.role));
-    let layer = writes(|r| matches!(r, OutputRole::RenderTargetArrayIndex));
-    let viewport = writes(|r| matches!(r, OutputRole::ViewportArrayIndex));
-    let dropped = cx.inputs.dropped_vertex_layer || amplified.is_some_and(|d| !d.layered);
-    let stored = [
-        (
-            RawIndex::Layer,
-            if layer {
-                !dropped
-            } else {
-                amplified.is_some_and(|d| d.layered)
-            },
-            !layer || uniform_index(cx, RawIndex::Layer),
-        ),
-        (
-            RawIndex::Viewport,
-            viewport || amplified.is_some_and(|d| d.viewports),
-            !viewport || uniform_index(cx, RawIndex::Viewport),
-        ),
-    ];
-    stored.into_iter().any(|(index, stored, uniform)| {
-        stored
-            && matches!(
-                own_index_store(cx, index, uniform, false),
-                Ok(IndexStore::Selected)
-            )
-    })
-}
-
-/// The selected index's flat `uint` vertex output (`IoRole::SelectedLayer`,
-/// `IoRole::SelectedViewport`), which the pipeline's synthesized geometry stage reads.
-fn selected_index(sp: &mut StageIoPlan, index: RawIndex) -> Result<usize, Error> {
-    let (key, role) = match index {
-        RawIndex::Viewport => (VaryingKey::selected_viewport(), IoRole::SelectedViewport),
-        RawIndex::Layer => (VaryingKey::selected_layer(), IoRole::SelectedLayer),
-    };
-    let ty = IoType {
-        numeric: IoNumeric::Uint,
-        components: 1,
-        source_bits: 32,
-    };
-    let deco = IoDecor {
-        packed: true,
-        ..IoDecor::default()
-    };
-    push_var(
-        &mut sp.interface.outputs,
-        IoVariable {
-            key: key.clone(),
-            role,
-            ty,
-        },
-    );
-    user(sp, key, IoDir::Output, ty, deco)
 }
 
 /// Whether the profile can declare fragment input builtin `b`: one of its enabling
@@ -1714,38 +1472,6 @@ fn zero_index(
     Ok(())
 }
 
-/// The window depth's `float` variable in direction `dir` (`IoRole::WindowDepth`): a vertex
-/// function's output, or the no-perspective input of a fragment function that computes each
-/// sample's depth from it.
-pub(super) fn window_depth(sp: &mut StageIoPlan, dir: IoDir) -> Result<usize, Error> {
-    let key = VaryingKey::window_depth();
-    let ty = IoType {
-        numeric: IoNumeric::Float,
-        components: 1,
-        source_bits: 32,
-    };
-    let mut deco = IoDecor {
-        packed: true,
-        ..IoDecor::default()
-    };
-    let list = match dir {
-        IoDir::Input => {
-            deco.interpolation = SInterp::NoPerspective;
-            &mut sp.interface.inputs
-        }
-        IoDir::Output => &mut sp.interface.outputs,
-    };
-    push_var(
-        list,
-        IoVariable {
-            key: key.clone(),
-            role: IoRole::WindowDepth,
-            ty,
-        },
-    );
-    user(sp, key, dir, ty, deco)
-}
-
 /// The primitive ID's flat `uint` variable in direction `dir` (`IoRole::PrimitiveId`): the input a
 /// fragment function reads as `[[primitive_id]]` on a device without a fragment `PrimitiveId` or
 /// under `LoweringInputs::primitive_id_varying`, or the output of a vertex function compiled under
@@ -1778,20 +1504,15 @@ fn first_vertex(cx: &mut SelectCx<'_>) -> super::FirstVertex {
 /// vertex (the `BaseVertex` builtin with `shaderDrawParameters`, lane 0 of
 /// `PushField::BaseVertexInstance` without, as for `[[base_vertex]]`), and
 /// `PushField::VerticesPerPrimitive`. A post-tessellation vertex function's vertices are the
-/// tessellator's: one the device emulates writes its patch's position to the varying instead
-/// (`lower::tessellation::emulated`), and one drawn through the device's tessellation stages,
-/// whose primitive IDs are not built, is `NotImplemented(Tessellation)`, as for a fragment
-/// function that reads `[[primitive_id]]` behind one (`link::tessellation`). A form
+/// tessellator's, whose primitive IDs are not built: `NotImplemented(Tessellation)`, as for a
+/// fragment function that reads `[[primitive_id]]` behind one (`link::tessellation`). A form
 /// that reads its draw's indices at their address ([`captured_index_type`]) draws them as
 /// `index count` vertices from vertex 0: its first vertex is 0
 /// ([`super::FirstVertex::Zero`]). The private list form draws its list from its first vertex,
 /// as a draw without indices does.
 fn primitive_id_output(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     if matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) }) {
-        return match crate::lower::tessellation::emulates(cx.profile) {
-            true => Ok(()),
-            false => Err(Unsupported::not_implemented(Feature::Tessellation).into()),
-        };
+        return Err(Unsupported::not_implemented(Feature::Tessellation).into());
     }
     cx.push.insert(PushField::VerticesPerPrimitive);
     let first = match captured_index_type(cx).is_some() && !listed(cx) {
@@ -1812,37 +1533,7 @@ fn primitive_id_output(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         first,
         object,
     });
-    sp.words = sp.words.saturating_add(super::PRIMITIVE_ID_WORDS);
     Ok(())
-}
-
-/// The barycentric weights' `float2` input of form `perspective` (`IoRole::Barycentric`): a
-/// center-sampled varying, perspective-correct or not, which the pipeline's synthesized geometry
-/// stage writes.
-fn barycentric_weights(sp: &mut StageIoPlan, perspective: bool) -> Result<usize, Error> {
-    let key = VaryingKey::barycentric(perspective);
-    let ty = IoType {
-        numeric: IoNumeric::Float,
-        components: 2,
-        source_bits: 32,
-    };
-    let deco = IoDecor {
-        interpolation: if perspective {
-            SInterp::Smooth
-        } else {
-            SInterp::NoPerspective
-        },
-        ..IoDecor::default()
-    };
-    push_var(
-        &mut sp.interface.inputs,
-        IoVariable {
-            key: key.clone(),
-            role: IoRole::Barycentric { perspective },
-            ty,
-        },
-    );
-    user(sp, key, IoDir::Input, ty, deco)
 }
 
 /// The perspective and place of a `[[barycentric_coord]]` read of interpolation `i` into form
@@ -1875,37 +1566,21 @@ fn note_rotated_weights(cx: &mut SelectCx<'_>, place: Place) {
 }
 
 /// Records that the device interpolates a fragment input of interpolation `interp`: a smooth one
-/// takes Metal's answer only where the device is measured to interpolate as Metal does (the module
-/// then requires that), elsewhere the device's, which the module records.
+/// takes the device's answer, which the module records.
 fn note_device_interpolation(cx: &mut SelectCx<'_>, interp: Interpolation) {
     if matches!(interp, Interpolation::Smooth { .. }) {
-        if cx
-            .profile
-            .takes_driver_deviation(DriverDeviation::MetalInterpolation)
-        {
-            cx.families.stage_io.interpolation_by_metal = true;
-        } else {
-            cx.precision.insert(PrecisionNote::DeviceInterpolation);
-        }
+        cx.precision.insert(PrecisionNote::DeviceInterpolation);
     }
 }
 
 /// Records that the fragment function reads a perspective input at a sample or an offset other
-/// than the pixel center (`InterpolateAtSample`, `InterpolateAtOffset`) on a device whose driver
-/// answers such a read with the pixel center's value extrapolated along the quad's derivatives
-/// (`DriverWorkaround::PerspectiveReadsExtrapolated`): the device's answer, which the module
-/// records. The pixel-center form of a center read (`InterpolateAtOffset` at offset 0) moves
-/// nothing and records nothing.
+/// than the pixel center (`InterpolateAtSample`, `InterpolateAtOffset`): a device may answer such
+/// a read with the pixel center's value extrapolated along the quad's derivatives (RADV does), its
+/// own interpolation, which the module records on every device. The pixel-center form of a center
+/// read (`InterpolateAtOffset` at offset 0) moves nothing and records nothing.
 fn note_extrapolated_read(cx: &mut SelectCx<'_>) {
-    if cx
-        .profile
-        .fields()
-        .workarounds
-        .contains(&DriverWorkaround::PerspectiveReadsExtrapolated)
-    {
-        cx.precision
-            .insert(PrecisionNote::ExtrapolatedInterpolation);
-    }
+    cx.precision
+        .insert(PrecisionNote::ExtrapolatedInterpolation);
 }
 
 /// The raw index's flat `uint` variable in direction `dir`: a vertex function's output, or the
@@ -2154,9 +1829,7 @@ fn input_builtin(
                 None,
             )
         }
-        // The coverage after the early tests reads the same builtin under `PostDepthCoverage`
-        // (the entry's mode, `ParamRole::Builtin` in `plan`).
-        Bi::SampleMaskIn | Bi::PostDepthCoverage if !vertex => {
+        Bi::SampleMaskIn if !vertex => {
             int_scalar(f)?;
             (
                 B::SampleMask,
@@ -2212,19 +1885,9 @@ fn input_builtin(
             // triangle drawn with Metal's last vertex first takes them rotated back
             // (`LoweringInputs::rotated_weights`).
             let (perspective, place) = barycentric_read(i, f, cx.inputs.rotated_weights)?;
-            // `param` reads the weights from a varying without `fragmentShaderBarycentric`.
+            // `param` refuses the weights without `fragmentShaderBarycentric`.
             if !frag.barycentric {
                 return Err(cx.invariant("a barycentric builtin without the feature"));
-            }
-            // A driver that rejects a shader reading both forms refuses the second.
-            let defect = DriverWorkaround::BothBarycentricFormsRejected;
-            let other = StageBuiltin::BaryCoord {
-                perspective: !perspective,
-            };
-            if cx.families.stage_io.interface.builtins.contains(&other)
-                && cx.profile.fields().workarounds.contains(&defect)
-            {
-                return Err(Unsupported::driver_defect(Feature::Barycentrics, defect).into());
             }
             let b = if perspective {
                 B::BaryCoordKHR
@@ -2288,19 +1951,6 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     }
     let (returned, tys) = output_types(cx)?;
     cx.families.stage_io.returned = returned;
-    // A fragment function of one of its pipeline's color groups (`LoweringInputs::color_group`),
-    // its colors renumbered before planning (`pipeline::compile::color_group::entry`): stated for
-    // link, and, where the pipeline takes more than one group, its per-fragment outputs invariant
-    // across the groups' variants, and the note of what is not.
-    if cx.stage == Stage::Fragment {
-        if let Some(group) = cx.inputs.color_group.clone() {
-            if group.groups() > 1 {
-                cx.families.stage_io.invariant_fragment_outputs = true;
-                cx.precision.insert(PrecisionNote::ColorAttachmentGroups);
-            }
-            cx.families.stage_io.interface.color_group = Some(group);
-        }
-    }
     // A fragment function compiled for a multisampled pipeline reads `[[position]]` at the pixel
     // center.
     cx.families.stage_io.interface.multisampled =
@@ -2319,13 +1969,6 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         });
     }
     let offset = |field| amplified.map(|_| field);
-    if cx.stage == Stage::Vertex {
-        cx.families.stage_io.indices_selected = indices_selected(
-            cx,
-            &outputs,
-            amplified.filter(|_| returned != Returned::Void),
-        );
-    }
     // The pipeline's colors the pass lacks, whose writes plain Metal drops: stated whether or
     // not the function writes them, so the plan settles on the variant.
     let dropped = match cx.stage {
@@ -2349,6 +1992,14 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         if matches!(o.role, OutputRole::PointSize) {
             point_size = true;
         }
+        // A viewport or slice index the vertex function never writes is stored as 0 wherever it
+        // is stored.
+        let unwritten = cx.stage == Stage::Vertex
+            && matches!(
+                o.role,
+                OutputRole::RenderTargetArrayIndex | OutputRole::ViewportArrayIndex
+            )
+            && super::returns_undefined(cx.entry, o.field);
         // The private alpha test reads color 0's alpha as the function returns it, whatever the
         // pipeline stores of it.
         if let (Stage::Fragment, Some(function)) = (cx.stage, cx.inputs.alpha_test) {
@@ -2398,11 +2049,10 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         }
         if matches!(o.role, OutputRole::RenderTargetArrayIndex) && cx.stage == Stage::Vertex {
             // The slice a vertex function chooses selects one only in a pass of at least two
-            // layers; in a pass of one layer every index renders slice 0, and the variant for it
-            // does not write `Layer`. In every variant the raw varying holds the index as written,
-            // which Metal's fragment function reads. Drawn one amplification at a time, a pass of
-            // one layer writes no `Layer` either.
-            let dropped = cx.inputs.dropped_vertex_layer || amplified.is_some_and(|d| !d.layered);
+            // layers. Drawn one amplification at a time, a pass of one layer writes no `Layer`. In
+            // every variant the raw varying holds the index as written, which Metal's fragment
+            // function reads.
+            let dropped = amplified.is_some_and(|d| !d.layered);
             cx.facts.insert(RuntimeFact::RenderTargetArrayLength {
                 layer_dropped: dropped,
             });
@@ -2425,8 +2075,8 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                     color: None,
                     rotated: false,
                     alpha_red: false,
-                    premultiplied: false,
                     offset: offset(PushField::AmplificationLayerOffset),
+                    unwritten,
                 });
                 continue;
             }
@@ -2440,34 +2090,20 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             float_lanes(io_form(cx, ty)?, 1)?;
             continue;
         }
-        // An imageblock output is written to the pass's imageblock storage, not an interface
-        // variable.
-        if let OutputRole::ImageblockData(ib) = &o.role {
-            if cx.stage != Stage::Fragment {
-                return Err(cx.invariant("an imageblock output outside a fragment function"));
-            }
-            crate::lower::fragment::select_imageblock_output(cx, o.field, ib, o.ty.align, ty)?;
-            continue;
+        // An imageblock output is not implemented.
+        if let OutputRole::ImageblockData(_) = &o.role {
+            return Err(Unsupported::not_implemented(Feature::Imageblocks).into());
         }
-        // Compiled for draws whose fragment function runs their depth and stencil tests itself
-        // (`fragment::depth_test`), the device's stencil test is off: a stencil output is the
-        // in-shader stencil test's reference where the draws' stencil test acts, and changes
-        // nothing where it does not. Stored nowhere, on any device, so no shader-side stencil.
-        if matches!(o.role, OutputRole::Stencil)
-            && cx.stage == Stage::Fragment
-            && cx.inputs.shader_tests
-        {
-            int_scalar_form(cx, ty)?;
-            continue;
-        }
-        // A stencil output on a device without stencil export is the shader-side stencil,
-        // written to the stencil's shadow, not an interface variable.
+        // A stencil output needs stencil export.
         if matches!(o.role, OutputRole::Stencil)
             && cx.stage == Stage::Fragment
             && !cx.profile.fields().fragment.stencil_export
         {
-            crate::lower::fragment::select_stencil_output(cx, o.field, ty)?;
-            continue;
+            return Err(Unsupported::needs(
+                Feature::StencilExport,
+                Capability::Extension(VkExtension::ExtShaderStencilExport),
+            )
+            .into());
         }
         // An output to a color the pass lacks is stored nowhere, as plain Metal drops it: no
         // output variable, so the pipeline writes no location without an attachment. So is one to a
@@ -2492,22 +2128,6 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 }
             }
         }
-        // An output to an attachment the function reads in the interlocked storage form is
-        // written to its storage image, not an interface variable.
-        if let OutputRole::RenderTarget {
-            attachment: AbiInt::Const(color),
-            index: 0,
-            ..
-        } = o.role
-        {
-            if cx.stage == Stage::Fragment
-                && crate::lower::fragment::writes_through_storage(cx, color)
-            {
-                crate::lower::fragment::select_storage_output(cx, o.field, color, ty)
-                    .map_err(|e| e.at_attachment(Attachment::Color(color)))?;
-                continue;
-            }
-        }
         // A second output of the function's own to an attachment whose blend reads the one the
         // rotation needs (`LoweringInputs::rotated_factors`) is stored nowhere: Metal's blend
         // there reads no second output.
@@ -2520,28 +2140,9 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             if cx.stage == Stage::Fragment && cx.inputs.rotated_factors.contains_key(&color) {
                 continue;
             }
-            // The second source of an extended-range or generic blend the shader computes in the
-            // storage form, which the blend reads from the returned value.
-            if cx.stage == Stage::Fragment
-                && crate::lower::fragment::blends_second_through_storage(cx, color)
-            {
-                crate::lower::fragment::select_storage_second_output(cx, o.field, color, ty)
-                    .map_err(|e| e.at_attachment(Attachment::Color(color)))?;
-                continue;
-            }
-            // The second source of an extended-range blend the function computes over the
-            // attachment's input attachment, which the blend reads from the returned value.
-            if cx.stage == Stage::Fragment
-                && crate::lower::fragment::blends_second_through_inputs(cx, color)
-            {
-                crate::lower::fragment::select_input_second_output(cx, o.field, color, ty)
-                    .map_err(|e| e.at_attachment(Attachment::Color(color)))?;
-                continue;
-            }
-            // Every other write of an extended-range attachment (the storage form's of none of its
-            // channels or unblended, or the raw texel's through the interface) reads no second
-            // output, as Metal's write there reads none: it is stored nowhere, where the
-            // interface's raw texel refused it `Format`.
+            // A write of an extended-range attachment (the raw texel's through the interface)
+            // reads no second output, as Metal's unblended write there reads none: it is stored
+            // nowhere, where the interface's raw texel refused it `Format`.
             if cx.stage == Stage::Fragment && cx.inputs.extended_range_colors.contains_key(&color) {
                 continue;
             }
@@ -2557,12 +2158,7 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         // time, it holds the index plus the amplification's offset.
         if matches!(o.role, OutputRole::ViewportArrayIndex)
             && cx.stage == Stage::Vertex
-            && index_store(
-                cx,
-                RawIndex::Viewport,
-                uniform_index(cx, RawIndex::Viewport),
-                false,
-            )? == IndexStore::Nowhere
+            && index_store(cx, RawIndex::Viewport, false)? == IndexStore::Nowhere
         {
             let f = io_form(cx, ty)?;
             int_scalar(f)?;
@@ -2582,8 +2178,8 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 color: None,
                 rotated: false,
                 alpha_red: false,
-                premultiplied: false,
                 offset: offset(PushField::AmplificationViewportOffset),
+                unwritten,
             });
             continue;
         }
@@ -2635,7 +2231,6 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         // An output to an attachment held with its channels rotated stores them rotated; one to an
         // attachment holding Metal's alpha in red holds that alpha in the image's alpha lane too,
         // where alpha to coverage reads it.
-        let mut premultiplied = false;
         let mut alpha_red = false;
         let rotated = match o.role {
             OutputRole::RenderTarget {
@@ -2659,9 +2254,12 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 if let (0, Some(&lanes)) = (index, cx.inputs.rotated_factors.get(&attachment)) {
                     seconds.push((attachment, o.field, link.form, lanes));
                 }
-                if let (0, Some(&form)) = (index, cx.inputs.rotated_blends.get(&attachment)) {
-                    premultiplied = rotated_blend_form(cx, attachment, form, link.form)
-                        .map_err(|e| e.at_attachment(Attachment::Color(attachment)))?;
+                // A blend not exact by construction may round apart from Metal's
+                // (`LoweringInputs::rotated_blends`).
+                if index == 0 && cx.inputs.rotated_blends.contains(&attachment) {
+                    cx.precision.insert(PrecisionNote::RotatedBlendRounding);
+                    let sp = &mut cx.families.stage_io;
+                    sp.interface.rotated_blends.insert(attachment);
                 }
                 true
             }
@@ -2675,8 +2273,8 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             color,
             rotated,
             alpha_red,
-            premultiplied,
             offset: added,
+            unwritten,
         });
         if let Some((index, count, _)) = raw {
             cx.push.insert(count);
@@ -2692,8 +2290,8 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 color: None,
                 rotated: false,
                 alpha_red: false,
-                premultiplied: false,
                 offset: added,
+                unwritten,
             });
         }
     }
@@ -2718,42 +2316,12 @@ pub fn entry(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     if cx.inputs.region_viewports && cx.stage == Stage::Vertex {
         region_viewport(cx, &outputs, returned)?;
     }
-    if cx.inputs.region_copies && cx.stage == Stage::Vertex {
-        region_copy(cx, &outputs, returned)?;
-    }
-    // A viewport Vulkan's cannot be: the position compensated for it.
-    if let Some(c) = cx
-        .inputs
-        .viewport_compensation
-        .filter(|_| cx.stage == Stage::Vertex)
-    {
-        compensate(cx, c)?;
-    }
-    // The window depth of the position the function stores, for a fragment function that
-    // computes each sample's depth from it. A function that writes no position rasterizes
-    // nothing.
-    if cx.inputs.window_depth_varying && cx.stage == Stage::Vertex {
-        let sp = &mut cx.families.stage_io;
-        let position = sp.objects.iter().position(|o| {
-            matches!(
-                o,
-                IoObject::Builtin {
-                    builtin: B::Position,
-                    dir: IoDir::Output,
-                    ..
-                }
-            )
-        });
-        if let Some(position) = position {
-            let object = window_depth(sp, IoDir::Output)?;
-            sp.window_depth = Some(super::WindowDepth { position, object });
-            sp.words = sp.words.saturating_add(super::WINDOW_DEPTH_WORDS);
-        }
-    }
-    // The primitive ID a fragment function reads from its varying (an emulated post-tessellation
-    // vertex function's is its patch's position, `lower::tessellation::emulated`).
+    // The primitive ID a fragment function reads from its varying.
     if cx.inputs.primitive_id_varying && cx.stage == Stage::Vertex {
         primitive_id_output(cx)?;
+    }
+    if cx.inputs.indirect_range && cx.stage == Stage::Vertex {
+        indirect_range(cx)?;
     }
     // The pass's colors the pipeline lacks, which plain Metal zeroes where a draw covers them.
     if cx.stage == Stage::Fragment {
@@ -2829,6 +2397,27 @@ fn indices_feature(cx: &SelectCx<'_>) -> Feature {
     }
 }
 
+/// Plan the execution range test of a vertex function compiled under
+/// `LoweringInputs::indirect_range` ([`super::StageIoPlan::indirect_range`]): its range's address
+/// and its command, pushed, and its `Position` output, where it has one. The range is read by
+/// address: a device without device addresses refuses it.
+fn indirect_range(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+    let f = cx.profile.fields();
+    if f.buffer_access != crate::device::profile::BufferAccess::Addressed || !f.leaf.int64 {
+        return Err(Unsupported::needs_any_of(
+            Feature::GpuEncodedIndirectCommands,
+            vec![cx.profile.addressed_needs()],
+        )
+        .into());
+    }
+    cx.push.insert(PushField::IndirectRange);
+    cx.push.insert(PushField::IndirectSequence);
+    cx.push.insert(PushField::IndirectBase);
+    let sp = &mut cx.families.stage_io;
+    sp.indirect_range = Some(sp.invariant);
+    Ok(())
+}
+
 /// Refuse the de-indexed or private list form ([`indices_feature`]) on a device without device
 /// addresses, naming what it needs: the indices are reached by address.
 fn refuse_unaddressed(cx: &SelectCx<'_>) -> Result<(), Error> {
@@ -2875,7 +2464,6 @@ pub(super) fn captured_index(
         StageBuiltin::VertexIndex,
     );
     sp.captured_index = Some(super::CapturedIndex { vertex, ty, first });
-    sp.words = sp.words.saturating_add(super::CAPTURED_INDEX_WORDS);
     Ok(())
 }
 
@@ -2920,7 +2508,7 @@ fn captured_param(
 /// (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`): one compiled without
 /// `replay_bindings`, or under an input that reads the draw's own vertex or instance indices or
 /// draws it more than once (the primitive ID's varying or de-indexed form, the private list form,
-/// amplifications drawn apart, tessellation).
+/// amplifications drawn apart).
 fn merged(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     let i = cx.inputs;
     if !i.replay_bindings
@@ -2928,7 +2516,6 @@ fn merged(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         || i.primitive_id_indices.is_some()
         || i.private_list
         || i.amplification_draws.is_some()
-        || i.tessellation.is_some()
     {
         return Err(Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into());
     }
@@ -2958,7 +2545,6 @@ fn merged(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         instance,
         command,
     });
-    sp.words = sp.words.saturating_add(super::MERGED_WORDS);
     cx.push.insert(PushField::MergedDrawAddress);
     cx.facts.insert(RuntimeFact::MergedDraws);
     Ok(())
@@ -3006,215 +2592,9 @@ pub(crate) fn finish_merged(cx: &mut SelectCx<'_>) -> Result<(), Error> {
                 IoDir::Input,
             )?;
             sp.merged_fragment = Some(object);
-            sp.words = sp.words.saturating_add(super::MERGED_FRAGMENT_WORDS);
         }
         _ => {}
     }
-    Ok(())
-}
-
-/// Plan a vertex function's viewport compensation `c` (`LoweringInputs::viewport_compensation`):
-/// its `Position` is stored compensated by `PushField::ViewportCompensation`, and under
-/// [`ViewportCompensation::depth`] two `ClipDistance` elements follow the function's own, which
-/// Metal's near and far planes clip at. Under [`ViewportCompensation::point_guard`] the position
-/// is scaled by `PushField::PointGuard` too, and four more elements follow, Metal's guard band
-/// for points. Under [`ViewportCompensation::vertex_clamp`] the compensated depth is clamped by
-/// `PushField::VertexDepthClamp` before the interpolation. A function that writes no position
-/// rasterizes nothing and is compensated in nothing. Refused: the clip distances on a device
-/// without `shaderClipDistance`, or past its `maxClipDistances` or
-/// `maxCombinedClipAndCullDistances`.
-fn compensate(cx: &mut SelectCx<'_>, c: ViewportCompensation) -> Result<(), Error> {
-    cx.facts.insert(RuntimeFact::ViewportCompensation {
-        depth: c.depth,
-        point_guard: c.point_guard,
-        mirrors: c.mirrors,
-        vertex_clamp: c.vertex_clamp,
-    });
-    let is = |o: &IoObject, b| matches!(o, IoObject::Builtin { builtin, dir: IoDir::Output, .. } if *builtin == b);
-    let sp = &cx.families.stage_io;
-    let Some(position) = sp.objects.iter().position(|o| is(o, B::Position)) else {
-        return Ok(());
-    };
-    cx.push.insert(PushField::ViewportCompensation);
-    if c.point_guard {
-        cx.push.insert(PushField::PointGuard);
-    }
-    if c.mirrors {
-        cx.push.insert(PushField::ViewportMirrors);
-    }
-    // Each vertex's depth clamped, which only a compensated depth takes.
-    if c.vertex_clamp && c.depth {
-        cx.push.insert(PushField::VertexDepthClamp);
-    }
-    let added = 2 * u32::from(c.depth) + 4 * u32::from(c.point_guard);
-    let clips = match added {
-        0 => None,
-        _ => Some(added_clip_distances(cx, added, Feature::ClipDistance)?),
-    };
-    let clip = clips.filter(|_| c.depth);
-    let guard = clips
-        .filter(|_| c.point_guard)
-        .map(|(object, first)| (object, first + 2 * u32::from(c.depth)));
-    cx.families.stage_io.compensation = Some(Compensation {
-        position,
-        clip,
-        guard,
-        mirrors: c.mirrors,
-        vertex_clamp: c.vertex_clamp && c.depth,
-    });
-    Ok(())
-}
-
-/// Add `added` clip distances past a vertex function's own, for `feature`: its `ClipDistance`
-/// object, `added` elements longer, or a new one, and the first of the added elements. Refused as
-/// `feature` where the device writes no clip distances or the count passes its limits.
-fn added_clip_distances(
-    cx: &mut SelectCx<'_>,
-    added: u32,
-    feature: Feature,
-) -> Result<(usize, u32), Error> {
-    if !cx.profile.fields().fragment.clip_distance {
-        return Err(needs(feature, VkFeature::ShaderClipDistance));
-    }
-    let is = |o: &IoObject| {
-        matches!(
-            o,
-            IoObject::Builtin {
-                builtin: B::ClipDistance,
-                dir: IoDir::Output,
-                ..
-            }
-        )
-    };
-    let limits = cx.profile.fields().limits;
-    let sp = &mut cx.families.stage_io;
-    let own = sp.objects.iter().position(is);
-    let first = match own.and_then(|i| sp.objects.get(i)) {
-        Some(IoObject::Builtin {
-            shape: Shape::F32Array(n),
-            ..
-        }) => *n,
-        Some(_) => return Err(not_lowered()),
-        None => 0,
-    };
-    let count = first + added;
-    for (lim, max) in [
-        (VkLimit::MaxClipDistances, limits.max_clip_distances),
-        (
-            VkLimit::MaxCombinedClipAndCullDistances,
-            limits.max_combined_clip_and_cull_distances,
-        ),
-    ] {
-        if count > max {
-            return Err(limit(feature, lim, u64::from(count), max));
-        }
-    }
-    let object = match own {
-        // The function's own clip distances, `added` elements longer.
-        Some(i) => {
-            if let Some(IoObject::Builtin { shape, .. }) = sp.objects.get_mut(i) {
-                *shape = Shape::F32Array(count);
-            }
-            let builtins = &mut sp.interface.builtins;
-            builtins.retain(|b| !matches!(b, StageBuiltin::ClipDistance { .. }));
-            builtins.push(StageBuiltin::ClipDistance { count });
-            builtins.sort();
-            i
-        }
-        None => builtin(
-            sp,
-            B::ClipDistance,
-            IoDir::Output,
-            Shape::F32Array(count),
-            StageBuiltin::ClipDistance { count },
-        ),
-    };
-    Ok((object, first))
-}
-
-/// Plan the region's copy a vertex function with outputs `outputs`, returning `returned`,
-/// compiled under `LoweringInputs::region_copies`, stores at every return: region `first +
-/// (DrawIndex / c)·nx + DrawIndex mod c` of the region table (`PushField::RegionBox`'s `[first,
-/// c]`, the specification's `DrawIndex`, 0 for a draw that is no multi-draw's), its position moved
-/// by the region's line and four clip distances past its own keeping the region's pixels
-/// ([`super::RegionCopy`], `pipeline::link::fan_out::region_copy`), and 0 as `ViewportIndex`,
-/// the recording's one viewport. A merged draw's vertex function (`merged_draws`) takes it too:
-/// its corner is its `VertexIndex` and `InstanceIndex`'s, which a multi-draw's draws each give
-/// from their own first vertex, and its region its `DrawIndex`'s; so does a draw replay's of one
-/// draw per command (`replay_bindings`), whose buffers are in the slot table at its push. A
-/// function that writes its own viewport or slice index, one under another field that moves its
-/// indices or position (`amplification_draws`, `viewport_compensation`), runs behind the
-/// tessellator or returns no outputs is `NotImplemented(RasterizationRateMap)`: the runtime draws those through each
-/// region's viewport. A device that cannot store `ViewportIndex` from a vertex function, read
-/// `DrawIndex` or write four more clip distances refuses it.
-fn region_copy(
-    cx: &mut SelectCx<'_>,
-    outputs: &[OutputBinding],
-    returned: Returned,
-) -> Result<(), Error> {
-    let i = &cx.inputs;
-    let indexed = outputs.iter().any(|o| {
-        matches!(
-            o.role,
-            OutputRole::ViewportArrayIndex | OutputRole::RenderTargetArrayIndex
-        )
-    });
-    let tessellated = matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) });
-    let sp = &cx.families.stage_io;
-    let position = sp.objects.iter().position(|o| {
-        matches!(
-            o,
-            IoObject::Builtin {
-                builtin: B::Position,
-                dir: IoDir::Output,
-                ..
-            }
-        )
-    });
-    let position = match position {
-        Some(p) if returned != Returned::Void => p,
-        _ => return Err(Unsupported::not_implemented(Feature::RasterizationRateMap).into()),
-    };
-    if indexed
-        || tessellated
-        || i.amplification_draws.is_some()
-        || i.viewport_compensation.is_some()
-        || i.region_viewports
-    {
-        return Err(Unsupported::not_implemented(Feature::RasterizationRateMap).into());
-    }
-    let f = cx.profile.fields();
-    if !(f.fragment.output_viewport_index && f.draw_parameters) {
-        return Err(Unsupported::needs_any_of(
-            Feature::RasterizationRateMap,
-            vec![vec![
-                Capability::Feature(VkFeature::ShaderOutputViewportIndex),
-                Capability::Feature(VkFeature::ShaderDrawParameters),
-            ]],
-        )
-        .into());
-    }
-    let clip = added_clip_distances(cx, 4, Feature::RasterizationRateMap)?;
-    cx.push.insert(PushField::RegionBox);
-    // The region table, one more storage buffer of the stage.
-    let d = &mut cx.descriptors;
-    d.storage_buffers = d.storage_buffers.saturating_add(1);
-    let sp = &mut cx.families.stage_io;
-    let draw_index = builtin(
-        sp,
-        B::DrawIndex,
-        IoDir::Input,
-        Shape::U32,
-        StageBuiltin::DrawIndex,
-    );
-    // Not the contract's `ViewportIndex`, as a region viewport's is not (`region_viewport`).
-    let viewport = builtin_object(sp, B::ViewportIndex, IoDir::Output, Shape::U32);
-    sp.region_copy = Some(super::RegionCopy {
-        position,
-        draw_index,
-        viewport,
-        clip,
-    });
     Ok(())
 }
 
@@ -3343,22 +2723,11 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
                     StageBuiltin::ViewportIndex,
                 ),
             };
-            let uniform = uniform_index(cx, index);
-            let store = index_store(cx, index, uniform, false)?;
+            let store = index_store(cx, index, false)?;
             let f = io_form(cx, ty)?;
             int_scalar(f)?;
             match store {
-                IndexStore::Builtin => {
-                    // Differing among a primitive's vertices, stored to the builtin only on a
-                    // device that takes the first vertex's as Metal does.
-                    cx.families.stage_io.first_vertex_indices_by_device |= !uniform;
-                    out(cx, spirv, Shape::U32, Place::Whole, f, contract)
-                }
-                IndexStore::Selected => Link {
-                    object: selected_index(&mut cx.families.stage_io, index)?,
-                    place: Place::Whole,
-                    form: f,
-                },
+                IndexStore::Builtin => out(cx, spirv, Shape::U32, Place::Whole, f, contract),
                 IndexStore::Nowhere => {
                     return Err(cx.invariant("a viewport index stored nowhere as an output"))
                 }
@@ -3410,12 +2779,8 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
                 index: (index == 1).then_some(1),
                 ..IoDecor::default()
             };
-            let half = declared == io && half_variable(cx, attachment, f);
             let sp = &mut cx.families.stage_io;
-            let object = declare(sp, key.clone(), IoDir::Output, declared, deco, half)?;
-            if half {
-                sp.interface.half_outputs.push(key.clone());
-            }
+            let object = user(sp, key.clone(), IoDir::Output, declared, deco)?;
             push_var(
                 &mut sp.interface.outputs,
                 IoVariable {
@@ -3457,13 +2822,12 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
             }
             cx.families.stage_io.depth_clamp = Some(DepthClamp {
                 object: link.object,
-                clamps: clamps_fragment_depth(cx),
                 range,
             });
             cx.families.fragment.depth_output = true;
             link
         }
-        // A device without stencil export runs the shader-side stencil (`entry`).
+        // A device without stencil export refuses the output (`entry`).
         OutputRole::Stencil if !vertex && frag.stencil_export => {
             let f = io_form(cx, ty)?;
             int_scalar(f)?;
@@ -3499,28 +2863,13 @@ fn output(cx: &mut SelectCx<'_>, o: &OutputBinding, ty: AirTypeId) -> Result<Lin
     })
 }
 
-/// Words per interface object, per parameter use, and per stored output element.
-const OBJECT_WORDS: u64 = 32;
-const USE_WORDS: u64 = 24;
-const STORE_WORDS: u64 = 16;
-/// The words a use of a [`Source::PixelCenter`] parameter adds to a load: `[[position]]`'s floor,
-/// add, shuffle, and their constants; a varying's `InterpolateAtOffset` and its offset.
-const PIXEL_WORDS: u64 = 24;
-/// The words a use of a [`Source::Uniform`] parameter adds to a load: Metal's reading of an
-/// interpolated constant, nine integer instructions on the bits and their constants.
-const UNIFORM_WORDS: u64 = 64;
-/// The words a use of a [`Source::QuadPrimitive`] parameter adds to a load: the shift and its
-/// constant.
-const QUAD_PRIMITIVE_WORDS: u64 = 8;
-
-/// The per-stage interface limits and the size estimate.
+/// The per-stage interface limits.
 pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     if cx.stage == Stage::Kernel {
         // A kernel's stage inputs: the region it depends on, and their size.
         if cx.families.stage_io.region {
             cx.facts.insert(RuntimeFact::StageInRegion);
         }
-        cx.families.stage_io.words = param_words(cx);
         return Ok(());
     }
     // Buffer writes and atomics in a vertex or fragment function need the stage's store feature
@@ -3562,9 +2911,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             .map(|v| u64::from(v.ty.components))
             .sum()
     };
-    // An emulated post-tessellation vertex function is a plain vertex function.
-    let evaluation = matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) })
-        && !crate::lower::tessellation::emulates(cx.profile);
+    let evaluation = matches!(cx.entry.ep.stage, AirStage::Vertex { patch: Some(_) });
     let checks = match cx.stage {
         // A post-tessellation vertex function's outputs are an evaluation shader's; it has no
         // input variable of this family's.
@@ -3617,12 +2964,6 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         }
         cx.families.stage_io.interface.alpha_test = Some(function);
     }
-    // The render pipeline's private logic operation, which the function's writes compute
-    // (`lower::fragment`'s `logic`): recorded for link, whether or not the function writes an
-    // attachment the operation serves.
-    if cx.stage == Stage::Fragment {
-        cx.families.stage_io.interface.logic_operation = cx.inputs.logic_operation;
-    }
     // The render pipeline's private masks a fragment function applies itself: its `SampleMask`
     // output, the function's own where it writes one, which each return ANDs the pixel's mask
     // into or stores it as; and the `FragCoord` input whose pixel picks the mask, where the masks
@@ -3645,92 +2986,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         });
         sp.interface.sample_mask = Some(masks);
     }
-    // Size: every object, the parameters' words, and a store per output element; a count's
-    // compare and select (and its constant 0) are a store's words more, and so is an
-    // amplification's offset added; an amplified output is a store, an add and a count's, and a
-    // region's viewport a load and a store.
-    let params = param_words(cx);
-    let sp = &mut cx.families.stage_io;
-    let stores: u64 = sp
-        .outputs
-        .iter()
-        .map(|o| {
-            let elements = match o.link.place {
-                Place::Spread(n) => u64::from(n),
-                _ => 1,
-            };
-            elements
-                + super::POINT_SIZE_WORDS * u64::from(super::point_size_object(&sp.objects, o.link.object))
-                + u64::from(o.below.is_some())
-                + u64::from(o.offset.is_some())
-                + u64::from(o.rotated)
-                // Metal's blue premultiplied: two extracts, each lane's NaN test, select and
-                // clamp, the product (an `Fma` with `-0.0` where the builder writes one so), its
-                // insert, and their constants.
-                + 12 * u64::from(o.premultiplied)
-        })
-        .sum::<u64>()
-        // A rotation's second output: its field, two shuffles and a store.
-        + 4 * sp.rotated_seconds.len() as u64
-        + 3 * sp.amplified.len() as u64
-        // The region's draw index loaded and stored.
-        + 2 * u64::from(sp.region_viewport.is_some())
-        + u64::from(sp.point_size_default.is_some())
-        // The private sample mask's AND and store.
-        + 2 * u64::from(sp.private_mask.is_some())
-        // The alpha test: the alpha's extracts, its clamp and code, the reference, the
-        // comparison and the kill.
-        + 40 * u64::from(sp.alpha_test.is_some())
-        + compensation_stores(sp.compensation)
-        + sp.depth_clamp.map_or(0, |d| match (d.range, d.clamps) {
-            // The `[0, 1]` selects, the range's two clamps and the negative NaN's select.
-            (true, _) => 14,
-            (false, true) => 5,
-            (false, false) => 2,
-        });
-    // Each return stores every output.
-    let rets = cx
-        .body
-        .insts
-        .values()
-        .filter(|i| matches!(i.kind, crate::air::ir::InstKind::Ret(_)))
-        .count() as u64;
-    // Each return also rounds every color output that rounds, and encodes the extended-range
-    // colors' texels.
-    let rounding = super::color_write::words(sp.rounded.values().copied())
-        .saturating_add(super::extended_color::WORDS.saturating_mul(sp.extended.len() as u64))
-        .saturating_add(
-            (sp.words_written.values())
-                .map(|&w| super::word_color::encode_words(w))
-                .fold(0u64, u64::saturating_add),
-        );
-    sp.words = (sp.objects.len() as u64)
-        .saturating_mul(OBJECT_WORDS)
-        .saturating_add(params)
-        .saturating_add(
-            stores
-                .saturating_add(1)
-                .saturating_mul(rets)
-                .saturating_mul(STORE_WORDS),
-        )
-        .saturating_add(rounding.saturating_mul(rets));
     Ok(())
-}
-
-/// Whether a color output of form `f` to `attachment`, through a variable of its own type, is
-/// declared with 16-bit `float` lanes (`StageIo::half_outputs`): a `half` output on a profile that
-/// enables `storageInputOutput16` and `shaderFloat16`, so the device receives the `half` the
-/// function returns as a `half`, as Metal's attachment does, and blends and converts it as its own
-/// `half` output. Its value is a `half`, also where the attachment's write rounds a lane
-/// (`color_write::plan`: a `half` lane rounds only to a float format of no more precision and the
-/// same exponent range), so the conversion that stores it is exact. Not to an attachment held with
-/// its channels rotated, whose output may be premultiplied in `float` (`rotated_blend_form`).
-fn half_variable(cx: &SelectCx<'_>, attachment: u32, f: Form) -> bool {
-    let leaf = cx.profile.fields().leaf;
-    f.float_fmt() == Some(FloatFmt::Half)
-        && leaf.input_output_16bit
-        && leaf.float16
-        && !cx.inputs.rotated_colors.contains(&attachment)
 }
 
 /// Whether AIR type `ty` of entry `e` is `half` or a vector of it: a `half` color output
@@ -3761,71 +3017,4 @@ fn float_color(e: &crate::air::Entry, ty: AirTypeId) -> bool {
         other => other,
     };
     matches!(scalar, Some(Type::Float))
-}
-
-/// The stores' worth of words a compensated position adds to each return: the field's lanes and
-/// `x`'s product, under the depth's compensation its sum of products and the two clip distances'
-/// selects and stores, and under the point guard band its two lanes and products, the band, and the
-/// four clip distances' sums and stores.
-fn compensation_stores(c: Option<Compensation>) -> u64 {
-    let Some(c) = c else { return 0 };
-    let depth = if c.clip.is_some() { 9 } else { 0 };
-    let guard = if c.guard.is_some() { 13 } else { 0 };
-    3 + depth + guard
-}
-
-/// Whether a fragment function's depth output is clamped to `[0, 1]` as Metal stores it
-/// (`DepthClamp::clamps`; five stores' words with a positive NaN's kill, two for the kill
-/// alone): where the profile enables `VK_EXT_depth_range_unrestricted`, under which Vulkan no
-/// longer clamps it (RADV, NVIDIA and x86 lavapipe store 1.5 and -0.5 unclamped, measured).
-/// Without the extension Vulkan clamps it to `[0, 1]` itself.
-fn clamps_fragment_depth(cx: &SelectCx<'_>) -> bool {
-    cx.profile
-        .fields()
-        .enabled
-        .extensions
-        .contains(&VkExtension::ExtDepthRangeUnrestricted)
-}
-
-/// The words of the used stage-IO parameters: a load per use of an interface parameter (or of a
-/// kernel's stage-in region), with its pixel-center form for a [`Source::PixelCenter`] one, and one
-/// fetch per pulled attribute at entry (`fetch::PulledRead::words`), whose uses read the held
-/// value.
-fn param_words(cx: &SelectCx<'_>) -> u64 {
-    let mut fetch_words = 0u64;
-    let mut loaded: Vec<(u32, u64)> = Vec::new();
-    for p in &cx.families.stage_io.params {
-        match &p.source {
-            Source::Io(_)
-            | Source::AmplificationCount(_)
-            | Source::Unamplified(_)
-            | Source::Absent(_)
-            | Source::Pushed { .. }
-            | Source::DrawBase { .. }
-            | Source::StageInRegion { .. }
-            | Source::CapturedVertex(_)
-            | Source::CapturedBaseVertex(_)
-            | Source::Merged { .. } => loaded.push((p.param, USE_WORDS)),
-            Source::QuadPrimitive(_) => loaded.push((p.param, USE_WORDS + QUAD_PRIMITIVE_WORDS)),
-            Source::PixelCenter(_) | Source::LoopSample(_) | Source::AtLoopSample(_) => {
-                loaded.push((p.param, USE_WORDS + PIXEL_WORDS))
-            }
-            Source::Uniform(_) => loaded.push((p.param, USE_WORDS + UNIFORM_WORDS)),
-            // A read through an interpolation function (the call's own arithmetic is its
-            // strategy's).
-            Source::Interpolant { .. } => loaded.push((p.param, USE_WORDS + PIXEL_WORDS)),
-            Source::Pulled(r) => fetch_words = fetch_words.saturating_add(u64::from(r.words())),
-        }
-    }
-    let mut use_words = 0u64;
-    for inst in cx.body.insts.values() {
-        inst.kind.for_each_value(|v| {
-            if let Value::Arg(a) = v {
-                if let Some(&(_, words)) = loaded.iter().find(|(p, _)| *p == a.raw()) {
-                    use_words = use_words.saturating_add(words);
-                }
-            }
-        });
-    }
-    fetch_words.saturating_add(use_words)
 }

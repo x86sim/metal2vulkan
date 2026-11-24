@@ -383,11 +383,6 @@ impl Merged {
             } else {
                 false
             };
-        // A Vulkan 1.2 property (`VkPhysicalDeviceVulkan12Properties`, and the descriptor
-        // indexing structure it absorbed), so every description's version exposes it; a document
-        // that does not state it reads false, which holds it to the rule it gates.
-        desc.robust_buffer_access_update_after_bind =
-            p.bool("robustBufferAccessUpdateAfterBind")?;
         // `VkFormatProperties3` is core in 1.3 and the extension's before.
         desc.khr_format_feature_flags2 = self.extensions.contains("VK_KHR_format_feature_flags2");
         // `VK_EXT_device_generated_commands` where the document lists it with the EXT
@@ -717,11 +712,6 @@ fn limits(p: &Props<'_>, api: ApiVersion, extensions: &BTreeSet<String>) -> Resu
         };
     // The acceleration-structure limits exist where `VK_KHR_acceleration_structure` is exposed;
     // an omitted one there is the required minimum, 16.
-    // The sample-location properties exist where `VK_EXT_sample_locations` is exposed; elsewhere
-    // no count takes custom locations.
-    let sample_locations = Route::Ext(&["VK_EXT_sample_locations"], None).exposed(api, extensions);
-    // The provoking-vertex property exists where `VK_EXT_provoking_vertex` is exposed.
-    let provoking_vertex = Route::Ext(&["VK_EXT_provoking_vertex"], None).exposed(api, extensions);
     // The parallelogram property exists where `VK_KHR_maintenance5` is exposed.
     let maintenance5 = Route::Ext(&["VK_KHR_maintenance5"], Some(4)).exposed(api, extensions);
     let accel = Route::Ext(&["VK_KHR_acceleration_structure"], None).exposed(api, extensions);
@@ -760,16 +750,12 @@ fn limits(p: &Props<'_>, api: ApiVersion, extensions: &BTreeSet<String>) -> Resu
             .u32("maxDescriptorSetUpdateAfterBindSampledImages")?,
         max_descriptor_set_update_after_bind_storage_images: p
             .u32("maxDescriptorSetUpdateAfterBindStorageImages")?,
-        max_descriptor_set_update_after_bind_storage_buffers: p
-            .u32("maxDescriptorSetUpdateAfterBindStorageBuffers")?,
         max_per_stage_descriptor_update_after_bind_samplers: p
             .u32("maxPerStageDescriptorUpdateAfterBindSamplers")?,
         max_per_stage_descriptor_update_after_bind_sampled_images: p
             .u32("maxPerStageDescriptorUpdateAfterBindSampledImages")?,
         max_per_stage_descriptor_update_after_bind_storage_images: p
             .u32("maxPerStageDescriptorUpdateAfterBindStorageImages")?,
-        max_per_stage_descriptor_update_after_bind_storage_buffers: p
-            .u32("maxPerStageDescriptorUpdateAfterBindStorageBuffers")?,
         max_per_stage_update_after_bind_resources: p.u32("maxPerStageUpdateAfterBindResources")?,
         max_storage_buffer_range: p.u32("maxStorageBufferRange")?,
         max_uniform_buffer_range: p.u32("maxUniformBufferRange")?,
@@ -860,17 +846,6 @@ fn limits(p: &Props<'_>, api: ApiVersion, extensions: &BTreeSet<String>) -> Resu
         )?,
         independent_resolve_none: p.bool("independentResolveNone")?,
         independent_resolve: p.bool("independentResolve")?,
-        sample_location_sample_counts: if sample_locations {
-            p.flags_any(
-                &["sampleLocationSampleCounts"],
-                vk::SampleCountFlags::from_name,
-            )?
-        } else {
-            vk::SampleCountFlags::default()
-        },
-        variable_sample_locations: sample_locations && p.bool("variableSampleLocations")?,
-        provoking_vertex_mode_per_pipeline: provoking_vertex
-            && p.bool("provokingVertexModePerPipeline")?,
         mesh: if Route::Ext(&["VK_EXT_mesh_shader"], None).exposed(api, extensions) {
             mesh_limits(p)?
         } else {
@@ -947,7 +922,7 @@ fn float_controls(p: &Props<'_>) -> Result<FloatControls, Error> {
 
 /// The limits and subgroup properties every device of `version` guarantees, for the members the
 /// core reads: the Vulkan "Required Limits" table as transcribed by Vulkan-Profiles
-/// `VP_LUNARG_minimum_requirements_1_2` (the source of the committed `vk12-floor` profile), plus
+/// `VP_LUNARG_minimum_requirements_1_2` (the source of `below-floor/vk12-floor`), plus
 /// `maxBufferSize ≥ 2^30` from Vulkan 1.3. A Khronos *profile* document states only what it
 /// raises above its base version, so an omitted member means this value, never "unsupported".
 /// Device reports list every member and are not affected.
@@ -1327,8 +1302,6 @@ fn feature_route(structure: &str) -> Option<Route> {
 pub(super) const FEATURE_MEMBERS: &[(&str, VkFeature)] = {
     use VkFeature as F;
     &[
-        ("robustBufferAccess", F::RobustBufferAccess),
-        ("robustBufferAccess2", F::RobustBufferAccess2),
         ("robustImageAccess", F::RobustImageAccess),
         ("robustImageAccess2", F::RobustImageAccess2),
         ("nullDescriptor", F::NullDescriptor),

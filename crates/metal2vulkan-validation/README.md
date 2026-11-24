@@ -26,10 +26,7 @@ as tightly packed selected regions, not backend-specific row-pitched storage.
 | `corpus-pipeline` | Ask a Vulkan driver to create each translated pipeline, without dispatching |
 | `corpus-metal` | Qualify cases on Metal (`--device-type gpu`) |
 | `corpus-vulkan` | Run cases on a Vulkan device against their Metal observations (`--device-type cpu\|gpu`) |
-| `corpus-moltenvk` | The same through MoltenVK (macOS) |
-| `corpus-draw-ab` | Draw logged fragment functions through the runtime and compare two builds |
-| `command-replay` | Run a recorded stretch of Metal commands through the runtime |
-| `format-scout` | Drive every Metal pixel format through the runtime, one use at a time |
+| `command-replay` | Play a replay stream on a Vulkan device through the runtime, or print its calls |
 
 Each command's `--help` lists its options.
 
@@ -41,8 +38,8 @@ cargo nextest run -p metal2vulkan-validation --all-features
 
 That run opens no device. Tests that execute on a device compile only under `--cfg m2v_cpu_icd` (a
 CPU Vulkan ICD such as lavapipe) or `--cfg m2v_gpu` (a real GPU); see
-[docs/VALIDATION.md](../../docs/VALIDATION.md#device-tests-and-gpu-safety). MoltenVK execution is
-macOS-only; native Vulkan execution is Linux-only.
+[docs/VALIDATION.md](../../docs/VALIDATION.md#device-tests-and-gpu-safety). Vulkan execution is
+Linux-only.
 
 ## The corpus
 
@@ -137,11 +134,12 @@ payload a generated object function writes, need none. Nor does a mesh row whose
 vertex or primitive and writes no device memory: it has no effect a stage observes, so it draws
 without rasterization and its case observes the empty output (`"output": {"kind": "none"}`). The Metal oracle draws a case through
 `MTLMeshRenderPipelineDescriptor` and the case's own stage's setters. The engine's candidate
-draws it through the runtime's mesh render pipeline state and `draw_mesh_threadgroups` or
-`draw_mesh_threads`. On a device without `VK_EXT_mesh_shader` the runtime emulates the draw and
-announces `emulated-mesh-draws`. An object case's `threadgroup_memory` sets its arguments'
-lengths: the oracle's through `setObjectThreadgroupMemoryLength:atIndex:`, the candidate's
-through the runtime's `set_object_threadgroup_memory_length`.
+does not draw one: an object or mesh case requires `mesh_render_pipeline`, which no candidate
+runs, so its Metal observation stands with its Vulkan side unsupported. The authored compile
+census still compiles its mesh render pipeline, as the candidate would build it, on each
+profile: a `compiled` cell of an object or mesh case says the pipeline compiles, not that it draws
+as Metal does. An object case's
+`threadgroup_memory` sets its arguments' lengths through `setObjectThreadgroupMemoryLength:atIndex:`.
 
 Dynamic Metal `threadgroup` arguments are declared through `threadgroup_memory` binding/length
 pairs. Metal binds that exact allocation; Vulkan uses the translator's descriptor-free `Workgroup`
@@ -160,8 +158,8 @@ Custom fragment imageblocks use the distinct `fragment_imageblock` resource. Eac
 member is identified by its AIR `user(...)` semantic and carries an exact tightly packed `half`,
 `half4`, `uchar4`, or `ushort` plane; scalar `half` is the backward-compatible default format.
 `output.kind: fragment_imageblock` reads a selected plane region. The Metal runner uses same-pass
-initializer/resolver fragments, while Vulkan binds the matching reflected storage format under
-ordered fragment interlock.
+initializer/resolver fragments. On Vulkan the product refuses a fragment function that reads or
+writes an imageblock (`Unsupported{Imageblocks, NotImplemented}`), which is the case's answer.
 
 Textures nested in an `air.indirect_buffer` are authored through
 `argument_buffer_textures`, keyed by owning buffer binding plus field byte offset. Product

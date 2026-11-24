@@ -2,7 +2,7 @@
 //!
 //! - The committed memcpy/memset fixtures (buffer ↔ private arena, constant buffer → private arena
 //!   with a partial memset, threadgroup → threadgroup) compute their documented results on the CPU
-//!   interpreter and pass L3 on every profile, with robust descriptors and without.
+//!   interpreter and pass L3 on every profile.
 //! - A copy and a fill longer than the unroll threshold are counted loops (statically bounded)
 //!   and exact; `memmove` of overlapping ranges is exact.
 //! - Byte-aligned copies write only their bytes: the neighbours of the destination survive.
@@ -27,60 +27,50 @@ use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{Capability, Error, Feature, Unsupported};
-use crate::library::FunctionConstantValues;
-use crate::lower::select::{LowerInputs, Plan};
-use crate::pipeline::compile::{plan_bitcode, EntryRef};
+use crate::lower::select::Plan;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
+    PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
 };
 use crate::pipeline::testing::{
-    compile, fixtures_dir, link_and_validate, llvm_assemble, meter, profile, typed_module,
-    AssembleError,
+    compile, fixtures_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, InterpError, Order, Resources, TrapKind};
 use crate::spirv::ir::{GlobalKind, TypedModule};
+use crate::spirv::testing::zeroes_threadgroup_memory;
 
-const PROFILES: [&str; 5] = [
+const PROFILES: [&str; 4] = [
     "moltenvk-m3",
-    "lunarg-desktop-baseline-2023",
-    "vk12-floor",
+    "runtime-floor",
     "lavapipe",
     "nvidia-pascal-linux",
 ];
 
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
-/// Every profile of [`PROFILES`] as committed, and without buffer robustness (so containment is
-/// checked in the shader).
+/// Every profile of [`PROFILES`] as committed.
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in PROFILES {
-        out.push((
-            stem.to_owned(),
-            profile(stem, DevicePolicy::default()).expect("profile"),
-        ));
-        out.push((format!("{stem} unrobust"), variant(stem, true, false)));
-    }
-    out
+    PROFILES
+        .into_iter()
+        .map(|stem| {
+            let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
+            (stem.to_owned(), p)
+        })
+        .collect()
 }
 
-/// `stem` without buffer robustness (`unrobust`) and without `shaderInt64` (`no_int64`).
-fn variant(stem: &str, unrobust: bool, no_int64: bool) -> DeviceProfile {
+/// `stem`, without `shaderInt64` where `no_int64`.
+fn variant(stem: &str, no_int64: bool) -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    if unrobust {
-        desc.features.remove(&VkFeature::RobustBufferAccess);
-        desc.features.remove(&VkFeature::RobustBufferAccess2);
-    }
     if no_int64 {
         desc.features.remove(&VkFeature::ShaderInt64);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -122,26 +112,10 @@ fn fixture(name: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Compile entry `entry` of `bc` for `prof`, pass L3, and check that the plan's size estimate
-/// bounds the emitted words.
+/// Compile entry `entry` of `bc` for `prof` and pass L3.
 fn l3(bc: &[u8], entry: &str, prof: &DeviceProfile, what: &str) {
     let a = compile(bc, entry, prof).unwrap_or_else(|e| panic!("{what}: compile: {e}"));
     link_and_validate(&a, prof).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-    let plan = plan_bitcode(
-        bc,
-        EntryRef::Name(entry),
-        &FunctionConstantValues::defaults(),
-        prof,
-        &LowerInputs::new(),
-        &mut meter(),
-    )
-    .unwrap_or_else(|e| panic!("{what}: plan: {e}"));
-    let words = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= words,
-        "{what}: estimate {} < emitted {words}",
-        plan.estimate.words
-    );
 }
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
@@ -161,10 +135,7 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 /// `spec` besides the local size, and the blob when the plan reads one.
 fn resources(plan: &Plan, init: &[Vec<u8>], threads: u32, spec: &[(SpecKey, u64)]) -> Resources {
     let mut s = BTreeMap::new();
-    s.insert(SpecKey::LocalSize(Axis::X), u64::from(threads));
-    s.insert(SpecKey::LocalSize(Axis::Y), 1);
-    s.insert(SpecKey::LocalSize(Axis::Z), 1);
-    s.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    s.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     s.extend(spec.iter().copied());
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
@@ -345,7 +316,10 @@ fn threadgroup_record_copy_is_exact() {
         return;
     };
     let entry = "kernel_threadgroup_flat_leaf";
-    for (what, prof) in profiles() {
+    let profiles = profiles()
+        .into_iter()
+        .filter(|(_, p)| zeroes_threadgroup_memory(p));
+    for (what, prof) in profiles {
         l3(&bc, entry, &prof, &what);
         let (plan, m) = typed_module(&bc, entry, &prof).expect("module");
         assert_eq!(
@@ -814,20 +788,13 @@ declare void @llvm.memmove.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1
 /// loop runs thousands of words past every binding long before the limit stops it.
 const HUGE_STEPS: u64 = 1 << 18;
 
-/// Every profile of [`PROFILES`] with and without buffer robustness, as committed and without
-/// `shaderInt64`: `(what, profile, unrobust)`.
-fn int64_profiles() -> Vec<(String, DeviceProfile, bool)> {
+/// Every profile of [`PROFILES`] as committed and without `shaderInt64`.
+fn int64_profiles() -> Vec<(String, DeviceProfile)> {
     let mut out = Vec::new();
     for stem in PROFILES {
-        for unrobust in [false, true] {
-            for no_int64 in [false, true] {
-                let what = format!(
-                    "{stem}{}{}",
-                    if unrobust { " unrobust" } else { "" },
-                    if no_int64 { " no-int64" } else { "" }
-                );
-                out.push((what, variant(stem, unrobust, no_int64), unrobust));
-            }
+        for no_int64 in [false, true] {
+            let what = format!("{stem}{}", if no_int64 { " no-int64" } else { "" });
+            out.push((what, variant(stem, no_int64)));
         }
     }
     out
@@ -860,11 +827,10 @@ fn assert_huge_run_is_contained(m: &TypedModule, plan: &Plan, init: &[Vec<u8>], 
 
 /// `memcpy`, `memset`, and directed `memmove`s (forward within one buffer, and backward over an
 /// overlap) of `i64` lengths loaded from a buffer are exact for several lengths on every profile
-/// with `shaderInt64`, in both containment encodings. A length of 2³² or more counts as `u32::MAX`
-/// bytes, and on the in-shader encoding (which the interpreter executes; it traps on any access
-/// outside a binding) every access its loop makes is contained until the interpreter's step limit
-/// stops the run (no execution bound does). Without `shaderInt64` the length is two words, whose
-/// nonzero high word saturates the same way.
+/// with `shaderInt64`. A length of 2³² or more counts as `u32::MAX` bytes, and every access its
+/// loop makes is contained (the interpreter traps on any access outside a binding) until the
+/// interpreter's step limit stops the run (no execution bound does). Without `shaderInt64` the
+/// length is two words, whose nonzero high word saturates the same way.
 #[test]
 fn i64_lengths_are_exact_and_contained() {
     let Some(bc) = assemble("wide", WIDE) else {
@@ -874,7 +840,7 @@ fn i64_lengths_are_exact_and_contained() {
     let src: Vec<u8> = (0..1728u32).map(|i| (i * 7 + 3) as u8).collect();
     let dst: Vec<u8> = vec![0x11; 1024];
     let (mut two_words, mut contained) = (0, 0);
-    for (what, prof, unrobust) in int64_profiles() {
+    for (what, prof) in int64_profiles() {
         two_words += u32::from(!prof.fields().leaf.int64);
         l3(&bc, "wide", &prof, &what);
         let (plan, m) = typed_module(&bc, "wide", &prof).expect("module");
@@ -899,11 +865,6 @@ fn i64_lengths_are_exact_and_contained() {
             assert_eq!(out[1], moved, "{what} {n} {mm} {k} {j}: memmove");
             assert_eq!(out[0], want, "{what} {n} {mm} {k} {j}: dst");
         }
-        if !unrobust {
-            // Robust descriptors contain the huge copies in hardware, which the interpreter does
-            // not model; the in-shader encoding below is the executed evidence.
-            continue;
-        }
         // One huge length per run, each call's loop in turn.
         for huge in 0..4 {
             let mut l = [0u64; 4];
@@ -919,8 +880,8 @@ fn i64_lengths_are_exact_and_contained() {
 
 /// `i64` lengths that are a `uint` count scaled by `shl` (the length Metal emits for `count *
 /// sizeof(uint)`) are exact for counts below 2³⁰; a count of 2³⁰ or more makes the scaled length
-/// 2³² or more, which counts as `u32::MAX` bytes whose every access is contained on the in-shader
-/// encoding, with `shaderInt64` and as two words without it.
+/// 2³² or more, which counts as `u32::MAX` bytes whose every access is contained, with `shaderInt64`
+/// and as two words without it.
 #[test]
 fn scaled_i64_counts_are_exact_and_contained() {
     let Some(bc) = assemble("wide_count", WIDE_COUNT) else {
@@ -929,7 +890,7 @@ fn scaled_i64_counts_are_exact_and_contained() {
     let src: Vec<u8> = (0..1728u32).map(|i| (i * 5 + 1) as u8).collect();
     let dst: Vec<u8> = vec![0x22; 1024];
     let (mut two_words, mut contained) = (0, 0);
-    for (what, prof, unrobust) in int64_profiles() {
+    for (what, prof) in int64_profiles() {
         two_words += u32::from(!prof.fields().leaf.int64);
         l3(&bc, "wide_count", &prof, &what);
         let (plan, m) = typed_module(&bc, "wide_count", &prof).expect("module");
@@ -945,9 +906,6 @@ fn scaled_i64_counts_are_exact_and_contained() {
             assert_eq!(out[0], want, "{what} {x}: dst");
             assert_eq!(out[1], moved, "{what} {x}: memmove");
         }
-        if !unrobust {
-            continue;
-        }
         // 4 * (2^30 + 1) = 2^32 + 4: the memcpy counts u32::MAX bytes.
         let init = [dst.clone(), src.clone(), to_bytes(&[(1 << 30) + 1])];
         assert_huge_run_is_contained(&m, &plan, &init, &format!("{what} huge"));
@@ -960,9 +918,8 @@ fn scaled_i64_counts_are_exact_and_contained() {
 /// runtime `ulong` length between word-aligned buffers, then a `__builtin_memset` of a `uint` count
 /// widened to `i64`) is exact on every profile, with `shaderInt64` and without it, where each `i64`
 /// length is two words. The lengths have a high word of 0 and run the tail bytes alone, whole words
-/// alone, and both. A copy length with a nonzero high word (2³² + 5) counts `u32::MAX` bytes: on
-/// the in-shader encoding every access its loop makes is contained until the interpreter's step
-/// limit stops the run.
+/// alone, and both. A copy length with a nonzero high word (2³² + 5) counts `u32::MAX` bytes: every
+/// access its loop makes is contained until the interpreter's step limit stops the run.
 #[test]
 fn a_runtime_ulong_length_is_exact_in_two_words() {
     let entry = "kernel_copy_runtime_ulong_length";
@@ -979,7 +936,7 @@ fn a_runtime_ulong_length_is_exact_in_two_words() {
         b
     };
     let (mut two_words, mut contained) = (0, 0);
-    for (what, prof, unrobust) in int64_profiles() {
+    for (what, prof) in int64_profiles() {
         two_words += u32::from(!prof.fields().leaf.int64);
         l3(&bc, entry, &prof, &what);
         let (plan, m) = typed_module(&bc, entry, &prof).expect("module");
@@ -1002,11 +959,6 @@ fn a_runtime_ulong_length_is_exact_in_two_words() {
             want[512..512 + fill as usize].fill(0x5a);
             assert_eq!(out[1], want, "{case}: dst");
             assert_eq!(out[0], src, "{case}: src");
-        }
-        if !unrobust {
-            // Robust descriptors contain the huge copy in hardware, which the interpreter does
-            // not model; the in-shader encoding is the executed evidence.
-            continue;
         }
         let init = [src.clone(), dst.clone(), lengths((1 << 32) + 5, 7)];
         assert_huge_run_is_contained(&m, &plan, &init, &format!("{what} huge"));

@@ -6,7 +6,7 @@ use crate::spirv::builder::ops::{err, index};
 use crate::spirv::error::{BResult, BuildError, ControlRule, OperandRule};
 use crate::spirv::ids::{FuncId, TypeId, Value};
 use crate::spirv::ir::{
-    natural_layout, ConvOp, Inst, LayoutRule, Shape, StorageClass, Type, ValueOrigin,
+    natural_layout, ConvOp, Inst, LayoutRule, Shape, StorageClass, StructLayout, Type, ValueOrigin,
 };
 
 impl FunctionBuilder<'_> {
@@ -23,13 +23,14 @@ impl FunctionBuilder<'_> {
     /// kind's non-uniform indexing capability and feature. `base` must point to a `UniformConstant`
     /// array of images (not subpass data) or samplers, or a `StorageBuffer` array of blocks. The
     /// serializer decorates `NonUniform` the result and every value that carries the element to the
-    /// instruction consuming it (VUID-RuntimeSpirv-NonUniform-06274): a load of an image or sampler
-    /// element, an image texel pointer to it, a sampled image of a loaded element, the image of
-    /// such a sampled image, and a further access chain into a block element, which a load, a
-    /// store, an atomic, or `OpArrayLength` then reads through. The builder refuses every other use
-    /// of those values that would carry the element on (a phi, select, copy, store, composite part,
-    /// or call argument), and an image or sampler element is not indexable further. A value loaded
-    /// from a block element is data, which carries no element.
+    /// instruction consuming it (VUID-RuntimeSpirv-None-10148 and
+    /// VUID-RuntimeSpirv-subgroupSize-10149): a load of an image or sampler element, an image texel
+    /// pointer to it, a sampled image of a loaded element, the image of such a sampled image, and a
+    /// further access chain into a block element, which a load, a store, an atomic, or
+    /// `OpArrayLength` then reads through. The builder refuses every other use of those values that
+    /// would carry the element on (a phi, select, copy, store, composite part, or call argument),
+    /// and an image or sampler element is not indexable further. A value loaded from a block
+    /// element is data, which carries no element.
     pub fn access_chain_non_uniform(&mut self, base: Value, index: Value) -> BResult<Value> {
         const OP: crate::spv::Op = crate::spv::Op::AccessChain;
         let (class, pointee, f) = self.pointer(OP, base)?;
@@ -124,13 +125,27 @@ impl FunctionBuilder<'_> {
     /// from here. The block takes the pointee's own layout rule, at most std430, so it needs no
     /// layout feature the pointee does not.
     pub fn device_place(&mut self, addr: Value, pointee: TypeId) -> BResult<Value> {
+        self.place_at(addr, pointee, false)
+    }
+
+    /// [`device_place`](Self::device_place) for memory nothing writes while the module runs: its
+    /// block's member is `NonWritable`, so the device may read it as read-only memory (RADV reads a
+    /// uniform address of it with a scalar load). Only loads go through it.
+    pub fn device_place_read_only(&mut self, addr: Value, pointee: TypeId) -> BResult<Value> {
+        self.place_at(addr, pointee, true)
+    }
+
+    fn place_at(&mut self, addr: Value, pointee: TypeId, non_writable: bool) -> BResult<Value> {
         let rule = self
             .mb()
             .types()
             .facts(pointee)?
             .max_rule()
             .min(LayoutRule::Std430);
-        let layout = natural_layout(self.mb().types(), rule, true, &[pointee])?;
+        let layout = StructLayout {
+            non_writable,
+            ..natural_layout(self.mb().types(), rule, true, &[pointee])?
+        };
         let block = self.module().ty(Type::Struct {
             members: [pointee].into(),
             layout: Some(layout),

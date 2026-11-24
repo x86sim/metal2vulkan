@@ -2,7 +2,7 @@
 //!
 //! The result is what the physical device **supports**. A description must record what the
 //! consumer **enables** (`device::description`), so the consumer removes every feature and
-//! extension it does not enable at `vkCreateDevice` before calling `Device::new`.
+//! extension it does not enable at `vkCreateDevice` before calling `Device::from_queries`.
 //!
 //! Which structures are chained follows the same exposure rule as the Khronos JSON reader
 //! (`device::khronos`), at the **effective** API version `min(instance, device)` (the Vulkan
@@ -411,7 +411,6 @@ const EXT_LIST_RESTART: &[&str] = &["VK_EXT_primitive_topology_list_restart"];
 const EXT_PROVOKING_VERTEX: &[&str] = &["VK_EXT_provoking_vertex"];
 const EXT_LINE_RASTERIZATION: &[&str] = &["VK_EXT_line_rasterization", "VK_KHR_line_rasterization"];
 const EXT_MULTI_DRAW: &[&str] = &["VK_EXT_multi_draw"];
-const EXT_SAMPLE_LOCATIONS: &[&str] = &["VK_EXT_sample_locations"];
 const EXT_RAY_QUERY: &[&str] = &["VK_KHR_ray_query"];
 const EXT_ACCELERATION_STRUCTURE: &[&str] = &["VK_KHR_acceleration_structure"];
 const EXT_PORTABILITY_SUBSET: &[&str] = &["VK_KHR_portability_subset"];
@@ -625,8 +624,6 @@ macro_rules! v13_or {
 }
 
 feature_sources! { c, x;
-    RobustBufferAccess => on(c.core.robust_buffer_access);
-    RobustBufferAccess2 => on(c.robustness2.robust_buffer_access2);
     RobustImageAccess => v13_or!(c.robust_image_access, image_robustness.robust_image_access);
     RobustImageAccess2 => on(c.robustness2.robust_image_access2);
     NullDescriptor => on(c.robustness2.null_descriptor);
@@ -857,9 +854,7 @@ struct PropertyChain {
     maintenance10: Maintenance10Properties,
     acceleration_structure: avk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     generated_commands: GeneratedCommandsProperties,
-    sample_locations: avk::PhysicalDeviceSampleLocationsPropertiesEXT<'static>,
     mesh_shader: avk::PhysicalDeviceMeshShaderPropertiesEXT<'static>,
-    provoking_vertex: avk::PhysicalDeviceProvokingVertexPropertiesEXT<'static>,
     maintenance5: avk::PhysicalDeviceMaintenance5PropertiesKHR<'static>,
 }
 
@@ -876,9 +871,7 @@ struct PropertiesChained {
     maintenance10: bool,
     acceleration_structure: bool,
     generated_commands: bool,
-    sample_locations: bool,
     mesh_shader: bool,
-    provoking_vertex: bool,
     maintenance5: bool,
 }
 
@@ -897,9 +890,7 @@ impl PropertiesChained {
             maintenance10: x.ext(&["VK_KHR_maintenance10"]),
             acceleration_structure: x.ext(EXT_ACCELERATION_STRUCTURE),
             generated_commands: x.ext(EXT_GENERATED_COMMANDS),
-            sample_locations: x.ext(EXT_SAMPLE_LOCATIONS),
             mesh_shader: x.ext(EXT_MESH_SHADER),
-            provoking_vertex: x.ext(EXT_PROVOKING_VERTEX),
             maintenance5: x.promoted(EXT_MAINTENANCE5, Some(4)),
         }
     }
@@ -938,9 +929,7 @@ impl PropertyChain {
                 maintenance10,
                 acceleration_structure,
                 generated_commands,
-                sample_locations,
                 mesh_shader,
-                provoking_vertex,
                 maintenance5
             );
             // SAFETY: as in `FeatureChain::query`.
@@ -957,12 +946,12 @@ impl DeviceDescription {
     /// limits and properties the core consumes, and the format properties of exactly
     /// [`FormatSupport::queries_for`] its version and available extensions.
     ///
-    /// The result describes what the device **supports**; remove what the consumer does not
-    /// enable before `Device::new`. `instance_api_version` is the `VkApplicationInfo::apiVersion`
+    /// The result describes what the device **supports**; remove what the consumer does not enable
+    /// before `Device::from_queries`. `instance_api_version` is the `VkApplicationInfo::apiVersion`
     /// the instance was created with (e.g. `vk::ApiVersion::from_packed(app_info.api_version)`):
     /// the Vulkan spec limits the device's core functionality to `min(instance, device)` version,
-    /// so the description's `api_version`, the structures chained, and every feature sourced from
-    /// a core version follow that minimum, never the device's own version alone. Only the
+    /// so the description's `api_version`, the structures chained, and every feature sourced from a
+    /// core version follow that minimum, never the device's own version alone. Only the
     /// physical-device query entry points are called; nothing is created and no device is opened.
     ///
     /// Errors: an effective version below Vulkan 1.2 is `Unsupported{VulkanVersion}` (nothing
@@ -1060,8 +1049,6 @@ impl DeviceDescription {
                     vk::ShaderStageFlags::from_raw(g.supported_stages_pipeline_binding.as_raw()),
                 )
             });
-        desc.robust_buffer_access_update_after_bind =
-            on(properties.v12.robust_buffer_access_update_after_bind);
         // No query reports where the driver departs from the specifications; the driver and
         // its release decide it, measured (`device::driver_facts`). `VkFormatProperties3` where the
         // effective version or an available extension has it, whose storage-without-format bits
@@ -1212,16 +1199,12 @@ fn limits(l: &avk::PhysicalDeviceLimits, p: &PropertyChain, chained: &Properties
             .max_descriptor_set_update_after_bind_sampled_images,
         max_descriptor_set_update_after_bind_storage_images: v12
             .max_descriptor_set_update_after_bind_storage_images,
-        max_descriptor_set_update_after_bind_storage_buffers: v12
-            .max_descriptor_set_update_after_bind_storage_buffers,
         max_per_stage_descriptor_update_after_bind_samplers: v12
             .max_per_stage_descriptor_update_after_bind_samplers,
         max_per_stage_descriptor_update_after_bind_sampled_images: v12
             .max_per_stage_descriptor_update_after_bind_sampled_images,
         max_per_stage_descriptor_update_after_bind_storage_images: v12
             .max_per_stage_descriptor_update_after_bind_storage_images,
-        max_per_stage_descriptor_update_after_bind_storage_buffers: v12
-            .max_per_stage_descriptor_update_after_bind_storage_buffers,
         max_per_stage_update_after_bind_resources: v12.max_per_stage_update_after_bind_resources,
         max_storage_buffer_range: l.max_storage_buffer_range,
         max_uniform_buffer_range: l.max_uniform_buffer_range,
@@ -1320,15 +1303,6 @@ fn limits(l: &avk::PhysicalDeviceLimits, p: &PropertyChain, chained: &Properties
         ),
         independent_resolve_none: on(v12.independent_resolve_none),
         independent_resolve: on(v12.independent_resolve),
-        // Zero where `VK_EXT_sample_locations` is not listed (the structure is not chained).
-        sample_location_sample_counts: vk::SampleCountFlags::from_raw(
-            p.sample_locations.sample_location_sample_counts.as_raw(),
-        ),
-        variable_sample_locations: on(p.sample_locations.variable_sample_locations),
-        // `false` where `VK_EXT_provoking_vertex` is not listed (the structure is not chained).
-        provoking_vertex_mode_per_pipeline: on(p
-            .provoking_vertex
-            .provoking_vertex_mode_per_pipeline),
         // Zero where `VK_EXT_mesh_shader` is not listed (the structure is not chained).
         mesh: mesh_limits(&p.mesh_shader),
         max_point_size: crate::device::whole_point_size(l.point_size_range[1]),

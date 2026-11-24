@@ -39,6 +39,7 @@ fn plan(scope: GroupScope, op: GroupOp, form: Form, konst: Option<u32>) -> Group
         arith: combine(op, form, Some(Sign::Signed)).expect("combine"),
         konst,
         quad_instructions: true,
+        helpers: false,
     }
 }
 
@@ -50,14 +51,25 @@ fn without_quads(g: GroupPlan) -> GroupPlan {
     }
 }
 
+/// `plan` in a fragment function, whose quads hold helpers.
+fn in_fragment(g: GroupPlan) -> GroupPlan {
+    GroupPlan {
+        quad_instructions: false,
+        helpers: true,
+        ..g
+    }
+}
+
 /// The classes each operation needs follow the SPIR-V the tier emits: a `Direct` vote is
 /// `OpGroupNonUniformAll` (vote), a `Cluster32` one a ballot word; a `Direct` reduction or product
 /// is arithmetic, a `Cluster32` one clustered; a `Cluster32` prefix sum or product is ballot and
 /// shuffles; a rotate up is a shuffle; a quad broadcast or shuffle-xor by a constant is the quad
-/// class where the stage takes quad instructions and a shuffle elsewhere.
+/// class where the stage takes quad instructions and a shuffle elsewhere; every fragment quad
+/// operation is the quad class, but a fill by a constant modulo whose segment is wider than the
+/// quad (8 lanes for a modulo of 8), a shuffle.
 #[test]
 fn operation_classes_follow_the_tier() {
-    let cases: [(GroupPlan, OpBits, OpBits); 21] = [
+    let cases: [(GroupPlan, OpBits, OpBits); 34] = [
         (
             plan(S::Simdgroup, G::Shuffle, F32, None),
             OpBits::SHUFFLE,
@@ -162,6 +174,71 @@ fn operation_classes_follow_the_tier() {
             plan(S::Quad, G::All, BOOL, None),
             OpBits::BALLOT,
             OpBits::BALLOT,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Sum, F32, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Xor, LANE_FORM, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::All, BOOL, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Any, BOOL, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::PrefixInclusiveSum, F32, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::BroadcastFirst, F32, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Ballot, LANE_FORM, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::ActiveThreadsMask, LANE_FORM, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::IsFirst, BOOL, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Shuffle, F32, None)),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::Broadcast, F32, Some(1))),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::ShuffleAndFillDown, F32, Some(4))),
+            OpBits::QUAD,
+            OpBits::QUAD,
+        ),
+        (
+            in_fragment(plan(S::Quad, G::ShuffleAndFillUp, F32, Some(8))),
+            OpBits::SHUFFLE,
+            OpBits::SHUFFLE,
         ),
     ];
     for (g, d, c) in cases {

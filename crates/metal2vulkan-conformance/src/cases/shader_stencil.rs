@@ -6,8 +6,8 @@
 //! its fixed-function stencil test the way Metal does, under a state whose two faces disagree and
 //! whose masks are not all ones.
 //!
-//! The pass, as the probe this ports drew it: a 4 by 1 `Stencil8` target whose stencil starts at
-//! `0x40`, the encoder's stencil reference `0x99`, and three draws of the fullscreen triangle:
+//! The pass, as the probe drew it: a 4 by 1 `Stencil8` target whose stencil starts at `0x40`, the
+//! encoder's stencil reference `0x99`, and three draws of the fullscreen triangle:
 //!
 //! 1. `stx_stencil`'s `stx_stencil_by_pixel`, which returns word `x` of a buffer, under both faces
 //!    `Always` and `Replace`: the stencil becomes each pixel's output.
@@ -28,15 +28,13 @@
 //!
 //! The expectation is **computed, not copied**: the module's `metal_rule` test applies
 //! Metal's own stencil rules — compare under the read mask, pick the failure or pass operation,
-//! write the result under the write mask — to the three draws, and checks the answer against the
-//! table the runtime lane carries. The lane's table was measured on an M4, a machine this project
-//! no longer has, so record mode measures the same pass on the oracle for the first time; the rule
-//! is what says whether the two agree for a reason.
+//! write the result under the write mask — to the three draws, and checks the answer against a
+//! table measured on an Apple M4 under macOS 27.0.1. Record mode measures the same pass on the
+//! oracle; the rule is what says whether the two agree for a reason.
 //!
 //! Nothing here can fault a GPU: two render passes of three triangles each over a 4 by 1 target,
 //! no loop in either fixture, and one blit of four bytes.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -47,9 +45,9 @@ use crate::render::{
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::LoadAction;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::metal::{CompareFunction, PixelFormat, StencilOperation};
-use metal2vulkan_runtime::{Degradation, LoadAction};
 
 /// The fixture the vertex function comes from: Metal's fullscreen triangle at a depth its vertex
 /// buffer holds.
@@ -94,7 +92,7 @@ fn output_bytes(outputs: [u32; 4]) -> Vec<u8> {
     outputs.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-/// The target: a private `Stencil8` render target a shader may also read, as the lane makes its.
+/// The target: a private `Stencil8` render target a shader may also read.
 fn target_spec() -> TargetSpec {
     TargetSpec::read(FORMAT, [WIDTH, 1])
 }
@@ -236,24 +234,6 @@ impl Case for ShaderStencil {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Exact: every stencil byte Metal leaves is a byte we must leave. A device without
-        // `VK_EXT_shader_stencil_export` runs the shader-side stencil instead, which is a route
-        // and not a difference -- it must still answer Metal's bytes, so it gets no loosening
-        // here. The route is **declared** rather than loosened, which is what lets the case be
-        // read on a device that takes it.
-        //
-        // All three were measured firing for both rows on the RTX 5080: the shader-side stencil
-        // itself (`shader-side-stencil`), the render pass that route splits
-        // (`render-pass-split`), and the `Shared` buffer the pass reads its stencil back through
-        // ([`crate::replay::shared_memory_notice`]).
-        vec![
-            crate::replay::notice_allowance(Degradation::ShaderSideStencil.code()),
-            crate::replay::notice_allowance(Degradation::RenderPassSplit.code()),
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -457,11 +437,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Metal's stencil after the three draws, by pixel, as
-    /// `runtime_lane::shader_stencil::METAL` carries it. The lane measured it on an **M4** with
-    /// macOS 27.0.1, a machine this project no longer has, so it is a cross-check of the rule
-    /// below and never a stand-in for the recording.
-    const LANE: [u8; 4] = [0x01, 0xa1, 0x00, 0x01];
+    /// Metal's stencil after the three draws, by pixel, as measured on an **M4** with macOS
+    /// 27.0.1: a cross-check of the rule below and never a stand-in for the recording.
+    const M4_STENCIL: [u8; 4] = [0x01, 0xa1, 0x00, 0x01];
 
     /// Metal's stencil rule for one pixel under one face: the reference and the stored value are
     /// compared under the read mask, the failure or pass operation gives the new value, and only
@@ -525,12 +503,12 @@ mod tests {
     }
 
     /// Metal's rules, applied to the three draws with the triangle back-facing, give exactly the
-    /// bytes the runtime lane measured on Metal. That is the case's expectation earning its place:
+    /// bytes measured on Metal on an Apple M4. That is the case's expectation earning its place:
     /// the table is not copied into the case, it is derived, and the derivation agrees with the
     /// measurement.
     #[test]
     fn metal_rule() {
-        assert_eq!(by_the_rule(true), LANE);
+        assert_eq!(by_the_rule(true), M4_STENCIL);
     }
 
     /// The two faces are genuinely different questions: had the triangle been front-facing, draw 3
@@ -542,7 +520,7 @@ mod tests {
         assert_eq!(front, [0x11, 0x51, 0x40, 0x41]);
         for pixel in 0..4 {
             assert_ne!(
-                front[pixel], LANE[pixel],
+                front[pixel], M4_STENCIL[pixel],
                 "pixel {pixel} answers the same either way"
             );
         }
@@ -560,7 +538,7 @@ mod tests {
                 *value = stencil_step(*value, REFERENCE as u8, &state.back_face_stencil);
             }
         }
-        assert_ne!(stencil, LANE);
+        assert_ne!(stencil, M4_STENCIL);
     }
 
     /// The case's bookkeeping holds: two rows of distinct names, the layout covers the four

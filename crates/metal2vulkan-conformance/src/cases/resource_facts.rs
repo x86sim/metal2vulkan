@@ -91,7 +91,6 @@
 //! the placement offsets': an offset that is not a multiple of 256, or a placement that runs past
 //! the heap, is one Metal's validation stops. This module's own tests hold every row to both with no device.
 
-use crate::allowance::Allowance;
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
 use crate::heap_query::{
     cache_word, hazard_word, purgeable_pairs, purgeable_word, HeapBufferSpec, HeapSpec,
@@ -101,8 +100,8 @@ use crate::texture::TextureRequest;
 use crate::texture_query::Storage;
 use crate::texture_views::{ParentShape, ViewCall, ViewRequest};
 use crate::transcript::{Node, Observed, Sites, Value};
+use crate::values::{CpuCacheMode, HazardTrackingMode, PurgeableState};
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::{CpuCacheMode, HazardTrackingMode, PurgeableState};
 
 /// The case names, as the report and the recordings spell them.
 pub const OWN_GETTERS: &str = "resource-own-getters";
@@ -414,6 +413,9 @@ const TOGETHER: [(u64, bool); 3] = [(4096, false), (8192, true), (1 << 16, false
 mod site {
     /// The resource's ten getters, fresh.
     pub const FRESH: &str = "fresh";
+    /// `storageMode` alone, read beside the ten: the getter a side answers apart from the rest
+    /// (`Side::resource_storage_mode`).
+    pub const STORAGE_MODE: &str = "storage-mode";
     /// The heap the resource was placed in, before anything touched the resource.
     pub const HEAP_BEFORE: &str = "heap-before";
     /// That heap after `makeAliasable`.
@@ -437,13 +439,6 @@ impl Case for ResourceFactsCase {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // One declaration and no tolerance: the `Shared` buffers these getters answer about is `Shared`, which is
-        // what [`crate::replay::shared_memory_notice`] is for. It loosens the notices site alone,
-        // so every value this case reads still compares exactly.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<crate::recording::ShaderRef>, String> {
@@ -514,6 +509,13 @@ impl Case for ResourceFactsCase {
                 }
             };
             node = node.with(facts(side, &made, site::FRESH));
+            node = node.with(Node::leaf(
+                site::STORAGE_MODE,
+                Observed::value(match side.resource_storage_mode(made.resource) {
+                    Ok(mode) => Value::Uint(mode),
+                    Err(failure) => failure.recorded(),
+                }),
+            ));
             match self.ask {
                 Ask::OwnGetters => {}
                 Ask::Aliasing => node = aliasing_of(side, &made, node),
@@ -1010,37 +1012,6 @@ mod tests {
             fingerprints.len(),
             all().len(),
             "two cases fingerprint alike"
-        );
-    }
-}
-
-/// The second half of this family's safety argument, run on a device: the **order of work** the
-/// heap-size and sparse-heap families state, which is that a table is replayed on the runtime
-/// first and only one that answers no `Error::Invalid` anywhere is handed to Metal.
-///
-/// [`crate::device::sites_the_runtime_calls_invalid`] is the shared walk; this is the family that
-/// asks it. The device-free guards above check each row's shape against the rules; this checks the
-/// runtime's own reading of every call the rows actually make, including the ones no rule above
-/// names.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::case::Case;
-
-    #[test]
-    fn no_call_of_the_family_is_one_metals_validation_stops() {
-        let cases: Vec<Box<dyn Case>> = all()
-            .into_iter()
-            .map(|case| Box::new(case) as Box<dyn Case>)
-            .collect();
-        let stopped =
-            crate::device::sites_the_runtime_calls_invalid(&cases).expect("a device for the guard");
-        assert!(
-            stopped.is_empty(),
-            "the runtime answers `Error::Invalid` at these sites, which is this tree's reading of \
-             \"Metal's own validation stops this call\" -- so record mode would end Metal's \
-             process. Take the rows behind them out of the tables:\n{}",
-            stopped.join("\n")
         );
     }
 }

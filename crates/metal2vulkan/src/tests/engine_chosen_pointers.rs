@@ -32,13 +32,14 @@ use crate::library::FunctionConstantValues;
 use crate::lower::select::LowerInputs;
 use crate::pipeline::compile::{compile_bitcode_linked, EntryRef, LinkedSource};
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     engine_dir, link_and_validate, llvm_assemble, meter, profile, typed_module_linked_with,
     AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::testing::committed_profiles;
+use crate::spirv::testing::refuses_threadgroup_memory;
 
 const CALLER: &str = "fpc_chosen_pointers";
 const FUNCTIONS: &str = "fpc_pointer_functions";
@@ -153,12 +154,7 @@ fn dispatch(
         }
     }
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
-    let spec = BTreeMap::from([
-        (SpecKey::LocalSize(Axis::X), u64::from(N)),
-        (SpecKey::LocalSize(Axis::Y), 1),
-        (SpecKey::LocalSize(Axis::Z), 1),
-        (SpecKey::FlatLocalSize, u64::from(N)),
-    ]);
+    let spec = BTreeMap::from(crate::pipeline::threadgroup_constants([N, 1, 1]));
     let res = Resources {
         buffers: buffers
             .iter()
@@ -265,8 +261,11 @@ fn chosen_pointer_kernels_validate_on_every_profile() {
     };
     for (stem, p) in committed_profiles().expect("profiles") {
         for kernel in SHAPES.iter().map(|&(k, _)| k).chain(OTHERS) {
-            let a = compile(&fx, kernel, linked_names(kernel), 1, &p)
-                .unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
+            let a = match compile(&fx, kernel, linked_names(kernel), 1, &p) {
+                // A profile without zeroed workgroup memory takes no threadgroup memory.
+                Err(e) if refuses_threadgroup_memory(&e, &p) => continue,
+                a => a.unwrap_or_else(|e| panic!("{stem} {kernel}: {e}")),
+            };
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: L3: {e}"));
         }
     }
@@ -280,7 +279,7 @@ fn pointers_chosen_at_run_time_call_the_functions_they_hold() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     for (kernel, want) in SHAPES {
         let out = dispatch(&fx, kernel, 1, &p, &[(0, zeros()), (1, zeros())]);
         let all: Vec<u32> = (0..N).map(want).collect();
@@ -303,7 +302,7 @@ fn a_pointer_through_an_integer_is_its_word() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let out = dispatch(&fx, "fpc_int_back", 1, &p, &[(0, zeros()), (1, zeros())]);
     let all: Vec<u32> = (0..N)
         .map(|t| if t & 1 != 0 { dbl(t) } else { inc(t) })
@@ -327,7 +326,7 @@ fn table_entries_and_addresses_call_and_compare_alike() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let mut table = FunctionTableWords::new(3);
     let lib = crate::library::Library::from_air(&fx.1).expect("library");
     let linked = LINKED
@@ -368,7 +367,7 @@ fn recursion_through_chosen_pointers_reaches_metal_s_depth() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     for k in [1, 2, 4, 8] {
         let (calls, reach) = (2 * k, 2 * k - 1);
         let depths: Vec<u8> = (0..N).flat_map(|t| (t / 2).to_le_bytes()).collect();
@@ -394,7 +393,7 @@ fn an_unlinked_function_s_address_needs_it() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let needs = |symbol: &str| {
         Err(Error::NeedsInput(RuntimeInput::LinkedFunction {
             symbol: DiagName::new(symbol),
@@ -418,7 +417,7 @@ fn the_recursion_s_stack_is_refused_where_metal_s_is() {
     let Some(fx) = fixtures() else {
         return;
     };
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let refused = Err(Error::LimitExceeded(Limit::CallStackBytes));
     let names = &LINKED[3..];
     assert_eq!(

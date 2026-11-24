@@ -1,14 +1,14 @@
 //! The authored compile census through real compile workers: `corpus-triage --audit
 //! authored-compile` serves the compile worker, compiles a committed public case's executor request
-//! in it, blesses, adds the committed C3 venues' profile-legs with an additions bless, reruns warm
+//! in it, blesses, adds the committed C3 venues' profiles with an additions bless, reruns warm
 //! with no compile, and fails on a difference from the expectations, which an additions bless
 //! refuses to write; a worker that stops is a failed cell. The case is copied into an owned scratch
 //! corpus; nothing is read from the developer's private corpus or index.
 
 use metal2vulkan_devtools::{engine_dir, llvm_assemble, AssembleError};
 use metal2vulkan_validation::authored_compile::{
-    expectations_path, run, venue_legs, ArtifactBuild, Cell, CellOutcome, Expectations,
-    FailureClass, Mode, Options, ProfileLeg, WorkerCompiler,
+    expectations_path, run, venue_profiles, ArtifactBuild, Cell, CellOutcome, Expectations,
+    FailureClass, Mode, Options, ProfileStem, WorkerCompiler,
 };
 use metal2vulkan_validation::c3::Venues;
 use metal2vulkan_validation::store::CorpusStore;
@@ -92,7 +92,7 @@ fn the_census_compiles_blesses_reruns_warm_and_fails_on_a_difference() {
         .unwrap();
     assert_eq!(
         expected.cases.values().collect::<Vec<_>>(),
-        vec![&vec![Cell::covered(CellOutcome::Compiled)]]
+        vec![&vec![Cell::bare(CellOutcome::Compiled)]]
     );
 
     // Nothing changed: no case is admitted, no compile runs.
@@ -102,35 +102,35 @@ fn the_census_compiles_blesses_reruns_warm_and_fails_on_a_difference() {
     assert_eq!(summary(&output, "selected_cells"), "0", "{output}");
     assert_eq!(summary(&output, "cached_cells"), "1", "{output}");
 
-    // An additions bless adds every committed C3 venue's profile-leg the file lacks, compiling
+    // An additions bless adds every committed C3 venue's profile the file lacks, compiling
     // only their cells; run again, it changes nothing.
-    let mut legs = vec![ProfileLeg::parse("lavapipe").unwrap()];
-    for leg in venue_legs(&Venues::load(&Venues::committed_path()).unwrap()) {
-        if !legs.contains(&leg) {
-            legs.push(leg);
+    let mut profiles = vec![ProfileStem::parse("lavapipe").unwrap()];
+    for profile in venue_profiles(&Venues::load(&Venues::committed_path()).unwrap()) {
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
         }
     }
     let (ok, output) = triage(root, &["--bless-additions"]);
     assert!(ok, "{output}");
     assert_eq!(
         summary(&output, "selected_cells"),
-        (legs.len() - 1).to_string(),
+        (profiles.len() - 1).to_string(),
         "{output}"
     );
     assert_eq!(summary(&output, "written"), "true", "{output}");
     let expected = Expectations::load(&expectations_path(root))
         .unwrap()
         .unwrap();
-    assert_eq!(expected.profiles, legs);
+    assert_eq!(expected.profiles, profiles);
     // Each venue's compiled cell holds the digest of what a run executes there, at this build; the
-    // file's own non-venue profile-leg holds none.
+    // file's own non-venue profile holds none.
     assert_eq!(expected.build, Some(ArtifactBuild::this()));
-    for (leg, cell) in legs.iter().zip(expected.cases.values().next().unwrap()) {
-        let venue = leg.label() != "lavapipe";
-        if cell.outcome == CellOutcome::Compiled && cell.uncovered == 0 {
-            assert_eq!(cell.artifact.is_some(), venue, "{}", leg.label());
+    for (profile, cell) in profiles.iter().zip(expected.cases.values().next().unwrap()) {
+        let venue = profile.label() != "lavapipe";
+        if cell.outcome == CellOutcome::Compiled {
+            assert_eq!(cell.artifact.is_some(), venue, "{}", profile.label());
         } else {
-            assert_eq!(cell.artifact, None, "{}", leg.label());
+            assert_eq!(cell.artifact, None, "{}", profile.label());
         }
     }
     assert!(expected
@@ -167,8 +167,8 @@ fn the_census_compiles_blesses_reruns_warm_and_fails_on_a_difference() {
                 (
                     id.clone(),
                     vec![
-                        Cell::covered(CellOutcome::Refused("not_supported{bind}".into()));
-                        legs.len()
+                        Cell::bare(CellOutcome::Refused("not_supported{bind}".into()));
+                        profiles.len()
                     ],
                 )
             })
@@ -212,7 +212,7 @@ fn a_stopped_compile_worker_fails_its_cell() {
             root,
             index: &index,
             expectations: &expectations,
-            profiles: Some(vec![ProfileLeg::parse("lavapipe").unwrap()]),
+            profiles: Some(vec![ProfileStem::parse("lavapipe").unwrap()]),
             cases: None,
             jobs: 1,
             mode: Mode::Bless,
@@ -261,16 +261,12 @@ fn corpus_with_templates(name: &str) -> (ScratchDir, metal2vulkan_validation::ca
     (scratch, case)
 }
 
-/// The executor's requests for a case whose executed compute command buffer the device replay
-/// runs: on a profile with device addresses, the case's pipeline and each registered variant
-/// compile in the worker; on one without, the command buffer is host-replayed and only the case's
-/// own pipeline is compiled. A render command buffer is always host-replayed.
+/// A case over an indirect command buffer, which no candidate runs (here the runtime's limits on
+/// compute commands and on commands the host encodes), is refused in the census by those
+/// requirements, as a run's preparation refuses it: one cell per device, no compile, no digest.
 #[test]
-fn case_compiles_lists_the_replay_variants_where_the_device_replay_runs() {
-    use metal2vulkan_validation::authored_compile::{compile_prepared, CensusProfile};
-    use metal2vulkan_validation::candidate::engine::{case_compiles, prepare_case, CompileSubject};
-    use metal2vulkan_validation::check::admission::{admit, ExecutionRequest};
-    use metal2vulkan_validation::gpu::DeviceType;
+fn the_census_refuses_command_buffer_cases_by_their_requirements() {
+    use metal2vulkan_validation::authored_compile::compile_case;
     if !llvm_as_available() {
         return;
     }
@@ -279,52 +275,133 @@ fn case_compiles_lists_the_replay_variants_where_the_device_replay_runs() {
         let _ = Command::new(&program).arg("--help").output();
         CompileWorker::program(program)
     };
-    let prepared = |root: &Path, case: &metal2vulkan_validation::case::AuthoredCase| {
-        let device = DeviceType::Cpu;
-        let admitted = admit(
-            root,
-            case.clone(),
-            ExecutionRequest::EngineCandidate { device },
-        )
-        .unwrap_or_else(|error| panic!("admission: {error}"));
-        prepare_case(device, admitted).unwrap_or_else(|error| panic!("preparation: {error}"))
-    };
-    let profile = |label: &str| CensusProfile::load(&ProfileLeg::parse(label).unwrap()).unwrap();
-    let (lavapipe, floor) = (profile("lavapipe"), profile("vk12-floor"));
-
+    let lavapipe = metal2vulkan_validation::worker::compile::WorkerDevice::new(
+        metal2vulkan_validation::engine::load_description("lavapipe").unwrap(),
+        metal2vulkan::device::DevicePolicy::RESIDENT_TABLES,
+    )
+    .unwrap();
     let (scratch, case) =
         corpus_with_templates("gpu-encoded-buffers-keep-the-host-encoded-dispatches");
-    let compute = prepared(scratch.path(), &case);
-    let on_device = case_compiles(&compute, &lavapipe.device).unwrap();
-    assert_eq!(on_device.host_replayed, 0);
-    assert_eq!(on_device.compiles[0].subject, CompileSubject::Case);
-    assert!(on_device.compiles.len() > 1);
-    assert!(on_device.compiles[1..]
-        .iter()
-        .all(|compile| matches!(compile.subject, CompileSubject::ReplayVariant { .. })));
-    let cell = compile_prepared(&compute, &worker, &lavapipe.device);
-    assert_eq!(cell.outcome, Ok(CellOutcome::Compiled), "{cell:?}");
-    assert_eq!(cell.compiles, on_device.compiles.len());
-    // What a run executes there is digested: the case, each variant, and the preprocess module; the
-    // same compiles digest the same.
-    let digest = cell
-        .artifact
-        .clone()
-        .expect("a device-replayed case's digest");
-    let again = compile_prepared(&compute, &worker, &lavapipe.device);
-    assert_eq!(again.artifact, Some(digest));
-    let on_host = case_compiles(&compute, &floor.device).unwrap();
-    assert_eq!(on_host.host_replayed, 1);
-    assert_eq!(on_host.compiles.len(), 1);
-    // Where the host replay runs a command buffer, the census compiles less than the run does:
-    // no digest.
-    let host = compile_prepared(&compute, &worker, &floor.device);
-    assert_eq!(host.artifact, None, "{host:?}");
+    let cells = compile_case(scratch.path(), &worker, &case, &[&lavapipe]);
+    assert_eq!(cells.len(), 1, "{cells:?}");
+    assert_eq!(
+        cells[0].outcome,
+        Ok(CellOutcome::Refused(
+            "not_supported{tooling_requirement:indirect_compute_commands,\
+             host_encoded_indirect_commands}"
+                .into()
+        )),
+        "{cells:?}"
+    );
+    assert_eq!(cells[0].compiles, 0, "{cells:?}");
+    assert_eq!(cells[0].artifact, None, "{cells:?}");
+}
 
-    let (scratch, case) =
-        corpus_with_templates("gpu-encoded-vertex-buffers-run-the-host-encoded-draws");
-    let render = prepared(scratch.path(), &case);
-    let drawn = case_compiles(&render, &lavapipe.device).unwrap();
-    assert_eq!(drawn.host_replayed, 1);
-    assert_eq!(drawn.compiles.len(), 1);
+/// An object or mesh case, which no candidate draws (`mesh_render_pipeline`), still compiles its
+/// mesh render pipeline in the census: a run's preparation refuses the committed public mesh and
+/// object cases by that requirement alone, the census's prepares them, and each one's pipeline,
+/// its partners' stages with it, compiles in the worker as its one compile. Under the resident-table
+/// domains: the identity domains refuse every stage but kernel, vertex and fragment.
+#[test]
+fn the_census_compiles_the_mesh_pipelines_no_candidate_draws() {
+    use metal2vulkan_validation::authored_compile::compile_case;
+    use metal2vulkan_validation::candidate::engine::{case_compile, prepare_case, prepare_compile};
+    use metal2vulkan_validation::check::admission::{
+        admit, ExecutionRequest, ExecutorError, NotSupported,
+    };
+    use metal2vulkan_validation::gpu::DeviceType;
+    use metal2vulkan_validation::requirement::ToolingRequirement;
+    if !llvm_as_available() {
+        return;
+    }
+    let worker = {
+        let program = bin_exe!("corpus-triage");
+        let _ = Command::new(&program).arg("--help").output();
+        CompileWorker::program(program)
+    };
+    let lavapipe = metal2vulkan_validation::worker::compile::WorkerDevice::new(
+        metal2vulkan_validation::engine::load_description("lavapipe").unwrap(),
+        metal2vulkan::device::DevicePolicy::RESIDENT_TABLES,
+    )
+    .unwrap();
+    let device = DeviceType::Cpu;
+    for name in [
+        "a-mesh-grid-of-threadgroups-draws-through-its-fragment",
+        "an-object-function-launches-its-mesh-partner-with-a-payload",
+    ] {
+        let (scratch, case) = corpus_with_templates(name);
+        let admitted = || {
+            admit(
+                scratch.path(),
+                case.clone(),
+                ExecutionRequest::EngineCandidate { device },
+            )
+            .unwrap_or_else(|error| panic!("{name}: admission: {error}"))
+        };
+        let refused = prepare_case(device, admitted()).err();
+        assert!(
+            matches!(&refused, Some(ExecutorError::NotSupported(NotSupported::Requirements(stops)))
+                if stops.iter().eq([&ToolingRequirement::MeshRenderPipeline])),
+            "{name}: {refused:?}"
+        );
+        let prepared = prepare_compile(device, admitted())
+            .unwrap_or_else(|error| panic!("{name}: preparation: {error}"));
+        case_compile(&prepared).unwrap();
+        let cells = compile_case(scratch.path(), &worker, &case, &[&lavapipe]);
+        assert_eq!(cells.len(), 1, "{name}");
+        assert_eq!(
+            cells[0].outcome,
+            Ok(CellOutcome::Compiled),
+            "{name}: {cells:?}"
+        );
+        assert_eq!(cells[0].compiles, 1, "{name}");
+    }
+}
+
+/// A case whose argument buffer holds a texture buffer, which a run draws through the runtime,
+/// compiles in the census as the runtime compiles it: each committed case that holds one, on
+/// lavapipe.
+#[test]
+fn the_census_compiles_a_texture_buffer_an_argument_buffer_holds() {
+    use metal2vulkan_validation::authored_compile::compile_case;
+    use metal2vulkan_validation::case::TextureType;
+    if !llvm_as_available() {
+        return;
+    }
+    let worker = {
+        let program = bin_exe!("corpus-triage");
+        let _ = Command::new(&program).arg("--help").output();
+        CompileWorker::program(program)
+    };
+    let lavapipe = metal2vulkan_validation::worker::compile::WorkerDevice::new(
+        metal2vulkan_validation::engine::load_description("lavapipe").unwrap(),
+        metal2vulkan::device::DevicePolicy::default(),
+    )
+    .unwrap();
+    let holding = CorpusStore::new(metal2vulkan_validation::source::corpus_root())
+        .read_all_cases()
+        .unwrap()
+        .into_iter()
+        .filter(|case| {
+            case.argument_buffer_textures
+                .iter()
+                .any(|member| member.texture_type == TextureType::Buffer)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !holding.is_empty(),
+        "no committed case holds a texture buffer member"
+    );
+    for held in &holding {
+        let (scratch, case) = corpus_with_templates(&held.name);
+        let cells = compile_case(scratch.path(), &worker, &case, &[&lavapipe]);
+        assert_eq!(cells.len(), 1, "{}", case.name);
+        assert_eq!(
+            cells[0].outcome,
+            Ok(CellOutcome::Compiled),
+            "{}: {cells:?}",
+            case.name
+        );
+        assert_eq!(cells[0].compiles, 1, "{}", case.name);
+    }
 }

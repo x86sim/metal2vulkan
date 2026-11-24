@@ -3,7 +3,8 @@
 //! (`IoRole::PrimitiveId`) that its pipeline's vertex function writes from its vertex index, base
 //! vertex and `PushField::VerticesPerPrimitive` (`LoweringInputs::primitive_id_varying`). The
 //! owned fixture `engine/primitive_ids` on `lavapipe` with both features withheld, on
-//! `vk12-floor`, and on `lavapipe` as it is, where the fragment stage declares the builtin.
+//! `runtime-floor` without `tessellationShader` (below the runtime's floor), and on `lavapipe` as
+//! it is, where the fragment stage declares the builtin.
 //! `llvm-as` assembles the fixture; a missing tool skips visibly.
 
 use crate::budget::Budget;
@@ -57,11 +58,15 @@ fn withholding(colors: u32, more: &[VkFeature]) -> Device {
     }
     desc.limits.max_color_attachments = colors;
     desc.limits.max_fragment_output_attachments = colors;
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 fn device(stem: &str) -> Device {
-    Device::new(description(stem).expect("profile"), DevicePolicy::default()).expect("device")
+    Device::from_queries(
+        description(stem).expect("profile"),
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("device")
 }
 
 fn function(bc: &[u8], name: &str) -> FunctionDescriptor {
@@ -137,11 +142,21 @@ fn standalone(dev: &Device, bc: &[u8], name: &str) -> CompiledFunction {
 
 /// A fragment function compiled on its own for a device with neither feature reads
 /// `[[primitive_id]]` from a flat `uint` varying, declaring no `PrimitiveId`; with them it reads
-/// the builtin. `vk12-floor` has neither: the function no longer needs either feature.
+/// the builtin. `runtime-floor` without `tessellationShader` has neither: the function no longer
+/// needs either feature.
 #[test]
 fn without_either_feature_the_id_is_a_flat_varying() {
     let Some(bc) = fixture() else { return };
-    for dev in [withheld(8), device("vk12-floor")] {
+    let mut floor = description("runtime-floor").expect("runtime-floor");
+    for f in [
+        VkFeature::TessellationShader,
+        VkFeature::ShaderTessellationAndGeometryPointSize,
+        VkFeature::MultiviewTessellationShader,
+    ] {
+        floor.features.remove(&f);
+    }
+    let floor = Device::from_queries(floor, DevicePolicy::RESIDENT_TABLES).expect("device");
+    for dev in [withheld(8), floor] {
         let f = standalone(&dev, &bc, "pi_ids");
         let io = &f.artifact().interface.io;
         let input = io
@@ -178,7 +193,6 @@ fn the_vertex_function_writes_the_id_its_fragment_function_reads() {
         }
         let p = compile(&dev, &d).unwrap_or_else(|e| panic!("{vertex}: {e}"));
         assert!(reads_layout(&p), "{vertex}");
-        assert!(p.graphics.flat_fragment_inputs, "{vertex}");
         validate(&p, &dev);
         let present = device("lavapipe");
         let q = compile(&present, &d).unwrap_or_else(|e| panic!("{vertex}: {e}"));
@@ -322,231 +336,7 @@ fn the_fragment_reads_the_id_flat() {
     assert_eq!(flat, 3);
 }
 
-/// With five colors on a device of four, each color group's variant reads the ID from the same
-/// varying of the same vertex module: the groups' vertex words are identical, and the varying
-/// takes one location beside the vertex function's own.
-#[test]
-fn color_groups_share_the_vertex_function_s_id() {
-    let Some(bc) = fixture() else { return };
-    let dev = withheld(4);
-    let d = pipeline(&bc, "pi_place", Some("pi_five"), 5);
-    let groups: Vec<RenderPipeline> = (0..2)
-        .map(|g| {
-            let mut v = VariantKey::new();
-            v.color_group = g;
-            dev.compile_render_variant(&d, &v, &Budget::standard())
-                .unwrap_or_else(|e| panic!("group {g}: {e}"))
-        })
-        .collect();
-    for p in &groups {
-        assert!(reads_layout(p));
-        validate(p, &dev);
-    }
-    assert_eq!(
-        stage(&groups[0], vk::ShaderStage::VERTEX).spirv,
-        stage(&groups[1], vk::ShaderStage::VERTEX).spirv
-    );
-}
-
 // ---- Indexed draws: the de-indexed form (VariantKey::primitive_id_indices) -------------------
-
-/// A state binding `pi_place`'s and `pi_counts`' buffers, at device addresses.
-fn bound() -> crate::bind::BindState {
-    use crate::bind::{BindState, BoundBuffer, StageTable};
-    let buffer = |length| BoundBuffer::Buffer {
-        length,
-        offset: 0,
-        gpu_address: 0x1_0000,
-        device_address: Some(0x7_0000_0000),
-        attribute_stride: None,
-    };
-    let mut v = StageTable::default();
-    for (index, length) in [(0, 1024), (1, 256), (2, 256)] {
-        v.buffers.insert(index, buffer(length));
-    }
-    let mut s = BindState::default();
-    s.stages.insert(crate::pipeline::sym::Stage::Vertex, v);
-    s
-}
-
-/// The `u16` indexed draw of 12 indices from index 2, base vertex 10, two instances from 1.
-fn indexed() -> crate::bind::DrawCall {
-    crate::bind::DrawCall::Indexed {
-        index_type: vk::IndexType::UINT16,
-        index_buffer: crate::bind::IndexBufferRef::new(1, 64),
-        index_count: 12,
-        index_offset: 4,
-        instance_count: 2,
-        base_vertex: 10,
-        base_instance: 1,
-    }
-}
-
-/// The words of `field`'s place in `commands`' vertex push bytes, under `plan`.
-fn pushed(
-    plan: &crate::bind::BindingPlan,
-    commands: &crate::bind::DrawCommands,
-    field: PushField,
-    words: usize,
-) -> Vec<u32> {
-    let place = plan
-        .push
-        .fields
-        .iter()
-        .find(|f| f.stage == crate::pipeline::sym::Stage::Vertex && f.field == field)
-        .expect("placed");
-    let crate::bind::FieldLocation::PushWindow { offset } = place.location else {
-        panic!("{field:?} spilled: {place:?}");
-    };
-    let write = commands
-        .push_constants
-        .iter()
-        .find(|w| w.stages.contains(vk::ShaderStageFlags::VERTEX))
-        .expect("vertex push");
-    let at = (offset - write.offset) as usize;
-    write.bytes[at..at + 4 * words]
-        .chunks(4)
-        .map(|w| u32::from_le_bytes(w.try_into().expect("a word")))
-        .collect()
-}
-
-/// An indexed draw of a pipeline whose vertex function writes the ID asks for the de-indexed
-/// variant of its index type through the shape (`BindState::primitive_id_indices`). That variant
-/// reads its indices at `PushField::CaptureIndexAddress`, writes the ID as `VertexIndex / n` (no
-/// base vertex), and draws the indices as `index count` vertices from 0 with layout
-/// `[0, index count, base instance, base vertex]`. Every module is valid. A draw without indices
-/// asks for the variant without the form; an indexed strip is not implemented.
-#[test]
-fn an_indexed_draw_runs_the_de_indexed_variant() {
-    use crate::bind::{DrawCall, PushHole};
-    use crate::error::BindError;
-    use crate::error::{Feature, Unsupported};
-    use crate::metal::{IndexType, PrimitiveType};
-    let Some(bc) = fixture() else { return };
-    let dev = withheld(8);
-    let d = pipeline(&bc, "pi_place", Some("pi_ids"), 1);
-    let base = compile(&dev, &d).expect("base");
-    let mut state = bound();
-    state.primitive_type = Some(PrimitiveType::Triangle);
-    state.primitive_id_indices = Some(IndexType::UInt16);
-    let plan = base.plan(&dev, &state.shape()).expect("base plan");
-    assert_eq!(plan.variant.primitive_id_indices, Some(IndexType::UInt16));
-    let key = plan.variant.clone();
-    let p = dev
-        .compile_render_variant(&d, &key, &Budget::standard())
-        .expect("de-indexed variant");
-    validate(&p, &dev);
-    assert!(reads_layout(&p));
-    assert!(reads_field(&p, PushField::CaptureIndexAddress));
-    assert!(reads_field(&p, PushField::CaptureLayout));
-    assert!(!reads_field(&p, PushField::BaseVertexInstance));
-    let plan = p.plan(&dev, &state.shape()).expect("plan");
-    assert_eq!(plan.variant, key);
-    let commands = plan.instantiate_draw(&state, &indexed()).expect("draw");
-    assert_eq!(
-        commands.draw,
-        vk::DrawCommand::Draw {
-            vertex_count: 12,
-            instance_count: 2,
-            first_vertex: 0,
-            first_instance: 1,
-        }
-    );
-    assert!(commands
-        .push_holes
-        .iter()
-        .any(|h| matches!(h, PushHole::CaptureIndexAddress { .. })));
-    assert_eq!(
-        pushed(&plan, &commands, PushField::CaptureLayout, 4),
-        [0, 12, 1, 10]
-    );
-    assert_eq!(
-        pushed(&plan, &commands, PushField::VerticesPerPrimitive, 1),
-        [3]
-    );
-    let not_implemented = Err(BindError::Unsupported(Unsupported::not_implemented(
-        Feature::PrimitiveId,
-    )));
-    let mut strip = state.clone();
-    strip.primitive_type = Some(PrimitiveType::TriangleStrip);
-    assert_eq!(
-        plan.instantiate_draw(&strip, &indexed()).map(|_| ()),
-        not_implemented
-    );
-    let unindexed = DrawCall::Primitives {
-        vertex_start: 0,
-        vertex_count: 3,
-        instance_count: 1,
-        base_instance: 0,
-    };
-    assert_eq!(
-        plan.instantiate_draw(&state, &unindexed).map(|_| ()),
-        Err(BindError::NeedsVariant {
-            variant: Box::new(VariantKey {
-                primitive_id_indices: None,
-                ..key.clone()
-            }),
-        })
-    );
-    // Without the shape's index type, the base plan refuses the indexed draw.
-    let mut plain = state.clone();
-    plain.primitive_id_indices = None;
-    let plan = base.plan(&dev, &plain.shape()).expect("plan");
-    assert!(plan.variant.is_empty());
-    assert_eq!(
-        plan.instantiate_draw(&plain, &indexed()).map(|_| ()),
-        not_implemented
-    );
-    // A pipeline that writes no ID asks for no such variant.
-    let none = compile(&dev, &pipeline(&bc, "pi_place", None, 0)).expect("no fragment");
-    let plan = none.plan(&dev, &state.shape()).expect("plan");
-    assert_eq!(plan.variant.primitive_id_indices, None);
-}
-
-/// A vertex function whose attribute fixed-function input fetches in its base pipeline
-/// (`pi_attrib`'s `float2` at stride 8) reaches link in the de-indexed and private list forms,
-/// whose compile pulls every attribute (`pipeline::link::vertex`'s item 8): the variant the base
-/// plan asks for links, its vertex input binds no layout and pulls the attribute, its plan states
-/// the same variant, and every module is valid.
-#[test]
-fn a_fixed_function_attribute_links_in_the_de_indexed_and_list_forms() {
-    use crate::metal::{IndexType, PrimitiveType};
-    let Some(bc) = fixture() else { return };
-    let mut d = pipeline(&bc, "pi_attrib", Some("pi_ids"), 1);
-    d.vertex_descriptor = Some(attribute_descriptor());
-    for (dev, form) in [
-        (withheld(8), "de-indexed"),
-        (withheld(8), "listed"),
-        (device("lavapipe"), "listed"),
-    ] {
-        let base = compile(&dev, &d).expect("base");
-        assert_eq!(
-            base.vertex_input.bindings.len(),
-            1,
-            "{form}: the base fetch"
-        );
-        let mut state = bound();
-        state.primitive_type = Some(PrimitiveType::Triangle);
-        match form {
-            "de-indexed" => state.primitive_id_indices = Some(IndexType::UInt16),
-            _ => state.private_list = true,
-        }
-        let plan = base.plan(&dev, &state.shape()).expect("base plan");
-        let key = plan.variant.clone();
-        assert!(
-            key.primitive_id_indices.is_some() || key.private_list,
-            "{form}: {key:?}"
-        );
-        let p = dev
-            .compile_render_variant(&d, &key, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{form}: the variant: {e}"));
-        validate(&p, &dev);
-        assert!(p.vertex_input.bindings.is_empty(), "{form}");
-        assert_eq!(p.vertex_input.pulled.len(), 1, "{form}");
-        let plan = p.plan(&dev, &state.shape()).expect("variant plan");
-        assert_eq!(plan.variant, key, "{form}");
-    }
-}
 
 /// A vertex function that writes device memory (`pi_counts`' atomic counter) would run once per
 /// index in the de-indexed form: that variant is `NotImplemented(PrimitiveId)`, and its draws
@@ -567,76 +357,4 @@ fn a_memory_writing_vertex_function_is_refused_de_indexed() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
-}
-
-/// A private type's draw in the private list form (`BindState::private_list`) asks for the listed
-/// variant through the shape. It reads its list's address (`PushField::CaptureIndexAddress`, a
-/// push hole the consumer fills) and no capture layout, and draws the list's positions without
-/// indices from the call's first vertex, the list's first index, with its instances; its vertices
-/// per primitive are the list's, twice that for Metal's quads listed as two triangles a quad. A
-/// vertex function that writes memory, which the de-indexed form refuses, runs in it, on a device
-/// with both features too, where nothing reads the primitive ID's varying. Every module is valid.
-#[test]
-fn a_private_draw_in_the_list_form_runs_the_listed_variant() {
-    use crate::bind::{DrawCall, PushHole};
-    use crate::metal::PrimitiveType;
-    use crate::pipeline::RuntimeFact;
-    let Some(bc) = fixture() else { return };
-    let listed = |dev: &Device, vertex: &str| {
-        let d = pipeline(&bc, vertex, Some("pi_ids"), 1);
-        let base = compile(dev, &d).expect("base");
-        let mut state = bound();
-        state.primitive_type = Some(PrimitiveType::Triangle);
-        state.private_list = true;
-        let plan = base.plan(dev, &state.shape()).expect("base plan");
-        assert!(plan.variant.private_list, "{vertex}: the plan's variant");
-        let key = plan.variant.clone();
-        let p = dev
-            .compile_render_variant(&d, &key, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{vertex}: the listed variant: {e}"));
-        validate(&p, dev);
-        assert!(p
-            .dependencies
-            .iter()
-            .any(|d| d.fact == RuntimeFact::PrivateList));
-        assert!(reads_field(&p, PushField::CaptureIndexAddress), "{vertex}");
-        assert!(!reads_field(&p, PushField::CaptureLayout), "{vertex}");
-        let plan = p.plan(dev, &state.shape()).expect("plan");
-        assert_eq!(plan.variant, key);
-        let draw = DrawCall::Primitives {
-            vertex_start: 1,
-            vertex_count: 12,
-            instance_count: 2,
-            base_instance: 1,
-        };
-        let commands = plan.instantiate_draw(&state, &draw).expect("draw");
-        assert_eq!(
-            commands.draw,
-            vk::DrawCommand::Draw {
-                vertex_count: 12,
-                instance_count: 2,
-                first_vertex: 1,
-                first_instance: 1,
-            }
-        );
-        assert!(commands
-            .push_holes
-            .iter()
-            .any(|h| matches!(h, PushHole::CaptureIndexAddress { .. })));
-        (plan, state, draw)
-    };
-    let (plan, mut state, draw) = listed(&withheld(8), "pi_place");
-    let commands = plan.instantiate_draw(&state, &draw).expect("draw");
-    assert_eq!(
-        pushed(&plan, &commands, PushField::VerticesPerPrimitive, 1),
-        [3]
-    );
-    state.quad_primitive_ids = true;
-    let commands = plan.instantiate_draw(&state, &draw).expect("quads");
-    assert_eq!(
-        pushed(&plan, &commands, PushField::VerticesPerPrimitive, 1),
-        [6]
-    );
-    listed(&withheld(8), "pi_counts");
-    listed(&device("lavapipe"), "pi_counts");
 }

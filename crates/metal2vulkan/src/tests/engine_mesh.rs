@@ -25,7 +25,7 @@ use crate::pipeline::lower_inputs::LoweringInputs;
 use crate::pipeline::stage_io::{IoNumeric, IoRole, StageBuiltin};
 use crate::pipeline::sym::{PushField, SpecKey, Stage};
 use crate::pipeline::testing::{engine_dir, llvm_assemble, meter, AssembleError};
-use crate::spirv::testing::{check_words_valid, committed_profiles};
+use crate::spirv::testing::{check_words_valid, committed_profiles, threadgroup_profiles};
 use std::sync::Arc;
 
 pub(super) fn fixture(stem: &str) -> Option<Vec<u8>> {
@@ -176,10 +176,11 @@ fn a_mesh_function_is_a_mesh_entry() {
     }
 }
 
-/// The committed profiles whose device does not list `VK_EXT_mesh_shader`: those that emulate a
-/// mesh function.
-pub(super) fn emulating_profiles() -> Vec<(String, DeviceProfile)> {
-    let out: Vec<(String, DeviceProfile)> = committed_profiles()
+/// The committed profiles whose device does not list `VK_EXT_mesh_shader`, which refuse object and
+/// mesh functions. Only those that take threadgroup memory, which the object and mesh functions
+/// here use (`spirv::testing::threadgroup_profiles`).
+fn refusing_profiles() -> Vec<(String, DeviceProfile)> {
+    let out: Vec<(String, DeviceProfile)> = threadgroup_profiles()
         .expect("committed profiles")
         .into_iter()
         .filter(|(stem, _)| !lists_mesh_shader(stem))
@@ -188,180 +189,38 @@ pub(super) fn emulating_profiles() -> Vec<(String, DeviceProfile)> {
         !out.is_empty(),
         "every committed profile lists the extension"
     );
-    for (stem, p) in &out {
-        assert!(crate::lower::mesh::emulates(p), "{stem}");
-    }
     out
 }
 
-/// Whether profile `p` lets a vertex stage write every output `mesh_outputs_points` writes: its
-/// render target slice, its viewport and its clip distances.
-fn writes_points_outputs(p: &DeviceProfile) -> bool {
-    let f = p.fields().fragment;
-    f.output_layer
-        && f.output_viewport_index
-        && p.enabled()
-            .features
-            .contains(&VkFeature::ShaderClipDistance)
-}
-
-/// The execution models of a module's entry points.
-fn execution_models(words: &[u32]) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut i = 5;
-    while let Some(&w) = words.get(i) {
-        let len = (w >> 16).max(1) as usize;
-        if w & 0xFFFF == crate::spv::Op::EntryPoint as u32 {
-            out.extend(words.get(i + 1).copied());
-        }
-        i += len;
-    }
-    out
-}
-
-/// Without the extension a mesh function is emulated, a `GLCompute` entry that writes its
-/// threadgroup's records to the records buffer, valid, needing no mesh shading, and whose stage
-/// interface states the records' layout; an object function and a mesh function reading its payload
-/// are `GLCompute` entries too, their payload workgroup memory and their work buffer bound.
+/// Without the extension a mesh or object function is refused (`Unsupported{MeshShading}`), needing
+/// `VK_EXT_mesh_shader` and the stage's feature (`meshShader`, an object function's `taskShader`)
+/// where the profile lacks them.
 #[test]
-fn without_the_extension_mesh_and_object_functions_are_compute_entries() {
-    use crate::pipeline::interface::RecordValue;
+fn without_the_extension_mesh_and_object_functions_are_refused() {
     let (Some(order), Some(outputs)) = (fixture("mesh_order"), fixture("mesh_outputs")) else {
         return;
     };
-    for (stem, p) in emulating_profiles() {
-        // (bytecode, entry, the indices of a primitive)
-        for (bc, entry, corners) in [
-            (&order, "mesh_order_solo", 3),
-            (&outputs, "mesh_outputs_lines", 2),
-            (&outputs, "mesh_outputs_points", 1),
+    for (stem, p) in refusing_profiles() {
+        for (bc, entry, feature) in [
+            (&order, "mesh_order_solo", VkFeature::MeshShader),
+            (&outputs, "mesh_outputs_lines", VkFeature::MeshShader),
+            (&outputs, "mesh_outputs_points", VkFeature::MeshShader),
+            (&order, "mesh_order_object", VkFeature::TaskShader),
+            (&order, "mesh_order_mesh", VkFeature::MeshShader),
         ] {
             let what = format!("{stem} {entry}");
-            // The points choose their slice and viewport and write clip distances, which the
-            // synthesized vertex stage writes as a vertex function's: a device that lacks one
-            // refuses them as needing it.
-            if entry == "mesh_outputs_points" && !writes_points_outputs(&p) {
-                match compile(bc, entry, &p) {
-                    Err(Error::Unsupported(u))
-                        if matches!(
-                            u.feature,
-                            Feature::LayeredRendering | Feature::ClipDistance
-                        ) => {}
-                    other => panic!("{what}: {other:?}"),
-                }
-                continue;
+            let mut missing = vec![Capability::Extension(VkExtension::ExtMeshShader)];
+            if !p.enabled().features.contains(&feature) {
+                missing.push(Capability::Feature(feature));
             }
-            let a = compile(bc, entry, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert_eq!(a.interface.stage, Stage::Mesh, "{what}");
-            let r = &a.module.requirements;
-            assert!(
-                !r.extensions.contains(&VkExtension::ExtMeshShader)
-                    && !r.features.contains(&VkFeature::MeshShader),
-                "{what}: {r:?}"
-            );
-            check_words_valid(&a.module.words, r, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            assert_eq!(
-                execution_models(&a.module.words),
-                [crate::spv::ExecutionModel::GLCompute as u32],
-                "{what}"
-            );
-            let ops = opcodes(&a.module.words);
-            assert!(
-                !ops.contains(&(crate::spv::Op::SetMeshOutputsEXT as u32)),
-                "{what}"
-            );
-            assert_eq!(
-                a.interface.vk_stage(),
-                crate::vk::ShaderStage::COMPUTE,
-                "{what}"
-            );
-            assert!(
-                a.interface
-                    .descriptors
-                    .iter()
-                    .any(|d| d.slot == crate::lower::mesh::RECORDS_SLOT
-                        && d.ty == crate::vk::DescriptorType::STORAGE_BUFFER),
-                "{what}: the records binding"
-            );
-            let records = a.interface.mesh_records.as_ref().expect("the records");
-            assert_eq!(records.corners, corners, "{what}");
-            // Every field fits its record, the vertex record holds the position, and no two
-            // fields of a record overlap.
-            assert!(
-                records
-                    .fields
-                    .iter()
-                    .any(|f| f.value == RecordValue::Position && !f.per_primitive),
-                "{what}: {records:?}"
-            );
-            for per_primitive in [false, true] {
-                let (start, size) = if per_primitive {
-                    (corners, records.primitive_words)
-                } else {
-                    (0, records.vertex_words)
-                };
-                let mut words: Vec<(u32, u32)> = records
-                    .fields
-                    .iter()
-                    .filter(|f| f.per_primitive == per_primitive)
-                    .map(|f| (f.offset, f.offset + f.words))
-                    .collect();
-                words.sort_unstable();
-                let mut at = start;
-                for (from, to) in words {
-                    assert!(from >= at && to <= size, "{what}: {records:?}");
-                    at = to;
-                }
-            }
-            assert_eq!(
-                records.group_words(),
-                1 + u64::from(records.vertices) * u64::from(records.vertex_words)
-                    + u64::from(records.primitives) * u64::from(records.primitive_words),
-                "{what}"
-            );
-        }
-        // An object function and a mesh function reading its payload are compute entries too:
-        // the payload is workgroup memory, which the draw's work buffer carries between them.
-        for entry in ["mesh_order_object", "mesh_order_mesh"] {
-            let what = format!("{stem} {entry}");
-            let a = compile(&order, entry, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            let r = &a.module.requirements;
-            assert!(
-                !r.extensions.contains(&VkExtension::ExtMeshShader),
-                "{what}: {r:?}"
-            );
-            check_words_valid(&a.module.words, r, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            assert_eq!(
-                execution_models(&a.module.words),
-                [crate::spv::ExecutionModel::GLCompute as u32],
-                "{what}"
-            );
-            assert_eq!(
-                variables_of(
-                    &a.module.words,
-                    crate::spv::StorageClass::TaskPayloadWorkgroupEXT
+            match compile(bc, entry, &p) {
+                Err(Error::Unsupported(u)) => assert_eq!(
+                    (u.feature, &u.needs),
+                    (Feature::MeshShading, &Needs::AnyOf(vec![missing])),
+                    "{what}"
                 ),
-                0,
-                "{what}"
-            );
-            assert!(
-                a.interface.emulated_payload.is_some_and(|words| words > 0),
-                "{what}: {:?}",
-                a.interface.emulated_payload
-            );
-            assert_eq!(
-                a.interface.vk_stage(),
-                crate::vk::ShaderStage::COMPUTE,
-                "{what}"
-            );
-            let work = match a.interface.stage {
-                Stage::Object => crate::lower::mesh::OBJECT_WORK_SLOT,
-                _ => crate::lower::mesh::WORK_SLOT,
-            };
-            assert!(
-                a.interface.descriptors.iter().any(|d| d.slot == work),
-                "{what}: the work buffer"
-            );
+                other => panic!("{what}: {:?}", other.map(|_| ())),
+            }
         }
     }
 }
@@ -494,7 +353,7 @@ fn an_object_function_passes_its_payload_to_its_mesh_functions() {
         let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         desc.limits.mesh.max_task_payload_size = payload_size;
         desc.limits.mesh.max_task_payload_and_shared_memory_size = together;
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         let got = compile(&draws, "mesh_draws_object", dev.profile())
             .map(|_| ())
             .map_err(|e| match e {
@@ -546,7 +405,7 @@ fn a_mesh_functions_threadgroup_memory_is_its_workgroups() {
     for (available, fits) in [(260, true), (259, false)] {
         let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         desc.limits.mesh.max_mesh_shared_memory_size = available;
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         match compile(&outputs, "mesh_outputs_points", dev.profile()) {
             Ok(_) => assert!(fits, "{stem} at {available}"),
             Err(Error::Unsupported(u)) => {
@@ -631,7 +490,7 @@ fn a_mesh_point_size_is_noted_only_where_the_mesh_outputs_points() {
         let text = std::fs::read_to_string(path).expect("profile");
         let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         desc.limits.max_point_size = 64;
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         for (topology, bitcode) in &modules {
             let a = compile(bitcode, "mesh_outputs_points", dev.profile())
                 .unwrap_or_else(|e| panic!("{stem} {topology}: {e}"));
@@ -656,7 +515,7 @@ pub(super) fn device(stem: &str) -> crate::device::Device {
         .join(format!("../metal2vulkan-validation/profiles/{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// The `OpDecorate ... PerPrimitiveEXT` instructions of a module.
@@ -678,12 +537,10 @@ fn per_primitive_decorations(words: &[u32]) -> usize {
 /// A mesh render pipeline links its mesh function with a fragment function compiled for it: the
 /// fragment reads per primitive (`PerPrimitiveEXT`, flat) exactly the inputs the mesh function
 /// writes per primitive, and its other inputs as varyings. The pipeline's stages are the mesh and
-/// fragment stages, each valid under the pipeline's requirements, with no vertex input, and the
-/// binder plans its mesh draws ([`mesh_draws`]). A fragment function compiled for another pipeline
-/// is `NeedsInput(PrimitiveVaryings)`, one compiled alone under the mesh function's primitive keys
-/// links, and a pipeline with an object function passing a payload has its task stage first, each
-/// stage valid, and its draws specialize each stage's threadgroup under its own keys
-/// ([`object_draws`]).
+/// fragment stages, each valid under the pipeline's requirements, with no vertex input. A fragment
+/// function compiled for another pipeline is `NeedsInput(PrimitiveVaryings)`, one compiled alone
+/// under the mesh function's primitive keys links, and a pipeline with an object function passing a
+/// payload has its task stage first, each stage valid.
 #[test]
 fn a_mesh_pipeline_reads_its_primitive_outputs_per_primitive() {
     use crate::budget::Budget;
@@ -757,7 +614,6 @@ fn a_mesh_pipeline_reads_its_primitive_outputs_per_primitive() {
                 *per_primitive,
                 "{what}: the fragment's per-primitive inputs"
             );
-            mesh_draws(&dev, &pipeline, &what);
         }
         // The points' fragment function compiled on its own: for a render pipeline it reads the
         // primitive's `pc` per vertex, and under the mesh function's primitive keys it links.
@@ -822,7 +678,6 @@ fn a_mesh_pipeline_reads_its_primitive_outputs_per_primitive() {
             check_words_valid(&m.spirv, &pipeline.requirements, dev.profile())
                 .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
         }
-        object_draws(&dev, &pipeline, &stem);
     }
 }
 
@@ -854,8 +709,8 @@ fn wide_object_payload() -> Option<Vec<u8>> {
 /// payload by the type the object function declares: in the mesh render pipeline of
 /// `mesh_outputs_object`, its payload declared 64 bytes ([`wide_object_payload`]), and
 /// `mesh_outputs_triangles`, which declares 16 and reads 64, the mesh function's payload arena
-/// holds the object function's 64 bytes (`LoweringInputs::object_payload`), emulated or not, and
-/// each stage is valid. Compiled on its own, the mesh function's arena is its own 32 (the
+/// holds the object function's 64 bytes (`LoweringInputs::object_payload`), and each stage is
+/// valid. Compiled on its own, the mesh function's arena is its own 32 (the
 /// smallest), and the pipeline refuses it as `NeedsInput(ObjectPayload)`; compiled under the object
 /// function's bytes it links. An object payload its own arena holds leaves its key as compiled
 /// alone.
@@ -864,7 +719,6 @@ fn a_mesh_function_reads_its_payload_within_its_object_functions() {
     use crate::budget::Budget;
     use crate::error::RuntimeInput;
     use crate::library::Library;
-    use crate::lower::mesh::work;
     use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
     let Some(wide) = wide_object_payload() else {
         return;
@@ -872,9 +726,8 @@ fn a_mesh_function_reads_its_payload_within_its_object_functions() {
     let wide = Library::from_air(&wide).expect("library");
     let function = |name: &str| FunctionDescriptor::new(wide.function(name).expect("function"));
     let budget = Budget::standard();
-    for (stem, p) in mesh_profiles().into_iter().chain(emulating_profiles()) {
+    for (stem, p) in mesh_profiles() {
         let dev = device(&stem);
-        let emulated = crate::lower::mesh::emulates(&p);
         let compiled = |name: &str, inputs: &LoweringInputs| {
             dev.compile_function(&function(name), inputs, &budget)
                 .unwrap_or_else(|e| panic!("{stem} {name}: {e}"))
@@ -892,11 +745,6 @@ fn a_mesh_function_reads_its_payload_within_its_object_functions() {
         let within = compiled("mesh_outputs_triangles", &inputs);
         let a = within.artifact();
         assert_eq!(a.interface.payload, Some(64), "{stem}");
-        assert_eq!(
-            a.interface.emulated_payload,
-            emulated.then_some(16),
-            "{stem}"
-        );
         check_words_valid(&a.module.words, &a.module.requirements, &p)
             .unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         // An object payload the mesh function's own arena holds keeps its key.
@@ -918,8 +766,6 @@ fn a_mesh_function_reads_its_payload_within_its_object_functions() {
             check_words_valid(&m.spirv, &made.requirements, dev.profile())
                 .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
         }
-        let slot = made.graphics.mesh_records.as_ref().map(|r| r.slot_words);
-        assert_eq!(slot, emulated.then_some(work::GRID + 16), "{stem}");
         assert_eq!(
             pipeline(StageSource::Compiled(alone)).err(),
             Some(Error::NeedsInput(RuntimeInput::ObjectPayload)),
@@ -930,717 +776,38 @@ fn a_mesh_function_reads_its_payload_within_its_object_functions() {
     }
 }
 
-/// Without the extension a mesh render pipeline is emulated. Its mesh function is a compute stage
-/// writing records, a synthesized vertex stage draws them and the fragment reads the primitive's
-/// outputs flat (no `PerPrimitiveEXT`); every stage is valid under the pipeline's requirements, the
-/// records and work bindings are the compute and vertex stages', and the pipeline's topology is the
-/// records'. A draw of `G` threadgroups is the host's: a dispatch of `G` over records of `G`
-/// threadgroups' words, its work buffer complete, then a draw of `NP · k` vertices each; a grid
-/// whose records pass `maxStorageBufferRange` is refused naming it. An indirect draw is scanned
-/// from Metal's arguments into the command buffer's records pool and drawn from the work buffer.
-/// With an object function, the object stage is a compute stage first, the push range one hull, and
-/// a draw dispatches its object threadgroups and is scanned. A fragment reading `[[primitive_id]]`
-/// is not emulated yet.
+/// Without the extension a mesh render pipeline is refused (`Unsupported{MeshShading}`), with or
+/// without an object function.
 #[test]
-fn without_the_extension_a_mesh_pipeline_draws_its_records() {
-    use crate::bind::{
-        AccessClass, BindState, BufferRange, DrawCall, IndirectRef, MeshDispatch, MeshGroups,
-        MeshRecordsRegion, UseTarget,
-    };
+fn without_the_extension_a_mesh_pipeline_is_refused() {
     use crate::budget::Budget;
-    use crate::device::requirements::VkLimit;
-    use crate::error::{BindError, Unsupported};
     use crate::library::Library;
-    use crate::lower::mesh::work;
-    use crate::metal::PixelFormat;
-    use crate::pipeline::descriptor::{
-        ColorAttachmentDescriptor, FunctionDescriptor, MeshPipelineDescriptor, StageSource,
-    };
-    use crate::pipeline::layout::BindingSource;
-    use crate::pipeline::sym::SyntheticBinding;
-    use crate::vk;
-    let (Some(draws), Some(outputs)) = (fixture("mesh_draws"), fixture("mesh_outputs")) else {
+    use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
+    let Some(draws) = fixture("mesh_draws") else {
         return;
     };
-    let (draws, outputs) = (
-        Library::from_air(&draws).expect("library"),
-        Library::from_air(&outputs).expect("library"),
-    );
-    let stage = |lib: &Library, name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            lib.function(name).expect("function"),
-        ))
-    };
-    let budget = Budget::standard();
-    for (stem, _) in emulating_profiles() {
-        let dev = device(&stem);
-        let mut d = MeshPipelineDescriptor::new(stage(&draws, "mesh_draws_grid"));
-        d.fragment = Some(stage(&draws, "mesh_draws_fragment"));
-        for slot in d.color_attachments.iter_mut().take(2) {
-            *slot = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Uint));
-        }
-        let pipeline = dev
-            .compile_mesh_pipeline(&d, &budget)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let kinds: Vec<vk::ShaderStage> = pipeline.stages.iter().map(|m| m.stage).collect();
-        assert_eq!(
-            kinds,
-            [
-                vk::ShaderStage::COMPUTE,
-                vk::ShaderStage::VERTEX,
-                vk::ShaderStage::FRAGMENT
-            ],
-            "{stem}"
-        );
-        assert!(
-            !pipeline
-                .requirements
-                .extensions
-                .contains(&VkExtension::ExtMeshShader),
-            "{stem}"
-        );
-        for m in &pipeline.stages {
-            check_words_valid(&m.spirv, &pipeline.requirements, dev.profile())
-                .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
-        }
-        assert_eq!(
-            per_primitive_decorations(&pipeline.stages[2].spirv),
-            0,
-            "{stem}: the fragment reads the primitive's outputs flat"
-        );
-        let records = pipeline
-            .graphics
-            .mesh_records
-            .clone()
-            .expect("the pipeline's records");
-        assert_eq!(
-            pipeline.graphics.topology,
-            vk::PrimitiveTopology::TRIANGLE_LIST,
-            "{stem}"
-        );
-        let binding_of = |p: &crate::pipeline::RenderPipeline, stage, binding| {
-            p.layout
-                .sets
-                .iter()
-                .flat_map(|s| &s.bindings)
-                .find(|b| b.source == BindingSource::Synthetic { stage, binding })
-                .cloned()
-        };
-        for kind in [SyntheticBinding::MeshRecords, SyntheticBinding::MeshWork] {
-            let binding = binding_of(&pipeline, Stage::Mesh, kind).expect("the binding");
-            assert_eq!(binding.ty, vk::DescriptorType::STORAGE_BUFFER, "{stem}");
-            assert_eq!(
-                binding.stages,
-                vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX,
-                "{stem} {kind:?}"
-            );
-        }
-        // A draw of two threadgroups.
-        let state = BindState::default();
-        let plan = pipeline
-            .plan(&dev, &state.shape())
-            .unwrap_or_else(|e| panic!("{stem}: plan: {e}"));
-        let groups = |groups| DrawCall::MeshThreadgroups {
-            groups,
-            threads_per_object_group: [1; 3],
-            threads_per_mesh_group: [8, 1, 1],
-        };
-        let cmds = plan
-            .instantiate_draw(&state, &groups([2, 1, 1]))
-            .unwrap_or_else(|e| panic!("{stem}: a draw: {e}"));
-        assert_eq!(
-            cmds.draw,
-            vk::DrawCommand::Draw {
-                vertex_count: 2 * records.primitives * records.corners,
-                instance_count: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            },
-            "{stem}"
-        );
-        let d = cmds.mesh_dispatch.clone().expect("the draw's dispatch");
-        assert_eq!(d.mesh, MeshGroups::Direct([2, 1, 1]), "{stem}");
-        assert_eq!(d.object_groups, None, "{stem}");
-        assert_eq!(
-            d.records,
-            MeshRecordsRegion::Exact(2 * 4 * records.group_words()),
-            "{stem}"
-        );
-        // The host's work buffer: one virtual object threadgroup of the draw's grid and no
-        // payload, the draw's two mesh threadgroups from word 0 of its records, and the offsets.
-        let header = work::HEADER as usize;
-        let slot = records.slot_words as usize;
-        assert_eq!(records.slot_words, work::GRID, "{stem}: no payload");
-        assert_eq!(d.work.len(), header + slot + 2, "{stem}");
-        assert_eq!(d.work_bytes, 4 * (header + slot + 2) as u64, "{stem}");
-        assert_eq!(d.work[work::OBJECT_GROUPS as usize], 1, "{stem}");
-        assert_eq!(d.work[work::MESH_GROUPS as usize], 2, "{stem}");
-        assert_eq!(d.work[work::RECORDS_BASE as usize], 0, "{stem}");
-        assert_eq!(&d.work[header..header + 4], &[2, 1, 1, 0], "{stem}");
-        assert_eq!(&d.work[header + slot..], &[0, 2], "{stem}");
-        // A grid Metal draws nothing for (65,535 by 65,535) draws nothing, with no records.
-        let none = plan
-            .instantiate_draw(&state, &groups([65535, 65535, 1]))
-            .unwrap_or_else(|e| panic!("{stem}: a grid past Metal's: {e}"));
-        assert!(
-            matches!(
-                none.draw,
-                vk::DrawCommand::Draw {
-                    vertex_count: 0,
-                    ..
-                }
-            ),
-            "{stem}: {:?}",
-            none.draw
-        );
-        // Records past the device's storage buffer range, of the largest grid Metal draws.
-        let l = &dev.profile().fields().limits;
-        let x = l.max_compute_work_group_count[0].min(crate::bind::METAL_MESH_GRID_AXIS);
-        let y = l.max_compute_work_group_count[1].min(crate::bind::METAL_MESH_GRID_TOTAL / x);
-        let bytes = u64::from(x) * u64::from(y) * 4 * records.group_words();
-        if bytes > u64::from(l.max_storage_buffer_range) {
-            assert_eq!(
-                plan.instantiate_draw(&state, &groups([x, y, 1])).err(),
-                Some(BindError::Unsupported(Unsupported::needs(
-                    Feature::MeshShading,
-                    Capability::Limit {
-                        limit: VkLimit::MaxStorageBufferRange,
-                        required: bytes,
-                        available: u64::from(l.max_storage_buffer_range),
-                    },
-                ))),
-                "{stem}"
-            );
-        }
-        // An indirect draw: scanned from Metal's arguments, bound from their offset aligned
-        // down, and drawn from the work buffer.
-        let indirect = DrawCall::MeshThreadgroupsIndirect {
-            indirect: IndirectRef::new(1, 260),
-            threads_per_object_group: [1; 3],
-            threads_per_mesh_group: [8, 1, 1],
-        };
-        let cmds = plan
-            .instantiate_draw(&state, &indirect)
-            .unwrap_or_else(|e| panic!("{stem}: an indirect draw: {e}"));
-        assert!(!cmds.indirect_needs_arguments, "{stem}");
-        assert_eq!(
-            cmds.draw,
-            vk::DrawCommand::DrawIndirect {
-                offset: MeshDispatch::DRAW_OFFSET,
-                draw_count: 1,
-                stride: 16,
-            },
-            "{stem}"
-        );
-        let d = cmds.mesh_dispatch.clone().expect("the draw's dispatch");
-        let a = l.min_storage_buffer_offset_alignment.max(4);
-        let start = 260 - 260 % a;
-        assert_eq!(
-            d.mesh,
-            MeshGroups::Scanned {
-                arguments: Some(BufferRange {
-                    offset: start,
-                    range: 260 - start + 12,
-                }),
-            },
-            "{stem}"
-        );
-        assert_eq!(d.records, MeshRecordsRegion::Pool, "{stem}");
-        assert_eq!(d.object_groups, None, "{stem}");
-        assert_eq!(
-            d.work[work::ARGUMENTS as usize],
-            1 + ((260 - start) / 4) as u32,
-            "{stem}"
-        );
-        assert!(
-            cmds.uses.iter().any(|u| u.resource == UseTarget::Indirect
-                && u.class == AccessClass::Storage
-                && u.stages == vk::PipelineStageFlags2::COMPUTE_SHADER),
-            "{stem}: the scan's read of the arguments"
-        );
-        object_records_draws(&dev, &draws, &stem);
-        // A fragment reading the primitive's id (behind the points, where the device lets a
-        // vertex stage write their outputs).
-        if !writes_points_outputs(dev.profile()) {
-            continue;
-        }
-        let mut d = MeshPipelineDescriptor::new(stage(&outputs, "mesh_outputs_points"));
-        d.fragment = Some(stage(&outputs, "mesh_outputs_fragment"));
-        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Float));
-        match dev.compile_mesh_pipeline(&d, &budget) {
-            Err(Error::Unsupported(u))
-                if u.feature == Feature::MeshShading && u.needs == Needs::NotImplemented => {}
-            other => panic!("{stem}: a fragment reading the primitive's id: {other:?}"),
-        }
-    }
-}
-
-/// An emulated pipeline with an object function (`mesh_draws_object`, a 32-byte payload, with
-/// `mesh_draws_mesh` and `mesh_draws_fragment`): the object function's compute stage first, one
-/// push range of both compute stages' windows, both work bindings; a draw of object threadgroups
-/// dispatches them, is scanned into the records pool, and is drawn from the work buffer, whose
-/// slots hold the payload; an indirect one runs its object arguments pass first, its slots in the
-/// pool.
-fn object_records_draws(dev: &crate::device::Device, draws: &crate::library::Library, stem: &str) {
-    use crate::bind::{
-        BindState, DrawCall, MeshDispatch, MeshGroups, MeshRecordsRegion, UseTarget,
-    };
-    use crate::budget::Budget;
-    use crate::lower::mesh::work;
-    use crate::metal::PixelFormat;
-    use crate::pipeline::descriptor::{
-        ColorAttachmentDescriptor, FunctionDescriptor, MeshPipelineDescriptor, StageSource,
-    };
-    use crate::pipeline::layout::BindingSource;
-    use crate::pipeline::sym::SyntheticBinding;
-    use crate::pipeline::AccessSet;
-    use crate::vk;
+    let draws = Library::from_air(&draws).expect("library");
     let stage = |name: &str| {
         StageSource::Function(FunctionDescriptor::new(
             draws.function(name).expect("function"),
         ))
     };
-    let mut d = MeshPipelineDescriptor::new(stage("mesh_draws_mesh"));
-    d.object = Some(stage("mesh_draws_object"));
-    d.fragment = Some(stage("mesh_draws_fragment"));
-    for slot in d.color_attachments.iter_mut().take(2) {
-        *slot = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Uint));
-    }
-    let pipeline = dev
-        .compile_mesh_pipeline(&d, &Budget::standard())
-        .unwrap_or_else(|e| panic!("{stem}: an object function: {e}"));
-    let kinds: Vec<vk::ShaderStage> = pipeline.stages.iter().map(|m| m.stage).collect();
-    assert_eq!(
-        kinds,
-        [
-            vk::ShaderStage::COMPUTE,
-            vk::ShaderStage::COMPUTE,
-            vk::ShaderStage::VERTEX,
-            vk::ShaderStage::FRAGMENT
-        ],
-        "{stem}"
-    );
-    for m in &pipeline.stages {
-        check_words_valid(&m.spirv, &pipeline.requirements, dev.profile())
-            .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
-    }
-    let compute: Vec<_> = pipeline
-        .layout
-        .push_constants
-        .iter()
-        .filter(|r| r.stages.contains(vk::ShaderStageFlags::COMPUTE))
-        .collect();
-    assert_eq!(
-        compute.len(),
-        1,
-        "{stem}: {:?}",
-        pipeline.layout.push_constants
-    );
-    let stages_of = |stage, binding| {
-        pipeline
-            .layout
-            .sets
-            .iter()
-            .flat_map(|s| &s.bindings)
-            .find(|b| b.source == BindingSource::Synthetic { stage, binding })
-            .map(|b| b.stages)
-    };
-    assert_eq!(
-        stages_of(Stage::Object, SyntheticBinding::MeshWork),
-        Some(vk::ShaderStageFlags::COMPUTE),
-        "{stem}"
-    );
-    assert_eq!(
-        stages_of(Stage::Mesh, SyntheticBinding::MeshWork),
-        Some(vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX),
-        "{stem}"
-    );
-    // The object function's slots of an indirect draw lie in the records (`work::SLOTS`).
-    assert_eq!(
-        stages_of(Stage::Object, SyntheticBinding::MeshRecords),
-        Some(vk::ShaderStageFlags::COMPUTE),
-        "{stem}"
-    );
-    let records = pipeline
-        .graphics
-        .mesh_records
-        .clone()
-        .expect("the pipeline's records");
-    assert_eq!(
-        records.slot_words,
-        work::GRID + 8,
-        "{stem}: the 32-byte payload"
-    );
-    let state = BindState::default();
-    let plan = pipeline
-        .plan(dev, &state.shape())
-        .unwrap_or_else(|e| panic!("{stem}: plan: {e}"));
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [2, 3, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &draw)
-        .unwrap_or_else(|e| panic!("{stem}: a draw: {e}"));
-    assert_eq!(
-        cmds.draw,
-        vk::DrawCommand::DrawIndirect {
-            offset: MeshDispatch::DRAW_OFFSET,
-            draw_count: 1,
-            stride: 16,
-        },
-        "{stem}"
-    );
-    let d = cmds.mesh_dispatch.expect("the draw's dispatch");
-    assert_eq!(d.object_groups, Some([2, 3, 1]), "{stem}");
-    assert_eq!(d.mesh, MeshGroups::Scanned { arguments: None }, "{stem}");
-    assert_eq!(d.records, MeshRecordsRegion::Pool, "{stem}");
-    assert_eq!(d.work.len(), work::HEADER as usize, "{stem}");
-    assert_eq!(d.work[work::OBJECT_GROUPS as usize], 6, "{stem}");
-    assert_eq!(
-        d.work[work::SLOT_WORDS as usize],
-        records.slot_words,
-        "{stem}"
-    );
-    assert_eq!(
-        d.work_bytes,
-        4 * work::words(6, records.slot_words),
-        "{stem}"
-    );
-    // An indirect draw runs its object arguments pass first: Metal's arguments at word 1 plus
-    // the offset's residual, the object threadgroup packed, no object count yet, and the slots in
-    // the pool, which the pass reserves.
-    let indirect = DrawCall::MeshThreadgroupsIndirect {
-        indirect: crate::bind::IndirectRef::new(1, 4),
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &indirect)
-        .unwrap_or_else(|e| panic!("{stem}: an indirect draw: {e}"));
-    let d = cmds.mesh_dispatch.expect("the draw's dispatch");
-    assert_eq!(d.object_groups, None, "{stem}");
-    let range = d.object_arguments.expect("the object arguments pass");
-    assert_eq!(range.offset + range.range, 16, "{stem}");
-    assert_eq!(d.mesh, MeshGroups::Scanned { arguments: None }, "{stem}");
-    assert_eq!(d.records, MeshRecordsRegion::Pool, "{stem}");
-    assert_eq!(
-        d.work[work::OBJECT_ARGUMENTS as usize],
-        u32::try_from((4 - range.offset) / 4 + 1).expect("a word"),
-        "{stem}"
-    );
-    assert_eq!(d.work[work::OBJECT_GROUPS as usize], 0, "{stem}");
-    assert_eq!(
-        d.work_bytes,
-        4 * work::words(0, records.slot_words),
-        "{stem}"
-    );
-    assert!(
-        cmds.uses
-            .iter()
-            .any(|u| u.resource == UseTarget::Indirect && u.access == AccessSet::READ),
-        "{stem}: the pass reads Metal's arguments"
-    );
-    // A `drawMeshThreads` that leaves a partial object threadgroup: its object function, whose
-    // body holds no barrier, runs one, so the draw dispatches the threadgroups its threads fill,
-    // rounded up, its region flagged.
-    assert!(
-        pipeline
-            .dependencies
-            .iter()
-            .any(|d| d.fact == RuntimeFact::PartialObjectThreadgroups),
-        "{stem}"
-    );
-    let threads = DrawCall::MeshThreads {
-        threads: [6, 1, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &threads)
-        .unwrap_or_else(|e| panic!("{stem}: a partial object threadgroup: {e}"));
-    let d = cmds.mesh_dispatch.as_ref().expect("the draw's dispatch");
-    assert_eq!(d.object_groups, Some([2, 1, 1]), "{stem}");
-    assert_eq!(d.work[work::OBJECT_GROUPS as usize], 2, "{stem}");
-    assert!(
-        flags_region(&cmds, [6, 1, 1], [4, 1, 1]),
-        "{stem}: {:?}",
-        cmds.push_constants
-    );
-}
-
-/// Whether a draw's push constants hold the flagged region of a partial object threadgroup's draw
-/// of `threads` in threadgroups of `l` (`lower::dispatch::partial_region_bytes`).
-fn flags_region(cmds: &crate::bind::DrawCommands, threads: [u32; 3], l: [u32; 3]) -> bool {
-    let flagged = crate::lower::dispatch::partial_region_bytes(threads, l).expect("a region");
-    cmds.push_constants
-        .iter()
-        .any(|w| w.bytes.windows(flagged.len()).any(|b| b == flagged))
-}
-
-/// The binder's draws of mesh pipeline `p` with an object function: each stage's threadgroup size
-/// is a specialization of its own ids, which a draw of object threadgroups states beside each
-/// other.
-fn object_draws(dev: &crate::device::Device, p: &crate::pipeline::RenderPipeline, what: &str) {
-    use crate::bind::{BindState, DrawCall};
-    use crate::pipeline::sym::Axis;
-    use crate::vk;
-    let state = BindState::default();
-    let plan = p
-        .plan(dev, &state.shape())
-        .unwrap_or_else(|e| panic!("{what}: plan: {e}"));
-    let constants: Vec<_> = p
-        .stages
-        .iter()
-        .flat_map(|s| s.specialization.constants.iter())
-        .collect();
-    let id = |key: SpecKey| constants.iter().find(|c| c.key == key).map(|c| c.id);
-    let object = [Axis::X, Axis::Y, Axis::Z].map(|a| id(SpecKey::ObjectLocalSize(a)));
-    let mesh = [Axis::X, Axis::Y, Axis::Z].map(|a| id(SpecKey::LocalSize(a)));
-    assert!(
-        object.iter().chain(&mesh).all(Option::is_some) && object != mesh,
-        "{what}: {constants:?}"
-    );
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [2, 1, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &draw)
-        .unwrap_or_else(|e| panic!("{what}: an object draw: {e}"));
-    assert_eq!(
-        cmds.draw,
-        vk::DrawCommand::DrawMeshTasks {
-            group_count_x: 2,
-            group_count_y: 1,
-            group_count_z: 1,
-        },
-        "{what}"
-    );
-    let key = cmds.specialization.as_ref().expect("a mesh draw's key");
-    let value = |id: u32| {
-        key.entries.iter().find(|e| e.constant_id == id).map(|e| {
-            let at = e.offset as usize;
-            u32::from_le_bytes(key.data[at..at + 4].try_into().expect("4 bytes"))
-        })
-    };
-    assert_eq!(
-        object.map(|i| i.and_then(value)),
-        [Some(4), Some(1), Some(1)],
-        "{what}"
-    );
-    assert_eq!(
-        mesh.map(|i| i.and_then(value)),
-        [Some(8), Some(1), Some(1)],
-        "{what}"
-    );
-    // A `drawMeshThreads` that leaves a partial object threadgroup, which the object function
-    // (no barrier in its body) runs: the threadgroups its threads fill, rounded up, at their whole
-    // size, the region (or a folded variant's record) flagged.
-    assert!(
-        p.dependencies
-            .iter()
-            .any(|d| d.fact == crate::pipeline::facts::RuntimeFact::PartialObjectThreadgroups),
-        "{what}"
-    );
-    let partial = DrawCall::MeshThreads {
-        threads: [6, 1, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &partial)
-        .unwrap_or_else(|e| panic!("{what}: a partial object threadgroup: {e}"));
-    assert_eq!(
-        cmds.draw,
-        vk::DrawCommand::DrawMeshTasks {
-            group_count_x: 2,
-            group_count_y: 1,
-            group_count_z: 1,
-        },
-        "{what}"
-    );
-    match &cmds.object_fold {
-        Some(fold) => assert_eq!(
-            fold.record,
-            [2, 1, 1, 3, 6, 1, 1, crate::lower::dispatch::NONUNIFORM],
-            "{what}"
-        ),
-        None => assert!(
-            flags_region(&cmds, [6, 1, 1], [4, 1, 1]),
-            "{what}: {:?}",
-            cmds.push_constants
-        ),
-    }
-    // Where the device folds object grids, the object function reads its region record, and a
-    // grid past the task stage's limits runs in pieces (`bind::mesh_arguments`).
-    let folds = crate::lower::mesh::folds_object_grids(dev.profile());
-    assert_eq!(
-        p.dependencies
-            .iter()
-            .any(|d| d.fact == crate::pipeline::facts::RuntimeFact::FoldedGroups),
-        folds,
-        "{what}"
-    );
-    if !folds {
-        return;
-    }
-    let hole = |c: &crate::bind::DrawCommands| {
-        c.push_holes.iter().any(|h| {
-            matches!(h, crate::bind::PushHole::ReplayRegionAddress { stages, .. }
-                if *stages == vk::ShaderStageFlags::TASK_EXT)
-        })
-    };
-    assert!(hole(&cmds) && cmds.object_fold.is_some(), "{what}");
-    let task = dev.profile().fields().limits.mesh.max_task_work_group_count;
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [task[0].saturating_add(1), 100, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &draw)
-        .unwrap_or_else(|e| panic!("{what}: a folded object draw: {e}"));
-    let fold = cmds.object_fold.expect("a fold");
-    assert!(
-        fold.pieces >= 1 && !fold.past && hole(&cmds),
-        "{what}: {fold:?}"
-    );
-    let indirect = DrawCall::MeshThreadgroupsIndirect {
-        indirect: crate::bind::IndirectRef::new(1, 0),
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &indirect)
-        .unwrap_or_else(|e| panic!("{what}: a folded indirect object draw: {e}"));
-    assert!(
-        matches!(
-            cmds.draw,
-            vk::DrawCommand::DrawMeshTasksIndirectCount { .. }
-        ) && hole(&cmds),
-        "{what}: {:?}",
-        cmds.draw
-    );
-}
-
-/// The binder's plan of mesh pipeline `p` on `dev` and its mesh draws: the plan leaves the mesh
-/// threadgroup's size to each draw, whose specialization states it beside the plan's constants, and
-/// whose `DispatchRegion` is the draw's grid where the mesh function reads it; a draw of primitives
-/// is `InvalidMeshDraw`; a mesh function that chooses its slice is planned for a pass of up to
-/// `maxMeshOutputLayers` layers and no more.
-fn mesh_draws(dev: &crate::device::Device, p: &crate::pipeline::RenderPipeline, what: &str) {
-    use crate::bind::{BindState, DrawCall};
-    use crate::device::requirements::VkLimit;
-    use crate::error::BindError;
-    use crate::pipeline::sym::Axis;
-    use crate::vk;
-    let state = BindState::default();
-    let plan = p
-        .plan(dev, &state.shape())
-        .unwrap_or_else(|e| panic!("{what}: plan: {e}"));
-    let constants = &p.stages[0].specialization.constants;
-    let id = |key: SpecKey| constants.iter().find(|c| c.key == key).map(|c| c.id);
-    let local = [Axis::X, Axis::Y, Axis::Z].map(|a| id(SpecKey::LocalSize(a)));
-    assert!(local.iter().all(Option::is_some), "{what}: {constants:?}");
-    assert!(
-        plan.specialization
-            .entries
-            .iter()
-            .all(|e| !local.contains(&Some(e.constant_id))),
-        "{what}: the plan's key leaves the threadgroup to the draw"
-    );
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [2, 1, 1],
-        threads_per_object_group: [1; 3],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let cmds = plan
-        .instantiate_draw(&state, &draw)
-        .unwrap_or_else(|e| panic!("{what}: a mesh draw: {e}"));
-    assert_eq!(
-        cmds.draw,
-        vk::DrawCommand::DrawMeshTasks {
-            group_count_x: 2,
-            group_count_y: 1,
-            group_count_z: 1,
-        },
-        "{what}"
-    );
-    let key = cmds.specialization.as_ref().expect("a mesh draw's key");
-    let value = |id: u32| {
-        key.entries.iter().find(|e| e.constant_id == id).map(|e| {
-            let at = e.offset as usize;
-            u32::from_le_bytes(key.data[at..at + 4].try_into().expect("4 bytes"))
-        })
-    };
-    assert_eq!(
-        local.map(|i| i.and_then(value)),
-        [Some(8), Some(1), Some(1)],
-        "{what}"
-    );
-    if let Some(multi) = id(SpecKey::MultiRegion) {
-        assert_eq!(value(multi), Some(0), "{what}");
-        let region =
-            crate::lower::dispatch::region_bytes([0; 3], [16, 1, 1], [8, 1, 1]).expect("region");
-        let mesh = vk::ShaderStageFlags::MESH_EXT;
-        let field = plan
-            .push
-            .fields
-            .iter()
-            .find(|f| f.stage == Stage::Mesh && f.field == PushField::DispatchRegion)
-            .expect("the mesh function's region");
-        let crate::bind::FieldLocation::PushWindow { offset } = field.location else {
-            panic!("{what}: a region outside the push window");
-        };
-        let write = cmds
-            .push_constants
-            .iter()
-            .find(|w| w.stages == mesh)
-            .expect("the mesh stage's push");
-        let at = (offset - write.offset) as usize;
-        assert_eq!(write.bytes[at..at + 32], region, "{what}");
-    }
-    assert_eq!(
-        plan.instantiate_draw(
-            &state,
-            &DrawCall::Primitives {
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
+    for (stem, _) in refusing_profiles() {
+        let dev = device(&stem);
+        for object in [None, Some("mesh_draws_object")] {
+            let mut d = MeshPipelineDescriptor::new(stage(match object {
+                Some(_) => "mesh_draws_mesh",
+                None => "mesh_draws_grid",
+            }));
+            d.object = object.map(stage);
+            d.rasterization_enabled = false;
+            match dev.compile_mesh_pipeline(&d, &Budget::standard()) {
+                Err(Error::Unsupported(u)) => {
+                    assert_eq!(u.feature, Feature::MeshShading, "{stem} {object:?}")
+                }
+                other => panic!("{stem} {object:?}: {:?}", other.map(|_| ())),
             }
-        )
-        .err(),
-        Some(BindError::InvalidMeshDraw { mesh: false }),
-        "{what}"
-    );
-    // A pass of more layers than the mesh entry may write, where the function chooses its slice.
-    let chooses = p
-        .dependencies
-        .iter()
-        .any(|d| matches!(d.fact, RuntimeFact::RenderTargetArrayLength { .. }));
-    if chooses {
-        let layers = dev.profile().fields().limits.mesh.max_mesh_output_layers;
-        let mut shape = state.shape();
-        shape.render_target_array_length = layers;
-        p.plan(dev, &shape)
-            .unwrap_or_else(|e| panic!("{what}: a pass of {layers} layers: {e}"));
-        shape.render_target_array_length = layers + 1;
-        assert_eq!(
-            p.plan(dev, &shape).err(),
-            Some(BindError::Unsupported(crate::error::Unsupported::needs(
-                Feature::MeshShading,
-                Capability::Limit {
-                    limit: VkLimit::MaxMeshOutputLayers,
-                    required: u64::from(layers) + 1,
-                    available: u64::from(layers),
-                },
-            ))),
-            "{what}"
-        );
+        }
     }
 }
 
@@ -1837,84 +1004,36 @@ fn index_chains(words: &[u32]) -> [usize; 2] {
     chains
 }
 
-/// On a driver that misplaces a store into one component of an index vector
-/// (`DriverWorkaround::MeshIndexComponentStoresMisplaced`, lavapipe before Mesa 26.2) a triangle
-/// mesh function keeps its indices in workgroup words and its wrapper writes each primitive's
-/// indices whole: no access chain reaches a component of the indices, and the words count among
-/// the wrapper's workgroup memory, refused typed one byte short (`mesh_draws_grid`: one
-/// triangle, 12 bytes of indices beside the 4-byte count). Every other mesh profile stores each
-/// index into its component, as before. Each module passes L3.
+/// A triangle mesh function stores each index into its component, on every mesh profile: the
+/// wrapper's zeroed slot is the one access chain to the whole indices, and at least three reach a
+/// component (`mesh_draws_grid`: one triangle). Each module passes L3.
 #[test]
-fn a_mesh_function_stages_its_indices_where_the_driver_misplaces_component_stores() {
-    use crate::device::profile::DriverWorkaround;
-    use crate::device::requirements::VkLimit;
-    use crate::device::{Device, DeviceDescription, DevicePolicy};
+fn a_mesh_function_stores_each_index_into_its_component() {
     let Some(draws) = fixture("mesh_draws") else {
         return;
     };
-    let defect = DriverWorkaround::MeshIndexComponentStoresMisplaced;
-    let mut staged = 0;
     for (stem, p) in mesh_profiles() {
         let a = compile(&draws, "mesh_draws_grid", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         check_words_valid(&a.module.words, &a.module.requirements, &p)
             .unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
         let [whole, component] = index_chains(&a.module.words);
-        if p.fields().workarounds.contains(&defect) {
-            staged += 1;
-            assert_eq!((whole, component), (1, 0), "{stem}: staged indices");
-        } else {
-            assert_eq!(whole, 1, "{stem}: the wrapper's zeroed slot");
-            assert!(component >= 3, "{stem}: {component} component stores");
-        }
-    }
-    assert!(
-        staged >= 2,
-        "the lavapipe profiles of Mesa 26.0.8 and newer stage their indices"
-    );
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/gate-lavapipe-x86_64.json");
-    let text = std::fs::read_to_string(path).expect("profile");
-    for (available, fits) in [(16, true), (15, false)] {
-        let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        desc.limits.mesh.max_mesh_shared_memory_size = available;
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-        // The refusal's feature and needs (its location is the entry's).
-        let got = compile(&draws, "mesh_draws_grid", dev.profile())
-            .map(|_| ())
-            .map_err(|e| match e {
-                Error::Unsupported(u) => (u.feature, u.needs),
-                other => panic!("{available} bytes: {other:?}"),
-            });
-        let want = match fits {
-            true => Ok(()),
-            false => {
-                let u = crate::error::Unsupported::needs(
-                    Feature::ThreadgroupMemorySize,
-                    Capability::Limit {
-                        limit: VkLimit::MaxMeshSharedMemorySize,
-                        required: 16,
-                        available: 15,
-                    },
-                );
-                Err((u.feature, u.needs))
-            }
-        };
-        assert_eq!(got, want, "{available} bytes");
+        assert_eq!(whole, 1, "{stem}: the wrapper's zeroed slot");
+        assert!(component >= 3, "{stem}: {component} component stores");
     }
 }
 
 /// A mesh function's buffer writes need no stage store feature: Vulkan's
-/// `vertexPipelineStoresAndAtomics` and `fragmentStoresAndAtomics` name no task or mesh stage, and
-/// the emulation runs the function as a compute entry. `mesh_barrier_writer`, whose one store is
-/// to its device buffer, compiles on every committed profile with both features removed, as a
-/// `MeshEXT` entry or the emulation's compute entry, and passes L3 within that profile.
+/// `vertexPipelineStoresAndAtomics` and `fragmentStoresAndAtomics` name no task or mesh stage.
+/// `mesh_barrier_writer`, whose one store is to its device buffer, compiles on every committed
+/// profile with `VK_EXT_mesh_shader` with both features removed, as a `MeshEXT` entry, and passes
+/// L3 within that profile.
 #[test]
 fn a_mesh_functions_buffer_writes_need_no_stage_store_feature() {
     use crate::device::{Device, DeviceDescription, DevicePolicy};
     let Some(barrier) = fixture("mesh_barrier") else {
         return;
     };
-    for (stem, _) in committed_profiles().expect("committed profiles") {
+    for (stem, _) in mesh_profiles() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../metal2vulkan-validation/profiles/{stem}.json"));
         let text = std::fs::read_to_string(path).expect("profile");
@@ -1925,7 +1044,7 @@ fn a_mesh_functions_buffer_writes_need_no_stage_store_feature() {
         ] {
             desc.features.remove(&f);
         }
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         let p = dev.profile();
         let a =
             compile(&barrier, "mesh_barrier_writer", p).unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -1941,159 +1060,14 @@ fn a_mesh_functions_buffer_writes_need_no_stage_store_feature() {
     }
 }
 
-/// A mesh render pipeline's answers to Metal's mesh queries (`RenderPipeline::mesh_info`), on
-/// every committed profile, emulated or not: each stage's thread limit is the least of the
-/// descriptor's maximum, the function's `[[max_total_threads_per_threadgroup(n)]]`, the threads of
-/// the stage's required size and 1024, within the device's limit for the stage (the task and mesh
-/// stages' invocations, or the compute stage's where it runs them as compute work); the widths are
-/// 32; the mesh grid is the descriptor's maximum, else 2^20 whatever the object function's
-/// `[[max_total_threadgroups_per_mesh_grid(n)]]`, within the device's `maxMeshWorkGroupTotalCount`
-/// where it runs mesh functions natively. Without an object function the object stage answers 0
-/// and 0. Each as an M3 Max answers on a first compile (`mesh_pipeline_limits.m`).
-#[test]
-fn a_mesh_pipeline_answers_metals_mesh_queries_within_the_device() {
-    use crate::budget::Budget;
-    use crate::library::Library;
-    use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
-    use crate::pipeline::MeshPipelineMetalInfo;
-    let (Some(draws), Some(outputs)) = (fixture("mesh_draws"), fixture("mesh_outputs")) else {
-        return;
-    };
-    let (draws, outputs) = (
-        Library::from_air(&draws).expect("library"),
-        Library::from_air(&outputs).expect("library"),
-    );
-    let stage = |lib: &Library, name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            lib.function(name).expect("function"),
-        ))
-    };
-    let budget = Budget::standard();
-    for (stem, p) in mesh_profiles().into_iter().chain(emulating_profiles()) {
-        let dev = device(&stem);
-        let l = &p.fields().limits;
-        let emulated = p.emulates_mesh_shading();
-        assert_eq!(emulated, crate::lower::mesh::emulates(&p), "{stem}");
-        let (object, mesh, total) = match emulated {
-            true => (
-                l.max_compute_work_group_invocations,
-                l.max_compute_work_group_invocations,
-                u32::MAX,
-            ),
-            false => (
-                l.mesh.max_task_work_group_invocations,
-                l.mesh.max_mesh_work_group_invocations,
-                l.mesh.max_mesh_work_group_total_count,
-            ),
-        };
-        let info = |d: &MeshPipelineDescriptor| {
-            dev.compile_mesh_pipeline(d, &budget)
-                .unwrap_or_else(|e| panic!("{stem}: {e}"))
-                .mesh_info
-                .unwrap_or_else(|| panic!("{stem}: a mesh pipeline's answers"))
-        };
-        let mut d = MeshPipelineDescriptor::new(stage(&draws, "mesh_draws_mesh"));
-        d.object = Some(stage(&draws, "mesh_draws_object"));
-        d.rasterization_enabled = false;
-        let answers = |o: u32, m: u32, ow: u32, g: u32| MeshPipelineMetalInfo {
-            max_total_threads_per_object_threadgroup: o,
-            max_total_threads_per_mesh_threadgroup: m,
-            object_thread_execution_width: ow,
-            mesh_thread_execution_width: 32,
-            max_total_threadgroups_per_mesh_grid: g,
-        };
-        assert_eq!(
-            info(&d),
-            answers(object.min(1024), mesh.min(1024), 32, total.min(1 << 20)),
-            "{stem}"
-        );
-        // The descriptor's maxima, a grid past 2^20 among them, and a required size of the
-        // object maximum's threads.
-        let mut limited = d.clone();
-        limited.max_total_threads_per_object_threadgroup = Some(64);
-        limited.max_total_threads_per_mesh_threadgroup = Some(32);
-        limited.max_total_threadgroups_per_mesh_grid = Some(8);
-        assert_eq!(
-            info(&limited),
-            answers(object.min(64), mesh.min(32), 32, total.min(8)),
-            "{stem}"
-        );
-        limited.max_total_threadgroups_per_mesh_grid = Some(1 << 21);
-        limited.required_threads_per_object_threadgroup = Some([32, 2, 1]);
-        assert_eq!(
-            info(&limited),
-            answers(object.min(64), mesh.min(32), 32, total.min(1 << 21)),
-            "{stem}"
-        );
-        // A required size alone gives its stage its threads (an M3 Max's first compile answers 64
-        // for `required-object-32x2` and 32 for `required-mesh-16x2`).
-        let mut required = d.clone();
-        required.required_threads_per_object_threadgroup = Some([32, 2, 1]);
-        assert_eq!(
-            info(&required),
-            answers(object.min(64), mesh.min(1024), 32, total.min(1 << 20)),
-            "{stem}"
-        );
-        required.required_threads_per_object_threadgroup = None;
-        required.required_threads_per_mesh_threadgroup = Some([16, 2, 1]);
-        assert_eq!(
-            info(&required),
-            answers(object.min(1024), mesh.min(32), 32, total.min(1 << 20)),
-            "{stem}"
-        );
-        // The functions' own maxima (`mesh_outputs_object`'s 64 threads, `mesh_outputs_triangles`'
-        // 32 threads), and the descriptor's equal ones; the object function's 16 threadgroups
-        // change no grid.
-        let mut own = MeshPipelineDescriptor::new(stage(&outputs, "mesh_outputs_triangles"));
-        own.object = Some(stage(&outputs, "mesh_outputs_object"));
-        own.rasterization_enabled = false;
-        let theirs = answers(object.min(64), mesh.min(32), 32, total.min(1 << 20));
-        assert_eq!(info(&own), theirs, "{stem}");
-        own.max_total_threads_per_object_threadgroup = Some(64);
-        own.max_total_threads_per_mesh_threadgroup = Some(32);
-        assert_eq!(info(&own), theirs, "{stem}");
-        own.max_total_threadgroups_per_mesh_grid = Some(32);
-        assert_eq!(
-            info(&own).max_total_threadgroups_per_mesh_grid,
-            total.min(32),
-            "{stem}"
-        );
-        // A required size below the function's own maximum gives its stage its threads (an M3
-        // Max's first compile answers 32 for `required-object-32-attribute-64`).
-        own.max_total_threads_per_object_threadgroup = None;
-        own.max_total_threads_per_mesh_threadgroup = None;
-        own.max_total_threadgroups_per_mesh_grid = None;
-        own.required_threads_per_mesh_threadgroup = Some([16, 1, 1]);
-        assert_eq!(
-            info(&own),
-            answers(object.min(64), mesh.min(16), 32, total.min(1 << 20)),
-            "{stem}"
-        );
-        // Without an object function.
-        let mut alone = MeshPipelineDescriptor::new(stage(&draws, "mesh_draws_grid"));
-        alone.rasterization_enabled = false;
-        assert_eq!(
-            info(&alone),
-            answers(0, mesh.min(1024), 0, total.min(1 << 20)),
-            "{stem}"
-        );
-        alone.required_threads_per_mesh_threadgroup = Some([16, 2, 1]);
-        assert_eq!(
-            info(&alone),
-            answers(0, mesh.min(32), 0, total.min(1 << 20)),
-            "{stem}"
-        );
-    }
-}
-
 /// A mesh render pipeline descriptor Metal refuses is refused as Metal's rule
 /// (`InvalidDescriptor(MeshPipeline)`, measured on an M3 Max, `mesh_pipeline_limits.m`), on every
-/// committed profile, and the descriptors beside each are made: a required size with an axis of
+/// committed profile with `VK_EXT_mesh_shader`, and the descriptors beside each are made: a required size with an axis of
 /// 0, of more than 1024 threads or more than its stage's maximum, or of an object stage without an
 /// object function; a maximum past 1024; a required size of other threads than its stage's
 /// maximum, in either stage (Metal's first compile); a function's maximum other than the
 /// descriptor's; a payload past 16384 bytes. An amplification count of 0 is refused as a render
-/// pipeline's, and one of 2 is made, as Metal makes it ([`an_amplified_mesh_pipeline_draws_one_amplification`]).
+/// pipeline's, and one of 2 is made, as Metal makes it.
 #[test]
 fn a_mesh_descriptor_metal_refuses_is_refused_as_its_rule() {
     use crate::budget::Budget;
@@ -2118,7 +1092,7 @@ fn a_mesh_descriptor_metal_refuses_is_refused_as_its_rule() {
             crate::error::DescriptorError::MeshPipeline { problem },
         ))
     };
-    for (stem, _) in mesh_profiles().into_iter().chain(emulating_profiles()) {
+    for (stem, _) in mesh_profiles() {
         let dev = device(&stem);
         let answer = |d: &MeshPipelineDescriptor| dev.compile_mesh_pipeline(d, &budget).err();
         let mut d = MeshPipelineDescriptor::new(stage(&draws, "mesh_draws_mesh"));
@@ -2320,73 +1294,10 @@ fn a_mesh_descriptor_metal_refuses_is_refused_as_its_rule() {
     }
 }
 
-/// A mesh render pipeline of `maxVertexAmplificationCount` 2, which Metal makes (the
-/// `mesh-limits-amplification-2` conformance recording, an M3 Max under macOS 27.0.1), is made on
-/// every committed profile without multiview, and draws one amplification, Metal's default, as a
-/// pipeline without amplification does. Its draw of two is refused
-/// `NotImplemented(VertexAmplification)`: Vulkan's multiview may run the task stage once a view,
-/// where Metal runs the object function once a draw, and a mesh function does not add a view
-/// mapping's offsets, as a draw of each amplification in turn would need.
-#[test]
-fn an_amplified_mesh_pipeline_draws_one_amplification() {
-    use crate::bind::{BindState, DrawCall, VertexAmplification};
-    use crate::budget::Budget;
-    use crate::library::Library;
-    use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
-    let Some(draws) = fixture("mesh_draws") else {
-        return;
-    };
-    let draws = Library::from_air(&draws).expect("library");
-    let stage = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            draws.function(name).expect("function"),
-        ))
-    };
-    for (stem, _) in mesh_profiles().into_iter().chain(emulating_profiles()) {
-        let dev = device(&stem);
-        let mut d = MeshPipelineDescriptor::new(stage("mesh_draws_mesh"));
-        d.object = Some(stage("mesh_draws_object"));
-        d.rasterization_enabled = false;
-        d.max_vertex_amplification_count = 2;
-        let p = dev
-            .compile_mesh_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(p.graphics.max_vertex_amplification_count, 2, "{stem}");
-        assert!(
-            !p.requirements.features.contains(&VkFeature::Multiview),
-            "{stem}"
-        );
-        let state = BindState::default();
-        let plan = p
-            .plan(&dev, &state.shape())
-            .unwrap_or_else(|e| panic!("{stem}: plan: {e}"));
-        let draw = DrawCall::MeshThreadgroups {
-            groups: [2, 1, 1],
-            threads_per_object_group: [1; 3],
-            threads_per_mesh_group: [8, 1, 1],
-        };
-        plan.instantiate_draw(&state, &draw)
-            .unwrap_or_else(|e| panic!("{stem}: a draw: {e}"));
-        for mappings in [Vec::new(), vec![Default::default(); 2]] {
-            let two = BindState {
-                vertex_amplification: VertexAmplification::new(2, mappings),
-                ..Default::default()
-            };
-            assert_eq!(
-                p.plan(&dev, &two.shape()).err(),
-                Some(crate::bind::plan::compute::not_implemented(
-                    Feature::VertexAmplification
-                )),
-                "{stem}"
-            );
-        }
-    }
-}
-
 /// `payloadMemoryLength` sizes the payload of both stages: in the mesh render pipeline of
 /// `mesh_outputs_object`, which declares 16 bytes, and `mesh_outputs_triangles`, which declares 16
 /// and reads 64, a length of 64 gives the object function's arena and the mesh function's its 64
-/// bytes, as the object function's declaring 64 does ([`wide_object_payload`]), emulated or not;
+/// bytes, as the object function's declaring 64 does ([`wide_object_payload`]);
 /// a length the declared type holds leaves the object function's key as without it; and a stage
 /// compiled on its own without the length is refused as `NeedsInput(ObjectPayload)`.
 #[test]
@@ -2394,7 +1305,6 @@ fn the_descriptors_payload_length_sizes_both_stages_payloads() {
     use crate::budget::Budget;
     use crate::error::RuntimeInput;
     use crate::library::Library;
-    use crate::lower::mesh::work;
     use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
     let Some(outputs) = fixture("mesh_outputs") else {
         return;
@@ -2402,9 +1312,8 @@ fn the_descriptors_payload_length_sizes_both_stages_payloads() {
     let outputs = Library::from_air(&outputs).expect("library");
     let function = |name: &str| FunctionDescriptor::new(outputs.function(name).expect("function"));
     let budget = Budget::standard();
-    for (stem, p) in mesh_profiles().into_iter().chain(emulating_profiles()) {
+    for (stem, _) in mesh_profiles() {
         let dev = device(&stem);
-        let emulated = p.emulates_mesh_shading();
         let mut d =
             MeshPipelineDescriptor::new(StageSource::Function(function("mesh_outputs_triangles")));
         d.object = Some(StageSource::Function(function("mesh_outputs_object")));
@@ -2422,8 +1331,6 @@ fn the_descriptors_payload_length_sizes_both_stages_payloads() {
             })
             .collect();
         assert_eq!(arena, [Some(64)], "{stem}");
-        let slot = made.graphics.mesh_records.as_ref().map(|r| r.slot_words);
-        assert_eq!(slot, emulated.then_some(work::GRID + 16), "{stem}");
         for m in &made.stages {
             check_words_valid(&m.spirv, &made.requirements, dev.profile())
                 .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
@@ -2446,273 +1353,6 @@ fn the_descriptors_payload_length_sizes_both_stages_payloads() {
         assert_eq!(
             dev.compile_mesh_pipeline(&alone, &budget).err(),
             Some(Error::NeedsInput(RuntimeInput::ObjectPayload)),
-            "{stem}"
-        );
-    }
-}
-
-/// An object function's `[[threadgroup(n)]]` arguments take the render encoder's lengths
-/// (`setObjectThreadgroupMemoryLength:atIndex:`, the object stage's `threadgroup_lengths`): in the
-/// pipeline of `mesh_outputs_object` (its payload 64 bytes, [`wide_object_payload`]) and
-/// `mesh_outputs_triangles`, a draw specializes `TgLength(0)` to the length rounded up to 16, as
-/// a kernel's, and to 0 where it is unset, emulated or not. The artifact states the arena's static
-/// part and its payload (`RuntimeFact::ObjectThreadgroupArena`). The plan checks the arena with the
-/// lengths against the object stage's workgroup memory limit: the task stage's
-/// (`maxTaskSharedMemorySize`, beside the wrapper's 12-byte grid), whose 76 bytes fit a 64-byte
-/// length and not a 65-byte one, or, emulated, the compute stage's.
-#[test]
-fn an_object_functions_threadgroup_memory_is_the_encoders_lengths() {
-    use crate::bind::{BindState, DrawCall};
-    use crate::budget::Budget;
-    use crate::device::requirements::VkLimit;
-    use crate::device::{Device, DeviceDescription, DevicePolicy};
-    use crate::error::{BindError, Unsupported};
-    use crate::library::Library;
-    use crate::pipeline::descriptor::{FunctionDescriptor, MeshPipelineDescriptor, StageSource};
-    let Some(wide) = wide_object_payload() else {
-        return;
-    };
-    let wide = Library::from_air(&wide).expect("library");
-    let function = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            wide.function(name).expect("function"),
-        ))
-    };
-    let budget = Budget::standard();
-    let pipeline = |dev: &Device| {
-        let mut d = MeshPipelineDescriptor::new(function("mesh_outputs_triangles"));
-        d.object = Some(function("mesh_outputs_object"));
-        d.rasterization_enabled = false;
-        dev.compile_mesh_pipeline(&d, &budget)
-    };
-    let with_length = |len: Option<u32>| {
-        let mut state = BindState::default();
-        if let Some(len) = len {
-            state
-                .stages
-                .entry(Stage::Object)
-                .or_default()
-                .threadgroup_lengths
-                .insert(0, len);
-        }
-        state
-    };
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [1, 1, 1],
-        threads_per_object_group: [4, 1, 1],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let refused_limit = |r: Result<crate::bind::BindingPlan, BindError>| match r {
-        Err(BindError::Unsupported(Unsupported {
-            feature: Feature::ThreadgroupMemorySize,
-            needs: Needs::AnyOf(alternatives),
-            ..
-        })) => match alternatives.as_slice() {
-            [one] => match one.as_slice() {
-                [Capability::Limit {
-                    limit,
-                    required,
-                    available,
-                }] => Some((*limit, *required, *available)),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    };
-    for (stem, p) in mesh_profiles().into_iter().chain(emulating_profiles()) {
-        let dev = device(&stem);
-        let emulated = crate::lower::mesh::emulates(&p);
-        let made = pipeline(&dev).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let arena: Vec<_> = made
-            .dependencies
-            .iter()
-            .filter_map(|d| match d.fact {
-                RuntimeFact::ObjectThreadgroupArena {
-                    static_bytes,
-                    payload,
-                } => Some((static_bytes, payload)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(arena, [(0, Some(64))], "{stem}");
-        let id = made
-            .stages
-            .iter()
-            .flat_map(|s| s.specialization.constants.iter())
-            .find(|c| c.key == SpecKey::TgLength(0))
-            .map(|c| c.id)
-            .unwrap_or_else(|| panic!("{stem}: the object function's TgLength(0)"));
-        for (len, want) in [(None, 0), (Some(20), 32), (Some(64), 64)] {
-            let state = with_length(len);
-            let plan = made
-                .plan(&dev, &state.shape())
-                .unwrap_or_else(|e| panic!("{stem} {len:?}: plan: {e}"));
-            let cmds = plan
-                .instantiate_draw(&state, &draw)
-                .unwrap_or_else(|e| panic!("{stem} {len:?}: draw: {e}"));
-            let key = cmds.specialization.as_ref().expect("a mesh draw's key");
-            let value = key.entries.iter().find(|e| e.constant_id == id).map(|e| {
-                let at = e.offset as usize;
-                u32::from_le_bytes(key.data[at..at + 4].try_into().expect("4 bytes"))
-            });
-            assert_eq!(
-                value,
-                Some(want),
-                "{stem} {len:?}: Metal's 16-byte rounding"
-            );
-        }
-        // Past the object stage's limit, refused at plan naming it.
-        let l = &p.fields().limits;
-        let past = if emulated {
-            l.max_compute_shared_memory_size
-        } else {
-            l.mesh.max_task_shared_memory_size
-        };
-        let refused = refused_limit(made.plan(&dev, &with_length(Some(past)).shape()));
-        let named = refused.map(|(limit, _, _)| limit);
-        if emulated {
-            assert_eq!(named, Some(VkLimit::MaxComputeSharedMemorySize), "{stem}");
-        } else {
-            assert!(
-                matches!(
-                    named,
-                    Some(VkLimit::MaxTaskSharedMemorySize)
-                        | Some(VkLimit::MaxTaskPayloadAndSharedMemorySize)
-                ),
-                "{stem}: {refused:?}"
-            );
-        }
-    }
-    // The task stage's limit: 76 bytes hold the wrapper's 12 and a 64-byte length, and a 65-byte
-    // length, 80 rounded, is refused naming it.
-    let (stem, _) = &mesh_profiles()[0];
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../metal2vulkan-validation/profiles/{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.limits.mesh.max_task_shared_memory_size = 76;
-    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-    let made = pipeline(&dev).unwrap_or_else(|e| panic!("{stem} at 76: {e}"));
-    made.plan(&dev, &with_length(Some(64)).shape())
-        .unwrap_or_else(|e| panic!("{stem} at 76: 64 bytes: {e}"));
-    assert_eq!(
-        refused_limit(made.plan(&dev, &with_length(Some(65)).shape())),
-        Some((VkLimit::MaxTaskSharedMemorySize, 92, 76)),
-        "{stem} at 76: 65 bytes"
-    );
-}
-
-/// Under `VariantKey::mesh_last_first` an emulated mesh pipeline's synthesized vertex stage reads
-/// each triangle's corner `(c + k - 1) mod k`, so the draw takes each primitive from its last
-/// index first: one `OpIAdd` and one `OpUMod` more than the base's, valid, its plan stating the
-/// variant (`RuntimeFact::MeshLastFirst`). A draw whose shape asks for it runs it
-/// (`BindError::NeedsVariant` from the base), and the variant's plan of the default shape asks
-/// for the base again.
-#[test]
-fn a_last_first_mesh_draw_reads_its_corners_from_the_last() {
-    use crate::bind::{BindState, DrawCall};
-    use crate::budget::Budget;
-    use crate::error::BindError;
-    use crate::library::Library;
-    use crate::metal::PixelFormat;
-    use crate::pipeline::descriptor::{
-        ColorAttachmentDescriptor, FunctionDescriptor, MeshPipelineDescriptor, StageSource,
-    };
-    use crate::vk;
-    /// `OpIAdd` and `OpUMod`.
-    const ADD_MOD: [u32; 2] = [128, 137];
-    let Some(draws) = fixture("mesh_draws") else {
-        return;
-    };
-    let draws = Library::from_air(&draws).expect("library");
-    let stage = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            draws.function(name).expect("function"),
-        ))
-    };
-    let budget = Budget::standard();
-    let draw = DrawCall::MeshThreadgroups {
-        groups: [2, 1, 1],
-        threads_per_object_group: [1; 3],
-        threads_per_mesh_group: [8, 1, 1],
-    };
-    let last_first = BindState {
-        mesh_last_first: true,
-        ..Default::default()
-    };
-    for (stem, _) in emulating_profiles() {
-        let dev = device(&stem);
-        let mut d = MeshPipelineDescriptor::new(stage("mesh_draws_grid"));
-        d.fragment = Some(stage("mesh_draws_fragment"));
-        for slot in d.color_attachments.iter_mut().take(2) {
-            *slot = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Uint));
-        }
-        let base = dev
-            .compile_mesh_pipeline(&d, &budget)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let plan = base
-            .plan(&dev, &last_first.shape())
-            .unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-        assert!(plan.variant.mesh_last_first, "{stem}");
-        assert_eq!(
-            plan.instantiate_draw(&last_first, &draw),
-            Err(BindError::NeedsVariant {
-                variant: Box::new(plan.variant.clone())
-            }),
-            "{stem}"
-        );
-        let key = plan.variant.clone();
-        let v = dev
-            .compile_mesh_variant(&d, &key, &budget)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        for m in &v.stages {
-            check_words_valid(&m.spirv, &v.requirements, dev.profile())
-                .unwrap_or_else(|e| panic!("{stem} {:?}: L3: {e}", m.stage));
-        }
-        assert!(
-            v.dependencies
-                .iter()
-                .any(|x| x.fact == RuntimeFact::MeshLastFirst),
-            "{stem}"
-        );
-        assert!(
-            !base
-                .dependencies
-                .iter()
-                .any(|x| x.fact == RuntimeFact::MeshLastFirst),
-            "{stem}"
-        );
-        assert_ne!(v.key, base.key, "{stem}");
-        let vertex = |p: &crate::pipeline::RenderPipeline| {
-            let m = p
-                .stages
-                .iter()
-                .find(|m| m.stage == vk::ShaderStage::VERTEX)
-                .expect("the synthesized vertex stage");
-            opcodes(&m.spirv)
-        };
-        let (a, b) = (vertex(&v), vertex(&base));
-        for op in ADD_MOD {
-            let n = |ops: &[u32]| ops.iter().filter(|&&o| o == op).count();
-            assert_eq!(n(&a), n(&b) + 1, "{stem}: opcode {op}");
-        }
-        let plan = v
-            .plan(&dev, &last_first.shape())
-            .unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-        assert_eq!(plan.variant, key, "{stem}");
-        plan.instantiate_draw(&last_first, &draw)
-            .unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-        let plain = BindState::default();
-        let plan = v
-            .plan(&dev, &plain.shape())
-            .unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-        assert!(!plan.variant.mesh_last_first, "{stem}");
-        assert!(
-            matches!(
-                plan.instantiate_draw(&plain, &draw),
-                Err(BindError::NeedsVariant { .. })
-            ),
             "{stem}"
         );
     }

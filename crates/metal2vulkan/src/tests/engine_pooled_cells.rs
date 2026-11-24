@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use crate::device::DevicePolicy;
 use crate::error::{Error, Feature, LowerFamily};
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
@@ -124,12 +124,7 @@ fn answers_as_metal(bc: &[u8], entry: &str, third: Option<Vec<u8>>, metal: &[[f3
         let res = Resources {
             buffers,
             push: vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)],
-            spec: BTreeMap::from([
-                (SpecKey::LocalSize(Axis::X), u64::from(THREADS)),
-                (SpecKey::LocalSize(Axis::Y), 1),
-                (SpecKey::LocalSize(Axis::Z), 1),
-                (SpecKey::FlatLocalSize, u64::from(THREADS)),
-            ]),
+            spec: BTreeMap::from(crate::pipeline::threadgroup_constants([THREADS, 1, 1])),
         };
         let cfg = Config {
             workgroups: [1, 1, 1],
@@ -181,8 +176,8 @@ fn a_pointer_copied_into_a_pool_as_data_answers_as_metal_or_is_refused() {
 #[test]
 fn a_context_s_argument_buffer_beside_a_pool_compiles() {
     let Some(bc) = fixture() else { return };
-    for stem in ["lavapipe", "amd-rdna3-radv", "moltenvk-m3"] {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+    for stem in ["lavapipe", "amd-780m-radv", "moltenvk-m3"] {
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a = compile(&bc, "pooled_context", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
     }

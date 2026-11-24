@@ -5,18 +5,19 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 target triple = "air64_v28-apple-macosx26.0.0"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020489, i64 0], align 8
+@__air_sampler_state.1 = internal addrspace(2) constant [2 x i64] [i64 34901797601026121, i64 0], align 8
 
 ; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(argmem: readwrite)
 define void @scale_and_offset(ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %0, ptr addrspace(1) noundef writeonly captures(none) "air-buffer-no-alias" %1, ptr addrspace(2) noundef readonly align 4 captures(none) dereferenceable(4) "air-buffer-no-alias" %2, i32 noundef %3) local_unnamed_addr #0 {
   %5 = zext i32 %3 to i64
   %6 = getelementptr inbounds float, ptr addrspace(1) %0, i64 %5
-  %7 = load float, ptr addrspace(1) %6, align 4, !tbaa !49, !alias.scope !53, !noalias !56
-  %8 = load float, ptr addrspace(2) %2, align 4, !tbaa !49, !alias.scope !59, !noalias !60
+  %7 = load float, ptr addrspace(1) %6, align 4, !tbaa !64, !alias.scope !68, !noalias !71
+  %8 = load float, ptr addrspace(2) %2, align 4, !tbaa !64, !alias.scope !74, !noalias !75
   %9 = fmul fast float %8, %7
-  %10 = tail call fast float @air.convert.f.f32.u.i32(i32 %3) #10
+  %10 = tail call fast float @air.convert.f.f32.u.i32(i32 %3) #11
   %11 = fadd fast float %9, %10
   %12 = getelementptr inbounds float, ptr addrspace(1) %1, i64 %5
-  store float %11, ptr addrspace(1) %12, align 4, !tbaa !49, !alias.scope !61, !noalias !62
+  store float %11, ptr addrspace(1) %12, align 4, !tbaa !64, !alias.scope !76, !noalias !77
   ret void
 }
 
@@ -27,11 +28,11 @@ declare float @air.convert.f.f32.u.i32(i32) local_unnamed_addr #1
 define <{ <4 x float>, <4 x float> }> @colored_vertex(ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %0, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %1, i32 noundef %2) local_unnamed_addr #2 {
   %4 = zext i32 %2 to i64
   %5 = getelementptr inbounds <2 x float>, ptr addrspace(1) %0, i64 %4
-  %6 = load <2 x float>, ptr addrspace(1) %5, align 8, !tbaa !63, !alias.scope !64, !noalias !67
+  %6 = load <2 x float>, ptr addrspace(1) %5, align 8, !tbaa !78, !alias.scope !79, !noalias !82
   %7 = shufflevector <2 x float> %6, <2 x float> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
   %8 = shufflevector <4 x float> %7, <4 x float> <float poison, float poison, float 0.000000e+00, float 1.000000e+00>, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
   %9 = getelementptr inbounds <4 x float>, ptr addrspace(1) %1, i64 %4
-  %10 = load <4 x float>, ptr addrspace(1) %9, align 16, !tbaa !63, !alias.scope !67, !noalias !64
+  %10 = load <4 x float>, ptr addrspace(1) %9, align 16, !tbaa !78, !alias.scope !82, !noalias !79
   %11 = insertvalue <{ <4 x float>, <4 x float> }> undef, <4 x float> %8, 0
   %12 = insertvalue <{ <4 x float>, <4 x float> }> %11, <4 x float> %10, 1
   ret <{ <4 x float>, <4 x float> }> %12
@@ -42,67 +43,120 @@ define <4 x float> @colored_fragment(<4 x float> %0, <4 x float> returned %1) lo
   ret <4 x float> %1
 }
 
+; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read)
+define <{ <4 x float>, <4 x float>, float }> @sized_vertex(ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %0, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %1, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %2, i32 noundef %3) local_unnamed_addr #2 {
+  %5 = zext i32 %3 to i64
+  %6 = getelementptr inbounds <2 x float>, ptr addrspace(1) %0, i64 %5
+  %7 = load <2 x float>, ptr addrspace(1) %6, align 8, !tbaa !78, !alias.scope !84, !noalias !87
+  %8 = shufflevector <2 x float> %7, <2 x float> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
+  %9 = shufflevector <4 x float> %8, <4 x float> <float poison, float poison, float 0.000000e+00, float 1.000000e+00>, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
+  %10 = getelementptr inbounds <4 x float>, ptr addrspace(1) %1, i64 %5
+  %11 = load <4 x float>, ptr addrspace(1) %10, align 16, !tbaa !78, !alias.scope !90, !noalias !91
+  %12 = getelementptr inbounds float, ptr addrspace(1) %2, i64 %5
+  %13 = load float, ptr addrspace(1) %12, align 4, !tbaa !64, !alias.scope !92, !noalias !93
+  %14 = insertvalue <{ <4 x float>, <4 x float>, float }> undef, <4 x float> %9, 0
+  %15 = insertvalue <{ <4 x float>, <4 x float>, float }> %14, <4 x float> %11, 1
+  %16 = insertvalue <{ <4 x float>, <4 x float>, float }> %15, float %13, 2
+  ret <{ <4 x float>, <4 x float>, float }> %16
+}
+
 ; Function Attrs: convergent mustprogress nofree nounwind willreturn memory(argmem: read)
 define <4 x half> @sampled_fragment(<4 x float> %0, <4 x float> %1, ptr addrspace(1) readonly captures(none) %2) local_unnamed_addr #4 {
   %4 = shufflevector <4 x float> %0, <4 x float> poison, <2 x i32> <i32 0, i32 1>
   %5 = fmul fast <2 x float> %4, splat (float 1.250000e-01)
-  %6 = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) @__air_sampler_state, <2 x float> %5, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #11
+  %6 = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) @__air_sampler_state, <2 x float> %5, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0) #12
   %7 = extractvalue { <4 x half>, i8 } %6, 0
   ret <4 x half> %7
 }
 
+; Function Attrs: mustprogress nofree nounwind willreturn memory(read)
+define <4 x float> @own_pixel_fragment(<4 x float> %0, <4 x float> %1, ptr addrspace(1) readonly captures(none) %2) local_unnamed_addr #5 {
+  %4 = shufflevector <4 x float> %0, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %5 = tail call <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float> %4) #11
+  %6 = tail call ptr addrspace(2) @air.get_read_sampler() #13
+  %7 = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) %6, <2 x i32> %5, <2 x i32> zeroinitializer, i32 0, i32 1) #14
+  %8 = extractvalue { <4 x float>, i8 } %7, 0
+  %9 = fadd fast <4 x float> %8, %1
+  ret <4 x float> %9
+}
+
+; Function Attrs: mustprogress nofree nosync nounwind willreturn memory(none)
+declare <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float>) local_unnamed_addr #1
+
+; Function Attrs: mustprogress nofree nounwind willreturn memory(read)
+define <4 x float> @first_texel_fragment(<4 x float> %0, <4 x float> %1, ptr addrspace(1) readonly captures(none) %2) local_unnamed_addr #5 {
+  %4 = tail call ptr addrspace(2) @air.get_read_sampler() #13
+  %5 = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) %4, <2 x i32> zeroinitializer, <2 x i32> zeroinitializer, i32 0, i32 1) #14
+  %6 = extractvalue { <4 x float>, i8 } %5, 0
+  %7 = fadd fast <4 x float> %6, %1
+  ret <4 x float> %7
+}
+
+; Function Attrs: convergent mustprogress nofree nounwind willreturn memory(argmem: read)
+define <4 x float> @first_level_fragment(<4 x float> %0, <4 x float> %1, ptr addrspace(1) readonly captures(none) %2) local_unnamed_addr #4 {
+  %4 = shufflevector <4 x float> %0, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %5 = fmul fast <2 x float> %4, splat (float 2.500000e-01)
+  %6 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %2, ptr addrspace(2) readonly captures(none) @__air_sampler_state.1, <2 x float> %5, i1 true, <2 x i32> zeroinitializer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0) #12
+  %7 = extractvalue { <4 x float>, i8 } %6, 0
+  ret <4 x float> %7
+}
+
 ; Function Attrs: mustprogress nounwind willreturn
-define void @invert_texels(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(1) %1, <2 x i32> noundef %2) local_unnamed_addr #5 {
-  %4 = tail call ptr addrspace(2) @air.get_read_sampler() #12
-  %5 = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(2) %4, <2 x i32> %2, <2 x i32> zeroinitializer, i32 0, i32 1) #13
+define void @invert_texels(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(1) %1, <2 x i32> noundef %2) local_unnamed_addr #6 {
+  %4 = tail call ptr addrspace(2) @air.get_read_sampler() #13
+  %5 = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(2) %4, <2 x i32> %2, <2 x i32> zeroinitializer, i32 0, i32 1) #14
   %6 = extractvalue { <4 x float>, i8 } %5, 0
   %7 = shufflevector <4 x float> %6, <4 x float> poison, <3 x i32> <i32 0, i32 1, i32 2>
   %8 = fsub fast <3 x float> splat (float 1.000000e+00), %7
   %9 = shufflevector <3 x float> %8, <3 x float> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
   %10 = shufflevector <4 x float> %9, <4 x float> %6, <4 x i32> <i32 0, i32 1, i32 2, i32 7>
-  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) captures(none) %1, <2 x i32> %2, <4 x float> %10, i32 0, i32 2) #14, !alias.scope !69
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) captures(none) %1, <2 x i32> %2, <4 x float> %10, i32 0, i32 2) #15, !alias.scope !94
   ret void
 }
 
 ; Function Attrs: convergent mustprogress nofree nounwind willreturn memory(argmem: read)
-declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i1, <2 x i32>, i1, float, float, i32) local_unnamed_addr #6
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i1, <2 x i32>, i1, float, float, i32) local_unnamed_addr #7
 
 ; Function Attrs: mustprogress nofree nounwind willreturn memory(inaccessiblemem: read)
-declare ptr addrspace(2) @air.get_read_sampler() local_unnamed_addr #7
+declare ptr addrspace(2) @air.get_read_sampler() local_unnamed_addr #8
 
 ; Function Attrs: mustprogress nofree nounwind willreturn memory(argmem: read)
-declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32) local_unnamed_addr #8
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly captures(none), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32) local_unnamed_addr #9
+
+; Function Attrs: convergent mustprogress nofree nounwind willreturn memory(argmem: read)
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i1, <2 x i32>, i1, float, float, i32) local_unnamed_addr #7
 
 ; Function Attrs: mustprogress nounwind willreturn memory(argmem: readwrite)
-declare void @air.write_texture_2d.v4f32(ptr addrspace(1) captures(none), <2 x i32>, <4 x float>, i32, i32) local_unnamed_addr #9
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1) captures(none), <2 x i32>, <4 x float>, i32, i32) local_unnamed_addr #10
 
 attributes #0 = { mustprogress nofree nosync nounwind willreturn memory(argmem: readwrite) "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
 attributes #1 = { mustprogress nofree nosync nounwind willreturn memory(none) }
 attributes #2 = { mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read) "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
 attributes #3 = { mustprogress nofree norecurse nosync nounwind willreturn memory(none) "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="128" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
 attributes #4 = { convergent mustprogress nofree nounwind willreturn memory(argmem: read) "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="128" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
-attributes #5 = { mustprogress nounwind willreturn "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="128" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
-attributes #6 = { convergent mustprogress nofree nounwind willreturn memory(argmem: read) }
-attributes #7 = { mustprogress nofree nounwind willreturn memory(inaccessiblemem: read) }
-attributes #8 = { mustprogress nofree nounwind willreturn memory(argmem: read) }
-attributes #9 = { mustprogress nounwind willreturn memory(argmem: readwrite) }
-attributes #10 = { nounwind willreturn memory(none) }
-attributes #11 = { convergent nounwind willreturn memory(argmem: read) }
-attributes #12 = { nounwind willreturn memory(inaccessiblemem: read) }
-attributes #13 = { nounwind willreturn memory(argmem: read) }
-attributes #14 = { nounwind willreturn memory(argmem: readwrite) }
+attributes #5 = { mustprogress nofree nounwind willreturn memory(read) "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="128" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+attributes #6 = { mustprogress nounwind willreturn "approx-func-fp-math"="true" "frame-pointer"="all" "min-legal-vector-width"="128" "no-builtins" "no-infs-fp-math"="true" "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "unsafe-fp-math"="true" }
+attributes #7 = { convergent mustprogress nofree nounwind willreturn memory(argmem: read) }
+attributes #8 = { mustprogress nofree nounwind willreturn memory(inaccessiblemem: read) }
+attributes #9 = { mustprogress nofree nounwind willreturn memory(argmem: read) }
+attributes #10 = { mustprogress nounwind willreturn memory(argmem: readwrite) }
+attributes #11 = { nounwind willreturn memory(none) }
+attributes #12 = { convergent nounwind willreturn memory(argmem: read) }
+attributes #13 = { nounwind willreturn memory(inaccessiblemem: read) }
+attributes #14 = { nounwind willreturn memory(argmem: read) }
+attributes #15 = { nounwind willreturn memory(argmem: readwrite) }
 
 !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
 !air.kernel = !{!9, !16}
-!air.vertex = !{!21}
-!air.fragment = !{!29, !35}
-!air.compile_options = !{!42, !43, !44}
-!air.sampler_states = !{!45}
-!llvm.ident = !{!46}
-!air.version = !{!47}
-!air.language_version = !{!48}
+!air.vertex = !{!21, !29}
+!air.fragment = !{!35, !41, !48, !51, !53}
+!air.compile_options = !{!56, !57, !58}
+!air.sampler_states = !{!59, !60}
+!llvm.ident = !{!61}
+!air.version = !{!62}
+!air.language_version = !{!63}
 
-!0 = !{i32 2, !"SDK Version", [2 x i32] [i32 27, i32 0]}
+!0 = !{i32 2, !"SDK Version", [2 x i32] [i32 27, i32 2]}
 !1 = !{i32 1, !"wchar_size", i32 4}
 !2 = !{i32 7, !"frame-pointer", i32 2}
 !3 = !{i32 7, !"air.max_device_buffers", i32 31}
@@ -131,46 +185,71 @@ attributes #14 = { nounwind willreturn memory(argmem: readwrite) }
 !26 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2", !"air.arg_name", !"positions"}
 !27 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"colors"}
 !28 = !{i32 2, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"id"}
-!29 = !{ptr @colored_fragment, !30, !32}
-!30 = !{!31}
-!31 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!32 = !{!33, !34}
-!33 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position", !"air.arg_unused"}
-!34 = !{i32 1, !"air.fragment_input", !"generated(5colorDv4_f)", !"air.flat", !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
-!35 = !{ptr @sampled_fragment, !36, !38}
+!29 = !{ptr @sized_vertex, !30, !32}
+!30 = !{!23, !24, !31}
+!31 = !{!"air.point_size", !"air.arg_type_name", !"float", !"air.arg_name", !"size"}
+!32 = !{!26, !27, !33, !34}
+!33 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"sizes"}
+!34 = !{i32 3, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"id"}
+!35 = !{ptr @colored_fragment, !36, !38}
 !36 = !{!37}
-!37 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
-!38 = !{!39, !40, !41}
-!39 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!40 = !{i32 1, !"air.fragment_input", !"generated(5colorDv4_f)", !"air.flat", !"air.arg_type_name", !"float4", !"air.arg_name", !"color", !"air.arg_unused"}
-!41 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"source"}
-!42 = !{!"air.compile.denorms_disable"}
-!43 = !{!"air.compile.fast_math_enable"}
-!44 = !{!"air.compile.framebuffer_fetch_enable"}
-!45 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-!46 = !{!"Apple metal version 32023.921 (metalfe-32023.921.6)"}
-!47 = !{i32 2, i32 8, i32 0}
-!48 = !{!"Metal", i32 4, i32 0, i32 0}
-!49 = !{!50, !50, i64 0}
-!50 = !{!"float", !51, i64 0}
-!51 = !{!"omnipotent char", !52, i64 0}
-!52 = !{!"Simple C++ TBAA"}
-!53 = !{!54}
-!54 = distinct !{!54, !55, !"air-alias-scope-arg(0)"}
-!55 = distinct !{!55, !"air-alias-scopes(scale_and_offset)"}
-!56 = !{!57, !58}
-!57 = distinct !{!57, !55, !"air-alias-scope-arg(1)"}
-!58 = distinct !{!58, !55, !"air-alias-scope-arg(2)"}
-!59 = !{!58}
-!60 = !{!54, !57}
-!61 = !{!57}
-!62 = !{!54, !58}
-!63 = !{!51, !51, i64 0}
-!64 = !{!65}
-!65 = distinct !{!65, !66, !"air-alias-scope-arg(0)"}
-!66 = distinct !{!66, !"air-alias-scopes(colored_vertex)"}
-!67 = !{!68}
-!68 = distinct !{!68, !66, !"air-alias-scope-arg(1)"}
-!69 = !{!70}
-!70 = distinct !{!70, !71, !"air-alias-scope-textures"}
-!71 = distinct !{!71, !"air-alias-scopes(invert_texels)"}
+!37 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!38 = !{!39, !40}
+!39 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position", !"air.arg_unused"}
+!40 = !{i32 1, !"air.fragment_input", !"generated(5colorDv4_f)", !"air.flat", !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!41 = !{ptr @sampled_fragment, !42, !44}
+!42 = !{!43}
+!43 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!44 = !{!45, !46, !47}
+!45 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!46 = !{i32 1, !"air.fragment_input", !"generated(5colorDv4_f)", !"air.flat", !"air.arg_type_name", !"float4", !"air.arg_name", !"color", !"air.arg_unused"}
+!47 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"source"}
+!48 = !{ptr @own_pixel_fragment, !36, !49}
+!49 = !{!45, !40, !50}
+!50 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"target"}
+!51 = !{ptr @first_texel_fragment, !36, !52}
+!52 = !{!39, !40, !50}
+!53 = !{ptr @first_level_fragment, !36, !54}
+!54 = !{!45, !46, !55}
+!55 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"chain"}
+!56 = !{!"air.compile.denorms_disable"}
+!57 = !{!"air.compile.fast_math_enable"}
+!58 = !{!"air.compile.framebuffer_fetch_enable"}
+!59 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!60 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1}
+!61 = !{!"Apple metal version 32023.922 (metalfe-32023.922.4)"}
+!62 = !{i32 2, i32 8, i32 0}
+!63 = !{!"Metal", i32 4, i32 0, i32 0}
+!64 = !{!65, !65, i64 0}
+!65 = !{!"float", !66, i64 0}
+!66 = !{!"omnipotent char", !67, i64 0}
+!67 = !{!"Simple C++ TBAA"}
+!68 = !{!69}
+!69 = distinct !{!69, !70, !"air-alias-scope-arg(0)"}
+!70 = distinct !{!70, !"air-alias-scopes(scale_and_offset)"}
+!71 = !{!72, !73}
+!72 = distinct !{!72, !70, !"air-alias-scope-arg(1)"}
+!73 = distinct !{!73, !70, !"air-alias-scope-arg(2)"}
+!74 = !{!73}
+!75 = !{!69, !72}
+!76 = !{!72}
+!77 = !{!69, !73}
+!78 = !{!66, !66, i64 0}
+!79 = !{!80}
+!80 = distinct !{!80, !81, !"air-alias-scope-arg(0)"}
+!81 = distinct !{!81, !"air-alias-scopes(colored_vertex)"}
+!82 = !{!83}
+!83 = distinct !{!83, !81, !"air-alias-scope-arg(1)"}
+!84 = !{!85}
+!85 = distinct !{!85, !86, !"air-alias-scope-arg(0)"}
+!86 = distinct !{!86, !"air-alias-scopes(sized_vertex)"}
+!87 = !{!88, !89}
+!88 = distinct !{!88, !86, !"air-alias-scope-arg(1)"}
+!89 = distinct !{!89, !86, !"air-alias-scope-arg(2)"}
+!90 = !{!88}
+!91 = !{!85, !89}
+!92 = !{!89}
+!93 = !{!85, !88}
+!94 = !{!95}
+!95 = distinct !{!95, !96, !"air-alias-scope-textures"}
+!96 = distinct !{!96, !"air-alias-scopes(invert_texels)"}

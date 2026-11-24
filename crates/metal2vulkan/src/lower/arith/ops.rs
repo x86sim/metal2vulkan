@@ -7,7 +7,8 @@
 use crate::air::ir::{BinOp as AirBin, FloatPredicate, IntFlags, IntPredicate};
 use crate::lower::arith::legal::{FloatFmt, Form, Held};
 use crate::lower::arith::narrow;
-use crate::spirv::builder::{FunctionBuilder, MaskForm};
+use crate::spirv::builder::ops::arith::RemainderSign;
+use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::{BResult, BuildError, TypeRule};
 use crate::spirv::ids::{TypeId, Value};
 use crate::spirv::ir::{BinOp, ConstBits, Constant, Contraction, ConvOp, GlslOp, Type, UnOp};
@@ -128,23 +129,14 @@ pub fn fsplat(fb: &mut FunctionBuilder<'_>, f: Form, x: f64) -> BResult<Value> {
 }
 
 /// `x` with the bits above its AIR width cleared (a no-op for a full-width integer): `x & (2^N -
-/// 1)`, or in a 32-bit container under [`MaskForm::Extract`] `OpBitFieldUExtract(x, 0, N)`, the
-/// same bits, for a driver whose compiler drops the mask after a signed clamp.
+/// 1)`, on every device. `OpBitFieldUExtract(x, 0, N)` gives the same bits, but Intel's Windows
+/// driver 101.2145 on the UHD 630 loses its device on a desktop's first pipelines in that form, so
+/// the mask is the one form. NVIDIA 615.71.09 on Ampere GA10x dropped this mask after a signed
+/// clamp to exactly the narrow range (it answered sign-extended words); 620.70.06 does not, and no
+/// card we run has that driver on that architecture (the runtime's README, known gaps).
 pub fn mask(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
     if !f.legalized() {
         return Ok(x);
-    }
-    if f.container() == 32 && fb.module().mask_form() == MaskForm::Extract {
-        let u32_ = Form {
-            held: Held::Int {
-                bits: 32,
-                container: 32,
-            },
-            lanes: 1,
-        };
-        let zero = splat(fb, u32_, 0)?;
-        let width = splat(fb, u32_, u64::from(f.bits()))?;
-        return fb.bit_field_extract(false, x, zero, width);
     }
     let m = splat(fb, f, ones(f.bits()))?;
     fb.binary(BinOp::BitwiseAnd, x, m)
@@ -163,39 +155,48 @@ pub fn sext(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
 /// An integer binary operator with the AIR instruction's `flags` on two held integers of form
 /// `f`. An add, sub, mul or shl marked `nuw` is not masked: a result that would carry above the
 /// width is poison, so every other result already fits it. (`nsw` alone says nothing of the
-/// zero-extended bits: `-1 + 1` carries out of them.)
+/// zero-extended bits: `-1 + 1` carries out of them.) Without `wrap` no result is masked: its
+/// bits within the width are the same, and no use reads those above it (`demand`).
 pub fn int_binary(
     fb: &mut FunctionBuilder<'_>,
     op: AirBin,
     flags: IntFlags,
     f: Form,
+    wrap: bool,
     a: Value,
     b: Value,
 ) -> BResult<Value> {
     let bin = |fb: &mut FunctionBuilder<'_>, o, x, y| fb.binary(o, x, y);
-    let wrap = |fb: &mut FunctionBuilder<'_>, r| {
+    let wrapped = |fb: &mut FunctionBuilder<'_>, r| {
+        if wrap {
+            mask(fb, f, r)
+        } else {
+            Ok(r)
+        }
+    };
+    let wrap_unsigned = |fb: &mut FunctionBuilder<'_>, r| {
         if flags.contains(IntFlags::NUW) {
             Ok(r)
         } else {
-            mask(fb, f, r)
+            wrapped(fb, r)
         }
     };
     match op {
         AirBin::Add => {
             let r = bin(fb, BinOp::IAdd, a, b)?;
-            wrap(fb, r)
+            wrap_unsigned(fb, r)
         }
         AirBin::Sub => {
             let r = bin(fb, BinOp::ISub, a, b)?;
-            wrap(fb, r)
+            wrap_unsigned(fb, r)
         }
         AirBin::Mul => {
             let r = bin(fb, BinOp::IMul, a, b)?;
-            wrap(fb, r)
+            wrap_unsigned(fb, r)
         }
         AirBin::Shl => {
             let r = bin(fb, BinOp::ShiftLeftLogical, a, b)?;
-            wrap(fb, r)
+            wrap_unsigned(fb, r)
         }
         AirBin::UDiv => bin(fb, BinOp::UDiv, a, b),
         AirBin::URem => bin(fb, BinOp::UMod, a, b),
@@ -205,18 +206,17 @@ pub fn int_binary(
         AirBin::Xor => bin(fb, BinOp::BitwiseXor, a, b),
         AirBin::SDiv | AirBin::SRem => {
             let (x, y) = (sext(fb, f, a)?, sext(fb, f, b)?);
-            let o = if op == AirBin::SDiv {
-                BinOp::SDiv
+            let r = if op == AirBin::SDiv {
+                bin(fb, BinOp::SDiv, x, y)?
             } else {
-                BinOp::SRem
+                fb.signed_remainder(x, y, RemainderSign::Dividend)?
             };
-            let r = bin(fb, o, x, y)?;
-            mask(fb, f, r)
+            wrapped(fb, r)
         }
         AirBin::AShr => {
             let x = sext(fb, f, a)?;
             let r = bin(fb, BinOp::ShiftRightArithmetic, x, b)?;
-            mask(fb, f, r)
+            wrapped(fb, r)
         }
         AirBin::FAdd | AirBin::FSub | AirBin::FMul | AirBin::FDiv | AirBin::FRem => {
             float_binary(fb, op, f, Contraction::Forbidden, a, b)
@@ -285,8 +285,7 @@ pub fn f16_binary_words(f: Form) -> u32 {
 /// ([`narrow::round`]), so no conversion barrier and no conversion pair, which a device's compiler
 /// spends most on (ANV's register allocation grows with the values the pairs add).
 ///
-/// The instruction is Metal's where the profile takes `DriverDeviation::MetalHalfArithmetic`, and,
-/// by the Vulkan spec, in an entry declaring the 16-bit float controls the module's roundings take
+/// The instruction is Metal's, by the Vulkan spec, in an entry declaring the 16-bit float controls the module's roundings take
 /// ([`narrow::controlled_modes`]): the precision table "for IEEE754 half- (16 bit) and single- (32
 /// bit) precision instructions" lists `OpFAdd`, `OpFSub` and `OpFMul` as "Correctly rounded",
 /// "according to IEEE 754 roundTiesToEven" under `RoundingModeRTE`, `DenormPreserve` keeps
@@ -300,11 +299,7 @@ pub fn f16_binary_words(f: Form) -> u32 {
 /// The instruction takes the AIR's own contraction, as `float` arithmetic does
 /// ([`float_binary`]): one whose flags carry both `contract` and `reassoc`
 /// (`Contraction::Allowed`) is undecorated, a product a plain `OpFMul`, and the device's compiler
-/// groups and fuses it with its neighbours as it chooses. On MoltenVK, Metal's fast and relaxed
-/// compiles fold such an operation's narrowings and widening away and answer the `float` sum,
-/// difference or product of the widened operands, unrounded (measured with
-/// `DriverDeviation::MetalHalfArithmetic`), which selection records as
-/// `PrecisionNote::FastMathRewrites`. Any other (`Contraction::Forbidden`) is kept apart: a sum or
+/// groups and fuses it with its neighbours as it chooses. Any other (`Contraction::Forbidden`) is kept apart: a sum or
 /// difference decorated `NoContraction` (SPIRV-Cross writes its `[[clang::optnone]]` `spvFAdd` or
 /// `spvFSub`), a product as `Fma(a, b, -0.0)` decorated `NoContraction`, the product's value
 /// whether the device fuses it or not; a `NoContraction` `OpFMul`, which SPIRV-Cross writes as

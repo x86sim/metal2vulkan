@@ -24,8 +24,7 @@ use crate::ir::{Call, Callee, Const, FuncId, InstKind, Module, ModuleParts, Valu
 /// A draw's primitive type (`draw_primitives` and `draw_indexed_primitives`) counts as the value
 /// its operand holds where that is a constant of Metal's five (`MTLPrimitiveType`'s raw values,
 /// bit `n` for value `n`), as a point draw where it is a constant past them (Metal's encoding
-/// writes one so: the translator's `lower::access::encode`), and as all five where it is anything
-/// else. A call the walk cannot see
+/// writes one so), and as all five where it is anything else. A call the walk cannot see
 /// into (an indirect call, an intrinsic outside the closed set, a call to a declaration other
 /// than the entry's control-point functions) may write anything: [`CommandWrites::ANY`].
 /// Records the function does not write are not its own fact: a command buffer's other writers
@@ -125,12 +124,6 @@ impl CommandWrites {
     /// Whether it may call an operation of any of `bits`.
     pub const fn may(self, bits: u32) -> bool {
         self.operations & bits != 0
-    }
-
-    /// Whether a draw it makes may pass the primitive type of raw value `raw` (`MTLPrimitiveType`;
-    /// a value past Metal's five is never one).
-    pub const fn may_draw_primitive_type(self, raw: u32) -> bool {
-        raw < 5 && self.primitive_types & (1 << raw) != 0
     }
 
     /// The writes of one operation `op`, called by `call`.

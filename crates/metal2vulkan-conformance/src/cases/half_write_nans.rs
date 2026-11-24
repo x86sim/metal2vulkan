@@ -13,12 +13,9 @@
 //!
 //! The kernel is the owned fixture `xr_two_planes`'s `xr2p_write_half`, a
 //! `texture2d<half, access::write>` that writes buffer 0's `half4` at the thread's texel, with the
-//! row's width in buffer 1 — the same call shape as the lane's own `write` kernel, and a committed
-//! fixture, so Metal's assembler and a host without Metal read the same shader. The lane's two
-//! other accesses (a `texture2d<half, access::read_write>`, and a texture an argument buffer holds)
-//! have no committed fixture that writes a `half4` from a buffer, so they are not ported; the
-//! module docs of `runtime_lane::half_write_nans` record that plain Metal stored the same bits
-//! through all three.
+//! row's width in buffer 1 — a committed fixture, so Metal's assembler and a host without Metal
+//! read the same shader. A `texture2d<half, access::read_write>` and a texture an argument buffer
+//! holds have no committed fixture that writes a `half4` from a buffer, so they are not cases here.
 //!
 //! Every texel of the texture holds one fill byte before the dispatch, so a texel the kernel did not
 //! reach is a recorded value rather than whatever the allocator left.
@@ -26,7 +23,6 @@
 //! Nothing here can fault a GPU: one compute pass, one texture, one thread a texel inside it, no
 //! loop and no sampling.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Bindings, Case, Failure, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -41,7 +37,7 @@ const FIXTURE: &str = "xr_two_planes";
 /// The kernel: `half4` from buffer 0 at the thread's texel, the row's width in buffer 1.
 const WRITE: &str = "xr2p_write_half";
 
-/// The halves written, in the lane's order: quiet NaNs, signalling NaNs, negative NaNs, then the
+/// The halves written, in a fixed order: quiet NaNs, signalling NaNs, negative NaNs, then the
 /// infinities, the zeros, the denormals and two normals.
 ///
 /// A signalling NaN is in here on purpose: it is the one input that tells a 16-bit float store
@@ -94,8 +90,8 @@ pub struct HalfWriteNans {
     shape: Shape,
 }
 
-/// Every format the lane writes: the three 16-bit float widths, the three 32-bit float widths, and
-/// the packed one whose NaN is the format's own.
+/// Every format the family writes: the three 16-bit float widths, the three 32-bit float widths,
+/// and the packed one whose NaN is the format's own.
 pub fn all() -> Vec<HalfWriteNans> {
     // One word is one channel for every float format, and the whole texel for the packed one.
     let channels = |name, format, word, words| HalfWriteNans {
@@ -205,27 +201,6 @@ impl Case for HalfWriteNans {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // The kernel writes `half` into a storage texture, and every stored word compares exactly
-        // whatever the device does. A format that cannot hold a NaN's bits (a channel narrower
-        // than the half it is given has no room for the payload) stores the device's own encoding
-        // and the runtime announces it (`device-nan-encoding`), the device's own answer, which the
-        // suite declares for every case (`crate::replay::NATIVE_NOTES`). A device that encodes its
-        // own way shows the word it stored beside Metal's rather than passing quietly.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 7 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

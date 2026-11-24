@@ -16,18 +16,17 @@
 //! entries `{host, guest, size, bind_offset}: u64`. Entry 0 is the null root (all fields 0:
 //! `guest = 0` makes a miss round-trip through a later `ptrtoint`, `size = 0` puts every access
 //! through it out of bounds). Entry 1 is the write-only sink (`host` its device address). Entry
-//! `2 + n` is `[[buffer(n)]]`. The **resident set** (the bound arguments and
-//! `BindState.used_resources`, overlaps coalesced into the outermost range) is the entries `R0 ..
+//! `2 + n` is `[[buffer(n)]]`. The **resident set** (the bound arguments and the resources the
+//! encoder makes resident, `useResource:`, overlaps coalesced into the outermost range) is the
+//! entries `R0 ..
 //! R0 + N`, sorted by `guest` and disjoint but for indirect command buffers' records, which may
 //! overlap (each found only at its start, `lower::access::dynamic::search_start`), each with
-//! `bind_offset = 0`. The binder states `R0` and
+//! `bind_offset = 0`. The consumer states `R0` and
 //! `N` in the sink entry's otherwise unread `guest` and `size` fields ([`RESIDENT_FIRST`],
-//! [`RESIDENT_COUNT`]); `N` is any count (At most 2¹⁶ before, a larger set
-//! `BindError::ResidentSetTooLarge`). `R0` counts entries from the table's address modulo 2⁶⁴, so
-//! the set may lie apart from the table, below it too (a consumer's set shared by many tables,
-//! `RootTable::resident_fields`).
+//! [`RESIDENT_COUNT`]); `N` is any count. `R0` counts entries from the table's address modulo 2⁶⁴, so
+//! the set may lie apart from the table, below it too (a consumer's set shared by many tables).
 //!
-//! **The search** ([`resolve`]) turns a guest address `i` into a wide pointer: a binary search for
+//! **The search** ([`define_resolve`]) turns a guest address `i` into a wide pointer: a binary search for
 //! the last resident entry whose `guest ≤ i`, whose step halves the candidates whatever its
 //! compare gives (one entry load and a select, no branch on the address), so its trip count
 //! follows `N` alone and every invocation that searches one table takes the same branches. A set
@@ -202,65 +201,6 @@ pub fn entry_field(
     )
 }
 
-/// The resident set a replay preprocess's resident root table at `table` names
-/// (`bind::ReplayPreprocess::resident`, `bind::DrawReplayPreprocess::resident`): its first root
-/// `R0` and count `N`, from the sink entry, which a consumer points anywhere
-/// (`RootTable::resident_fields`), the set's address (`table + 32·R0`, modulo 2⁶⁴), and the
-/// address of its entries' unpadded extents, a `u64` each, right after the set, then one zero
-/// (`ResidentSet::replay_bytes`; the binder lays its own set out so).
-#[derive(Clone, Copy)]
-pub struct ResidentView {
-    pub first: Value,
-    pub count: Value,
-    pub set: Value,
-    pub extents: Value,
-}
-
-/// [`ResidentView`] of the resident root table at `table`.
-pub fn resident_view(fb: &mut FunctionBuilder<'_>, table: Value) -> BResult<ResidentView> {
-    let e = entries(fb, table)?;
-    let sink = k64(fb, SINK_ROOT)?;
-    let first = field_of(fb, e, sink, RESIDENT_FIRST)?;
-    let count = field_of(fb, e, sink, RESIDENT_COUNT)?;
-    let stride = k64(fb, ENTRY_BYTES)?;
-    let skip = fb.binary(BinOp::IMul, first, stride)?;
-    let set = fb.binary(BinOp::IAdd, table, skip)?;
-    let bytes = fb.binary(BinOp::IMul, count, stride)?;
-    let extents = fb.binary(BinOp::IAdd, set, bytes)?;
-    Ok(ResidentView {
-        first,
-        count,
-        set,
-        extents,
-    })
-}
-
-/// The unpadded extent of root `root` of `view`'s set, which a search of it found where `found`
-/// holds; where it does not, the first entry's (or the zero after an empty set's), a read that
-/// stays in the set's bytes and that the caller's test of `found` discards.
-pub fn extent_of(
-    fb: &mut FunctionBuilder<'_>,
-    view: &ResidentView,
-    root: Value,
-    found: Value,
-) -> BResult<Value> {
-    let index = fb.binary(BinOp::ISub, root, view.first)?;
-    let zero = k64(fb, 0)?;
-    let index = fb.select(found, index, zero)?;
-    let eight = k64(fb, 8)?;
-    let rel = fb.binary(BinOp::IMul, index, eight)?;
-    let addr = fb.binary(BinOp::IAdd, view.extents, rel)?;
-    let u64_ = u64_ty(fb)?;
-    let p = fb.device_place(addr, u64_)?;
-    fb.load(
-        p,
-        MemAccess {
-            aligned: Some(8),
-            ..MemAccess::default()
-        },
-    )
-}
-
 /// Define the module's resident-set search: a function `fn(table: u64, guest: u64) -> wide`
 /// (`wide` a `u64vec4`), the wide pointer `(root, at, host, size)` of `guest` through the root
 /// table at `table` ([`resolve_wide`]). Every search of the module calls it, so its words are paid
@@ -310,7 +250,7 @@ fn field_of(fb: &mut FunctionBuilder<'_>, e: Value, root: Value, field: u64) -> 
 }
 
 /// The wide pointer `[root, at, host, size]` (four `u64`s) of guest address `guest` (a `u64`)
-/// through the resident set of the root table at `table` ([`resolve`]): a hit's `at` is `i −
+/// through the resident set of the root table at `table` ([`define_resolve`]): a hit's `at` is `i −
 /// guest` (a resident entry's `bind_offset` is 0) and `host` and `size` its entry's, read here
 /// once; a miss is `[0, i, 0, 0]`, the null root's fields.
 pub fn resolve_wide(
@@ -324,20 +264,6 @@ pub fn resolve_wide(
     let host = fb.select(s.hit, host, zero)?;
     let size = fb.select(s.hit, s.size, zero)?;
     Ok([s.root, s.off, host, size])
-}
-
-/// The wide pointer `(root, offset)` (two `u64`s) of guest address `guest` (a `u64`) through the
-/// resident set of the root table at `table` (the module docs' search). The search walks the
-/// set's entries from its first, `R0` entries from the table; an empty set starts at the null
-/// root, whose entry the final test reads (no step runs) and whose fields `(guest 0, size 0)`
-/// give the miss `(0, i)` whether or not that test hits.
-pub fn resolve(
-    fb: &mut FunctionBuilder<'_>,
-    table: Value,
-    guest: Value,
-) -> BResult<(Value, Value)> {
-    let s = search(fb, table, guest)?;
-    Ok((s.root, s.off))
 }
 
 /// A finished search ([`search`]).
@@ -354,7 +280,7 @@ struct Found {
     off: Value,
 }
 
-/// The search of [`resolve`].
+/// The search of [`define_resolve`].
 fn search(fb: &mut FunctionBuilder<'_>, table: Value, guest: Value) -> BResult<Found> {
     let e = entries(fb, table)?;
     let sink = k64(fb, SINK_ROOT)?;
@@ -420,8 +346,8 @@ fn search_step(
 /// The search's narrowing of a set of `2^32` entries or more: [`search_step`] in 64 bits while
 /// `2^32` or more of the `len` candidates from `base` are left; the first candidate and their count
 /// then. No set below `2^32` entries enters it; nothing bounds a set's count below that (a `u64`
-/// in the binder's tables, in a consumer's `RootTable::resident_fields`, and in the runtime's set
-/// of live buffers), so a larger set is narrowed here before the 32-bit loop ([`bisect`]). The
+/// in the binder's tables, in a consumer's root table, and in the runtime's set of live
+/// buffers), so a larger set is narrowed here before the 32-bit loop ([`bisect`]). The
 /// loop carries both in `Function` variables.
 fn narrow(
     fb: &mut FunctionBuilder<'_>,

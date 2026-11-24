@@ -1,0 +1,2797 @@
+//! The submit thread: each queue's FIFO of command buffers, the holds at event waits, the groups
+//! held while a queue's earlier submissions run, the upload that goes ahead of later commits, and
+//! the submissions it passes to `vkQueueSubmit2`.
+//!
+//! Each queue groups on its own. While the queue has room ([`room`]), each of its command buffers
+//! goes at once, alone. Without room, the ones committed meanwhile are held in one group of at
+//! most [`GROUP`], each scheduled as it joins; one the group does not take waits in the queue's
+//! list, not staged, with the queue's later commits behind it, each scheduled there as it would
+//! be in the group, in commit order with every queue's, once its waits are met
+//! ([`WorkState::hold`]), while other queues' go on. Only its `vkQueueSubmit2` waits for room.
+//! The group goes when a completion leaves room (the completion thread wakes the thread as
+//! it retires; a round of it sees no completion until it ends, and sends nothing), when the host
+//! is to wait for one of them or one waiting behind it
+//! ([`Work::send`]), when a command buffer of another queue that waits on a fence one of them
+//! updates is to go (`crate::fence`), or at teardown. The
+//! driver runs a submission's command buffers as one kernel job, which a job timeout ends as a
+//! whole (Linux's amdgpu ends a job past its timeout and resets the ring), so a command buffer
+//! joins the group only while the group's expected GPU runs, summed, stay within [`GROUP_RUN`];
+//! one whose queue has no run yet, or whose run is past the bound, goes alone, the group held
+//! going first where the queue has room. The
+//! bound is tested again as the group goes, with the expected run as it then stands (a completion
+//! between a join and the send may have raised it): a group past it goes member by member, one
+//! `vkQueueSubmit2` each, only the last signalling. At most [`UNSEEN_JOINS`] command buffers join
+//! a group while none of the queue's retires, so command buffers that turn long all at once join
+//! no more than that many on the estimate of the short ones before them. A segment that
+//! signals an event ends its group, which goes at once, so a command buffer that signals waits
+//! unstaged until its queue has room for it ([`WorkState::waits_for_room`]): a signal staged is
+//! one its waiters take as submitted. One that waits on a semaphore leads a new
+//! group, the one held going first. A group is one submission with one signal of the progress
+//! semaphore, which the completion thread follows in commit order. A command buffer that takes no
+//! submission of its own (one with nothing for the GPU that no copy-in waits for, or one ended
+//! with an error) and finds a
+//! group held joins it, and the group goes at once: what it retires behind is then submitted, so
+//! its completion waits on nothing that only a later completion or wait would send.
+//!
+//! The upload is cut at commits: the calls made between two commits record into an upload of
+//! their own, numbered as the later commit ([`WorkState::current`]), which goes ahead of
+//! everything in the first submission whose command buffers' last was committed at or after that
+//! number. So a call goes ahead of every command buffer committed after it, and never in a
+//! submission whose command buffers were all committed before it, whenever the submit thread
+//! takes it: what each submission carries follows the program's calls and commits and the
+//! submission's command buffers alone, by the copy-ins' rule (`crate::capture`).
+//! A commit only takes its number; the first call after it begins the next upload. The last
+//! upload a submission carries ends with the one barrier that makes their writes visible.
+//!
+//! The uploads not yet submitted are bounded: a call that finds them holding [`UPLOAD_ENTRIES`]
+//! calls, or [`UPLOAD_BYTES`] of memory they alone keep, has them submitted and waits for them to
+//! complete before it records. The release of a texture or a block one of them holds has them go
+//! at once, with no wait ([`Work::release`]), so its memory goes back once they complete, with no
+//! later call. A new texture's move to its home layout holds nothing until the
+//! submission that takes the upload of its commit, which records the moves of every upload it
+//! takes in one barrier where the textures still live. Copies stage their bytes in the device's
+//! staging region ([`crate::staging`]), which the work lock guards with the uploads; they go
+//! without a wait once their copies' spans take half the region.
+//!
+//! A command buffer's commit takes the Managed buffers' ranges named since the last capture
+//! ([`crate::capture`]): its copy-in, GPU copies from the consumers' blocks into the device
+//! copies, waits at that commit's number, and the first submission of a command buffer numbered
+//! at or after it takes it, ahead of that command buffer's first segment and outside its waits.
+
+use crate::alias;
+use crate::buffer::{BufferInner, BufferObject, DeviceCopy};
+use crate::capture::{self, Changes, CopyIn, Modified};
+use crate::command::{self, CbInner, CommandBufferError, DeviceLoss, Handler, Pending, Segment};
+use crate::complete;
+use crate::counters::{Counters, Gauge, Metric, Part, Site};
+use crate::device::{lock, Core};
+use crate::error::Error;
+use crate::event::EventInner;
+use crate::fault;
+use crate::fill;
+use crate::memory::{Block, BlockId, Internal};
+use crate::over::{self, ExportedOvers, Leans};
+use crate::queue::QueueInner;
+use crate::record::{self, Reach, Recorder};
+use crate::staging::{At, Oldest, Region, Stage, Staging, REGION_LEN};
+use crate::texture::{Homing, Image, OverCopy, TextureInner, TextureObject, Zeroing};
+use crate::times;
+use ash::vk;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+
+/// The command buffers one submission ends at most. A larger group is fewer submissions, until
+/// the group grows past what a completion can release: on the UHD 630, sixteen ran a burst of 160
+/// command buffers in half the time no bound did (probe 06860a3848, job m3-max-44105).
+pub(crate) const GROUP: usize = 16;
+
+/// The most expected GPU run, in nanoseconds, of the command buffers one group holds, summed, and
+/// of a queue's submissions behind its oldest not seen complete ([`room`]): 16 ms, the owner's
+/// line for an intolerable wait. Each command buffer's
+/// expected run is its queue's (`QueueInner::expected_run`), from the GPU times of the queue's
+/// command buffers as they retire. Command buffers each within the driver's job timeout may pass
+/// it summed in one job.
+pub(crate) const GROUP_RUN: u64 = 16_000_000;
+
+/// The most command buffers that join one group while none of their queue's retires with its GPU
+/// times: they join on an expected run no completion has updated, so a program whose command
+/// buffers turn long all at once puts at most this many of them in one job before the estimate
+/// rises. Four: the most GPU time summed over consecutive
+/// command buffers of one queue in a replay stream on an RTX 3090 was 385.1 ms over four, within
+/// a quarter of amdgpu's default job timeout of 2,000 ms, and 1,536.6 ms over sixteen, past it
+/// (job m3-max-49358).
+///
+/// Its measured price, against sixteen, is paid where command buffers come faster than they
+/// complete. On the UHD 630, a burst of 2,000 command buffers of one dispatch each made 344
+/// submissions a run against 127 and took 40.2 ms against 19.8. A burst of 160 command buffers of
+/// two dispatches made 27 against 10 and took 3.28 ms against 1.85 (job m3-max-49576). On an RTX
+/// 3090, sixteen ran such bursts 5.1-6.5% faster (job m3-max-49575). No replay stream pays it:
+/// glbench, gb and windrag on a 780M made the same submissions in every frame under both, as none
+/// of their groups passed four (jobs m3-max-49698 and m3-max-49721).
+pub(crate) const UNSEEN_JOINS: usize = 4;
+
+/// Whether a command buffer whose queue's expected run is `run` (none before one of its command
+/// buffers retired with its GPU times) joins a held group whose members' expected runs sum to
+/// `held`, `unseen` of them joined since the queue's last retirement: only while the sum with its
+/// own stays within [`GROUP_RUN`] and fewer than [`UNSEEN_JOINS`] joined unseen. Else the group
+/// goes first and the command buffer leads the next.
+pub(crate) fn joins(held: u64, unseen: usize, run: Option<u64>) -> bool {
+    run.is_some_and(|run| held.saturating_add(run) <= GROUP_RUN) && unseen < UNSEEN_JOINS
+}
+
+/// Whether a group of `members` command buffers goes member by member as it is sent, its queue's
+/// expected run being `run` then: where the members' expected runs, summed at that run, pass
+/// [`GROUP_RUN`], or the run is not known. One member is one submission either way.
+pub(crate) fn apart(members: u64, run: Option<u64>) -> bool {
+    members > 1 && run.is_none_or(|run| run.saturating_mul(members) > GROUP_RUN)
+}
+
+/// The submissions of a queue not yet seen complete at which its command buffers are held in a
+/// group ([`room`]). Three, not two: with two, the GPU idles between a group's end and the next
+/// submission's start whenever the completion that sends the held group comes late. Behind three,
+/// the frame of five command buffers on the UHD 630 completed in 420-429 us against 895-1137 us,
+/// and the second of four long command buffers was seen complete 74.7 ms after its commit against
+/// 99.2 ms (76.5 against 96.8 on an RTX 2080, 46.8 against 57.7 on an RX 550), while a burst of
+/// 160 kept its time within 0.5% on all three (probe b15b306d2f, jobs m3-max-44423, m3-max-44424
+/// and m3-max-44437). On an RTX 3090 the frame's mean commit-to-complete came to 152-165 us
+/// against 183-188 us, and the four long command buffers' to 32.6-32.9 ms against 44.3-67.2 ms,
+/// the burst within 0.1% (jobs m3-max-44525 and m3-max-44546). Not four: behind four the UHD 630 ran that burst in 2768-2839 us against
+/// 1850-1860 us, more of its command buffers going alone, and the RTX 2080's long rows came to
+/// 78.1-78.2 ms against 42.8-43.2 ms (jobs m3-max-44442 and m3-max-44443).
+pub(crate) const IN_FLIGHT: usize = 3;
+
+/// Whether a queue whose submissions not seen complete have the expected runs `in_flight`, oldest
+/// first (`u64::MAX` for one not known), has room for a group whose expected run is `run`: with
+/// fewer than two of them always, so one waits on the GPU behind the one running and long command
+/// buffers run back to back; with fewer than [`IN_FLIGHT`] while the runs behind the oldest, the
+/// group's with them, stay within [`GROUP_RUN`]. So a queue keeps on the device's one `VkQueue`
+/// no more than about that bound behind what runs, and another queue's command buffer committed
+/// later waits behind no more of it.
+pub(crate) fn room(in_flight: &VecDeque<(u64, u64)>, run: u64) -> bool {
+    let behind = (in_flight.iter().skip(1)).fold(run, |sum, &(_, run)| sum.saturating_add(run));
+    in_flight.len() < 2 || (in_flight.len() < IN_FLIGHT && behind <= GROUP_RUN)
+}
+
+/// The calls the uploads not yet submitted record at most: a call past them waits for them to
+/// complete.
+pub(crate) const UPLOAD_ENTRIES: usize = 4096;
+
+/// The memory the uploads not yet submitted alone keep, at most: their staging buffers, and the
+/// textures and blocks released while they held them. A call past it waits for them to complete;
+/// one call larger than it goes alone.
+pub(crate) const UPLOAD_BYTES: u64 = 64 << 20;
+
+/// The new textures awaiting their home layout at which the dead among them are first dropped.
+pub(crate) const HOMES_PRUNE: usize = 64;
+
+/// For the device tests: the nanoseconds this thread waited for the work lock
+/// ([`Work::lock`]), in all, since it last took them.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) mod waits {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WAITED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add(nanos: u64) {
+        WAITED.with(|waited| waited.set(waited.get().saturating_add(nanos)));
+    }
+
+    /// The nanoseconds waited since the last take, taken.
+    pub(crate) fn take() -> u64 {
+        WAITED.with(|waited| waited.replace(0))
+    }
+}
+
+/// The submit side: the FIFOs and the upload, and the submit thread's wake-up.
+pub(crate) struct Work {
+    state: Mutex<WorkState>,
+    changed: Condvar,
+    /// A span of the staging region another call held was released, or the device closed or was
+    /// lost: a staging call asleep for it looks again ([`Work::stage`]). Signalled only while one
+    /// sleeps ([`WorkState::span_sleepers`]).
+    spans: Condvar,
+    /// A queue holds a group, or a command buffer for room: the completion thread wakes the
+    /// thread as submissions complete.
+    keeping: AtomicBool,
+    /// Bytes of textures and blocks released while an upload held them, since the last
+    /// submission that left no upload unsent: they count against [`UPLOAD_BYTES`]. A texture's
+    /// release adds without the work lock, which its drop may run under.
+    released: AtomicU64,
+    /// For the device tests: a commit began its count of the wait for the work lock.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) counting: AtomicBool,
+    /// For the device tests: a submission began its count of the wait for the runtime's queue
+    /// lock.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) asking: AtomicBool,
+}
+
+pub(crate) struct WorkState {
+    /// The queues with command buffers enqueued, committed, held or in flight.
+    fifos: Vec<Fifo>,
+    /// The next command buffer's place in the commit order.
+    next_seq: u64,
+    /// The next FIFO entry's place in its queue's order.
+    next_place: u64,
+    /// The progress value of the last submission.
+    progress: u64,
+    /// The command buffers whose last segment a submission not seen complete when the submit
+    /// thread last looked carried, in the order submitted: each one's place in the commit order
+    /// and that submission's progress value ([`Work::settled`]). At most the command buffers
+    /// the queues hold at once.
+    carried: VecDeque<(u64, u64)>,
+    /// The progress value of the last submission that took an upload, 0 before the first.
+    uploaded: u64,
+    /// The upload recording: zero fills, copies and new textures' moves to a home layout, the
+    /// calls made since the last commit, or before it where none has been made since
+    /// ([`current`](WorkState::current)).
+    upload: Option<Upload>,
+    /// Uploads a later call or a flush ended the recording of, oldest first, not yet submitted.
+    sealed: VecDeque<Upload>,
+    /// How many of `sealed`, from the oldest, the next submission takes whatever its command
+    /// buffers, alone where no group goes ([`Work::flush`]); 0 for none.
+    flush: usize,
+    /// The staging region, from the first copy on.
+    region: Option<Region>,
+    /// The Managed buffers' ranges named since the last commit.
+    changes: Changes,
+    /// Something changed that may let a held segment or group go.
+    dirty: bool,
+    /// The submit thread is to end: what is held in groups goes, then what is held at waits ends.
+    stop: bool,
+    /// Quiesced or torn down: commits and uploads are refused.
+    closed: bool,
+    /// The device's first loss, from which it is lost ([`Work::lose`]).
+    loss: Option<DeviceLoss>,
+    /// The staging calls asleep for a span of the region another call holds ([`Work::stage`]): a
+    /// release signals [`Work::spans`] only while there are any, so with none it makes no call.
+    span_sleepers: u32,
+    /// The command buffers scheduled while held for room so far ([`WorkState::hold`]).
+    holds: u64,
+    /// The textures over a buffer in an exported block in an image of their own, and what each
+    /// owes its copy in.
+    exported: ExportedOvers,
+    /// For the device tests: the progress value of the last submission when the first loss came
+    /// ([`Work::stall`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    lost_at: u64,
+}
+
+struct Fifo {
+    queue: Arc<QueueInner>,
+    entries: VecDeque<Entry>,
+    /// The group staged and not yet submitted.
+    group: Option<Batch>,
+    /// The progress values of the queue's submissions not yet seen complete, in order, each with
+    /// its expected run ([`room`]).
+    in_flight: VecDeque<(u64, u64)>,
+    /// A host wait is to come for the command buffer at this place: a group from it or before
+    /// goes at once.
+    send_through: u64,
+    /// The progress value at which the last command buffer it ended with nothing held retires:
+    /// the next retires no earlier.
+    behind: u64,
+    /// Its head's segment the submit thread holds for an event's value neither set nor promised
+    /// by a submitted signal, as the command buffer's number and the segment's index, and the
+    /// host time the thread, with nothing left to stage, found it so ([`WorkState::mark_holds`]).
+    held_since: Option<(u64, usize, u64)>,
+}
+
+struct Entry {
+    cb: Arc<CbInner>,
+    /// Its place in its queue's order.
+    place: u64,
+    /// None while enqueued and not committed.
+    pending: Option<Pending>,
+    /// Ended before it was submitted: it retires with this error behind its queue's earlier
+    /// work.
+    error: Option<CommandBufferError>,
+    /// Scheduled while its queue held it, not staged, for room ([`WorkState::hold`]), numbered in
+    /// the order of those holds: its staging schedules it no more.
+    held: Option<u64>,
+}
+
+/// Commands recorded into one command buffer apart from any command buffer of the guest's (zero
+/// fills, texture copies, and new textures' moves to their home layouts), the calls made before
+/// one commit and after the one before it: submitted ahead of everything in the first submission
+/// whose command buffers' last was committed at or after them, which keeps what they use until it
+/// retires.
+pub(crate) struct Upload {
+    pub(crate) recorder: Recorder,
+    command: vk::CommandBuffer,
+    /// The commit number its calls come before ([`WorkState::current`]).
+    number: u64,
+    held: Vec<Held>,
+    /// How many of `held` it held at the last release of an object it held
+    /// ([`Work::release`]): a release of one held from there on is the first since.
+    met: usize,
+    /// The calls recorded, and one for the home layouts recorded as it is submitted.
+    entries: usize,
+    /// The bytes of the staging buffers of its own it holds.
+    staging: u64,
+    /// The staging region's spans its copies use, and their bytes.
+    spans: Vec<u64>,
+    span_bytes: u64,
+    /// Where a surface waits for the moves this upload records ([`Work::ready_point`]): set to
+    /// the progress value of the submission that takes it, 0 until then.
+    ready: Option<Arc<AtomicU64>>,
+    /// The textures made while it recorded, not held: the submission that takes it moves each
+    /// that still lives to its home layout ([`Work::home`]).
+    homes: Vec<Weak<Image>>,
+    /// The length of `homes` at which the dead are dropped from it.
+    prune_at: usize,
+    /// The buffer ranges its zero fills wrote since its last barrier ([`Work::fill`]), at most
+    /// one a call ([`UPLOAD_ENTRIES`]).
+    filled: Vec<Filled>,
+    /// Where it recorded a barrier between its fills: the ranges its fills wrote before the
+    /// first, which a fill of an upload before it in the same submission may meet
+    /// ([`order_fills`]).
+    leading: Option<Vec<Filled>>,
+    /// Its pair of timestamp queries, its start written as it began and its end as it ends
+    /// ([`times::begin_own`]); None where it runs untimed.
+    stamps: Option<times::Pair>,
+}
+
+/// A zero fill's buffer and its range of bytes.
+type Filled = (vk::Buffer, u64, u64);
+
+/// What an upload keeps until it retires.
+pub(crate) enum Held {
+    Block(Arc<Block>),
+    /// A texture's image the upload moves to its home layout or copies bytes to or from.
+    Texture(Arc<Image>),
+    /// The staging buffer of such a copy.
+    Staging(Arc<Staging>),
+    /// A Managed buffer's device copy the upload copies into.
+    Copy(Arc<DeviceCopy>),
+}
+
+impl Held {
+    /// Whether `self` and `other` are the same object.
+    fn is(&self, other: &Held) -> bool {
+        match (self, other) {
+            (Held::Block(a), Held::Block(b)) => Arc::ptr_eq(a, b),
+            (Held::Texture(a), Held::Texture(b)) => Arc::ptr_eq(a, b),
+            (Held::Staging(a), Held::Staging(b)) => Arc::ptr_eq(a, b),
+            (Held::Copy(a), Held::Copy(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Upload {
+    /// A new upload for the calls before the commit numbered `number`, its command buffer
+    /// recording.
+    ///
+    /// Err: [`Error::Vulkan`] where a command pool or buffer cannot be made.
+    fn begin(core: &Core, number: u64) -> Result<Upload, Error> {
+        let device = &core.device;
+        let mut recorder = core.recorders.take(device)?;
+        match recorder.next(device) {
+            Ok(command) => Ok(Upload {
+                recorder,
+                command,
+                number,
+                held: Vec::new(),
+                met: 0,
+                entries: 0,
+                staging: 0,
+                spans: Vec::new(),
+                span_bytes: 0,
+                ready: None,
+                homes: Vec::new(),
+                prune_at: HOMES_PRUNE,
+                filled: Vec::new(),
+                leading: None,
+                stamps: times::begin_own(core, command),
+            }),
+            Err(error) => {
+                core.recorders.give_back(core, recorder);
+                Err(error)
+            }
+        }
+    }
+
+    /// Records `homes`, images' moves from undefined to their home layouts
+    /// ([`Image::homing`]): in one barrier, with the acquires of the buffers' ranges under images
+    /// over a dma-buf's import (each such image's move counted in
+    /// [`Metrics::external_acquires`](crate::Metrics::external_acquires)), and where any is
+    /// zeroed, its zeroing after that barrier and its move home in a second, each counted in
+    /// `core`'s counters; the upload holds each image.
+    fn home(&self, core: &Core, homes: &[Homing]) {
+        if homes.is_empty() {
+            return;
+        }
+        let device = &core.device;
+        let barrier = |moves: &[vk::ImageMemoryBarrier2<'static>],
+                       buffers: &[vk::BufferMemoryBarrier2<'static>]| {
+            let dependency = vk::DependencyInfo::default()
+                .image_memory_barriers(moves)
+                .buffer_memory_barriers(buffers);
+            // SAFETY: the upload's command buffer is recording, under the work lock; each image
+            // is the device's and held by the upload, and holds the import whose buffer an
+            // acquire names, a dma-buf's, whose foreign family is enabled (`check_over`).
+            unsafe { device.cmd_pipeline_barrier2(self.command, &dependency) };
+            core.counters.count(Metric::Barriers);
+        };
+        let firsts: Vec<_> = homes.iter().map(|home| home.first).collect();
+        let acquires: Vec<_> = homes.iter().filter_map(|home| home.buffer).collect();
+        barrier(firsts.as_slice(), acquires.as_slice());
+        for _ in &acquires {
+            core.counters.count(Metric::ExternalAcquires);
+        }
+        let zeroings: Vec<&Zeroing> = homes.iter().filter_map(|home| home.zero.as_ref()).collect();
+        if zeroings.is_empty() {
+            return;
+        }
+        // Made before the upload holds an image whose zeroing copies from it (`Work::home`).
+        let zeros = fill::made(core);
+        for zeroing in &zeroings {
+            // SAFETY: as above, outside any render pass; the first barrier moved the image to
+            // the transfer destination layout.
+            unsafe { zeroing.record(device, self.command, zeros) };
+            core.counters.texture_cleared(zeroing.bytes);
+        }
+        let moves: Vec<_> = zeroings.iter().map(|zeroing| zeroing.home).collect();
+        barrier(moves.as_slice(), &[]);
+        core.counters.count(Metric::TextureClearBarriers);
+    }
+
+    /// A new upload that hands `planes`, Direct3D 11 planes' images, over ([`Image::handed`]) in
+    /// one barrier counted in `core`'s counters, its command buffer ended; with the first failed
+    /// call, which loses the device. An acquire follows a global barrier from and to every stage:
+    /// an acquire's own first synchronization scope does not apply, and the release before it,
+    /// an earlier submission's on the one queue, must happen before it (Vulkan 1.4, section
+    /// 7.7.6: "VK_PIPELINE_STAGE_ALL_COMMANDS_BIT is the only valid stage to wait on or wait for
+    /// these operations").
+    fn hand_over(
+        core: &Core,
+        planes: &[Arc<Image>],
+        acquire: bool,
+    ) -> (Option<Upload>, Result<(), DeviceLoss>) {
+        let upload = match Upload::begin(core, 0) {
+            Ok(upload) => upload,
+            Err(Error::Vulkan { call, result }) => {
+                return (None, Err(DeviceLoss::of(call)(result)))
+            }
+            Err(error) => unreachable!("an upload's begin fails only in a Vulkan call: {error}"),
+        };
+        let device = &core.device;
+        if acquire {
+            record::barrier(device, upload.command, Reach::Commands);
+            core.counters.count(Metric::Barriers);
+        }
+        let barriers: Vec<_> = (planes.iter())
+            .map(|image| image.handed(core.family, acquire))
+            .collect();
+        let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
+        // SAFETY: the upload's command buffer is recording, and only the submit thread has it;
+        // each image is the device's, held by the submission until it retires, and general
+        // between commands.
+        unsafe { device.cmd_pipeline_barrier2(upload.command, &dependency) };
+        core.counters.count(Metric::Barriers);
+        core.counters.count(match acquire {
+            true => Metric::ExternalAcquires,
+            false => Metric::ExternalReleases,
+        });
+        times::end_own(device, upload.command, upload.stamps);
+        // SAFETY: as above.
+        let ended = unsafe { device.end_command_buffer(upload.command) }
+            .map_err(DeviceLoss::of("vkEndCommandBuffer"));
+        (Some(upload), ended)
+    }
+}
+
+/// One queue's group: what one `vkQueueSubmit2` submits of it.
+struct Batch {
+    /// The place of the first command buffer with a segment in it.
+    first: u64,
+    segments: Vec<Staged>,
+    /// Command buffers whose last segment is in it, and those that ended behind them, in the
+    /// queue's order.
+    finished: Vec<Finished>,
+    /// The command buffers whose last segment is in it.
+    count: usize,
+    /// It holds segments of its queue's head, whose last is not yet staged.
+    partial: bool,
+    /// The expected GPU runs of its command buffers, summed, in nanoseconds ([`GROUP_RUN`]);
+    /// `u64::MAX` where one's was not known.
+    run: u64,
+    /// Where each command buffer that leads in it begins among `segments`, the copy-ins it takes
+    /// first, and its commit number, in the same order.
+    starts: Vec<usize>,
+    leads: Vec<u64>,
+    /// The copy-ins it took, which it keeps until it retires (`crate::capture`).
+    copy_ins: Vec<CopyIn>,
+    /// Its queue's completed command buffers when the last of its joins was counted, and the
+    /// command buffers that joined since one of them completed ([`UNSEEN_JOINS`]).
+    seen: u64,
+    unseen: usize,
+    /// It goes member by member ([`GROUP_RUN`], tested again as it goes).
+    apart: bool,
+    /// It was held as a pass ended, its queue without room ([`room`]); once closed, that it goes
+    /// because a completion left room (`Metrics::held_starts`).
+    held: bool,
+    /// Events it signals that the completion thread is not yet watching.
+    watch: Vec<Arc<EventInner>>,
+    /// What its segments wrote of buffers under textures over a buffer in an image of their own
+    /// (`crate::over`).
+    leans: Leans,
+    /// The copies into those textures' images its upload makes first: one for each texture a
+    /// segment leans on the leading copy for (over an exported block, one an event owes,
+    /// `crate::over::ExportedOvers`), and, taken as it goes ([`WorkState::close`]), each
+    /// texture over a Managed buffer's device copy a command buffer of it keeps that owes one
+    /// (`crate::over::ManagedOvers`).
+    overs: Vec<OverCopy>,
+    /// The copies back owed first by textures over a Managed buffer's device copy whose ranges
+    /// meet those, for writes already submitted, with their images, which the upload keeps.
+    backs: Vec<over::Back>,
+    /// The Managed buffers its segments wrote whose textures over their device copies owe their
+    /// copies in once it is submitted.
+    written: Vec<Arc<BufferInner>>,
+    /// The textures over a Managed buffer's device copy its segments wrote, one for each segment
+    /// that wrote one, whose copies back its submission settles, each with whether its copy back
+    /// is owed (`crate::command::Segment::managed_wrote`).
+    wrote: Vec<(Arc<TextureInner>, bool)>,
+    /// The Managed buffers with textures over their device copies its segments reach, to which
+    /// its upload takes the copies back owed by writes submitted before (`crate::over`).
+    reached: Vec<Arc<BufferInner>>,
+    /// The images of the Direct3D 11 planes its segments use (`Segment::planes`).
+    planes: Vec<Arc<Image>>,
+    /// The first failed call recording a command buffer of moves that leads a segment of it
+    /// (`crate::alias::stage`), which loses the device.
+    lost: Option<DeviceLoss>,
+}
+
+/// One part of a submit info: a segment's or an upload's commands and its signals, and for a
+/// submission's first, the wait for a sparse bind (`submit`).
+#[derive(Default)]
+pub(crate) struct Staged {
+    pub(crate) waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    pub(crate) command: Option<vk::CommandBufferSubmitInfo<'static>>,
+    pub(crate) signals: Vec<vk::SemaphoreSubmitInfo<'static>>,
+}
+
+/// One `VkSubmitInfo2` of a submission: the waits of its first segment, the commands of each of
+/// its segments, and the signals of its last.
+pub(crate) struct Info<'a> {
+    pub(crate) waits: &'a [vk::SemaphoreSubmitInfo<'static>],
+    pub(crate) commands: Vec<vk::CommandBufferSubmitInfo<'static>>,
+    pub(crate) signals: &'a [vk::SemaphoreSubmitInfo<'static>],
+}
+
+/// The submit infos of a submission's segments, in order: a segment that waits on nothing joins
+/// the info before it where that one signals nothing, so only a signal, or the wait for a sparse
+/// bind, starts a new one. The GPU runs the command buffers of one info in order, as it runs those of consecutive
+/// infos, and a driver may pay for each info: the UHD 630's paid about 160 us apiece (probe
+/// 06860a3848, job m3-max-43935).
+pub(crate) fn infos(segments: &[Staged]) -> Vec<Info<'_>> {
+    let mut infos: Vec<Info<'_>> = Vec::with_capacity(1);
+    for staged in segments {
+        match infos.last_mut() {
+            Some(last) if staged.waits.is_empty() && last.signals.is_empty() => {
+                last.commands.extend(staged.command);
+                last.signals = &staged.signals;
+            }
+            _ => infos.push(Info {
+                waits: &staged.waits,
+                commands: staged.command.into_iter().collect(),
+                signals: &staged.signals,
+            }),
+        }
+    }
+    infos
+}
+
+/// A command buffer of a submission: with an error where it ended before it was submitted.
+pub(crate) type Finished = (Arc<CbInner>, Pending, Option<CommandBufferError>);
+
+/// A command buffer that retires with no submission of its own: with how it ended, or with no
+/// error where it had nothing to submit.
+pub(crate) type Ended = Finished;
+
+/// A command buffer that joined a group, with its scheduled handlers.
+pub(crate) type Joined = (Arc<CbInner>, Vec<Handler>);
+
+/// What staging the next ready segment did.
+enum Step {
+    /// Nothing is ready.
+    Idle,
+    /// Something was staged or ended; no group goes yet.
+    Staged,
+    /// The group of the FIFO at this index goes now.
+    Goes(usize),
+}
+
+impl Work {
+    pub(crate) fn new() -> Work {
+        Work {
+            state: Mutex::new(WorkState {
+                fifos: Vec::new(),
+                next_seq: 0,
+                next_place: 0,
+                progress: 0,
+                carried: VecDeque::new(),
+                uploaded: 0,
+                upload: None,
+                sealed: VecDeque::new(),
+                flush: 0,
+                region: None,
+                changes: Changes::default(),
+                dirty: false,
+                stop: false,
+                closed: false,
+                loss: None,
+                span_sleepers: 0,
+                holds: 0,
+                exported: ExportedOvers::default(),
+                #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                lost_at: 0,
+            }),
+            changed: Condvar::new(),
+            spans: Condvar::new(),
+            keeping: AtomicBool::new(false),
+            released: AtomicU64::new(0),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            counting: AtomicBool::new(false),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            asking: AtomicBool::new(false),
+        }
+    }
+
+    /// Keeps `texture`, over a buffer in an exported block in an image of its own whose copy is
+    /// `copy`, the block's flag `addressed` ([`ExportedOvers`]).
+    pub(crate) fn exported_over(
+        &self,
+        texture: &Arc<TextureInner>,
+        copy: &OverCopy,
+        addressed: Arc<AtomicBool>,
+    ) {
+        self.lock().exported.add(texture, copy, addressed);
+    }
+
+    /// Work recorded into the upload changed `range` of `block`'s bytes, ahead of every command
+    /// buffer committed from now on: the textures over them owe their copies in
+    /// ([`ExportedOvers`]).
+    pub(crate) fn exported_changed(&self, block: BlockId, range: (u64, u64)) {
+        let mut state = self.lock();
+        let number = state.next_seq + 1;
+        state.exported.owe(block, range, number);
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, WorkState> {
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        let began = crate::times::host_time();
+        let state = lock(&self.state);
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        waits::add(crate::times::host_time().saturating_sub(began));
+        state
+    }
+
+    /// For the device tests: what the submit side holds, read at once, for a wait that timed
+    /// out: across its queues, the command buffers enqueued or committed and not wholly
+    /// submitted, those committed, the heads held for an event's value, the groups staged and
+    /// not submitted, and the submissions not seen complete, with the progress value of the
+    /// last; and the device's first loss as it is recorded (its call, result and fault), with the
+    /// last submission's progress value when it came. Its lock is tried for a second: one held
+    /// longer is named, not waited for.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn stall(&self) -> String {
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let state = loop {
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return "the submit side's lock held by another thread for a second".to_owned();
+                }
+            }
+        };
+        let fifos = &state.fifos;
+        let entries: usize = fifos.iter().map(|fifo| fifo.entries.len()).sum();
+        let committed = (fifos.iter().flat_map(|fifo| &fifo.entries))
+            .filter(|entry| entry.pending.is_some())
+            .count();
+        let held = fifos
+            .iter()
+            .filter(|fifo| fifo.held_since.is_some())
+            .count();
+        let staged = fifos.iter().filter(|fifo| fifo.group.is_some()).count();
+        let in_flight: usize = fifos.iter().map(|fifo| fifo.in_flight.len()).sum();
+        let loss = match &state.loss {
+            None => "not lost".to_owned(),
+            Some(loss) => format!(
+                "lost at the last submission's progress {}: {loss:?}",
+                state.lost_at
+            ),
+        };
+        format!(
+            "the submit side: {} queues, {entries} command buffers not wholly submitted ({committed} \
+             committed), {held} heads held for an event's value, {staged} groups staged, \
+             {in_flight} submissions not seen complete, the last at progress {}; {loss}",
+            fifos.len(),
+            state.progress,
+        )
+    }
+
+    /// Wakes the submit thread after a change [`WorkState`] recorded.
+    pub(crate) fn wake(&self) {
+        self.changed.notify_one();
+    }
+
+    /// A host value rose: held segments may go.
+    pub(crate) fn poke(&self) {
+        self.lock().dirty = true;
+        self.wake();
+    }
+
+    /// Submissions completed: where a queue holds a group or a command buffer for room, it may
+    /// go.
+    pub(crate) fn completed(&self) {
+        if self.keeping.load(Ordering::SeqCst) {
+            self.poke();
+        }
+    }
+
+    /// The host is to wait for `cb`: where it is committed and not yet submitted, the group it is
+    /// in goes at once, or, where it is not yet staged, the group held ahead of it and the one it
+    /// joins. Nothing for a command buffer submitted, ended or not committed. It takes the lock
+    /// briefly and waits for no GPU work.
+    pub(crate) fn send(&self, cb: &Arc<CbInner>) {
+        let mut state = self.lock();
+        let Some(fifo) = (state.fifos.iter_mut()).find(|fifo| fifo.queue.is(&cb.queue)) else {
+            return;
+        };
+        let held = (fifo.group.as_ref()).and_then(|group| {
+            (group.finished.iter())
+                .any(|(joined, _, error)| error.is_none() && Arc::ptr_eq(joined, cb))
+                .then_some(group.first)
+        });
+        let place = held.or_else(|| {
+            (fifo.entries.iter())
+                .find(|entry| {
+                    Arc::ptr_eq(&entry.cb, cb) && entry.pending.is_some() && entry.error.is_none()
+                })
+                .map(|entry| entry.place)
+        });
+        let Some(place) = place.filter(|&place| place > fifo.send_through) else {
+            return;
+        };
+        fifo.send_through = place;
+        state.dirty = true;
+        drop(state);
+        self.wake();
+    }
+
+    /// Records into the upload of the next commit ([`WorkState::current`]) with `record`, which is
+    /// given the device and the upload's command buffer, recording, under the work lock:
+    /// commands that go ahead of every later commit, on every queue, in the first submission
+    /// whose command buffers' last was committed after the call. The upload keeps each of `held`
+    /// until it retires, and `stage`, the staging of a copy [`stage`](Self::stage) gave: its span
+    /// of the region until the submission completes, or its own staging buffer. A texture of
+    /// `held` not yet in its home layout is moved there first.
+    ///
+    /// Where the uploads not yet submitted are full ([`UPLOAD_ENTRIES`], [`UPLOAD_BYTES`]),
+    /// they are submitted and the call waits for them to complete first, without the lock. Where
+    /// their spans of the staging region reach half the region, they are submitted, and the call
+    /// does not wait. Where the call fails, `stage`'s span is given up.
+    ///
+    /// Err: [`Error::Quiesced`]; [`Error::Vulkan`] where a command pool or buffer cannot be made,
+    /// and with `VK_ERROR_DEVICE_LOST` where the device is lost while the call waits.
+    pub(crate) fn upload<const N: usize>(
+        &self,
+        core: &Core,
+        stage: Option<&Stage>,
+        held: [Held; N],
+        record: impl FnOnce(&ash::Device, vk::CommandBuffer),
+    ) -> Result<(), Error> {
+        let recorded = self.record_upload(core, stage, held, |device, upload| {
+            record(device, upload.command)
+        });
+        if recorded.is_err() {
+            if let Some(Stage::Region { number, .. }) = stage {
+                self.give_up(*number);
+            }
+        }
+        recorded
+    }
+
+    /// The work lock, once the uploads not yet submitted have room for a call of `staging` bytes
+    /// of staging of its own: where they are full ([`WorkState::full`]), they are submitted and
+    /// the call waits for them to complete, without the lock.
+    ///
+    /// Err: [`Error::Quiesced`]; [`Error::Vulkan`] with `VK_ERROR_DEVICE_LOST` where the device is
+    /// lost while the call waits.
+    fn room(&self, core: &Core, staging: u64) -> Result<MutexGuard<'_, WorkState>, Error> {
+        let mut state = self.lock();
+        loop {
+            if state.closed {
+                return Err(Error::Quiesced);
+            }
+            let released = self.released.load(Ordering::Relaxed);
+            if !state.full(staging, released) {
+                return Ok(state);
+            }
+            let value = state.flush();
+            drop(state);
+            self.wake();
+            core.counters.count(Metric::UploadWaits);
+            core.done.wait(core, value)?;
+            state = self.lock();
+        }
+    }
+
+    /// `didModifyRange:` of a Managed buffer with a device copy: the consumer's bytes
+    /// `start..end` of `buffer` changed. The range is only named, merged with the buffer's others
+    /// where they overlap or touch, holding the buffer weakly; the next commit, of a command
+    /// buffer with commands or none, copies it in ([`capture`](Self::capture)) where the buffer
+    /// still lives. It allocates nothing.
+    ///
+    /// Err: [`Error::Quiesced`].
+    pub(crate) fn modify(
+        &self,
+        buffer: &Arc<BufferInner>,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Error> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err(Error::Quiesced);
+        }
+        state.changes.add(buffer, start, end);
+        Ok(())
+    }
+
+    /// At every commit, with commands or none, on the committing thread, under the work lock
+    /// `state`, which it keeps: takes every Managed buffer's range named since the last
+    /// capture (`crate::capture`) into one copy-in, GPU copies from the consumers' blocks into the
+    /// device copies, recorded into a command buffer of its own ([`capture::copy_in`]); none
+    /// where every buffer named is gone. It waits at the committing command buffer's number, the
+    /// next in the commit order ([`WorkState::seq`]), for the first command buffer submitted that
+    /// is numbered at or after it ([`capture::Captured`]). A commit that fails after its capture
+    /// leaves it there, for the next.
+    ///
+    /// Err: [`Error::Quiesced`]; what making the copy-in's command buffer returns. The ranges are
+    /// then named again for the next commit.
+    pub(crate) fn capture<'a>(
+        &'a self,
+        core: &Core,
+        mut state: MutexGuard<'a, WorkState>,
+    ) -> Result<MutexGuard<'a, WorkState>, Error> {
+        let named = state.changes.take();
+        if named.is_empty() {
+            return Ok(state);
+        }
+        if state.closed {
+            return Err(self.unwind(state, &named, Error::Quiesced));
+        }
+        let number = state.next_seq + 1;
+        let copy_in = match capture::copy_in(core, &named, number) {
+            Ok(copy_in) => copy_in,
+            Err(error) => return Err(self.unwind(state, &named, error)),
+        };
+        core.counters
+            .captured(named.iter().map(Modified::bytes).sum());
+        state.changes.captured.push(number, copy_in);
+        Ok(state)
+    }
+
+    /// A capture that cannot finish: its ranges `named` are named again for the next commit (none
+    /// once the device is closed: its submit thread forgot the ranges at its end), and `error` is
+    /// the commit's.
+    fn unwind(
+        &self,
+        mut state: MutexGuard<'_, WorkState>,
+        named: &[Modified],
+        error: Error,
+    ) -> Error {
+        let again = if state.closed { &[] } else { named };
+        state.changes.give_up(again);
+        error
+    }
+
+    /// [`upload`](Self::upload) up to the span's give-up on a failure, `record` given the upload
+    /// itself.
+    fn record_upload<const N: usize>(
+        &self,
+        core: &Core,
+        stage: Option<&Stage>,
+        held: [Held; N],
+        record: impl FnOnce(&ash::Device, &mut Upload),
+    ) -> Result<(), Error> {
+        let staging = match stage {
+            Some(Stage::Own(staging)) => staging.len,
+            _ => 0,
+        };
+        let mut state = self.room(core, staging)?;
+        let device = &core.device;
+        let upload = state.current(core)?;
+        let homes: Vec<Homing> = (held.iter())
+            .filter_map(|item| match item {
+                Held::Texture(image) => image.homing(),
+                _ => None,
+            })
+            .collect();
+        upload.home(core, &homes);
+        record(device, upload);
+        upload.entries += 1;
+        upload.staging += staging;
+        for item in held {
+            if !upload.held.iter().any(|kept| kept.is(&item)) {
+                upload.held.push(item);
+            }
+        }
+        let mut half = false;
+        match stage {
+            Some(Stage::Region { number, len, .. }) => {
+                upload.spans.push(*number);
+                upload.span_bytes += len;
+                if let Some(region) = &mut state.region {
+                    region.ring.set(*number, At::Recorded);
+                }
+                self.release_spans(&state);
+                let spans: u64 = state.unsent().map(|upload| upload.span_bytes).sum();
+                half = spans >= REGION_LEN / 2;
+            }
+            Some(Stage::Own(staging)) => upload.held.push(Held::Staging(Arc::clone(staging))),
+            None => {}
+        }
+        if half {
+            state.flush();
+            drop(state);
+            self.wake();
+        }
+        Ok(())
+    }
+
+    /// Staging for a copy of `len` bytes: a span of the device's staging region, which the
+    /// block-maker thread makes as its first work, so a copy before then waits for that make
+    /// ([`Pool::await_made`](crate::memory::Pool::await_made)), and where that thread made none,
+    /// the copy makes it ([`make_staging_region`](Self::make_staging_region)); a staging buffer
+    /// of its own for a copy larger than the region. Where the region has
+    /// no room, the call waits, without the lock, for what frees its oldest span: the submission
+    /// that carries it, after submitting the uploads not yet submitted where it is in one. Where
+    /// another call holds that span, still writing its bytes or reading them, the call sleeps on
+    /// [`spans`](Work::spans) until that call releases it ([`release_spans`](Self::release_spans)),
+    /// counted in [`Metrics::staging_sleeps`](crate::Metrics::staging_sleeps). `read` keeps the
+    /// span until [`unread`](Self::unread), for a copy the host reads once it completed. The
+    /// caller passes the stage to [`upload`](Self::upload).
+    ///
+    /// Err: [`Error::Quiesced`]; what making the region or the staging buffer can return;
+    /// [`Error::Vulkan`] with `VK_ERROR_DEVICE_LOST` where the device is lost while the call
+    /// waits.
+    pub(crate) fn stage(&self, core: &Arc<Core>, len: u64, read: bool) -> Result<Stage, Error> {
+        if len > REGION_LEN {
+            if self.lock().closed {
+                return Err(Error::Quiesced);
+            }
+            return Ok(Stage::Own(Arc::new(Staging::new(core, len)?)));
+        }
+        let mut state = self.lock();
+        if state.closed {
+            return Err(Error::Quiesced);
+        }
+        if state.region.is_none() {
+            drop(state);
+            core.pool.await_made(Internal::StagingRegion);
+            self.make_staging_region(core)?;
+            state = self.lock();
+        }
+        // The progress value known complete: what the completion thread has seen, or what this
+        // call waited for.
+        let mut completed = core.done.completed();
+        loop {
+            if state.closed {
+                return Err(Error::Quiesced);
+            }
+            // Made above, and taken only at teardown.
+            let Some(region) = &mut state.region else {
+                return Err(Error::Quiesced);
+            };
+            region.ring.reclaim(completed.max(core.done.completed()));
+            if let Some((number, offset)) = region.ring.take(len, read) {
+                return Ok(Stage::Region {
+                    number,
+                    len,
+                    buffer: region.buffer,
+                    offset,
+                    host: region.host(offset),
+                });
+            }
+            let Some(oldest) = region.ring.oldest() else {
+                unreachable!("a ring with no live span takes any span of at most its length");
+            };
+            let value = match oldest {
+                Oldest::Submitted(value) => value,
+                Oldest::Pending => state.flush(),
+                // Another call finishes writing or reading its span: its release wakes this one.
+                Oldest::Busy => {
+                    if state.lost() {
+                        return Err(Error::Vulkan {
+                            call: "vkWaitSemaphores",
+                            result: vk::Result::ERROR_DEVICE_LOST,
+                        });
+                    }
+                    core.counters.count(Metric::StagingSleeps);
+                    state.span_sleepers += 1;
+                    state = (self.spans.wait(state)).unwrap_or_else(PoisonError::into_inner);
+                    state.span_sleepers -= 1;
+                    continue;
+                }
+            };
+            drop(state);
+            self.wake();
+            core.counters.count(Metric::UploadWaits);
+            core.done.wait(core, value)?;
+            completed = completed.max(value);
+            state = self.lock();
+        }
+    }
+
+    /// The host no longer reads span `number` of the staging region.
+    pub(crate) fn unread(&self, number: u64) {
+        let mut state = self.lock();
+        if let Some(region) = &mut state.region {
+            region.ring.unread(number);
+        }
+        self.release_spans(&state);
+    }
+
+    /// Gives up span `number` of the staging region, with no copy recorded.
+    fn give_up(&self, number: u64) {
+        let mut state = self.lock();
+        if let Some(region) = &mut state.region {
+            region.ring.set(number, At::Done);
+            region.ring.unread(number);
+        }
+        self.release_spans(&state);
+    }
+
+    /// Wakes the staging calls asleep for a span another call holds ([`stage`](Self::stage)), where
+    /// any sleep: after a change, under the work lock `state`, that can release the region's
+    /// oldest span, or end the wait. Three changes release a span a call sleeps for: its copy
+    /// recorded, its give-up, and its read's end. A span's later moves, to its submission or given
+    /// up with an upload not yet submitted, are of recorded spans, for which no call sleeps: one
+    /// finding its oldest span recorded submits the uploads and waits for the GPU instead.
+    fn release_spans(&self, state: &WorkState) {
+        if state.span_sleepers > 0 {
+            self.spans.notify_all();
+        }
+    }
+
+    /// Makes the staging region where none is made yet: on the block-maker thread, its first work
+    /// (`crate::memory::Internal::StagingRegion`), or on a copy's own thread where that thread
+    /// made none, counted in
+    /// [`Metrics::staging_region_allocations`](crate::Metrics::staging_region_allocations).
+    ///
+    /// Err: what [`Region::new`] returns.
+    pub(crate) fn make_staging_region(&self, core: &Core) -> Result<(), Error> {
+        if self.lock().region.is_some() {
+            return Ok(());
+        }
+        let made = Region::new(core, REGION_LEN, Site::StagingRegion)?;
+        let mut state = self.lock();
+        if state.region.is_none() && !state.closed {
+            state.region = Some(made);
+            core.counters.rise_by(Gauge::StagingBytes, REGION_LEN);
+        } else {
+            drop(state);
+            // SAFETY: another call made the region first, or the device closed; nothing used this
+            // one.
+            unsafe { made.free(core) };
+        }
+        Ok(())
+    }
+
+    /// At teardown: the staging region, for the core to free.
+    pub(crate) fn take_region(&mut self) -> Option<Region> {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.region.take()
+    }
+
+    /// A new texture's `image`, or a drawable's acquired again: the upload of the next commit
+    /// ([`WorkState::current`]) keeps it, and the submission that takes that upload moves it to
+    /// its home layout where it still lives, holding it from then; until then nothing holds it.
+    /// Where its move home copies from the zero source, the zero source is made first
+    /// ([`fill::zeros`]), off the work lock.
+    ///
+    /// Err: [`Error::Quiesced`]; [`Error::Vulkan`] where a command pool or buffer cannot be made;
+    /// what [`fill::zeros`] returns.
+    pub(crate) fn home(&self, core: &Core, image: &Arc<Image>) -> Result<(), Error> {
+        if image.copies_zeros() {
+            fill::zeros(core)?;
+        }
+        let mut state = (core.counters).time(Part::HomeLock, 0, || self.lock());
+        if state.closed {
+            return Err(Error::Quiesced);
+        }
+        let upload = state.current(core)?;
+        image.owe_home();
+        if upload.homes.len() >= upload.prune_at {
+            upload.homes.retain(|home| home.strong_count() > 0);
+            upload.prune_at = (upload.homes.len() * 2).max(HOMES_PRUNE);
+        }
+        upload.homes.push(Arc::downgrade(image));
+        Ok(())
+    }
+
+    /// A texture whose image an upload holds is released: its `bytes` count against the
+    /// [`UPLOAD_BYTES`] of the uploads not yet submitted. An upload already submitted frees it
+    /// soon; counting it anyway can only submit the others sooner.
+    pub(crate) fn released(&self, bytes: u64) {
+        self.released.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The consumer released `block`: where an upload not yet submitted holds it, the release is
+    /// a held one ([`release`](Self::release)), and its length counts against their
+    /// [`UPLOAD_BYTES`].
+    pub(crate) fn release_block(&self, core: &Core, block: &Arc<Block>) {
+        let len = block.memory.len;
+        if self.release(core, &Held::Block(Arc::clone(block)), len) {
+            self.released(len);
+        }
+    }
+
+    /// The last holder of `held` outside the uploads let go of it, `bytes` of a texture's image
+    /// or of a block: whether an upload not yet submitted holds it. Such a release is counted
+    /// ([`Metrics::held_releases`](crate::Metrics::held_releases), with its bytes), as one that
+    /// starts a send where no such release came since those uploads came to hold it
+    /// ([`Metrics::held_release_starts`](crate::Metrics::held_release_starts)), and every upload
+    /// not yet submitted goes at once, alone where no group goes, with no wait
+    /// ([`flush`](Self::flush)), so what they hold is freed once they complete, with no later
+    /// call.
+    pub(crate) fn release(&self, core: &Core, held: &Held, bytes: u64) -> bool {
+        let mut state = self.lock();
+        let mut holds = false;
+        let mut starts = false;
+        for upload in state.unsent() {
+            if let Some(at) = (upload.held.iter()).position(|kept| kept.is(held)) {
+                holds = true;
+                starts |= at >= upload.met;
+            }
+        }
+        if !holds {
+            return false;
+        }
+        core.counters.held_release(bytes, starts);
+        for upload in state.unsent_mut() {
+            upload.met = upload.held.len();
+        }
+        state.flush();
+        drop(state);
+        self.wake();
+        true
+    }
+
+    /// For the device tests: the calls of the uploads not yet submitted, the bytes they alone
+    /// keep, and the new textures awaiting their home layout.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn pending(&self) -> (usize, u64, usize) {
+        let state = self.lock();
+        let released = self.released.load(Ordering::Relaxed);
+        let (entries, staging) = state.unsent_calls();
+        let homes = state.unsent().map(|upload| upload.homes.len()).sum();
+        (entries, staging + released, homes)
+    }
+
+    /// For the device tests: the staging region's live spans, oldest first; none before the
+    /// region is made.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn staging_spans(&self) -> Vec<(u64, u64, crate::staging::At)> {
+        let state = self.lock();
+        (state.region.as_ref()).map_or_else(Vec::new, |region| region.ring.live())
+    }
+
+    /// For the device tests: `queue`'s submissions not seen complete when the submit thread last
+    /// looked, and whether it holds a group not yet submitted.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn in_flight(&self, queue: &QueueInner) -> (usize, bool) {
+        let state = self.lock();
+        (state.fifos.iter().find(|fifo| fifo.queue.is(queue))).map_or((0, false), |fifo| {
+            (fifo.in_flight.len(), fifo.group.is_some())
+        })
+    }
+
+    /// For the device tests: the queues whose head's next segment the submit thread holds for an
+    /// event's value ([`WorkState::mark_holds`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn holding(&self) -> usize {
+        let state = self.lock();
+        (state.fifos.iter())
+            .filter(|fifo| {
+                (fifo.head()).is_some_and(|pending| {
+                    (fifo.held_since)
+                        .is_some_and(|(seq, next, _)| (seq, next) == (pending.seq, pending.next))
+                })
+            })
+            .count()
+    }
+
+    /// Records the zero fill of `offset..end` of `block` into the upload ([`fill`](Self::fill)).
+    ///
+    /// Err: as [`fill`](Self::fill).
+    pub(crate) fn zero(
+        &self,
+        core: &Core,
+        block: &Arc<Block>,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), Error> {
+        let (buffer, base) = block.memory.range(0);
+        let held = Held::Block(Arc::clone(block));
+        self.fill(core, held, buffer, base + offset, base + end)?;
+        if block.memory.exported() {
+            self.exported_changed(block.memory.id, (offset, end));
+        }
+        Ok(())
+    }
+
+    /// Records the zero fill of `start..end` of `buffer` into the upload, which keeps `held`, what
+    /// holds the buffer, until it retires. The upload's commands are in no order of their own:
+    /// a fill that meets bytes an earlier fill of the upload wrote goes after a barrier, so the
+    /// two do not write the same bytes at once (a write-after-write hazard). Fills of other bytes
+    /// take none. One that meets a fill of an earlier upload of the same submission goes after
+    /// a barrier the submission records between them ([`order_fills`]).
+    ///
+    /// Err: as [`upload`](Self::upload); what [`fill::zeros_for`] returns.
+    pub(crate) fn fill(
+        &self,
+        core: &Core,
+        held: Held,
+        buffer: vk::Buffer,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Error> {
+        let zeros = fill::zeros_for(core, start, end)?;
+        self.record_upload(core, None, [held], |device, upload| {
+            let meets = |&(filled, from, to): &Filled| filled == buffer && from < end && start < to;
+            if upload.filled.iter().any(meets) {
+                record::barrier(device, upload.command, Reach::Commands);
+                core.counters.count(Metric::Barriers);
+                if upload.leading.is_none() {
+                    upload.leading = Some(upload.filled.clone());
+                }
+                upload.filled.clear();
+            }
+            upload.filled.push((buffer, start, end));
+            // SAFETY: the upload's command buffer is recording, under the lock; `held` holds the
+            // buffer, which has every usage, `start..end` lies in it, and `zeros` is what
+            // `zeros_for` answered for it.
+            unsafe { fill::record(device, upload.command, zeros, buffer, start, end) }
+        })
+    }
+
+    /// Has every upload not yet submitted go at once, alone where no group goes: the progress
+    /// value at which everything recorded into uploads so far has completed and is visible to the
+    /// host, for [`Done::wait`](crate::complete::Done::wait).
+    pub(crate) fn flush(&self) -> u64 {
+        let value = self.lock().flush();
+        self.wake();
+        value
+    }
+
+    /// The point at which every move to a home layout recorded so far has completed, with no
+    /// submission of its own: the last upload's not yet submitted, whose submission sets it, and
+    /// takes every one before it; where none is, the last submission that took one.
+    /// [`ready_value`](Self::ready_value) reads it.
+    pub(crate) fn ready_point(&self) -> Arc<AtomicU64> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let uploaded = state.uploaded;
+        match state.upload.as_mut().or(state.sealed.back_mut()) {
+            Some(upload) => Arc::clone(
+                upload
+                    .ready
+                    .get_or_insert_with(|| Arc::new(AtomicU64::new(0))),
+            ),
+            None => Arc::new(AtomicU64::new(uploaded)),
+        }
+    }
+
+    /// The progress value at which `point` ([`ready_point`](Self::ready_point)) is reached: the
+    /// value of the submission that took its upload, or where that upload is not yet submitted,
+    /// the next submission's, which this call has take it at once ([`flush`](Self::flush)).
+    pub(crate) fn ready_value(&self, point: &AtomicU64) -> u64 {
+        let mut state = self.lock();
+        // A submission takes the upload under this lock, setting the point as it does.
+        match point.load(Ordering::Relaxed) {
+            0 => {
+                let value = state.flush();
+                drop(state);
+                self.wake();
+                value
+            }
+            value => value,
+        }
+    }
+
+    /// Ends `queue`'s command buffers not yet scheduled with `NotRun`: one not committed at its
+    /// commit, the rest in the queue's order as the submit thread reaches each
+    /// (`WorkState::step`), behind those scheduled, in a group held or held for room, which go at
+    /// once.
+    pub(crate) fn abandon(&self, queue: &QueueInner) {
+        let mut state = self.lock();
+        let Some(fifo) = state.fifos.iter_mut().find(|fifo| fifo.queue.is(queue)) else {
+            return;
+        };
+        fifo.entries
+            .retain_mut(|entry| match (&entry.pending, entry.held) {
+                (None, _) => {
+                    entry.cb.end_uncommitted(CommandBufferError::NotRun);
+                    false
+                }
+                (Some(_), None) => {
+                    entry.error.get_or_insert(CommandBufferError::NotRun);
+                    true
+                }
+                (Some(_), Some(_)) => true,
+            });
+        state.dirty = true;
+        drop(state);
+        self.wake();
+    }
+
+    /// Closes the device to commits and uploads, and tells the submit thread to end.
+    pub(crate) fn stop(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.stop = true;
+        state.dirty = true;
+        self.wake();
+        self.release_spans(&state);
+    }
+
+    /// At a loss: the submit thread ends everything it holds. The first loss's cause is kept, and
+    /// a later one's dropped.
+    pub(crate) fn lose(&self, loss: DeviceLoss) {
+        let mut state = self.lock();
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        if state.loss.is_none() {
+            state.lost_at = state.progress;
+        }
+        state.loss.get_or_insert(loss);
+        state.dirty = true;
+        self.wake();
+        self.release_spans(&state);
+    }
+
+    /// The progress value of the last submission.
+    pub(crate) fn progress(&self) -> u64 {
+        self.lock().progress
+    }
+
+    /// Once every command buffer committed up to place `commits` in the commit order is
+    /// submitted, or ended before it was: the progress value of the last submission that carried
+    /// the last segment of one of them, which no later commit moves, or 0 where each was seen
+    /// complete. None while one waits in its queue's FIFO or in a group not yet submitted
+    /// (`crate::memory::Wait`).
+    pub(crate) fn settled(&self, commits: u64) -> Option<u64> {
+        let state = self.lock();
+        let waits = |pending: &Pending| pending.seq <= commits;
+        let queued = (state.fifos.iter()).flat_map(|fifo| &fifo.entries);
+        let staged = (state.fifos.iter()).filter_map(|fifo| fifo.group.as_ref());
+        let held = queued.filter_map(|entry| entry.pending.as_ref()).any(waits)
+            || (staged.flat_map(|group| &group.finished)).any(|(_, pending, _)| waits(pending));
+        // The values rise along the list: the last of them that carried one is the highest.
+        (!held).then(|| {
+            (state.carried.iter().rev())
+                .find(|&&(seq, _)| seq <= commits)
+                .map_or(0, |&(_, value)| value)
+        })
+    }
+}
+
+impl WorkState {
+    pub(crate) fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub(crate) fn lost(&self) -> bool {
+        self.loss.is_some()
+    }
+
+    /// The device's first loss, None while it is not lost.
+    pub(crate) fn loss(&self) -> Option<DeviceLoss> {
+        self.loss.clone()
+    }
+
+    /// The next place in the commit order.
+    pub(crate) fn seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    /// Has every upload not yet submitted go at once, alone where no group goes: the progress
+    /// value at which everything recorded into uploads so far has completed. The upload
+    /// recording ends here; a later call begins the next. The caller wakes the thread.
+    fn flush(&mut self) -> u64 {
+        self.sealed.extend(self.upload.take());
+        if self.sealed.is_empty() {
+            // Every upload so far went in a submission already made.
+            return self.progress;
+        }
+        self.flush = self.sealed.len();
+        self.dirty = true;
+        // The next submission takes them.
+        self.progress + 1
+    }
+
+    /// The upload a call made now records into: the one of the next commit, numbered as that
+    /// commit will be. Where the upload recording holds calls made before the last commit, the
+    /// call ends its recording ([`sealed`](WorkState::sealed)): it goes in the first submission
+    /// whose command buffers' last was committed at or after its number, and the call begins the
+    /// next. So what each upload holds follows the program's calls and commits alone, whenever
+    /// the submit thread takes it. A commit only takes its number ([`seq`](Self::seq)).
+    ///
+    /// Err: [`Error::Vulkan`] where a command pool or buffer cannot be made.
+    fn current(&mut self, core: &Core) -> Result<&mut Upload, Error> {
+        let number = self.next_seq + 1;
+        let earlier = self.upload.take_if(|upload| upload.number < number);
+        self.sealed.extend(earlier);
+        let upload = match self.upload.take() {
+            Some(upload) => upload,
+            None => Upload::begin(core, number)?,
+        };
+        Ok(self.upload.insert(upload))
+    }
+
+    /// The uploads not yet submitted, oldest first.
+    fn unsent(&self) -> impl Iterator<Item = &Upload> {
+        self.sealed.iter().chain(&self.upload)
+    }
+
+    /// [`unsent`](Self::unsent), to change.
+    fn unsent_mut(&mut self) -> impl Iterator<Item = &mut Upload> {
+        self.sealed.iter_mut().chain(&mut self.upload)
+    }
+
+    /// The calls the uploads not yet submitted hold, and the bytes of the staging buffers of their
+    /// own they hold.
+    fn unsent_calls(&self) -> (usize, u64) {
+        (self.unsent()).fold((0, 0), |(entries, staging), upload| {
+            (entries + upload.entries, staging + upload.staging)
+        })
+    }
+
+    /// Whether a call of `staging` bytes waits for the uploads not yet submitted: they hold a
+    /// call, and they are at [`UPLOAD_ENTRIES`], or the call would take what they alone keep
+    /// (with `released`) past [`UPLOAD_BYTES`].
+    fn full(&self, staging: u64, released: u64) -> bool {
+        let (entries, kept) = self.unsent_calls();
+        entries > 0
+            && (entries >= UPLOAD_ENTRIES
+                || kept.saturating_add(released).saturating_add(staging) > UPLOAD_BYTES)
+    }
+
+    /// Takes the uploads the submission of progress `value` carries, oldest first: each whose
+    /// calls came before the commit numbered `through`, the last of its command buffers' (0 for
+    /// none), and those a flush sends ([`flush`](Self::flush)). Their spans of the staging region
+    /// are free once `value` completes. The moves to their home layouts of the textures they keep
+    /// that still live are recorded in the last, in one barrier, which holds each texture from
+    /// then. `released` starts again once no upload is left unsent.
+    fn take_uploads(
+        &mut self,
+        core: &Core,
+        released: &AtomicU64,
+        value: u64,
+        through: u64,
+    ) -> Vec<Upload> {
+        let within = (self.sealed.iter())
+            .take_while(|upload| upload.number <= through)
+            .count();
+        let count = within.max(self.flush).min(self.sealed.len());
+        self.flush = 0;
+        let mut taken: Vec<Upload> = self.sealed.drain(..count).collect();
+        if self.sealed.is_empty() {
+            taken.extend(self.upload.take_if(|upload| upload.number <= through));
+        }
+        if taken.is_empty() {
+            return taken;
+        }
+        if self.sealed.is_empty() && self.upload.is_none() {
+            released.store(0, Ordering::Relaxed);
+        }
+        self.uploaded = value;
+        let mut homes = Vec::new();
+        let mut held = Vec::new();
+        for upload in &mut taken {
+            if let Some(ready) = &upload.ready {
+                ready.store(value, Ordering::Relaxed);
+            }
+            if let Some(region) = &mut self.region {
+                for &number in &upload.spans {
+                    region.ring.set(number, At::Submitted(value));
+                }
+            }
+            for image in upload.homes.drain(..).filter_map(|home| home.upgrade()) {
+                // One an upload copied to or from was moved before its copy, and is held.
+                if let Some(homing) = image.homing() {
+                    homes.push(homing);
+                    held.push(Held::Texture(image));
+                }
+            }
+        }
+        if let (false, Some(last)) = (homes.is_empty(), taken.last_mut()) {
+            last.home(core, &homes);
+            last.entries += 1;
+            last.held.extend(held);
+        }
+        taken
+    }
+
+    /// Takes the uploads not yet submitted where they will never be: their spans of the staging
+    /// region are given up, and the textures awaiting their home layout need none.
+    fn drop_uploads(&mut self) -> Vec<Upload> {
+        let mut dropped: Vec<Upload> = self.sealed.drain(..).collect();
+        dropped.extend(self.upload.take());
+        self.flush = 0;
+        if let Some(region) = &mut self.region {
+            for upload in &dropped {
+                for &number in &upload.spans {
+                    region.ring.set(number, At::Done);
+                }
+            }
+        }
+        dropped
+    }
+
+    fn fifo(&mut self, queue: &Arc<QueueInner>) -> &mut Fifo {
+        let index = match self.fifos.iter().position(|fifo| fifo.queue.is(queue)) {
+            Some(index) => index,
+            None => {
+                self.fifos.push(Fifo {
+                    queue: Arc::clone(queue),
+                    entries: VecDeque::new(),
+                    group: None,
+                    in_flight: VecDeque::new(),
+                    send_through: 0,
+                    behind: 0,
+                    held_since: None,
+                });
+                self.fifos.len() - 1
+            }
+        };
+        &mut self.fifos[index]
+    }
+
+    /// Takes `cb`'s place at its queue's end.
+    fn push(&mut self, cb: &Arc<CbInner>) -> &mut Entry {
+        self.next_place += 1;
+        let place = self.next_place;
+        let entries = &mut self.fifo(&cb.queue).entries;
+        entries.push_back(Entry {
+            cb: Arc::clone(cb),
+            place,
+            pending: None,
+            error: None,
+            held: None,
+        });
+        entries.back_mut().expect("an entry just pushed")
+    }
+
+    /// Takes `cb`'s place in its queue's FIFO.
+    pub(crate) fn enqueue(&mut self, cb: &Arc<CbInner>) {
+        self.push(cb);
+    }
+
+    /// Hands `cb` to the submit thread: at its place where it was enqueued, else at its queue's
+    /// end. With `error` (it ended while enqueued, and its place went), at its queue's end, to
+    /// retire with that error behind the work held or in flight before it.
+    pub(crate) fn commit(
+        &mut self,
+        cb: &Arc<CbInner>,
+        pending: Pending,
+        error: Option<CommandBufferError>,
+    ) {
+        self.dirty = true;
+        let enqueued = (self.fifo(&cb.queue).entries.iter_mut())
+            .find(|entry| Arc::ptr_eq(&entry.cb, cb) && entry.pending.is_none());
+        let entry = match enqueued {
+            Some(entry) => entry,
+            None => self.push(cb),
+        };
+        entry.pending = Some(pending);
+        entry.error = error;
+    }
+
+    /// With nothing left to stage at `now`: each queue's head whose next segment waits for an
+    /// event's value neither set nor promised by a submitted signal is held from `now`, where it
+    /// was not held already ([`Metrics::event_holds`](crate::Metrics::event_holds)).
+    fn mark_holds(&mut self, now: u64) {
+        for fifo in &mut self.fifos {
+            let Some(Entry {
+                pending: Some(pending),
+                error: None,
+                ..
+            }) = fifo.entries.front()
+            else {
+                continue;
+            };
+            let at = (pending.seq, pending.next);
+            let marked = (fifo.held_since).is_some_and(|(seq, next, _)| (seq, next) == at);
+            if !marked && !ready(&pending.gpu.segments[pending.next]) {
+                fifo.held_since = Some((at.0, at.1, now));
+            }
+        }
+    }
+
+    /// The FIFO whose command buffer goes next, and whether its head waits for room
+    /// ([`waits_for_room`](Self::waits_for_room)). First a head scheduled while held for room that
+    /// no longer waits, the earliest held: it was scheduled before anything that comes next.
+    /// Else, of the committed heads that are ended or whose next segment is ready, and of the
+    /// first command buffers not yet scheduled behind heads that wait, ended or with every
+    /// segment's waits met, the earliest committed.
+    fn next_ready(&self) -> Option<(usize, bool)> {
+        let mut held: Option<(u64, usize)> = None;
+        let mut best: Option<(usize, bool, u64)> = None;
+        for (index, fifo) in self.fifos.iter().enumerate() {
+            let waits = self.waits_for_room(fifo);
+            if let (false, Some(at)) = (waits, fifo.entries.front().and_then(|head| head.held)) {
+                held = held.filter(|&(first, _)| first < at).or(Some((at, index)));
+                continue;
+            }
+            let entry = match waits {
+                true => fifo.entries.iter().find(|entry| entry.held.is_none()),
+                false => fifo.entries.front(),
+            };
+            let Some(Entry {
+                pending: Some(pending),
+                error,
+                ..
+            }) = entry
+            else {
+                continue;
+            };
+            if best.is_some_and(|(.., seq)| seq < pending.seq) {
+                continue;
+            }
+            let from = if waits { 0 } else { pending.next };
+            let to = if waits {
+                pending.gpu.segments.len()
+            } else {
+                from + 1
+            };
+            if error.is_some() || pending.gpu.segments[from..to].iter().all(ready) {
+                best = Some((index, waits, pending.seq));
+            }
+        }
+        (held.map(|(_, index)| (index, false))).or(best.map(|(index, waits, _)| (index, waits)))
+    }
+
+    /// Whether the head of `fifo` waits in its list, not staged, for room: committed, with
+    /// commands or a copy-in for the GPU, its first segment not yet staged, behind a group held
+    /// that does not go ([`Fifo::goes`]) nor conflict with it, and that does not take it
+    /// ([`Batch::takes`]) or would go at its signal. With no group held, one that signals an event
+    /// in any segment, which would send its group at once, waits where its queue has no room for
+    /// it. The command buffers behind it wait with it.
+    fn waits_for_room(&self, fifo: &Fifo) -> bool {
+        let Some(head) = fifo.entries.front() else {
+            return false;
+        };
+        let (Some(pending), None) = (&head.pending, head.error) else {
+            return false;
+        };
+        let empty = pending.gpu.is_empty() && !self.changes.captured.waits_for(pending.seq);
+        if pending.next != 0 || empty {
+            return false;
+        }
+        let segments = &pending.gpu.segments;
+        let signals = (segments.iter()).any(|segment| !segment.signals.is_empty());
+        let (segment, run) = (&segments[0], fifo.queue.expected_run());
+        match &fifo.group {
+            Some(group) => {
+                !group.leans.conflicts(&segment.overs)
+                    && (signals || !group.takes(run, fifo.queue.retired()))
+                    && !fifo.goes(self.stop)
+            }
+            None => {
+                let room = room(&fifo.in_flight, run.unwrap_or(u64::MAX));
+                signals && !(self.stop || fifo.send_through >= head.place || room)
+            }
+        }
+    }
+
+    /// The first command buffer not yet scheduled of the FIFO at `index`, whose head waits for
+    /// room, every wait of its met: scheduled now, as it would be in a group held, its scheduled
+    /// handlers going to `joined`, and counted. One that presents a drawable (scheduled once
+    /// submitted), has nothing for the GPU, or ended has the queue sent through to it instead,
+    /// as its group would go at once.
+    fn hold(&mut self, index: usize, now: u64, counters: &Counters, joined: &mut Vec<Joined>) {
+        let captured = &self.changes.captured;
+        let fifo = &mut self.fifos[index];
+        let Some(entry) = fifo.entries.iter_mut().find(|entry| entry.held.is_none()) else {
+            return;
+        };
+        let Some(pending) = entry.pending.as_mut() else {
+            return;
+        };
+        let empty = pending.gpu.is_empty() && !captured.waits_for(pending.seq);
+        if entry.error.is_some() || empty || pending.gpu.presents() {
+            fifo.send_through = fifo.send_through.max(entry.place);
+            return;
+        }
+        let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+        entry.cb.scheduled(now, !scheduled.is_empty());
+        if !scheduled.is_empty() {
+            joined.push((Arc::clone(&entry.cb), scheduled));
+        }
+        self.holds += 1;
+        entry.held = Some(self.holds);
+        counters.held_for_room();
+    }
+
+    /// The FIFO, other than the one at `index`, holding a command buffer that updates a fence the
+    /// head at `index` waits on, and the place its queue goes through to: the last such command
+    /// buffer scheduled while held for room before that head was (`crate::fence`), or where none
+    /// is, its group held's first, where that group holds one, finished or its queue's head.
+    fn updater_held(&self, index: usize) -> Option<(usize, u64)> {
+        let head = self.fifos[index].entries.front()?;
+        let waiter = &head.pending.as_ref()?.gpu.fences;
+        if !waiter.waits() {
+            return None;
+        }
+        let before = head.held.unwrap_or(u64::MAX);
+        let updates = |pending: &Pending| pending.gpu.fences.updates_for(waiter);
+        let mut others = (self.fifos.iter().enumerate()).filter(|&(other, _)| other != index);
+        others.find_map(|(other, fifo)| {
+            let held = (fifo.entries.iter())
+                .map_while(|entry| entry.held.filter(|&at| at < before).map(|_| entry))
+                .filter(|entry| entry.pending.as_ref().is_some_and(updates))
+                .last()
+                .map(|entry| entry.place);
+            let grouped = (fifo.group.as_ref()).filter(|group| {
+                (group.finished.iter()).any(|(_, pending, _)| updates(pending))
+                    || (group.partial && fifo.head().is_some_and(updates))
+            });
+            held.or(grouped.map(|group| group.first))
+                .map(|place| (other, place))
+        })
+    }
+
+    /// Forgets the submissions seen complete by `completed`, and the FIFOs left with nothing.
+    fn settle(&mut self, completed: u64) {
+        while (self.carried.front()).is_some_and(|&(_, value)| value <= completed) {
+            self.carried.pop_front();
+        }
+        self.fifos.retain_mut(|fifo| {
+            while (fifo.in_flight.front()).is_some_and(|&(value, _)| value <= completed) {
+                fifo.in_flight.pop_front();
+            }
+            !(fifo.entries.is_empty() && fifo.group.is_none() && fifo.in_flight.is_empty())
+        });
+    }
+
+    /// Stages the next ready segment, in commit order, into its queue's group, or ends the next
+    /// ended command buffer behind its queue's work. A command buffer whose last segment joins a
+    /// group is scheduled at `now`, its scheduled handlers going to `joined`, but one that
+    /// presents a drawable, which `submit` schedules once its submission has passed
+    /// `vkQueueSubmit2`; one ended with nothing held goes to `ended`. Behind a head that waits
+    /// for room, the next command buffer is scheduled instead ([`hold`](Self::hold)).
+    fn step(
+        &mut self,
+        now: u64,
+        core: &Core,
+        joined: &mut Vec<Joined>,
+        ended: &mut Vec<Ended>,
+    ) -> Step {
+        let counters = &core.counters;
+        let Some((index, waits)) = self.next_ready() else {
+            return Step::Idle;
+        };
+        if waits {
+            self.hold(index, now, counters, joined);
+            return Step::Staged;
+        }
+        let stop = self.stop;
+        let fifo = &mut self.fifos[index];
+        let Some(entry) = fifo.entries.front_mut() else {
+            return Step::Idle;
+        };
+        if let Some(error) = entry.error {
+            if let Some(entry) = fifo.entries.pop_front() {
+                fifo.end(entry, error, ended);
+            }
+            return Step::Staged;
+        }
+        // A command buffer that waits on a fence goes after each command buffer of another queue
+        // held in a group or for room that updates it, which Metal would have submitted at its
+        // commit (`crate::fence`): that queue goes through to it first, as a host wait for it
+        // would send it.
+        if let Some((other, place)) = self.updater_held(index) {
+            let fifo = &mut self.fifos[other];
+            fifo.send_through = fifo.send_through.max(place);
+            return Step::Goes(other);
+        }
+        let fifo = &mut self.fifos[index];
+        let Some(entry) = fifo.entries.front_mut() else {
+            return Step::Idle;
+        };
+        let Some(pending) = entry.pending.as_mut() else {
+            return Step::Idle;
+        };
+        // A command buffer with nothing for the GPU takes no submission: it is scheduled now, and
+        // completes with its queue's work before it. One that a copy-in waits for goes on below,
+        // as one with commands does, so the copy-in is its submission and it completes after it.
+        if pending.gpu.is_empty() && !self.changes.captured.waits_for(pending.seq) {
+            if let Some(Entry {
+                cb,
+                pending: Some(mut pending),
+                ..
+            }) = fifo.entries.pop_front()
+            {
+                let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+                cb.scheduled(now, !scheduled.is_empty());
+                if !scheduled.is_empty() {
+                    joined.push((Arc::clone(&cb), scheduled));
+                }
+                fifo.behind_held(cb, pending, None, ended);
+            }
+            return Step::Staged;
+        }
+        let segment = &pending.gpu.segments[pending.next];
+        // A segment that leans on the leading copy for a buffer an earlier segment of the group
+        // wrote leads its group, so its copy follows the write (`crate::over`); so does one that
+        // reaches a Managed buffer a texture over which an earlier segment of the group wrote, so
+        // its upload takes the copy back the write owes (`Batch::owes_over`).
+        if (fifo.group.as_ref()).is_some_and(|group| {
+            group.leans.conflicts(&segment.overs) || group.owes_over(&segment.managed_reached)
+        }) {
+            return Step::Goes(index);
+        }
+        // A command buffer joins the group held only while the group's expected GPU runs, summed,
+        // stay within the bound: the group goes first where its own run is not known or would take
+        // the sum past it. Without room, the command buffer waits instead (`next_ready`). One
+        // that takes a copy-in over a Managed buffer a texture over which a command buffer of the
+        // group wrote leads its own group, so the write is submitted, and owes its copy back,
+        // before the copy-in goes (`crate::capture`).
+        let run = fifo.queue.expected_run();
+        let retired = fifo.queue.retired();
+        let leads = pending.next == 0;
+        if let (true, Some(group)) = (leads, &fifo.group) {
+            let after = group.leads.last().copied().unwrap_or(0);
+            if !group.takes(run, retired)
+                || (!group.wrote.is_empty()
+                    && (self.changes.captured).names_written(after, pending.seq, &group.wrote))
+            {
+                return Step::Goes(index);
+            }
+        }
+        let place = entry.place;
+        let group = fifo.group.get_or_insert_with(|| Batch {
+            first: place,
+            segments: Vec::new(),
+            finished: Vec::new(),
+            count: 0,
+            partial: false,
+            run: 0,
+            starts: Vec::new(),
+            leads: Vec::new(),
+            copy_ins: Vec::new(),
+            seen: 0,
+            unseen: 0,
+            apart: false,
+            held: false,
+            watch: Vec::new(),
+            leans: Leans::default(),
+            overs: Vec::new(),
+            backs: Vec::new(),
+            written: Vec::new(),
+            wrote: Vec::new(),
+            reached: Vec::new(),
+            planes: Vec::new(),
+            lost: None,
+        });
+        if leads {
+            group.run = group.run.saturating_add(run.unwrap_or(u64::MAX));
+            group.starts.push(group.segments.len());
+            group.leads.push(pending.seq);
+            if group.seen != retired {
+                group.seen = retired;
+                group.unseen = 0;
+            }
+            group.unseen += 1;
+        }
+        group.leans.join(&segment.overs);
+        for buffer in &segment.managed_written {
+            if !group.written.iter().any(|kept| kept.id() == buffer.id()) {
+                group.written.push(buffer.clone());
+            }
+        }
+        group.wrote.extend(segment.managed_wrote.iter().cloned());
+        for buffer in &segment.managed_reached {
+            if !group.reached.iter().any(|kept| kept.id() == buffer.id()) {
+                group.reached.push(buffer.clone());
+            }
+        }
+        for copy in segment.overs.leaning() {
+            if !group.overs.iter().any(|kept| kept.image == copy.image) {
+                group.overs.push(copy);
+            }
+        }
+        for image in &segment.planes {
+            image.keep_plane(&mut group.planes);
+        }
+        // The moves its checks find owed lead it, in its submit info (`crate::alias`).
+        if let Some(part) = &segment.aliased {
+            match alias::stage(core, &mut pending.gpu.recorder, part) {
+                Ok(Some(lead)) => group.segments.push(Staged {
+                    command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(lead)),
+                    ..Staged::default()
+                }),
+                Ok(None) => {}
+                Err(loss) => {
+                    group.lost.get_or_insert(loss);
+                }
+            }
+        }
+        let staged = stage(segment, &mut group.watch);
+        let at = (pending.seq, pending.next);
+        if let Some((.., since)) =
+            (fifo.held_since).take_if(|&mut (seq, next, _)| (seq, next) == at)
+        {
+            counters.event_hold(now.saturating_sub(since));
+        }
+        // An event's signal goes at once, staged only with room: nothing waits on it behind a held
+        // group, as a waiter takes a signal staged as submitted. So does a
+        // presenting command buffer's signal of the consumer's semaphore, which its present waits on
+        // once the command buffer is scheduled.
+        let signals = !staged.signals.is_empty();
+        group.segments.push(staged);
+        pending.next += 1;
+        if pending.next < pending.gpu.segments.len() {
+            group.partial = true;
+            return if signals {
+                Step::Goes(index)
+            } else {
+                Step::Staged
+            };
+        }
+        let Some(Entry {
+            cb,
+            pending: Some(mut pending),
+            held,
+            ..
+        }) = fifo.entries.pop_front()
+        else {
+            return Step::Staged;
+        };
+        if held.is_none() && !pending.gpu.presents() {
+            let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+            cb.scheduled(now, !scheduled.is_empty());
+            if !scheduled.is_empty() {
+                joined.push((Arc::clone(&cb), scheduled));
+            }
+        }
+        group.finished.push((cb, pending, None));
+        group.partial = false;
+        group.count += 1;
+        // A command buffer held for room behind it joins it or, not taken, sends it first: with
+        // room the two would have been staged together.
+        let held_behind = (fifo.entries.front()).is_some_and(|entry| entry.held.is_some());
+        match signals || (fifo.goes(stop) && !held_behind) {
+            true => Step::Goes(index),
+            false => Step::Staged,
+        }
+    }
+
+    /// The FIFO at `index`'s group, given the next progress value and the uploads of the commits
+    /// up to its last command buffer's ([`take_uploads`](Self::take_uploads)): the submission it
+    /// makes.
+    fn close(
+        &mut self,
+        index: usize,
+        core: &Core,
+        released: &AtomicU64,
+    ) -> Option<(u64, Vec<Upload>, Batch)> {
+        let fifo = &mut self.fifos[index];
+        let mut batch = fifo.group.take()?;
+        // The bound again, with the expected run as it now stands: a completion since a join may
+        // have raised it.
+        batch.apart = apart(batch.starts.len() as u64, fifo.queue.expected_run());
+        // A group held that goes with room goes as a completion left it, whatever else would have
+        // sent it now.
+        batch.held &= room(&fifo.in_flight, batch.run);
+        if batch.held {
+            core.counters.held_start();
+        }
+        // Each texture over a Managed buffer's device copy that a command buffer of it with
+        // commands keeps and an event owes its copy in takes it now, as the group goes, not as it
+        // joined: the first submission on the device's one `VkQueue` that reads the texture, of
+        // whichever queue, makes the copy (`crate::over::ManagedOvers`).
+        let partial = batch.partial;
+        let head =
+            (fifo.entries.front().filter(|_| partial)).and_then(|entry| entry.pending.as_ref());
+        let readers = (batch.finished.iter())
+            .filter(|(_, _, error)| error.is_none())
+            .map(|(_, pending, _)| pending)
+            .chain(head)
+            .filter(|pending| pending.gpu.managed && !pending.gpu.is_empty());
+        for pending in readers {
+            for texture in pending.gpu.kept.textures.iter() {
+                let Some(buffer) = texture.managed_over() else {
+                    continue;
+                };
+                let taken =
+                    (buffer.over_entries()).take_into(texture.id(), pending.seq, &mut batch.backs);
+                batch.overs.extend(taken);
+            }
+        }
+        // Over an exported block, a texture takes its copy in only where an event changed its
+        // bytes, and the batch's writes change those they meet (`crate::over::ExportedOvers`).
+        let through = batch.leads.last().copied().unwrap_or(0);
+        let exported = &mut self.exported;
+        (batch.overs).retain(|copy| !copy.exported || exported.takes(copy, through));
+        self.exported.wrote(&batch.leans);
+        // The copy-ins captured at or before the number of a command buffer that goes first in
+        // it, each ahead of the first such one, and the copies back owed to the textures over
+        // their ranges by writes submitted before, which its upload makes first
+        // (`crate::capture`).
+        let taken = self.changes.captured.take(&batch.leads);
+        for (_, copy_in) in &taken {
+            copy_in.backs(&mut batch.backs);
+        }
+        // The copies back owed by writes submitted before it to the Managed buffers its segments
+        // reach, which its upload makes first: as it goes, the order of each write and its
+        // readers on the device's one `VkQueue` is known (`crate::over::ManagedOvers`).
+        for buffer in &batch.reached {
+            buffer.over_entries().backs(None, &mut batch.backs);
+        }
+        batch.take(taken);
+        self.progress += 1;
+        let value = self.progress;
+        fifo.in_flight.push_back((value, batch.run));
+        if batch.partial {
+            if let Some(Entry {
+                pending: Some(pending),
+                ..
+            }) = fifo.entries.front_mut()
+            {
+                pending.value = value;
+                pending.gpu.fences.submitted(value);
+            }
+        }
+        for (_, pending, error) in &mut batch.finished {
+            pending.value = value;
+            if error.is_none() {
+                pending.gpu.fences.submitted(value);
+            }
+        }
+        (self.carried).extend((batch.finished.iter()).map(|(_, pending, _)| (pending.seq, value)));
+        let uploads = self.take_uploads(core, released, value, through);
+        Some((value, uploads, batch))
+    }
+
+    /// The first FIFO whose group goes at the end of a pass ([`Fifo::goes`]).
+    fn unheld(&self) -> Option<usize> {
+        (self.fifos.iter()).position(|fifo| fifo.goes(self.stop))
+    }
+
+    /// The FIFO, other than the one at `index`, whose group goes now ([`Fifo::goes`]) and whose
+    /// first command buffer was committed first, before every command buffer the group at `index`
+    /// holds ([`Fifo::first_committed`]): it goes before that group. So a group that goes at a
+    /// signal, as a host wait sends it, or at the end of a pass goes no sooner than another
+    /// queue's group that goes now and was committed before it, the part of a command buffer
+    /// before its event wait included: Metal submits a command buffer committed to a queue with
+    /// nothing ahead of it at its commit, and its hazard tracking orders after that part a command
+    /// buffer of another queue, committed later, that shares a tracked resource with it (the
+    /// runtime README's M3 Max rows, and the conformance case event-signaller-of-a-wait). Both go
+    /// now either way: neither waits for anything more.
+    fn goes_before(&self, index: usize) -> Option<usize> {
+        let before = self.fifos[index].first_committed();
+        (0..self.fifos.len())
+            .filter(|&other| other != index && self.fifos[other].goes(self.stop))
+            .map(|other| (other, self.fifos[other].first_committed()))
+            .filter(|&(_, first)| first < before)
+            .min_by_key(|&(_, first)| first)
+            .map(|(other, _)| other)
+    }
+}
+
+impl Batch {
+    /// Whether a command buffer of its queue that leads joins it, the queue's expected run being
+    /// `run` and `retired` of its command buffers retired: while it holds fewer than [`GROUP`],
+    /// as [`joins`] answers.
+    fn takes(&self, run: Option<u64>, retired: u64) -> bool {
+        let unseen = if self.seen == retired { self.unseen } else { 0 };
+        self.count < GROUP && joins(self.run, unseen, run)
+    }
+
+    /// Whether a texture over one of `reached`, Managed buffers, owes its copy back for a write of
+    /// one of its segments: a segment that reaches one of them after these leads its own group,
+    /// so the write is submitted, and owes its copy back, before the upload that leads that
+    /// segment's submission takes it (`crate::over::ManagedOvers`).
+    fn owes_over(&self, reached: &[Arc<BufferInner>]) -> bool {
+        (self.wrote.iter()).any(|(texture, owes)| {
+            *owes
+                && (texture.managed_over())
+                    .is_some_and(|over| reached.iter().any(|buffer| buffer.id() == over.id()))
+        })
+    }
+}
+
+impl Fifo {
+    /// Its head's pending part, where its head is committed.
+    fn head(&self) -> Option<&Pending> {
+        (self.entries.front()).and_then(|entry| entry.pending.as_ref())
+    }
+
+    /// Whether it holds a group that goes now: at teardown (`stop`), where a host wait is to come
+    /// for one of its command buffers or one behind it, or with room ([`room`]). A round of the
+    /// completion thread sends none: it holds what it saw complete when it began, so held work
+    /// waits for the round to end.
+    fn goes(&self, stop: bool) -> bool {
+        self.group.as_ref().is_some_and(|group| {
+            stop || self.send_through >= group.first || room(&self.in_flight, group.run)
+        })
+    }
+
+    /// The place in the commit order of the first command buffer its group holds: the first that
+    /// finished in it, else its head, whose segments it holds; `u64::MAX` with no group.
+    fn first_committed(&self) -> u64 {
+        let Some(group) = &self.group else {
+            return u64::MAX;
+        };
+        let finished = (group.finished.first()).map(|(_, pending, _)| pending.seq);
+        let partial = self.head().filter(|_| group.partial).map(|head| head.seq);
+        finished.or(partial).unwrap_or(u64::MAX)
+    }
+
+    /// Ends `entry` with `error` (its own, where it has one): behind the group held, which it
+    /// joins to retire with; else once the queue's submissions in flight and the command buffers
+    /// it ended before complete, at once where none is. One not committed ends at its commit.
+    fn end(&mut self, entry: Entry, error: CommandBufferError, ended: &mut Vec<Ended>) {
+        let Entry {
+            cb,
+            pending,
+            error: own,
+            ..
+        } = entry;
+        let error = own.unwrap_or(error);
+        let Some(pending) = pending else {
+            cb.end_uncommitted(error);
+            return;
+        };
+        if let Some(group) = &mut self.group {
+            // The head whose segments the group holds is ended now, if it was the head.
+            group.partial = false;
+        }
+        self.behind_held(cb, pending, Some(error), ended);
+    }
+
+    /// Retires a committed command buffer with no submission of its own: behind the group held,
+    /// which it joins to retire with and which goes at once; else once the queue's submissions in
+    /// flight and the command buffers it ended before complete, at once where none is.
+    fn behind_held(
+        &mut self,
+        cb: Arc<CbInner>,
+        mut pending: Pending,
+        error: Option<CommandBufferError>,
+        ended: &mut Vec<Ended>,
+    ) {
+        match &mut self.group {
+            Some(group) => {
+                // Sent as a host wait for it would send it (`Work::send`): its completion then
+                // waits only on submitted work.
+                self.send_through = self.send_through.max(group.first);
+                group.finished.push((cb, pending, error));
+            }
+            None => {
+                // Behind its queue's work, and, where it waits on a fence, behind the last
+                // submission that updates it, as Metal's fence wait holds a command buffer with no
+                // work too (`crate::fence`).
+                let in_flight = self.in_flight.back().map_or(0, |&(value, _)| value);
+                let waited = pending.gpu.fences.waited_through();
+                pending.value = pending.value.max(in_flight).max(self.behind).max(waited);
+                self.behind = pending.value;
+                ended.push((cb, pending, error));
+            }
+        }
+    }
+}
+
+/// Whether every wait of `segment` is met by the host's value or by a submitted signal.
+fn ready(segment: &Segment) -> bool {
+    segment.waits.iter().all(|(event, value)| {
+        let state = lock(&event.state);
+        state.floor >= *value || state.submitted >= *value
+    })
+}
+
+/// A ready segment's submit info. Its waits for events' values submit nothing: a ready segment's
+/// every wait is met by the host's value or by a signal already submitted on the device's one
+/// `VkQueue`, earlier in its submission order, and the barrier ending each segment with commands
+/// (`record::end`) orders every later command after the signaller's, as a semaphore wait would. A
+/// signal not above the highest value submitted or set is left out, so the semaphore only rises.
+/// The consumer's binary semaphores of a presenting command buffer's last segment are signalled
+/// with it.
+fn stage(segment: &Segment, watch: &mut Vec<Arc<EventInner>>) -> Staged {
+    let mut staged = Staged {
+        command: segment
+            .command
+            .map(|command| vk::CommandBufferSubmitInfo::default().command_buffer(command)),
+        ..Staged::default()
+    };
+    for (event, value) in &segment.signals {
+        let mut state = lock(&event.state);
+        if *value <= state.submitted.max(state.floor) {
+            continue;
+        }
+        state.submitted = *value;
+        state.pending.push_back(*value);
+        if !state.watched {
+            state.watched = true;
+            watch.push(Arc::clone(event));
+        }
+        staged.signals.push(
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(event.semaphore)
+                .value(*value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        );
+    }
+    for &ready in &segment.binary {
+        staged.signals.push(
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(ready)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        );
+    }
+    staged
+}
+
+/// Ends FIFO entries: a committed one now, one not yet committed at its commit; `error` answers
+/// for each without its own, with its pending part where it is committed.
+fn end(
+    entries: VecDeque<Entry>,
+    error: impl Fn(Option<&Pending>) -> CommandBufferError,
+) -> Vec<Ended> {
+    let mut ended = Vec::new();
+    for Entry {
+        cb,
+        pending,
+        error: own,
+        ..
+    } in entries
+    {
+        let error = own.unwrap_or_else(|| error(pending.as_ref()));
+        match pending {
+            Some(pending) => ended.push((cb, pending, Some(error))),
+            None => cb.end_uncommitted(error),
+        }
+    }
+    ended
+}
+
+/// The submit thread, until it is stopped.
+pub(crate) fn run(core: Arc<Core>) {
+    let work = &core.work;
+    let mut state = work.lock();
+    loop {
+        if state.lost() {
+            let submitted = state.progress;
+            let error = |pending: Option<&Pending>| CommandBufferError::DeviceLost {
+                in_flight: pending.is_some_and(|pending| (1..=submitted).contains(&pending.value)),
+            };
+            let mut ended = Vec::new();
+            for fifo in state.fifos.drain(..) {
+                // A group held never reached the GPU: its command buffers end as in flight only
+                // where an earlier segment of theirs did.
+                for (cb, pending, own) in fifo.group.into_iter().flat_map(|group| group.finished) {
+                    let error = own.unwrap_or_else(|| error(Some(&pending)));
+                    ended.push((cb, pending, Some(error)));
+                }
+                ended.extend(end(fifo.entries, error));
+            }
+            // Nothing more runs: the textures awaiting their home layout need none.
+            let uploads = state.drop_uploads();
+            drop(state);
+            for upload in uploads {
+                upload.retire(&core, times::OwnEnd::Unsent);
+            }
+            core.done.end_all(&core, ended);
+            state = work.lock();
+        } else {
+            state = pass(&core, state);
+        }
+        if state.stop {
+            let ended: Vec<Ended> = (state.fifos.drain(..))
+                .flat_map(|fifo| end(fifo.entries, |_| CommandBufferError::NotRun))
+                .collect();
+            let uploads = state.drop_uploads();
+            // The copy-ins not taken hold device copies, which hold the core.
+            let captured = state.changes.clear();
+            drop(state);
+            for upload in uploads {
+                upload.retire(&core, times::OwnEnd::Unsent);
+            }
+            for copy_in in captured {
+                copy_in.retire(&core, times::OwnEnd::Unsent);
+            }
+            core.done.end_all(&core, ended);
+            // The last command buffers this thread ends went to the completion thread first, so
+            // it retires them before it ends.
+            core.done.stop(&core);
+            return;
+        }
+        while !state.dirty {
+            state = work
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.dirty = false;
+    }
+}
+
+/// One pass of the submit thread: stages what is ready in commit order, submits each group that
+/// goes as it closes, then each group its queue no longer holds, then an upload to flush alone.
+fn pass<'a>(core: &'a Core, mut state: MutexGuard<'a, WorkState>) -> MutexGuard<'a, WorkState> {
+    let work = &core.work;
+    // Marked before the completed value is read: a completion the read misses sees the mark and
+    // wakes the thread.
+    work.keeping.store(true, Ordering::SeqCst);
+    state.settle(core.done.completed());
+    let mut joined: Vec<Joined> = Vec::new();
+    let mut ended: Vec<Ended> = Vec::new();
+    let mut sent = false;
+    // The group that goes once the groups committed before it that go now have gone
+    // (`WorkState::goes_before`), before anything more is staged: nothing staged after it
+    // passes it, so no waiter goes ahead of a signal it staged.
+    let mut then: Option<usize> = None;
+    loop {
+        let now = times::host_time();
+        let step = match then.take() {
+            Some(index) => Step::Goes(index),
+            None => state.step(now, core, &mut joined, &mut ended),
+        };
+        let index = match step {
+            Step::Idle => match state.unheld() {
+                Some(index) => index,
+                None => {
+                    state.mark_holds(now);
+                    // Each group open now waits for its queue's submissions in flight (`unheld`).
+                    for group in (state.fifos.iter_mut()).filter_map(|fifo| fifo.group.as_mut()) {
+                        group.held = true;
+                    }
+                    break;
+                }
+            },
+            Step::Staged => continue,
+            Step::Goes(index) => index,
+        };
+        let index = match state.goes_before(index) {
+            Some(before) => {
+                then = Some(index);
+                before
+            }
+            None => index,
+        };
+        let Some((value, uploads, batch)) = state.close(index, core, &work.released) else {
+            continue;
+        };
+        drop(state);
+        // Scheduled handlers run here, with no lock held, before the submission they are in.
+        scheduled(&mut joined);
+        core.done.end_all(core, std::mem::take(&mut ended));
+        submit(core, value, uploads, batch);
+        sent = true;
+        state = work.lock();
+    }
+    if state.flush > 0 && !sent {
+        let value = state.progress + 1;
+        let uploads = state.take_uploads(core, &work.released, value, 0);
+        if !uploads.is_empty() {
+            state.progress = value;
+            drop(state);
+            submit(core, value, uploads, Batch::empty());
+            state = work.lock();
+        }
+    }
+    let holds = |fifo: &Fifo| {
+        fifo.entries
+            .front()
+            .is_some_and(|entry| entry.held.is_some())
+    };
+    if (state.fifos.iter()).all(|fifo| fifo.group.is_none() && !holds(fifo)) {
+        work.keeping.store(false, Ordering::SeqCst);
+    }
+    if !joined.is_empty() || !ended.is_empty() {
+        drop(state);
+        scheduled(&mut joined);
+        core.done.end_all(core, ended);
+        state = work.lock();
+    }
+    state
+}
+
+impl Batch {
+    /// Puts each copy-in of `taken` ahead of the command buffer that takes it (its index in
+    /// `leads`), as a part of its own with no waits ([`put_ahead`]). The batch keeps them until it
+    /// retires.
+    fn take(&mut self, taken: Vec<(usize, CopyIn)>) {
+        let part = |copy_in: &CopyIn| Staged {
+            command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(copy_in.command)),
+            ..Staged::default()
+        };
+        let kept = put_ahead(&mut self.segments, &mut self.starts, taken, part);
+        self.copy_ins.extend(kept);
+    }
+
+    /// A submission of no command buffer's: an upload alone.
+    fn empty() -> Batch {
+        Batch {
+            first: 0,
+            segments: Vec::new(),
+            finished: Vec::new(),
+            count: 0,
+            partial: false,
+            run: 0,
+            starts: Vec::new(),
+            leads: Vec::new(),
+            copy_ins: Vec::new(),
+            seen: 0,
+            unseen: 0,
+            apart: false,
+            held: false,
+            watch: Vec::new(),
+            leans: Leans::default(),
+            overs: Vec::new(),
+            backs: Vec::new(),
+            written: Vec::new(),
+            wrote: Vec::new(),
+            reached: Vec::new(),
+            planes: Vec::new(),
+            lost: None,
+        }
+    }
+}
+
+/// Puts each of `taken`, with the index in `starts` of the command buffer of a group that takes it,
+/// where that command buffer begins among the group's `segments`, as the segment `part` makes of
+/// it, after those taken before it: behind every segment of the command buffers before it in the
+/// group, and ahead of the taker's first, which then begins with them. Returns the taken, in their
+/// order.
+pub(crate) fn put_ahead<S, C>(
+    segments: &mut Vec<S>,
+    starts: &mut [usize],
+    taken: Vec<(usize, C)>,
+    part: impl Fn(&C) -> S,
+) -> Vec<C> {
+    let mut kept = Vec::with_capacity(taken.len());
+    for (lead, item) in taken.into_iter().rev() {
+        segments.insert(starts[lead], part(&item));
+        for start in &mut starts[lead + 1..] {
+            *start += 1;
+        }
+        kept.push(item);
+    }
+    kept.reverse();
+    kept
+}
+
+/// Orders the zero fills of the uploads one submission carries, oldest first: where a fill an
+/// upload records before any barrier of its own meets bytes a fill of an earlier one wrote since
+/// the last barrier, a barrier ends the upload before it, so the two do not write the same bytes
+/// at once ([`Work::fill`]), counted in `core`'s counters.
+fn order_fills(core: &Core, uploads: &[Upload]) {
+    if uploads.len() < 2 {
+        return;
+    }
+    let mut open: Vec<Filled> = Vec::new();
+    for (index, upload) in uploads.iter().enumerate() {
+        let first = upload.leading.as_ref().unwrap_or(&upload.filled);
+        let meets = |&(buffer, start, end): &Filled| {
+            (open.iter()).any(|&(other, from, to)| other == buffer && from < end && start < to)
+        };
+        if let (Some(before), true) = (index.checked_sub(1), first.iter().any(meets)) {
+            record::barrier(&core.device, uploads[before].command, Reach::Commands);
+            core.counters.count(Metric::Barriers);
+            open.clear();
+        }
+        if upload.leading.is_some() {
+            open.clear();
+        }
+        open.extend_from_slice(&upload.filled);
+    }
+}
+
+/// Runs the scheduled handlers of the command buffers `joined` scheduled, in order, with no lock
+/// held: before the submission they are in goes, and before any of them is handed on as ended.
+fn scheduled(joined: &mut Vec<Joined>) {
+    for (cb, handlers) in joined.drain(..) {
+        command::run_scheduled(cb, handlers);
+    }
+}
+
+/// Submits a group: its uploads first, oldest first, then each segment in order, the last
+/// signalling the progress `value`. Whatever was passed to `vkQueueSubmit2` goes to the completion
+/// thread as in flight; a failed submission is taken as a loss.
+fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
+    let Batch {
+        mut segments,
+        mut finished,
+        watch,
+        overs,
+        backs,
+        written,
+        wrote,
+        starts,
+        apart,
+        held,
+        copy_ins,
+        mut planes,
+        lost,
+        ..
+    } = batch;
+    let device = &core.device;
+    // An upload begun for textures gone before their move records nothing; one is kept, or begun,
+    // for the copies into textures over a buffer in an image of their own.
+    let sides = !overs.is_empty() || !backs.is_empty();
+    // The first failed call, which loses the device.
+    let mut ok: Result<(), DeviceLoss> = lost.map_or(Ok(()), Err);
+    let mut empty = None;
+    let mut kept = Vec::with_capacity(uploads.len());
+    for upload in uploads {
+        match upload.entries {
+            0 => {
+                if let Some(earlier) = empty.replace(upload) {
+                    earlier.retire(core, times::OwnEnd::Unsent);
+                }
+            }
+            _ => kept.push(upload),
+        }
+    }
+    match (sides && kept.is_empty(), empty) {
+        (true, Some(upload)) => kept.push(upload),
+        (true, None) => match Upload::begin(core, 0) {
+            Ok(upload) => kept.push(upload),
+            Err(Error::Vulkan { call, result }) => ok = Err(DeviceLoss::of(call)(result)),
+            Err(error) => unreachable!("an upload's begin fails only in a Vulkan call: {error}"),
+        },
+        (false, Some(upload)) => {
+            upload.retire(core, times::OwnEnd::Unsent);
+        }
+        (false, None) => {}
+    }
+    let mut uploads = kept;
+    order_fills(core, &uploads);
+    // What the uploads wrote is visible to every command after them, and to the host once the
+    // submission completes: one barrier, at the end of the last.
+    if let Some((last, earlier)) = uploads.split_last_mut() {
+        for upload in earlier {
+            times::end_own(device, upload.command, upload.stamps);
+            // SAFETY: the upload's command buffer was recording under the work lock, which
+            // `close` took it out under.
+            let ended = unsafe { device.end_command_buffer(upload.command) };
+            ok = ok.and(ended.map_err(DeviceLoss::of("vkEndCommandBuffer")));
+        }
+        // Each texture over a buffer in an image of its own that a segment leans on takes the
+        // bytes shaders reach (`crate::over`).
+        // SAFETY: the upload's command buffer is recording, and only this thread has it; the
+        // command buffers of the submission hold each texture, which holds its buffer, until it
+        // retires, and each image is in its home layout, any move there recorded before.
+        unsafe {
+            let copies: Vec<OverCopy> = backs.iter().map(|(_, copy, _)| *copy).collect();
+            over::record_side(device, last.command, &copies, false, &core.counters);
+            over::record_side(device, last.command, &overs, true, &core.counters);
+        }
+        (last.held).extend(backs.into_iter().map(|(_, _, image)| Held::Texture(image)));
+        record::barrier(device, last.command, Reach::Host);
+        core.counters.count(Metric::Barriers);
+        times::end_own(device, last.command, last.stamps);
+        // SAFETY: as above.
+        let ended = unsafe { device.end_command_buffer(last.command) };
+        ok = ok.and(ended.map_err(DeviceLoss::of("vkEndCommandBuffer")));
+    }
+    // Each Direct3D 11 plane its command buffers or uploads use is the runtime's from the
+    // submission's start to its end: acquired from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer
+    // of its own ahead of everything, and released to it in another after everything, which holds
+    // the images (`Metrics::d3d11_plane_submissions`).
+    for upload in &uploads {
+        for held in &upload.held {
+            if let Held::Texture(image) = held {
+                image.keep_plane(&mut planes);
+            }
+        }
+    }
+    let (head, tail) = match planes.is_empty() {
+        true => (None, None),
+        false => {
+            let (head, began) = Upload::hand_over(core, &planes, true);
+            let (tail, ended) = Upload::hand_over(core, &planes, false);
+            ok = ok.and(began).and(ended);
+            (head, tail)
+        }
+    };
+    if let Some(head) = head {
+        uploads.insert(0, head);
+        core.counters.count(Metric::D3d11PlaneSubmissions);
+    }
+    let ahead = uploads.len();
+    segments.splice(
+        0..0,
+        uploads.iter().map(|upload| Staged {
+            command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(upload.command)),
+            ..Staged::default()
+        }),
+    );
+    // One part, or, where the group goes member by member, one for each command buffer that leads
+    // in it, the uploads with the first.
+    let mut parts: Vec<Vec<Staged>> = Vec::with_capacity(1);
+    let bounds: Vec<usize> = match apart {
+        true => (starts.iter())
+            .map(|start| start + ahead)
+            .filter(|&at| at > 0)
+            .collect(),
+        false => Vec::new(),
+    };
+    for &at in bounds.iter().rev() {
+        parts.push(segments.split_off(at));
+    }
+    parts.push(segments);
+    parts.reverse();
+    for part in &mut parts {
+        part.retain(|staged| staged.command.is_some() || !staged.signals.is_empty());
+    }
+    parts.retain(|part| !part.is_empty());
+    // The release goes after every segment and takes its last signals, so it adds no submit info
+    // (`infos`).
+    if let Some(mut tail) = tail {
+        let last = parts.last_mut().and_then(Vec::pop).unwrap_or_default();
+        let release = Staged {
+            waits: Vec::new(),
+            command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(tail.command)),
+            signals: last.signals,
+        };
+        let last = Staged {
+            signals: Vec::new(),
+            ..last
+        };
+        match parts.last_mut() {
+            Some(part) => part.extend([last, release]),
+            None => parts.push(vec![last, release]),
+        }
+        tail.held.extend(planes.into_iter().map(Held::Texture));
+        uploads.push(tail);
+    }
+    let progress = vk::SemaphoreSubmitInfo::default()
+        .semaphore(core.done.progress)
+        .value(value)
+        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+    match parts.last_mut().and_then(|part| part.last_mut()) {
+        Some(last) => last.signals.push(progress),
+        None => parts.push(vec![Staged {
+            signals: vec![progress],
+            ..Staged::default()
+        }]),
+    }
+    if ok.is_ok() {
+        let asked = times::host_time();
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        (core.work.asking).store(true, Ordering::SeqCst);
+        let queue = lock(&core.queues.runtime);
+        (core.counters).queue_lock_wait(times::host_time().saturating_sub(asked));
+        // A bind of an import over several dma-bufs since the last submission: this one waits for
+        // it, and every later command, in this submission and after it, is ordered after that
+        // wait (`crate::import::Sparse`).
+        #[cfg(unix)]
+        if let Some((timeline, value)) = (core.imports.sparse.as_ref()).and_then(|s| s.owed()) {
+            if let Some(first) = parts.first_mut().and_then(|part| part.first_mut()) {
+                first.waits.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(timeline)
+                        .value(value)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+                );
+            }
+        }
+        // The runtime's own command buffers of the submission, the uploads ahead of its command
+        // buffers and each copy-in ahead of the one that takes it: counted before the calls, as
+        // each call is.
+        (core.counters).runtime_command_buffers((uploads.len() + copy_ins.len()) as u64);
+        for part in &parts {
+            let merged = infos(part);
+            let infos: Vec<vk::SubmitInfo2<'_>> = merged
+                .iter()
+                .map(|info| {
+                    vk::SubmitInfo2::default()
+                        .wait_semaphore_infos(info.waits)
+                        .command_buffer_infos(&info.commands)
+                        .signal_semaphore_infos(info.signals)
+                })
+                .collect();
+            // Counted before the call: the work can complete, and a thread waiting on it go on to
+            // read the metrics, before the call returns here.
+            core.counters.count(Metric::Submissions);
+            core.counters.submitted_infos(infos.len() as u64);
+            // Inside the driver from here until the call returns, for the block-maker thread's
+            // wait after its memory calls (`crate::submit_calls`). One made during a free is
+            // counted before the call too; one a free began beside, as it returns.
+            let call = core.submit_calls.enter();
+            if call.entered_in_free() {
+                core.counters.count(Metric::SubmissionsDuringFrees);
+            }
+            let began = times::host_time();
+            // SAFETY: every command buffer is executable and in no other pending submission;
+            // the one wait, a sparse bind's, is on a signal submitted earlier, and every signal
+            // raises its semaphore;
+            // the queue is held.
+            ok = unsafe { device.queue_submit2(*queue, &infos, vk::Fence::null()) }
+                .map_err(DeviceLoss::of("vkQueueSubmit2"));
+            let nanos = times::host_time().saturating_sub(began);
+            core.counters.submit_call(nanos);
+            if call.met_free() {
+                if !call.entered_in_free() {
+                    core.counters.count(Metric::SubmissionsDuringFrees);
+                }
+                core.counters.submit_call_during_free(nanos);
+            }
+            drop(call);
+            if ok.is_err() {
+                break;
+            }
+        }
+        drop(queue);
+    }
+    match ok {
+        Ok(()) => {
+            // A command buffer that presents a drawable is scheduled now that the submission that
+            // signals the consumer's semaphores has passed `vkQueueSubmit2`: a present made from
+            // here, its own scheduled handlers' included, waits on a submitted signal. They run
+            // before the completion thread learns of it below, so before its completed handlers.
+            // One whose submission failed is not scheduled; its scheduled handlers run as it
+            // retires.
+            let now = times::host_time();
+            for (cb, pending, error) in &mut finished {
+                if error.is_none() && pending.gpu.presents() {
+                    let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+                    cb.scheduled(now, !scheduled.is_empty());
+                    if !scheduled.is_empty() {
+                        command::run_scheduled(Arc::clone(cb), scheduled);
+                    }
+                }
+            }
+        }
+        Err(loss) => complete::lose(core, fault::report(core, loss)),
+    }
+    core.done.submitted(
+        core,
+        complete::Sent { value, held },
+        uploads,
+        copy_ins,
+        finished,
+        watch,
+    );
+    // Device work of the submission wrote these Managed buffers: their textures over their device
+    // copies owe their copies in from the next submission (`crate::over::ManagedOvers`).
+    for buffer in written {
+        buffer.over_entries().written();
+    }
+    // Its writes of textures over a Managed buffer's device copy are submitted: the upload that
+    // leads a later submission may take their copies back.
+    for (texture, owes) in wrote {
+        if let Some(buffer) = texture.managed_over() {
+            buffer.over_entries().settle(texture.id(), owes);
+        }
+    }
+}
+
+impl Upload {
+    /// Recycles the upload's recorder and gives up what it holds, and its pair of timestamp
+    /// queries, read where its submission completed (`end`, [`times::retire_own`]): once its
+    /// submission completed, or ended at a loss, or where it never went. Answers its two
+    /// timestamps where it completed and both read.
+    pub(crate) fn retire(self, core: &Core, end: times::OwnEnd) -> Option<(u64, u64)> {
+        let read = times::retire_own(core, self.stamps, end);
+        core.recorders.give_back(core, self.recorder);
+        read
+    }
+}

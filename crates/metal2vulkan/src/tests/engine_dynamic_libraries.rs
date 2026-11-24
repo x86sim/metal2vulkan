@@ -218,7 +218,7 @@ fn device() -> Device {
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 fn stage(lib: &Library, libraries: DynamicLibraries) -> FunctionDescriptor {
@@ -234,7 +234,7 @@ fn compile(fd: FunctionDescriptor) -> Result<(), Error> {
 
 /// `out` after the stage `fd` runs over 16 threads on the CPU interpreter.
 fn computed(fd: &FunctionDescriptor) -> Vec<u32> {
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let m = compile_stage_kept(fd, &p, &mut meter()).unwrap_or_else(|e| panic!("{e}"));
     const N: u32 = 16;
     let res = Resources {
@@ -505,60 +505,4 @@ fn the_searched_libraries_are_part_of_the_key() {
             &inputs
         )
     );
-}
-
-/// Loading a stage's dependencies asks for each install name in the search's order, a loaded
-/// library's own after those already reached, skips one already loaded, and stops at the first
-/// that does not load, whose imports the compile then refuses.
-#[test]
-fn dependencies_load_in_the_search_order() {
-    let (Some(a), Some(b)) = (dylib("libA.metallib", 3, 7), dylib("libB.metallib", 5, 11)) else {
-        return;
-    };
-    let Some(module) = library_module("libC", 9, 13, false) else {
-        return;
-    };
-    let c = Library::parse(&dylib_bytes_linked(
-        "libC.metallib",
-        &module,
-        &["libA.metallib"],
-    ))
-    .expect("library");
-    let c = DynamicLibrary::new(c, &Budget::standard()).expect("dynamic");
-    let Some(client) = client("load", true, &["libC.metallib", "libB.metallib"]) else {
-        return;
-    };
-    let file = |name: &str| match name {
-        "libA.metallib" => Some(a.clone()),
-        "libB.metallib" => Some(b.clone()),
-        "libC.metallib" => Some(c.clone()),
-        _ => None,
-    };
-    let mut asked = Vec::new();
-    let fd = stage(&client, DynamicLibraries::new()).with_loaded_dependencies(|name| {
-        asked.push(name.to_owned());
-        file(name)
-    });
-    assert_eq!(asked, ["libC.metallib", "libB.metallib", "libA.metallib"]);
-    // The client's first dependency exports both symbols.
-    let want: Vec<u32> = (0..16).map(|i| 9 * i + 13).collect();
-    assert_eq!(computed(&fd), want);
-
-    // A library already loaded is not asked for.
-    let mut asked = Vec::new();
-    let given = DynamicLibraries::new().with_loaded("libC.metallib", c.clone());
-    stage(&client, given).with_loaded_dependencies(|name| {
-        asked.push(name.to_owned());
-        file(name)
-    });
-    assert_eq!(asked, ["libB.metallib", "libA.metallib"]);
-
-    // An install name that does not load ends the loading, and the import is refused.
-    let mut asked = Vec::new();
-    let fd = stage(&client, DynamicLibraries::new()).with_loaded_dependencies(|name| {
-        asked.push(name.to_owned());
-        (name == "libC.metallib").then(|| c.clone())
-    });
-    assert_eq!(asked, ["libC.metallib", "libB.metallib"]);
-    assert_eq!(compile(fd), Err(needs_library("libB.metallib")));
 }

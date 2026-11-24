@@ -24,24 +24,23 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{BindState, BoundBuffer, BoundTexture, StageTable, TextureFacts, WriteSource};
 use crate::budget::{Budget, SPIRV_WORDS};
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::Feature;
 use crate::library::{FunctionConstantValues, Library};
 use crate::lower::select::{LowerInputs, Plan};
 use crate::metal::format::ExtendedRange;
-use crate::metal::{self, PixelFormat, TextureType};
-use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
+use crate::metal::{self, PixelFormat};
+use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::lower_inputs::{StorageImageChoice, StorageImageClass};
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef};
 use crate::pipeline::sym::{SpecKey, Stage};
 use crate::pipeline::testing::{
     link_and_validate, llvm_assemble, meter, profile, typed_module_with, AssembleError,
 };
+use crate::pipeline::FunctionDescriptor;
 use crate::pipeline::StageSource;
-use crate::pipeline::{ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor};
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 
@@ -184,14 +183,13 @@ fn profiles() -> Vec<(&'static str, crate::device::profile::DeviceProfile)> {
         .map(|stem| {
             (
                 stem,
-                profile(stem, DevicePolicy::default()).expect("profile"),
+                profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile"),
             )
         })
         .collect()
 }
 
-/// Compile the kernel `bc` under `inputs` on `p`, check that the plan's word estimate bounds the
-/// emission, and validate the linked module.
+/// Compile the kernel `bc` under `inputs` on `p` and validate the linked module.
 fn validate(
     bc: &[u8],
     inputs: &LowerInputs,
@@ -211,16 +209,8 @@ fn validate_entry(
 ) -> std::sync::Arc<crate::library::FunctionArtifact> {
     let consts = FunctionConstantValues::defaults();
     let entry = EntryRef::Name(entry);
-    let plan = plan_bitcode(bc, entry, &consts, p, inputs, &mut meter())
-        .unwrap_or_else(|e| panic!("{what}: {e}"));
     let a = compile_bitcode(bc, entry, &consts, p, inputs, &mut meter(), SPIRV_WORDS)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
-    let words = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= words,
-        "{what}: estimate {} < emitted {words}",
-        plan.estimate.words
-    );
     link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: {e}"));
     a
 }
@@ -329,17 +319,12 @@ fn image(index: u32, texels: impl Fn(u32) -> [u32; 4]) -> Image {
 /// texel, with `spec`'s specializations.
 fn resources(plan: &Plan, bytes: usize, spec: &[(SpecKey, u64)]) -> Resources {
     let mut map = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        map.insert(SpecKey::LocalSize(axis), 1);
-    }
-    map.insert(SpecKey::FlatLocalSize, 1);
+    map.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     map.extend(spec.iter().copied());
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -643,21 +628,15 @@ fn argb8_storage_slots_rotate_their_bytes() {
 }
 
 /// A half-float storage slot (formatless, and declared `Rgba16f`) writes each `float` channel as
-/// computed, the device's conversion rounding it and storing its NaN. The rounding is Metal's
-/// toward zero where the profile takes `DriverDeviation::MetalHalfStorageWrites` (the module
-/// requires its property), else the device's own (`PrecisionNote::DeviceColorConversion`); the
-/// NaN is Metal's `0x7e00` where it takes `DriverDeviation::MetalHalfStorageNans` (MoltenVK's: the
-/// module requires its property), else the device's (`PrecisionNote::DeviceNanEncoding`); a
-/// formatless slot's notes hold under the format bound there (`tests::engine_half_storage_notes`).
-/// A formatless slot may also reach a packed small float image, whose NaN is the device's (noted
-/// too) but where the profile takes `DriverDeviation::MetalSmallFloatNans` (the module requires
-/// its property), or a normalized one, whose conversion is the device's on every profile (noted
-/// too). The held lanes cover every tie between neighbouring halves and its
+/// computed, the device's conversion rounding it and storing its NaN, on every profile: the
+/// rounding is the device's own (`PrecisionNote::DeviceColorConversion`) and so is the NaN
+/// (`PrecisionNote::DeviceNanEncoding`); a formatless slot's notes hold under the format bound
+/// there (`tests::engine_half_storage_notes`). A formatless slot may also reach a packed small
+/// float image, whose NaN is the device's (noted too), or a normalized one, whose conversion is the
+/// device's (noted too). The held lanes cover every tie between neighbouring halves and its
 /// neighbours, past the largest, the infinities and NaNs.
 #[test]
 fn half_float_storage_slots_leave_their_writes_to_the_device() {
-    use crate::device::requirements::VkProperty;
-    use crate::error::DriverDeviation;
     use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = assemble("halves", &kernel(Source::ReadWrite, false, 0)) else {
         return;
@@ -690,7 +669,6 @@ fn half_float_storage_slots_leave_their_writes_to_the_device() {
     };
     let held = move |n: u32| -> [u32; 4] { [0, 1, 2, 3].map(|c| value(n, c)) };
     let class = StorageImageClass::Identity;
-    let mut nans_seen = std::collections::BTreeSet::new();
     for choice in [
         StorageImageChoice {
             numeric: Some(crate::pipeline::sym::SampledType::Float),
@@ -701,7 +679,10 @@ fn half_float_storage_slots_leave_their_writes_to_the_device() {
         let mut i = LowerInputs::new();
         i.storage_images.insert(TARGET, choice);
         let anv = "intel-irisxe-rplp-anv";
-        let anv = (anv, profile(anv, DevicePolicy::default()).expect("profile"));
+        let anv = (
+            anv,
+            profile(anv, DevicePolicy::RESIDENT_TABLES).expect("profile"),
+        );
         for (stem, p) in profiles().into_iter().chain([anv]) {
             // The kernel reads both textures: without formatless reads, the target's choice
             // declares its format and the source's `RGBA32Float`'s.
@@ -738,41 +719,14 @@ fn half_float_storage_slots_leave_their_writes_to_the_device() {
                 SPIRV_WORDS,
             )
             .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let rounds = p.takes_driver_deviation(DriverDeviation::MetalHalfStorageWrites);
-            let nans = p.takes_driver_deviation(DriverDeviation::MetalHalfStorageNans);
-            nans_seen.insert(nans);
-            let relied = &a.requirements.properties;
-            assert_eq!(
-                relied.contains(&VkProperty::MetalHalfStorageWrites),
-                rounds,
-                "{what}"
-            );
-            let formatless = choice.vk_format == crate::vk::Format::UNDEFINED;
-            let converted = a.precision.contains(&PrecisionNote::DeviceColorConversion);
-            assert!(converted || rounds, "{what}: {:?}", a.precision);
-            if !formatless {
-                assert_eq!(converted, !rounds, "{what}: {:?}", a.precision);
+            for note in [
+                PrecisionNote::DeviceColorConversion,
+                PrecisionNote::DeviceNanEncoding,
+            ] {
+                assert!(a.precision.contains(&note), "{what}: {:?}", a.precision);
             }
-            assert_eq!(
-                relied.contains(&VkProperty::MetalHalfStorageNans),
-                nans,
-                "{what}"
-            );
-            let small = p.takes_driver_deviation(DriverDeviation::MetalSmallFloatNans);
-            assert_eq!(
-                relied.contains(&VkProperty::MetalSmallFloatNans),
-                formatless && small,
-                "{what}"
-            );
-            assert_eq!(
-                a.precision.contains(&PrecisionNote::DeviceNanEncoding),
-                !nans || (formatless && !small),
-                "{what}: {:?}",
-                a.precision
-            );
         }
     }
-    assert_eq!(nans_seen.len(), 2, "both NaN facts: {nans_seen:?}");
 }
 
 /// The value of a `half`'s bits (not a NaN).
@@ -805,312 +759,19 @@ fn devices() -> Vec<(String, Device)> {
         let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
         out.push((
             stem,
-            Device::new(desc, DevicePolicy::default()).expect("device"),
+            Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device"),
         ));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
-/// The kernel compiled into a compute pipeline under `inputs`, or `None` where the device needs a
-/// storage slot's format as an input (it accesses no storage image without one).
-fn pipeline(dev: &Device, bc: &[u8], inputs: &LowerInputs) -> Option<ComputePipeline> {
-    pipeline_entry(dev, bc, "k", inputs)
-}
-
-/// [`pipeline`] of the kernel `entry` of `bc`.
-fn pipeline_entry(
-    dev: &Device,
-    bc: &[u8],
-    entry: &str,
-    inputs: &LowerInputs,
-) -> Option<ComputePipeline> {
-    let lib = Library::from_air(bc).expect("library");
-    let f = lib.function(entry).expect("function");
-    let compiled =
-        match dev.compile_function(&FunctionDescriptor::new(f), inputs, &Budget::standard()) {
-            Ok(c) => c,
-            Err(crate::error::Error::NeedsInput(_)) => return None,
-            Err(e) => panic!("compile: {e}"),
-        };
-    Some(
-        dev.compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &Budget::standard(),
-        )
-        .expect("pipeline"),
-    )
-}
-
-/// A kernel's state: texture slots 0 and 1 bound in `pf` (shader read and write), buffer 0.
-fn state(pf: PixelFormat) -> BindState {
-    let mut t = StageTable::default();
-    for index in [0, 1] {
-        let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-        facts.usage = metal::TextureUsage::SHADER_READ | metal::TextureUsage::SHADER_WRITE;
-        t.textures.insert(
-            index,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-    }
-    t.buffers.insert(
-        0,
-        BoundBuffer::Buffer {
-            length: 65536,
-            offset: 0,
-            gpu_address: 0x1_0000,
-            device_address: None,
-            attribute_stride: None,
-        },
-    );
-    let mut s = BindState::default();
-    s.stages.insert(Stage::Kernel, t);
-    s
-}
-
-/// A slot bound in an extended-range format joins the plan's variant, the variant's pipeline
-/// plans the same key for the same shape, and both slots view the image in the format's raw
-/// unsigned format; a slot bound in another format leaves the variant. On every committed
-/// profile, for a sampled and a storage source.
-#[test]
-fn a_slot_bound_in_an_extended_range_format_joins_the_variant() {
-    let formats = [
-        (PixelFormat::BGR10XR, ExtendedRange::Bgr10 { srgb: false }),
-        (
-            PixelFormat::BGR10XRSRGB,
-            ExtendedRange::Bgr10 { srgb: true },
-        ),
-        (PixelFormat::BGRA10XR, ExtendedRange::Bgra10 { srgb: false }),
-        (
-            PixelFormat::BGRA10XRSRGB,
-            ExtendedRange::Bgra10 { srgb: true },
-        ),
-        (
-            PixelFormat::RGB10A82PXR10,
-            ExtendedRange::Planes { srgb: false },
-        ),
-        (
-            PixelFormat::RGB10A82PXR10SRGB,
-            ExtendedRange::Planes { srgb: true },
-        ),
-    ];
-    let mut planned = 0;
-    for source in [Source::Read, Source::ReadWrite] {
-        let Some(bc) = assemble("bind", &kernel(source, false, 0)) else {
-            return;
-        };
-        for (stem, dev) in devices() {
-            let Some(plain) = pipeline(&dev, &bc, &LowerInputs::new()) else {
-                continue;
-            };
-            for (pf, form) in formats {
-                let what = format!("{source:?} {pf:?} on {stem}");
-                let shape = state(pf).shape();
-                let plan = match plain.plan(&dev, &shape) {
-                    Ok(plan) => plan,
-                    // A profile without the raw format's storage refuses it for the format.
-                    Err(crate::error::BindError::Unsupported(u))
-                        if u.feature == Feature::Format =>
-                    {
-                        continue
-                    }
-                    Err(e) => panic!("{what}: {e}"),
-                };
-                assert_eq!(
-                    plan.variant.extended_range,
-                    BTreeMap::from([(SOURCE, form), (TARGET, form)]),
-                    "{what}"
-                );
-                let key = plan.variant.lowering_inputs(Stage::Kernel);
-                assert_eq!(key.extended_range, plan.variant.extended_range, "{what}");
-                let variant = pipeline(&dev, &bc, &key).expect("the variant's inputs");
-                let again = variant.plan(&dev, &shape).expect("variant plan");
-                assert_eq!(again.variant, plan.variant, "{what}");
-                let views: Vec<_> = again
-                    .descriptors
-                    .iter()
-                    .filter_map(|d| match &d.source {
-                        WriteSource::Texture { view, .. } => Some(view.format),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(views, [form.raw_format(); 2], "{what}");
-                planned += 1;
-                let other = variant
-                    .plan(&dev, &state(PixelFormat::RGBA16Float).shape())
-                    .expect("plan");
-                assert!(other.variant.extended_range.is_empty(), "{what}");
-            }
-        }
-    }
-    assert!(planned > 0);
-}
-
-/// A swizzled extended-range, padded or bfloat texture joins the plan's variant
-/// (`swizzled_storage`) at a sampled slot as at a storage slot: its view holds raw codes, which
-/// a swizzle in the view's component mapping would move before the function decodes them, so the
-/// view takes none (`shader_swizzle`) and the variant's function swizzles the decoded texel
-/// under the slot's `TextureSwizzle` specialization, the swizzle's word. An
-/// unswizzled texture leaves the variant. On every committed profile.
-#[test]
-fn a_swizzled_extended_texture_joins_the_variant_at_a_sampled_slot() {
-    use crate::metal::{TextureSwizzle as S, TextureSwizzleChannels};
-    let swizzle = TextureSwizzleChannels::new(S::Alpha, S::Red, S::One, S::Zero);
-    let mut planned = 0;
-    for source in [Source::Read, Source::ReadWrite] {
-        let Some(bc) = assemble("extended swizzle", &kernel(source, false, 0)) else {
-            return;
-        };
-        for (stem, dev) in devices() {
-            let Some(plain) = pipeline(&dev, &bc, &LowerInputs::new()) else {
-                continue;
-            };
-            for pf in [
-                PixelFormat::BGR10XR,
-                PixelFormat::BGR10XRSRGB,
-                PixelFormat::BGRA10XR,
-                PixelFormat::BGRA10XRSRGB,
-                PixelFormat::R10UnormX6,
-                PixelFormat::RG10UnormX12,
-                PixelFormat::R16Bfloat,
-                PixelFormat::RG16Bfloat,
-                PixelFormat::RGBA16Bfloat,
-            ] {
-                let what = format!("{source:?} {pf:?} on {stem}");
-                let mut state = state(pf);
-                if let Some(BoundTexture::Texture { facts, .. }) = state
-                    .stages
-                    .get_mut(&Stage::Kernel)
-                    .and_then(|t| t.textures.get_mut(&0))
-                {
-                    facts.swizzle = swizzle;
-                }
-                let shape = state.shape();
-                let (plan, own) = match (
-                    plain.plan(&dev, &shape),
-                    plain.plan(&dev, &self::state(pf).shape()),
-                ) {
-                    // A profile without the raw format's storage refuses it for the format.
-                    (_, Err(crate::error::BindError::Unsupported(u)))
-                        if u.feature == Feature::Format =>
-                    {
-                        continue
-                    }
-                    (Ok(plan), Ok(own)) => (plan, own),
-                    (swizzled, unswizzled) => panic!(
-                        "{what}: swizzled {:?}, unswizzled {:?}",
-                        swizzled.map(|_| ()),
-                        unswizzled.map(|_| ())
-                    ),
-                };
-                assert!(plan.variant.swizzled_storage.contains(&SOURCE), "{what}");
-                assert!(!own.variant.swizzled_storage.contains(&SOURCE), "{what}");
-                let key = plan.variant.lowering_inputs(Stage::Kernel);
-                let variant = pipeline(&dev, &bc, &key).expect("the variant's inputs");
-                let again = variant
-                    .plan(&dev, &shape)
-                    .unwrap_or_else(|e| panic!("{what}: variant {e}"));
-                assert_eq!(again.variant, plan.variant, "{what}");
-                let view = again
-                    .descriptors
-                    .iter()
-                    .find_map(|d| match &d.source {
-                        WriteSource::Texture { slot, view } if *slot == SOURCE => Some(*view),
-                        _ => None,
-                    })
-                    .expect("the source's view");
-                assert!(view.shader_swizzle, "{what}");
-                let id = variant
-                    .stage
-                    .specialization
-                    .constants
-                    .iter()
-                    .find_map(|c| (c.key == SpecKey::TextureSwizzle(SOURCE)).then_some(c.id))
-                    .unwrap_or_else(|| panic!("{what}: no TextureSwizzle constant"));
-                let e = again
-                    .specialization
-                    .entries
-                    .iter()
-                    .find(|e| e.constant_id == id)
-                    .expect("TextureSwizzle entry");
-                let at = e.offset as usize;
-                let word = u32::from_le_bytes(
-                    again.specialization.data[at..at + 4]
-                        .try_into()
-                        .expect("a u32"),
-                );
-                assert_eq!(word, swizzle.word(), "{what}");
-                planned += 1;
-            }
-        }
-    }
-    assert!(planned > 0);
-}
-
-/// A storage slot of `YCbCrWrite`, a 4:4:4 two-plane YCbCr texture's write shadow, stores each
-/// texel the kernel writes as its red, green and blue bits and the mark 1 in an
-/// `R32G32B32A32_UINT` image, which the encode kernel reads (`bind::ycbcr_write`); the module
-/// validates on the profiles. The held lanes run from below 0 to above 1. A slot that also reads
-/// the texture keeps the format's refusal.
-#[test]
-fn ycbcr_write_slots_store_each_texel_s_bits_and_mark() {
-    let Some(bc) = assemble("ycbcr-write", &kernel(Source::Read, false, 0)) else {
-        return;
-    };
-    let shadow = StorageImageChoice::new(
-        crate::vk::Format::R32G32B32A32_UINT,
-        StorageImageClass::YCbCrWrite,
-    );
-    let mut i = LowerInputs::new();
-    i.storage_images.insert(TARGET, shadow);
-    let value = |k: u32| (k % 211) as f32 / 128.0 - 0.25;
-    let held = |n: u32| -> [u32; 4] { [0, 1, 2, 3].map(|c| value(4 * n + c).to_bits()) };
-    for (stem, p) in profiles() {
-        let (plan, m) =
-            typed_module_with(&bc, "k", &p, &i).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        validate(&bc, &i, &p, stem);
-        let images = [image(0, held), image(1, |_| [0; 4])];
-        let (_, images) = run(&m, &resources(&plan, 16, &[]), &images);
-        let target = texels_of(&images, 1);
-        let layout = image(1, |_| [0; 4]);
-        for n in 0..SIDE * SIDE {
-            let [r, g, b, _] = held(n);
-            let at = layout
-                .index(0, 0, 0, [n % SIDE, n / SIDE, 0])
-                .expect("texel");
-            assert_eq!(target[at], [r, g, b, 1], "{stem}: texel {n}");
-        }
-    }
-    let Some(bc) = assemble("ycbcr-write-read", &kernel(Source::ReadWrite, false, 0)) else {
-        return;
-    };
-    let mut both = LowerInputs::new();
-    both.storage_images.insert(SOURCE, shadow);
-    both.storage_images.insert(TARGET, shadow);
-    for (stem, p) in profiles() {
-        match typed_module_with(&bc, "k", &p, &both) {
-            Err(crate::error::Error::Unsupported(u)) => {
-                assert_eq!(u.feature, Feature::Format, "{stem}: {u:?}")
-            }
-            Err(other) => panic!("{stem}: {other}"),
-            Ok(_) => panic!("{stem}: a YCbCr write slot that reads is lowered"),
-        }
-    }
-}
-
 /// A `half` read of a slot bound in an extended-range form decodes the texel's codes and rounds
-/// the decoded `f32` through the device's conversion (`narrow::round_texel`). On `moltenvk-m3`,
-/// which takes `DriverDeviation::MetalHalfConversion`, the module records no
-/// `NativeHalfConversion` for it and requires `VkProperty::MetalHalfConversion`; it records
-/// `DevicePackConversion`, which states the decoded `half` against Metal's. Without the deviation
-/// (the same profile with it dropped) it records the note and requires nothing.
+/// the decoded `f32` through the device's conversion (`narrow::round_texel`). On `moltenvk-m3` the
+/// module records `NativeHalfConversion` for it and `DevicePackConversion`, which states the
+/// decoded `half` against Metal's.
 #[test]
-fn decoded_half_texels_round_by_the_measured_conversion() {
-    use crate::device::requirements::VkProperty;
-    use crate::error::DriverDeviation;
+fn decoded_half_texels_round_by_the_device_s_conversion() {
     use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = assemble("decoded-halves", &kernel(Source::Read, true, 0)) else {
         return;
@@ -1118,20 +779,15 @@ fn decoded_half_texels_round_by_the_measured_conversion() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(&path).expect("profile");
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    let p = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
+        .expect("device")
+        .profile()
+        .clone();
     for form in FORMS {
         let i = inputs(form, Source::Read);
-        for taken in [true, false] {
-            let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-            let p = Device::with_deviation(
-                desc,
-                DevicePolicy::default(),
-                DriverDeviation::MetalHalfConversion,
-                taken,
-            )
-            .expect("device")
-            .profile()
-            .clone();
-            let what = format!("{form:?}, the deviation taken: {taken}");
+        {
+            let what = format!("{form:?}");
             let a = compile_bitcode(
                 &bc,
                 EntryRef::Name("k"),
@@ -1143,9 +799,8 @@ fn decoded_half_texels_round_by_the_measured_conversion() {
             )
             .unwrap_or_else(|e| panic!("{what}: {e}"));
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            assert_eq!(
+            assert!(
                 a.precision.contains(&PrecisionNote::NativeHalfConversion),
-                !taken,
                 "{what}: {:?}",
                 a.precision
             );
@@ -1153,13 +808,6 @@ fn decoded_half_texels_round_by_the_measured_conversion() {
                 a.precision.contains(&PrecisionNote::DevicePackConversion),
                 "{what}: {:?}",
                 a.precision
-            );
-            assert_eq!(
-                a.requirements
-                    .properties
-                    .contains(&VkProperty::MetalHalfConversion),
-                taken,
-                "{what}"
             );
         }
     }

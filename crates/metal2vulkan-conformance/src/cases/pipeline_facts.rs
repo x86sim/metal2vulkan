@@ -33,8 +33,20 @@
 //!   indirect-command support**: the sample length is the two texels packed, so a case where the
 //!   packing rule has something to get wrong;
 //! - **the same pipeline at four samples**: the memory length is the sample length times the
-//!   extent times the raster sample count, and the sample count is the factor only this case
-//!   moves.
+//!   extent times the raster sample count, and the sample count is the factor only this case and
+//!   its twin move;
+//! - **its twin without indirect-command support**: the same lengths from a state a side that
+//!   makes no state for indirect commands makes too;
+//! - **a drawing state over `R8Unorm` then `RG16Float`**: the one set of formats whose sample
+//!   length tells three packing rules apart, 6 where each texel aligns to its component's size, 5
+//!   where the texels pack tight, 8 where every texel wider than a byte aligns to 4. The M3 Max
+//!   answers 6;
+//! - **the two-attachment pipeline with a `Depth32Float_Stencil8` depth and stencil
+//!   attachment**: the M3 Max answers 12, the two colors' length without them, so depth and
+//!   stencil take no room in the record.
+//!
+//! The last three ask for no indirect-command support, so a side that makes no state for
+//! indirect commands still makes theirs and answers their lengths.
 //!
 //! # Why this family is safe
 //!
@@ -104,6 +116,18 @@ const TWO_COLORS: &[Option<ColorState>] = &[
     Some(ColorState::new(PixelFormat::RGBA8Unorm)),
     Some(ColorState::new(PixelFormat::RGBA16Float)),
 ];
+
+/// One colour attachment of a one-byte texel, then one of a four-byte texel of two-byte
+/// components: the packed sample length is 6 where each texel aligns to its component's size, 5
+/// where the texels pack tight, and 8 where every texel wider than a byte aligns to 4.
+const NARROW_COLORS: &[Option<ColorState>] = &[
+    Some(ColorState::new(PixelFormat::R8Unorm)),
+    Some(ColorState::new(PixelFormat::RG16Float)),
+];
+
+/// The depth and stencil attachment format of the case that holds depth and stencil out of the
+/// sample length: one format with both aspects, as both attachments name it.
+const DEPTH_STENCIL: PixelFormat = PixelFormat::Depth32FloatStencil8;
 
 /// What one case makes and reads.
 enum Subject {
@@ -189,6 +213,38 @@ pub fn all() -> Vec<PipelineFactsCase> {
                     .labelled("conformance-render-state")
                     .for_indirect_commands()
                     .multisampled(4),
+            ),
+        },
+        // The multisampled case without indirect-command support: the same lengths, from a state
+        // a side with no indirect command buffers makes too.
+        PipelineFactsCase {
+            name: "pipeline-facts-render-multisampled-direct",
+            fixture: RENDER_FIXTURE,
+            entry: VERTEX,
+            subject: Subject::Render(
+                RenderPipelineSpec::new(VERTEX, TWO_TARGETS, TWO_COLORS)
+                    .labelled("conformance-render-state")
+                    .multisampled(4),
+            ),
+        },
+        // `R8Unorm` then `RG16Float`: the packing rule's own question, whose three candidate
+        // rules answer 6, 5 and 8. The M3 Max answers 6, each texel at its component's alignment
+        // (`RG16Float` at byte 2), and 192 at `IMAGEBLOCK`.
+        PipelineFactsCase {
+            name: "pipeline-facts-render-narrow-attachments",
+            fixture: RENDER_FIXTURE,
+            entry: VERTEX,
+            subject: Subject::Render(RenderPipelineSpec::new(VERTEX, TWO_TARGETS, NARROW_COLORS)),
+        },
+        // The two-attachment pipeline with a depth and stencil attachment. The M3 Max answers 12
+        // and 384 at `IMAGEBLOCK`, as without them: depth and stencil take no room in the record.
+        PipelineFactsCase {
+            name: "pipeline-facts-render-depth-stencil",
+            fixture: RENDER_FIXTURE,
+            entry: VERTEX,
+            subject: Subject::Render(
+                RenderPipelineSpec::new(VERTEX, TWO_TARGETS, TWO_COLORS)
+                    .depth_stencil(Some(DEPTH_STENCIL), Some(DEPTH_STENCIL)),
             ),
         },
     ]

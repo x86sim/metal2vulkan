@@ -16,11 +16,11 @@ use crate::archives::{
 };
 use crate::argument_encoders::{ArgumentDescriptorSpec, ArgumentWrite, EncoderFacts};
 use crate::case::{
-    Answer, ArgumentSlot, Bindings, CommandDraw, CoordinateProbe, Failure, FragmentFill,
-    FragmentFilled, Handle, MappedCoordinates, MeshCommand, MeshFunctions, MeshReflectionSpec,
-    MeshStep, PassOutcome, RateMapFacts, RateMapForm, RateMapLayer, RateMapRequest, SamplerSpec,
-    ShaderSource, Side, StageInRegion, StageInput, TextureRole, TextureSpec, TileFacts,
-    TilePipelineSpec, TileStep, Venue,
+    Answer, ArgumentSlot, Bindings, CommandDraw, CoordinateProbe, EncodedRange, Failure,
+    FragmentFill, FragmentFilled, Handle, MappedCoordinates, MeshCommand, MeshFunctions,
+    MeshReflectionSpec, MeshStep, PassOutcome, RangeWrite, RateMapFacts, RateMapForm, RateMapLayer,
+    RateMapRequest, SamplerSpec, ShaderSource, Side, StageInRegion, StageInput, TextureRole,
+    TextureSpec, TileFacts, TilePipelineSpec, TileStep, Venue,
 };
 use crate::command_buffer_facts::CommandBufferFacts;
 use crate::compute_descriptors::{
@@ -80,12 +80,13 @@ use crate::sparse_query::{
     TileSize,
 };
 use crate::texture_query::{HeapTextureQuery, SizeAndAlign, Storage};
-use crate::texture_views::{SharedHandleFacts, ViewCall, ViewFacts, ViewRequest};
+use crate::texture_views::{SharedHandleFacts, ViewCall, ViewFacts, ViewParent, ViewRequest};
 use crate::tile_descriptors::{
     DescriptorSpec as TileDescriptorSpec, SuppliedLists as TileSuppliedLists, TileDescriptorFacts,
     AWAY as TILE_AWAY,
 };
 use crate::transcript::Value;
+use crate::values::{PurgeableState, SparsePageSize, VisibilityResultType};
 use crate::visible_tables::{
     Asked, Binding, Entry, HandleFacts, LinkedList as SpecLinkedList, Made as MadeTable, Maker,
     TableFacts, TableOutcome, TableSpec, Writes,
@@ -96,7 +97,6 @@ use metal2vulkan::metal::{
     ArgumentBuffersTier, BindingAccess, BindingType, FunctionOptions, FunctionType, PatchType,
     PixelFormat, ReadWriteTextureTier, RenderStages,
 };
-use metal2vulkan_runtime::{PurgeableState, SparsePageSize, VisibilityResultType};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, ClassType};
@@ -440,11 +440,15 @@ fn our_stage_input_attributes(
 fn constant_values(values: &[ConstantValue]) -> Retained<MTLFunctionConstantValues> {
     let built = MTLFunctionConstantValues::new();
     for value in values {
-        let bytes = std::ptr::NonNull::from(value.bytes.as_slice()).cast::<std::ffi::c_void>();
+        // The case states a vector's lanes packed (a `ushort3` in 6 bytes, as the translator
+        // takes it); zeros past them cover a setter that reads the type's aligned size.
+        let mut padded = value.bytes.clone();
+        padded.extend([0u8; 16]);
+        let bytes = std::ptr::NonNull::from(padded.as_slice()).cast::<std::ffi::c_void>();
         let data_type = MTLDataType(value.data_type.as_raw() as usize);
-        // SAFETY: each pointer is to `value.bytes`, which outlives the call, and each holds the
-        // bytes the case states for the type and the count it states. The index, the range and
-        // the name are the case's own; Metal checks them against the function's own constants
+        // SAFETY: each pointer is to `padded`, which outlives the call, and each holds the bytes
+        // the case states for the type and the count it states, then zeros. The index, the range
+        // and the name are the case's own; Metal checks them against the function's own constants
         // when the pipeline state compiles, and a value naming no constant is ignored.
         unsafe {
             match &value.at {
@@ -513,12 +517,12 @@ fn our_function_facts(
         vertex_attributes: our_vertex_attributes(vertex.as_deref())?,
         stage_input_attributes: our_stage_input_attributes(stage_in.as_deref())?,
         constants: found,
-        options: FunctionOptions::try_from(function.options().0 as u32)
-            .map_err(|error| Failure::named("UnknownFunctionOptions", error.to_string()))?,
+        options: Ok(FunctionOptions::try_from(function.options().0 as u32)
+            .map_err(|error| Failure::named("UnknownFunctionOptions", error.to_string()))?),
         // The registry ID is each host's own number, so only the **comparison** is portable: the
         // two sides agree that the function came from the case's device, never on the number that
         // says so.
-        device_is_the_cases: function.device().registryID() == registry,
+        device_is_the_cases: Ok(function.device().registryID() == registry),
     })
 }
 
@@ -1560,7 +1564,7 @@ fn read_descriptor(
     let fragment: Option<Retained<ProtocolObject<dyn MTLFunction>>> = descriptor.fragmentFunction();
     let layout: Option<Retained<MTLVertexDescriptor>> = descriptor.vertexDescriptor();
     RenderDescriptorFacts {
-        label: descriptor.label().map(|label| label.to_string()),
+        label: Ok(descriptor.label().map(|label| label.to_string())),
         vertex_function: vertex.map(|held| held.name().to_string()),
         fragment_function: fragment.map(|held| held.name().to_string()),
         vertex_descriptor: layout.as_ref().map_or_else(
@@ -1593,7 +1597,7 @@ fn read_descriptor(
         // `len` and not `count`: the two are one Objective-C selector, and `count` is a selector
         // `objc2-metal` binds on other types, so the coverage derivation would read it as a Metal
         // call on the element type a preloaded-library getter answers.
-        binary_archives: archives.map_or(0, |held| held.len() as u64),
+        binary_archives: Ok(archives.map_or(0, |held| held.len() as u64)),
         supplied: supplied.then(|| read_supplied(descriptor)),
         support_adding_vertex_binary_functions: descriptor.supportAddingVertexBinaryFunctions(),
         support_adding_fragment_binary_functions: descriptor.supportAddingFragmentBinaryFunctions(),
@@ -1718,7 +1722,7 @@ fn read_compute_descriptor(
     let kernel: Option<Retained<ProtocolObject<dyn MTLFunction>>> = descriptor.computeFunction();
     let required = descriptor.requiredThreadsPerThreadgroup();
     ComputeDescriptorFacts {
-        label: descriptor.label().map(|label| label.to_string()),
+        label: Ok(descriptor.label().map(|label| label.to_string())),
         compute_function: kernel.map(|held| held.name().to_string()),
         threadgroup_size_is_multiple_of_execution_width: descriptor
             .threadGroupSizeIsMultipleOfThreadExecutionWidth(),
@@ -1728,7 +1732,7 @@ fn read_compute_descriptor(
         // `len` and not `count`: the two are one Objective-C selector, and `count` is a selector
         // `objc2-metal` binds on other types, so the coverage derivation would read it as a Metal
         // call on the element type the getter answers.
-        binary_archives: archives.map_or(0, |held| held.len() as u64),
+        binary_archives: Ok(archives.map_or(0, |held| held.len() as u64)),
         supplied: supplied.then(|| read_compute_supplied(descriptor)),
         support_adding_binary_functions: descriptor.supportAddingBinaryFunctions(),
         max_call_stack_depth: descriptor.maxCallStackDepth() as u64,
@@ -2280,6 +2284,32 @@ impl Side for MetalSide {
         let function = library
             .newFunctionWithName(&NSString::from_str(entry))
             .ok_or_else(|| Failure::named("NoSuchFunction", entry.to_owned()))?;
+        let pipeline = self
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|error| Failure::named("NewComputePipelineState", error.to_string()))?;
+        Ok(keep(&mut self.pipelines, pipeline))
+    }
+
+    fn compute_pipeline_with_constants(
+        &mut self,
+        library: Handle,
+        entry: &str,
+        constants: &[ConstantValue],
+    ) -> Answer<Handle> {
+        let library = self
+            .libraries
+            .get(library.0 as usize)
+            .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+        let values = constant_values(constants);
+        let function = library
+            .newFunctionWithName_constantValues_error(&NSString::from_str(entry), &values)
+            .map_err(|error| {
+                Failure::named(
+                    "NewFunctionWithConstantValues",
+                    error.localizedDescription().to_string(),
+                )
+            })?;
         let pipeline = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
@@ -3941,9 +3971,9 @@ impl Side for MetalSide {
             descriptor.setThreadgroupMemoryLength(numbers.0[7] as usize);
         }
         if let Some(stated) = spec.positions {
-            let positions: Vec<metal2vulkan_runtime::SamplePosition> = stated
+            let positions: Vec<crate::values::SamplePosition> = stated
                 .iter()
-                .map(|(x, y)| metal2vulkan_runtime::SamplePosition::new(*x, *y))
+                .map(|(x, y)| crate::values::SamplePosition::new(*x, *y))
                 .collect();
             // The suite's one guard for the shapes Metal asserts on, which every family that sets
             // sample positions goes through. The count is held against the row's own length: this
@@ -4017,7 +4047,7 @@ impl Side for MetalSide {
             install_name: install.map(|name| name.to_string()),
             // The registry ID is each host's own number, so only the **comparison** is portable,
             // as it is for a function's own device.
-            device_is_the_cases: library.device().registryID() == registry,
+            device_is_the_cases: Ok(library.device().registryID() == registry),
         })
     }
 
@@ -4545,6 +4575,218 @@ impl Side for MetalSide {
         let status = Value::unit_variant(status_word(command_buffer.status()));
         keep(&mut self.command_buffers, command_buffer);
         let bytes = self.blit_out(&target, fill.size, fill.row_pitch)?;
+        keep(&mut self.textures, target);
+        Ok(FragmentFilled { status, bytes })
+    }
+
+    fn encoded_range(&mut self, run: &EncodedRange<'_>) -> Answer<FragmentFilled> {
+        let format = MTLPixelFormat(run.format.as_raw() as usize);
+        let function = |side: &Self,
+                        library: Handle,
+                        name: &str|
+         -> Answer<Retained<ProtocolObject<dyn MTLFunction>>> {
+            let library = side
+                .libraries
+                .get(library.0 as usize)
+                .ok_or_else(|| Failure::named("NoSuchHandle", format!("library {}", library.0)))?;
+            library
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| Failure::named("NoSuchFunction", name.to_owned()))
+        };
+        // A render pipeline over one attachment of the run's format: the commands' state, or the
+        // rasterization-disabled writer of the range.
+        let render_state =
+            |vertex: &ProtocolObject<dyn MTLFunction>,
+             fragment: Option<&ProtocolObject<dyn MTLFunction>>| {
+                let descriptor = MTLRenderPipelineDescriptor::new();
+                descriptor.setVertexFunction(Some(vertex));
+                descriptor.setFragmentFunction(fragment);
+                descriptor.setRasterizationEnabled(fragment.is_some());
+                descriptor.setSupportIndirectCommandBuffers(fragment.is_some());
+                // SAFETY: attachment 0 is inside the eight every Metal pipeline descriptor holds.
+                let attachment =
+                    unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+                attachment.setPixelFormat(format);
+                self.device
+                    .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                    .map_err(|error| Failure::named("NewRenderPipelineState", error.to_string()))
+            };
+        let kernel_function = function(self, run.library, run.kernel)?;
+        let vertex_function = function(self, run.library, run.vertex)?;
+        let fragment_function = function(self, run.library, run.fragment)?;
+        let kernel = self
+            .device
+            .newComputePipelineStateWithFunction_error(&kernel_function)
+            .map_err(|error| Failure::named("NewComputePipelineState", error.to_string()))?;
+        let state = render_state(&vertex_function, Some(&*fragment_function))?;
+        let writer = match run.written {
+            RangeWrite::Copied { .. } => None,
+            RangeWrite::Drawn {
+                library,
+                function: name,
+                ..
+            } => {
+                let writer_function = function(self, library, name)?;
+                Some(render_state(&writer_function, None)?)
+            }
+        };
+        let descriptor = MTLIndirectCommandBufferDescriptor::new();
+        descriptor.setCommandTypes(MTLIndirectCommandType::DrawIndexed);
+        descriptor.setInheritPipelineState(true);
+        descriptor.setInheritBuffers(false);
+        descriptor.setMaxVertexBufferBindCount(run.bind_counts[0] as usize);
+        descriptor.setMaxFragmentBufferBindCount(run.bind_counts[1] as usize);
+        // SAFETY: the kernel's threads encode exactly `commands` commands, each inside the count.
+        let icb = unsafe {
+            self.device
+                .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                    &descriptor,
+                    run.commands as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+        }
+        .ok_or_else(|| {
+            Failure::named(
+                "NewIndirectCommandBuffer",
+                format!("{} commands returned nil", run.commands),
+            )
+        })?;
+        let arguments = self.buffer(&icb.gpuResourceID().to_raw().to_le_bytes())?;
+        let arguments = Retained::from(self.held(arguments)?);
+        let retained = |side: &Self, handles: &[Handle]| {
+            (handles.iter())
+                .map(|handle| side.held(*handle).map(Retained::from))
+                .collect::<Answer<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>>()
+        };
+        let buffers = retained(self, run.buffers)?;
+        let used = retained(self, run.used)?;
+        let range = Retained::from(self.held(run.range)?);
+        let [width, height] = run.size;
+        // SAFETY: the descriptor constructor reads only the format and the size it is given.
+        let target_descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                format,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        target_descriptor.setUsage(MTLTextureUsage::RenderTarget);
+        target_descriptor.setStorageMode(MTLStorageMode::Private);
+        let target = (self.device)
+            .newTextureWithDescriptor(&target_descriptor)
+            .ok_or_else(|| {
+                Failure::named(
+                    "NewTextureWithDescriptor",
+                    format!("{width}x{height} render target returned nil"),
+                )
+            })?;
+        let command_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| Failure::named("CommandBuffer", "returned nil".to_owned()))?;
+
+        // The kernel encodes the commands, one thread a command.
+        let compute = command_buffer
+            .computeCommandEncoder()
+            .ok_or_else(|| Failure::named("ComputeCommandEncoder", "returned nil".to_owned()))?;
+        compute.setComputePipelineState(&kernel);
+        // SAFETY: each buffer is at least as long as the kernel's binding reads, and the encoder
+        // outlives the calls.
+        unsafe {
+            compute.setBuffer_offset_atIndex(Some(&arguments), 0, 0);
+            for (index, buffer) in buffers.iter().enumerate() {
+                compute.setBuffer_offset_atIndex(Some(buffer), 0, index + 1);
+            }
+        }
+        compute.useResource_usage(ProtocolObject::from_ref(&*icb), MTLResourceUsage::Write);
+        let threads = run.commands as usize;
+        compute.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads.min(64),
+                height: 1,
+                depth: 1,
+            },
+        );
+        compute.endEncoding();
+
+        if let RangeWrite::Copied { from } = run.written {
+            let from = self.held(from)?;
+            let blit = command_buffer
+                .blitCommandEncoder()
+                .ok_or_else(|| Failure::named("BlitCommandEncoder", "returned nil".to_owned()))?;
+            // SAFETY: the case's source holds 8 bytes and the range buffer 8 at the offset.
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    from,
+                    0,
+                    &range,
+                    run.offset as usize,
+                    8,
+                );
+            }
+            blit.endEncoding();
+        }
+
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        // SAFETY: attachment 0 is inside the eight every Metal pass holds.
+        let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        color.setTexture(Some(&target));
+        color.setLoadAction(MTLLoadAction::Clear);
+        color.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 0.0,
+        });
+        color.setStoreAction(MTLStoreAction::Store);
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&pass)
+            .ok_or_else(|| Failure::named("RenderCommandEncoder", "returned nil".to_owned()))?;
+        for buffer in &used {
+            encoder.useResource_usage_stages(
+                ProtocolObject::from_ref(&**buffer),
+                MTLResourceUsage::Read,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+        }
+        if let (Some(writer), RangeWrite::Drawn { params, .. }) = (&writer, run.written) {
+            let params = self.held(params)?;
+            encoder.setRenderPipelineState(writer);
+            // SAFETY: the writer reads two words of `params` and writes two words at the range's
+            // offset, which the range buffer holds; the encoder outlives the calls.
+            unsafe {
+                encoder.setVertexBuffer_offset_atIndex(Some(params), 0, 0);
+                encoder.setVertexBuffer_offset_atIndex(Some(&range), run.offset as usize, 1);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Point, 0, 2);
+            }
+            encoder.memoryBarrierWithScope_afterStages_beforeStages(
+                MTLBarrierScope::Buffers,
+                MTLRenderStages::Vertex,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+        }
+        encoder.setRenderPipelineState(&state);
+        // SAFETY: the range lies at the offset of the range buffer, a multiple of 4, and the
+        // commands' state inherits the pipeline set just above.
+        unsafe {
+            encoder.executeCommandsInBuffer_indirectBuffer_indirectBufferOffset(
+                &icb,
+                &range,
+                run.offset as usize,
+            );
+        }
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        let status = Value::unit_variant(status_word(command_buffer.status()));
+        keep(&mut self.command_buffers, command_buffer);
+        let bytes = self.blit_out(&target, run.size, run.row_pitch)?;
         keep(&mut self.textures, target);
         Ok(FragmentFilled { status, bytes })
     }
@@ -5184,6 +5426,9 @@ impl Side for MetalSide {
         if spec.shader_write {
             usage |= MTLTextureUsage::ShaderWrite;
         }
+        if spec.unknown_usage {
+            usage = MTLTextureUsage::Unknown;
+        }
         descriptor.setUsage(usage);
         descriptor.setStorageMode(match spec.shared {
             true => MTLStorageMode::Shared,
@@ -5680,7 +5925,7 @@ impl Side for MetalSide {
         let after_max_signal = signal(u64::MAX)?;
         let waited_for_max = event.waitUntilSignaledValue_timeoutMS(u64::MAX, WAIT_MS);
         Ok(EventRise {
-            label: read_label,
+            label: Ok(read_label),
             initial,
             after_host_sets,
             after_gpu_signals,
@@ -6059,6 +6304,166 @@ impl Side for MetalSide {
         })
     }
 
+    fn fence_order(
+        &mut self,
+        shape: crate::fence_orders::FenceShape,
+    ) -> Answer<crate::fence_orders::FenceOrder> {
+        use crate::event_orders::{Status, COMPLETION};
+        use crate::fence_orders::{
+            written_words, FenceOrder, FenceShape, BYTES, HELD_BOUND, LONG_FILLS, LONG_FILL_BYTES,
+            WRITTEN,
+        };
+        objc2::rc::autoreleasepool(|_| {
+            let device = &self.device;
+            let queue = || {
+                device
+                    .newCommandQueue()
+                    .ok_or_else(|| Failure::named("NewCommandQueue", "returned nil"))
+            };
+            let (updating_queue, waiting_queue) = (queue()?, queue()?);
+            let tracking = match shape.untracked() {
+                true => MTLResourceOptions::HazardTrackingModeUntracked,
+                false => MTLResourceOptions::HazardTrackingModeDefault,
+            };
+            let buffer = |bytes: u64, options: MTLResourceOptions| {
+                device
+                    .newBufferWithLength_options(bytes as usize, options)
+                    .ok_or_else(|| Failure::named("NewBuffer", "returned nil"))
+            };
+            let shared = MTLResourceOptions::StorageModeShared | tracking;
+            let (x, y) = (buffer(BYTES, shared)?, buffer(BYTES, shared)?);
+            let long = buffer(LONG_FILL_BYTES, MTLResourceOptions::StorageModePrivate)?;
+            let fence = device
+                .newFence()
+                .ok_or_else(|| Failure::named("NewFence", "returned nil"))?;
+            let gate = device
+                .newSharedEvent()
+                .ok_or_else(|| Failure::named("NewSharedEvent", "returned nil"))?;
+            let command_buffer = |queue: &ProtocolObject<dyn MTLCommandQueue>| {
+                queue
+                    .commandBuffer()
+                    .ok_or_else(|| Failure::named("CommandBuffer", "returned nil"))
+            };
+            let blit = |command_buffer: &ProtocolObject<dyn MTLCommandBuffer>| {
+                command_buffer
+                    .blitCommandEncoder()
+                    .ok_or_else(|| Failure::named("BlitCommandEncoder", "returned nil"))
+            };
+            let long_job = |encoder: &ProtocolObject<dyn MTLBlitCommandEncoder>| {
+                for fill in 0..LONG_FILLS {
+                    encoder.fillBuffer_range_value(
+                        &long,
+                        objc2_foundation::NSRange::new(0, LONG_FILL_BYTES as usize),
+                        fill as u8,
+                    );
+                }
+            };
+            // The busy command buffers ahead of the updater, each a long job, committed at once.
+            let mut busy = Vec::new();
+            if shape.busy() > 0 {
+                for _ in 0..shape.busy() {
+                    let ahead = command_buffer(&updating_queue)?;
+                    let encoder = blit(&ahead)?;
+                    long_job(&encoder);
+                    encoder.endEncoding();
+                    ahead.commit();
+                    busy.push(ahead);
+                }
+            }
+            let updater = command_buffer(&updating_queue)?;
+            if shape == FenceShape::HeldUpdater {
+                updater.encodeWaitForEvent_value(ProtocolObject::from_ref(&*gate), 1);
+            }
+            let encoder = blit(&updater)?;
+            if matches!(shape, FenceShape::Ordered | FenceShape::EmptyWaiter) {
+                long_job(&encoder);
+            }
+            encoder.fillBuffer_range_value(
+                &x,
+                objc2_foundation::NSRange::new(0, BYTES as usize),
+                WRITTEN,
+            );
+            if shape.untracked() {
+                encoder.updateFence(&fence);
+            }
+            encoder.endEncoding();
+            let updater_done = completion_channel(&updater);
+            updater.commit();
+            let waiter = command_buffer(&waiting_queue)?;
+            let encoder = blit(&waiter)?;
+            if shape.untracked() {
+                encoder.waitForFence(&fence);
+            }
+            if shape != FenceShape::EmptyWaiter {
+                // SAFETY: both ranges are the whole of their own `BYTES`-byte buffer.
+                unsafe {
+                    encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        &x,
+                        0,
+                        &y,
+                        0,
+                        BYTES as usize,
+                    );
+                }
+            }
+            encoder.endEncoding();
+            // The waiter's completed handler counts X's words as it runs: what the updater had
+            // written by the waiter's completion.
+            let (sender, counted) = std::sync::mpsc::channel();
+            let x_address = x.contents().as_ptr() as usize;
+            let counting = block2::RcBlock::new(
+                move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    // SAFETY: X is `BYTES` bytes of shared memory the probe keeps alive until it
+                    // has waited for this handler or its bound; a read races no CPU write.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(x_address as *const u8, BYTES as usize)
+                    };
+                    let _ = sender.send(written_words(bytes));
+                },
+            );
+            // SAFETY: the block is a valid heap block kept alive until the probe returns, which
+            // is after every wait for it.
+            unsafe { waiter.addCompletedHandler(block2::RcBlock::as_ptr(&counting)) };
+            waiter.commit();
+            let mut waiter_completed_before_the_release = None;
+            let mut updater_before_the_release = None;
+            let mut source_words = None;
+            if shape == FenceShape::HeldUpdater {
+                let completed = counted.recv_timeout(HELD_BOUND);
+                updater_before_the_release = Some(Status::read(status_word(updater.status())));
+                waiter_completed_before_the_release = Some(completed.is_ok());
+                source_words = completed.ok();
+                gate.setSignaledValue(1);
+            }
+            let source_words = match source_words {
+                Some(words) => Some(words),
+                None => counted.recv_timeout(COMPLETION).ok(),
+            };
+            let waiter_at_the_end = match source_words {
+                Some(_) => Status::read(status_word(waiter.status())),
+                None => Status::NeverSettled,
+            };
+            let updater_at_the_end = settled(&updater_done, &updater);
+            for ahead in &busy {
+                ahead.waitUntilCompleted();
+            }
+            // SAFETY: Y's `BYTES` bytes of shared memory, read once the waiter completed.
+            let copied = unsafe {
+                std::slice::from_raw_parts(y.contents().as_ptr().cast::<u8>(), BYTES as usize)
+            };
+            Ok(FenceOrder {
+                waiter_completed_before_the_release,
+                updater_before_the_release,
+                source_words_when_the_waiter_completed: (shape == FenceShape::EmptyWaiter)
+                    .then_some(source_words)
+                    .flatten(),
+                copied_words: (shape != FenceShape::EmptyWaiter).then(|| written_words(copied)),
+                updater_at_the_end,
+                waiter_at_the_end,
+            })
+        })
+    }
+
     fn signal_before_a_wait(&mut self) -> Answer<crate::event_orders::SignalBeforeWait> {
         use crate::event_orders::{Status, HELD_FOR, SCRATCH, SIGNAL_WAIT};
         objc2::rc::autoreleasepool(|_| {
@@ -6425,6 +6830,98 @@ impl Side for MetalSide {
         if let Some(surface) = surface {
             self.surfaces.push(surface);
         }
+        Ok(keep(&mut self.textures, texture))
+    }
+
+    /// An IOSurface laid as the case states, read back plane by plane before a texture lies over
+    /// it, and `newTextureWithDescriptor:iosurface:plane:` of the plane's format and extent:
+    /// Shared, read by shaders.
+    fn surface_texture(&mut self, spec: &crate::case::SurfaceTexture) -> Answer<Handle> {
+        use crate::metal_surface::{PlaneLayout, Surface};
+        let at = spec.plane as usize;
+        let plane = *(spec.planes.get(at)).ok_or_else(|| {
+            Failure::named(
+                "NoSuchPlane",
+                format!("plane {at} of a surface of {}", spec.planes.len()),
+            )
+        })?;
+        let laid = |plane: &crate::case::SurfacePlane| PlaneLayout {
+            width: u64::from(plane.size[0]),
+            height: u64::from(plane.size[1]),
+            offset: plane.offset,
+            bytes_per_row: plane.bytes_per_row,
+            bytes_per_element: plane.texel,
+        };
+        // The layout was a request, so it is read back before a texture lies over it.
+        let surface = match (spec.planar, spec.planes.as_slice()) {
+            (true, [first, second]) => {
+                let planes = [laid(first), laid(second)];
+                let surface =
+                    Surface::two_plane(spec.ostype, first.size, &planes, spec.length as usize)
+                        .map_err(|why| Failure::named("NoSurface", why))?;
+                (surface.planes_are_as_asked(&planes))
+                    .map_err(|why| Failure::named("SurfaceLaidOtherwise", why))?;
+                surface
+            }
+            (false, [only]) => {
+                let (texel, row) = (only.texel as u32, only.bytes_per_row as u32);
+                let surface = Surface::single_plane(Some(spec.ostype), only.size, texel, row, 0)
+                    .map_err(|why| Failure::named("NoSurface", why))?;
+                (surface.is_as_asked(only.size, row))
+                    .map_err(|why| Failure::named("SurfaceLaidOtherwise", why))?;
+                surface
+            }
+            (planar, planes) => {
+                return Err(Failure::named(
+                    "NoSuchPlaneLayout",
+                    format!(
+                        "{} planes of a surface made {} a plane dictionary: this side lays one \
+                         without and two with",
+                        planes.len(),
+                        if planar { "with" } else { "without" }
+                    ),
+                ))
+            }
+        };
+        let [width, height] = plane.size;
+        let selector = objc2::sel!(newTextureWithDescriptor:iosurface:plane:);
+        let device: &ProtocolObject<dyn MTLDevice> = &self.device;
+        require_selector(
+            device,
+            selector,
+            "MTLDevice newTextureWithDescriptor:iosurface:plane:",
+        )?;
+        let texture = objc2::rc::autoreleasepool(|_| {
+            let descriptor = MTLTextureDescriptor::new();
+            descriptor.setTextureType(MTLTextureType::Type2D);
+            descriptor.setPixelFormat(MTLPixelFormat(plane.format.as_raw() as usize));
+            // SAFETY: the case's own extent; the setters read nothing but the value given.
+            unsafe {
+                descriptor.setWidth(width as usize);
+                descriptor.setHeight(height as usize);
+            }
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            descriptor.setUsage(MTLTextureUsage::ShaderRead);
+            let descriptor: &MTLTextureDescriptor = &descriptor;
+            // SAFETY: the selector was just checked; it takes the descriptor, a live surface laid
+            // as read back above and one of its planes, and answers a `+1` texture. The surface
+            // is kept below, so it outlives the texture over it.
+            let texture: Option<Retained<ProtocolObject<dyn MTLTexture>>> = unsafe {
+                objc2::msg_send![device, newTextureWithDescriptor: descriptor, iosurface: surface.as_ptr(), plane: at]
+            };
+            texture
+        })
+        .ok_or_else(|| {
+            Failure::named(
+                "NewTextureWithIOSurfacePlane",
+                format!(
+                    "{:?} over plane {at} of a {width}x{height} '{}' surface returned nil",
+                    plane.format,
+                    crate::metal_surface::four_cc(spec.ostype)
+                ),
+            )
+        })?;
+        self.surfaces.push(surface);
         Ok(keep(&mut self.textures, texture))
     }
 
@@ -6828,12 +7325,14 @@ impl Side for MetalSide {
             .as_ref()
             .map(|parent| &**parent as *const ProtocolObject<dyn MTLTexture>);
         Ok(ViewFacts {
-            has_parent: answered_ptr.is_some(),
-            expected_parent: answered_ptr.is_some() && answered_ptr == of_parent,
-            parent_relative_level: texture.parentRelativeLevel() as u64,
-            parent_relative_slice: texture.parentRelativeSlice() as u64,
+            parent: Ok(ViewParent {
+                has_parent: answered_ptr.is_some(),
+                expected_parent: answered_ptr.is_some() && answered_ptr == of_parent,
+                parent_relative_level: texture.parentRelativeLevel() as u64,
+                parent_relative_slice: texture.parentRelativeSlice() as u64,
+                shareable: texture.isShareable(),
+            }),
             swizzle: raw_swizzle(texture.swizzle()),
-            shareable: texture.isShareable(),
             texture_type: texture.textureType().0 as u64,
             pixel_format: texture.pixelFormat().0 as u64,
             mipmap_level_count: texture.mipmapLevelCount() as u64,
@@ -7220,7 +7719,7 @@ impl Side for MetalSide {
 
 /// Metal's `MTLHeapType` for a case's heap type, by its raw value, so the two spellings cannot
 /// drift apart.
-fn metal_heap_type(heap_type: metal2vulkan_runtime::HeapType) -> MTLHeapType {
+fn metal_heap_type(heap_type: crate::values::HeapType) -> MTLHeapType {
     MTLHeapType(heap_type.raw() as isize)
 }
 
@@ -7369,6 +7868,9 @@ impl MetalSide {
         if spec.shader_write {
             usage |= MTLTextureUsage::ShaderWrite;
         }
+        if spec.unknown_usage {
+            usage = MTLTextureUsage::Unknown;
+        }
         descriptor.setUsage(usage);
         // A texture over a buffer holds the buffer's own bytes, so its storage is the buffer's.
         descriptor.setStorageMode(MTLStorageMode::Shared);
@@ -7426,6 +7928,9 @@ impl MetalSide {
         if spec.shader_write {
             usage |= MTLTextureUsage::ShaderWrite;
         }
+        if spec.unknown_usage {
+            usage = MTLTextureUsage::Unknown;
+        }
         descriptor.setUsage(usage);
         descriptor.setStorageMode(MTLStorageMode::Shared);
         let framebuffer_only = objc2::sel!(setFramebufferOnly:);
@@ -7447,6 +7952,7 @@ impl MetalSide {
             let _: () = objc2::msg_send![&*descriptor, setRotation: plane.rotation as objc2_foundation::NSUInteger];
         }
         let surface = crate::metal_surface::Surface::single_plane(
+            None,
             plane.plane,
             plane.texel,
             plane.row_pitch,
@@ -7582,9 +8088,9 @@ fn buffer_texture_facts(
         sample_count: texture.sampleCount() as u64,
         usage: texture.usage().0 as u64,
         storage_mode: texture.storageMode().0 as u64,
-        cpu_cache_mode: texture.cpuCacheMode().0 as u64,
-        hazard_tracking_mode: texture.hazardTrackingMode().0 as u64,
-        gpu_optimized: texture.allowGPUOptimizedContents(),
+        cpu_cache_mode: crate::transcript::Value::Uint(texture.cpuCacheMode().0 as u64),
+        hazard_tracking_mode: crate::transcript::Value::Uint(texture.hazardTrackingMode().0 as u64),
+        gpu_optimized: crate::transcript::Value::Bool(texture.allowGPUOptimizedContents()),
     }
 }
 
@@ -10211,6 +10717,9 @@ impl MetalSide {
                     encoder.setThreadgroupMemoryLength_atIndex(*length as usize, *index as usize);
                 }
             }
+            ComputeStep::ImageblockSize { width, height } => {
+                encoder.setImageblockWidth_height(*width as usize, *height as usize);
+            }
             ComputeStep::UseResource {
                 resource: one,
                 usage,
@@ -10904,16 +11413,16 @@ fn compute_state_facts(
 ) -> ComputeStateFacts {
     let required = state.requiredThreadsPerThreadgroup();
     ComputeStateFacts {
-        label: state.label().map(|label| label.to_string()),
+        label: Ok(state.label().map(|label| label.to_string())),
         // The registry ID is each host's own number, so only the **comparison** is portable.
-        device_is_the_cases: state.device().registryID() == registry,
+        device_is_the_cases: Ok(state.device().registryID() == registry),
         static_threadgroup_memory_length: state.staticThreadgroupMemoryLength() as u64,
         support_indirect_command_buffers: state.supportIndirectCommandBuffers(),
         // SAFETY: the dimensions are the case's own three positive extents, which the call
         // multiplies by the kernel's imageblock cell size and nothing else.
-        imageblock_memory_length: unsafe {
+        imageblock_memory_length: Ok(unsafe {
             state.imageblockMemoryLengthForDimensions(size(imageblock))
-        } as u64,
+        } as u64),
         required_threads_per_threadgroup: [
             required.width as u64,
             required.height as u64,
@@ -10932,20 +11441,20 @@ fn render_state_facts(
 ) -> RenderStateFacts {
     let required = state.requiredThreadsPerTileThreadgroup();
     RenderStateFacts {
-        label: state.label().map(|label| label.to_string()),
-        device_is_the_cases: state.device().registryID() == registry,
-        max_total_threads_per_threadgroup: state.maxTotalThreadsPerThreadgroup() as u64,
-        threadgroup_size_matches_tile_size: state.threadgroupSizeMatchesTileSize(),
+        label: Ok(state.label().map(|label| label.to_string())),
+        device_is_the_cases: Ok(state.device().registryID() == registry),
+        max_total_threads_per_threadgroup: Ok(state.maxTotalThreadsPerThreadgroup() as u64),
+        threadgroup_size_matches_tile_size: Ok(state.threadgroupSizeMatchesTileSize()),
         imageblock_sample_length: Some(state.imageblockSampleLength() as u64),
         imageblock_memory_length: Some(
             state.imageblockMemoryLengthForDimensions(size(imageblock)) as u64
         ),
         support_indirect_command_buffers: state.supportIndirectCommandBuffers(),
-        required_threads_per_tile_threadgroup: [
+        required_threads_per_tile_threadgroup: Ok([
             required.width as u64,
             required.height as u64,
             required.depth as u64,
-        ],
+        ]),
     }
 }
 
@@ -11547,7 +12056,7 @@ fn metal_library_facts(
         function_names: names.iter().map(|name| name.to_string()).collect(),
         library_type: our_library_type(library.r#type().0)?,
         install_name: install.map(|name| name.to_string()),
-        device_is_the_cases: library.device().registryID() == registry,
+        device_is_the_cases: Ok(library.device().registryID() == registry),
     })
 }
 

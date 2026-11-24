@@ -19,9 +19,10 @@
 //! A submission that completes with a device-fault status (Vulkan `VK_ERROR_DEVICE_LOST`; Metal
 //! `MTLCommandBufferError` timeout, page fault, access revoked, or device removed) is a suspected
 //! GPU fault: it writes the tripwire too, then fails the operation normally, because nothing is
-//! in flight any more. A CPU implementation (lavapipe, SwiftShader) is an ordinary killable
-//! process: its timeouts and faults follow the same exit rules but never write the host GPU
-//! tripwire.
+//! in flight any more; a wait on the runtime's command buffers (`new_runtime`) leaves how
+//! the command buffer ended to its caller instead. A CPU implementation (lavapipe, SwiftShader)
+//! is an ordinary killable process: its timeouts and faults follow the same exit rules but never
+//! write the host GPU tripwire.
 
 use super::tripwire::{self, HangKind, HangRecord};
 use super::DeviceType;
@@ -143,11 +144,16 @@ pub(crate) enum WaitOutcome {
     Completed,
     /// The bound elapsed first; the work may still be running.
     TimedOut,
+    // The fence and Metal waits' own endings: absent on Windows, which has the runtime's wait
+    // (`new_runtime`) alone, as its crate is the player alone.
     /// The wait itself failed and the work may still be running.
+    #[cfg(not(windows))]
     Unresolved(String),
     /// The work ended with a status that indicates a device fault.
+    #[cfg(not(windows))]
     SuspectedFault(String),
     /// The work ended with an ordinary error.
+    #[cfg(not(windows))]
     Failed(String),
 }
 
@@ -161,7 +167,9 @@ pub(crate) trait CompletionSource {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Completed,
+    #[cfg(not(windows))]
     Failed(String),
+    #[cfg(not(windows))]
     Fault(HangRecord),
     Hang(HangRecord),
 }
@@ -188,7 +196,9 @@ pub(crate) fn judge(
     };
     match source.wait(timeout) {
         WaitOutcome::Completed => Verdict::Completed,
+        #[cfg(not(windows))]
         WaitOutcome::Failed(detail) => Verdict::Failed(format!("{operation} failed: {detail}")),
+        #[cfg(not(windows))]
         WaitOutcome::SuspectedFault(detail) => {
             Verdict::Fault(record(HangKind::SuspectedFault, detail))
         }
@@ -196,12 +206,14 @@ pub(crate) fn judge(
             HangKind::Timeout,
             format!("no completion within {timeout:?}"),
         )),
+        #[cfg(not(windows))]
         WaitOutcome::Unresolved(detail) => Verdict::Hang(record(HangKind::Unresolved, detail)),
     }
 }
 
 /// Wait on `source` with this process's bound and apply the hang protocol. Returns only when
-/// the work is no longer in flight.
+/// the work is no longer in flight. The fence and Metal waits' (absent on Windows).
+#[cfg(not(windows))]
 pub(crate) fn settle(
     source: &mut dyn CompletionSource,
     backend: SubmissionBackend,
@@ -298,68 +310,6 @@ pub(crate) mod vulkan {
         settle(&mut Fence { device, fence }, backend, operation)
     }
 
-    /// A timeline semaphore's value, for the device lanes (`runtime_lane::commit_costs`).
-    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-    struct Timeline<'a> {
-        device: &'a Device,
-        semaphore: vk::Semaphore,
-        value: u64,
-    }
-
-    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-    impl CompletionSource for Timeline<'_> {
-        fn wait(&mut self, timeout: Duration) -> WaitOutcome {
-            let nanos = u64::try_from(timeout.min(super::MAX_WAIT_TIMEOUT).as_nanos())
-                .expect("the wait bound fits in u64 nanoseconds");
-            let semaphores = [self.semaphore];
-            let values = [self.value];
-            let info = vk::SemaphoreWaitInfo::default()
-                .semaphores(&semaphores)
-                .values(&values);
-            match unsafe { self.device.wait_semaphores(&info, nanos) } {
-                Ok(()) => WaitOutcome::Completed,
-                Err(vk::Result::TIMEOUT) => WaitOutcome::TimedOut,
-                Err(vk::Result::ERROR_DEVICE_LOST) => {
-                    WaitOutcome::SuspectedFault("VK_ERROR_DEVICE_LOST".into())
-                }
-                // As a fence's: the submission is over only if its value is observably reached.
-                Err(error) => {
-                    match unsafe { self.device.get_semaphore_counter_value(self.semaphore) } {
-                        Ok(reached) if reached >= self.value => {
-                            WaitOutcome::Failed(format!("timeline wait: {error}"))
-                        }
-                        Ok(reached) => WaitOutcome::Unresolved(format!(
-                            "timeline wait failed ({error}) at {reached}, below {}",
-                            self.value
-                        )),
-                        Err(status) => WaitOutcome::Unresolved(format!(
-                            "timeline wait failed ({error}) and its value is unknown ({status})"
-                        )),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Wait for timeline `semaphore` to reach `value`, signaled by a submission `operation` just
-    /// made, under the hang protocol, as [`wait_for_fence`] does a fence. Returns only once that
-    /// signal is no longer in flight.
-    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-    pub(crate) fn wait_for_timeline(
-        device: &Device,
-        semaphore: vk::Semaphore,
-        value: u64,
-        backend: SubmissionBackend,
-        operation: &str,
-    ) -> Result<(), String> {
-        let mut timeline = Timeline {
-            device,
-            semaphore,
-            value,
-        };
-        settle(&mut timeline, backend, operation)
-    }
-
     /// Wait, bounded, until everything submitted to `queue` has finished, so the device may be
     /// destroyed. Replaces `vkDeviceWaitIdle`, which cannot time out: an empty submission with a
     /// fence signals once all earlier work on the queue has completed.
@@ -382,44 +332,77 @@ pub(crate) mod vulkan {
     }
 }
 
-/// Bounded waits on the Metal-like runtime's command buffers (`metal2vulkan_runtime`): the
-/// engine executor's runtime path.
-pub(crate) mod runtime {
-    use super::{settle, CompletionSource, SubmissionBackend, WaitOutcome};
-    use metal2vulkan_runtime::{CommandBuffer, CommandBufferError, CommandBufferStatus};
+/// Bounded waits on the runtime's command buffers (`metal2vulkan_runtime`): the replay player's
+/// backend over it. The runtime's own wait has no bound, so the wait is on the command buffer's
+/// completed handler, after the queue's wait hint has sent it. How the command buffer ended is the
+/// caller's to read (the player reads its error into the play's verdict): a wait here says only
+/// that its work is no longer in flight, so an ending with a device fault writes no tripwire.
+pub(crate) mod new_runtime {
+    use super::WaitOutcome;
+    use super::{hang, judge, wait_timeout, CompletionSource, SubmissionBackend, Verdict};
+    use metal2vulkan_runtime::{CommandBuffer, CommandQueue, Error};
+    use std::sync::{Arc, Condvar, Mutex, PoisonError};
     use std::time::Duration;
 
-    struct Committed<'a>(&'a CommandBuffer);
+    /// Whether a command buffer has retired: its completed handler ran, which the runtime runs
+    /// once it has let go of everything the command buffer held.
+    #[derive(Default)]
+    pub(crate) struct Retired {
+        done: Mutex<bool>,
+        condvar: Condvar,
+    }
 
-    impl CompletionSource for Committed<'_> {
+    impl Retired {
+        /// The flag of `command_buffer`, not yet committed, which its completed handler sets.
+        pub(crate) fn watch(command_buffer: &CommandBuffer) -> Result<Arc<Self>, Error> {
+            let retired = Arc::new(Self::default());
+            let flag = Arc::clone(&retired);
+            command_buffer.add_completed_handler(move |_| {
+                *flag.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                flag.condvar.notify_all();
+            })?;
+            Ok(retired)
+        }
+
+        /// Whether the command buffer has retired.
+        pub(crate) fn is_set(&self) -> bool {
+            *self.done.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    struct Waited<'a>(&'a Retired);
+
+    impl CompletionSource for Waited<'_> {
         fn wait(&mut self, timeout: Duration) -> WaitOutcome {
-            if self
-                .0
-                .wait_until_completed_for(timeout.min(super::MAX_WAIT_TIMEOUT))
-                .is_err()
-            {
-                return WaitOutcome::TimedOut;
-            }
-            match (self.0.status(), self.0.error()) {
-                (CommandBufferStatus::Completed, _) => WaitOutcome::Completed,
-                (_, Some(CommandBufferError::DeviceLost)) => {
-                    WaitOutcome::SuspectedFault("the command buffer lost its device".into())
-                }
-                (status, error) => {
-                    WaitOutcome::Failed(format!("the command buffer ended {status:?}: {error:?}"))
-                }
+            let done = self.0.done.lock().unwrap_or_else(PoisonError::into_inner);
+            let (done, _) = (self.0.condvar)
+                .wait_timeout_while(done, timeout, |done| !*done)
+                .unwrap_or_else(PoisonError::into_inner);
+            match *done {
+                true => WaitOutcome::Completed,
+                false => WaitOutcome::TimedOut,
             }
         }
     }
 
-    /// Wait for `command_buffer`, committed by `operation`, under the hang protocol. Returns
-    /// only once its work is no longer in flight.
-    pub(crate) fn wait_for_command_buffer(
+    /// Wait until `command_buffer`, committed on `queue`, has retired (`retired`), under the hang
+    /// protocol: a wait past the process's bound records the hang, named by `operation`, and ends
+    /// the process ([`HANG_EXIT_CODE`](super::HANG_EXIT_CODE)), so this returns only once it has
+    /// retired.
+    pub(crate) fn wait_until_retired(
+        queue: &CommandQueue,
         command_buffer: &CommandBuffer,
+        retired: &Retired,
         backend: SubmissionBackend,
         operation: &str,
-    ) -> Result<(), String> {
-        settle(&mut Committed(command_buffer), backend, operation)
+    ) {
+        queue.send_now(command_buffer);
+        // The handler's flag is set or the bound elapsed: completed or a hang, nothing else.
+        if let Verdict::Hang(record) =
+            judge(&mut Waited(retired), backend, operation, wait_timeout())
+        {
+            hang(&record)
+        }
     }
 }
 

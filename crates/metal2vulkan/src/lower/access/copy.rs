@@ -17,8 +17,9 @@
 //! every buffer endpoint's call-site `align` at least 16 and its offset proven a multiple of 16
 //! (`MemoryPlan::proven_align`: the call-site `align` alone is no proof, `memory::leaf`'s
 //! placement), and every other endpoint word-aligned, moves 16-byte `uvec4` units instead: a
-//! buffer slot with a `uvec4` view moves each unit as one element of it, and every other memory as
-//! its four words. Every unit is one leaf load and store
+//! buffer slot with a `uvec4` view moves each unit as one element of it, a device address as one
+//! access (`memory::leaf`'s whole words), and every other memory as its four words. Every unit is
+//! one leaf load and store
 //! (`memory::leaf`), each contained exactly as a plain access of that leaf, so a byte store never
 //! disturbs a neighbour (the sub-word atomics); an arena unit at a constant offset that ends inside
 //! the arena's translation-time size has no check, which could only pass. `memset` stores the byte
@@ -62,13 +63,11 @@ use std::borrow::Cow;
 use crate::air::intrinsics::LlvmIntrinsic;
 use crate::air::ir::{Callee, CastOp, Const, Inst, InstId, InstKind, Value, ValueId};
 use crate::budget::Meter;
-use crate::device::profile::Containment;
 use crate::error::{Error, LowerFamily};
 use crate::lower::arith::{Form, Held};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
 use crate::memory::arena::Arena;
-use crate::memory::contain::{self, Check};
 use crate::memory::leaf::{self, k32, u32_op, Leaf, Path};
 use crate::memory::plan::ArenaObject;
 use crate::pipeline::interface::Window;
@@ -104,8 +103,8 @@ pub enum Endpoint {
     Buffer(Access),
     /// An arena; the access's leaf is replaced per unit.
     Arena(LocalAccess),
-    /// The constant blob (a source only).
-    Blob { ptr: LocalPtr, checked: bool },
+    /// The constant blob (a source only), its loads checked in the shader.
+    Blob { ptr: LocalPtr },
     /// A wide (dynamic-root) pointer's allocation; the access's leaf is replaced per unit.
     Wide(WideAccess),
 }
@@ -387,12 +386,12 @@ pub fn endpoint(
         blob::use_blob(cx)?;
         return Ok(Endpoint::Blob {
             ptr: blob::blob_ptr(cx, v)?,
-            checked: contain::encoding(cx.profile) == Check::InShader,
         });
     }
     match local::home_of(cx, v) {
         Some(home @ Home::Arena(arena)) => {
             local::use_arena(cx, arena)?;
+            local::composed(cx, arena);
             if write {
                 local::writable(cx, arena)?;
             }
@@ -405,7 +404,7 @@ pub fn endpoint(
                 ptr,
                 value: None,
                 leaf,
-                contained: cx.profile.fields().containment != Containment::UnsafeOff,
+                contained: local::contained(cx, arena),
                 volatile: false,
             }));
         }
@@ -416,8 +415,12 @@ pub fn endpoint(
     }
     // A source may also point into the constant blob (its `BLOB_ROOT` candidate); the blob is
     // constant, so a destination may not. The targets are placed as a load's or a store's are.
-    let (mut targets, null, blob) = super::blob_roots(cx, v, write, m)?;
-    super::place_targets(cx, &mut targets, write)?;
+    let (targets, null, blob) = super::blob_roots(cx, v, write, m)?;
+    // A copy's chunks take their own leaves when it is emitted, words among them. A chunk's
+    // offset is the endpoint's plus a constant where the copy is unrolled; a looping copy's
+    // chunks are noted apart (`select`).
+    let fixed = super::fixed_offset(cx, v);
+    super::place_targets(cx, &targets, (write, fixed), 4)?;
     Ok(Endpoint::Buffer(Access {
         ptr: operand(cx, v)?,
         value: None,
@@ -595,6 +598,19 @@ pub fn select(
         }
     }
     let buffered = matches!(length, Length::Const { count, .. } if count <= unroll_units(unit));
+    // A copy that loops reaches its buffers at offsets that are not translation-time constants.
+    if !buffered {
+        for (e, write) in [(Some(&dst), true), (from.as_ref(), false)] {
+            if let Some(Endpoint::Buffer(a)) = e {
+                for t in &a.targets {
+                    if let Some(plan) = cx.memory.slots.get(t.slot) {
+                        let slot = plan.slot;
+                        super::note_variable(cx, slot, false, !write);
+                    }
+                }
+            }
+        }
+    }
     let src = if fill {
         let v = arg(cx, 1)?;
         match const_index(cx, v) {
@@ -745,7 +761,6 @@ pub enum Base<'a> {
     },
     Blob {
         off: SValue,
-        checked: bool,
     },
     /// A wide pointer `p` and its resolved allocation.
     Wide {
@@ -783,9 +798,8 @@ fn base_live<'a>(
                 LocalPtr::Offset(o) => k32(fb, o)?,
             },
         },
-        Endpoint::Blob { ptr, checked } => Base::Blob {
+        Endpoint::Blob { ptr } => Base::Blob {
             off: blob::ptr_value(cx, fb, *ptr)?,
-            checked: *checked,
         },
         Endpoint::Wide(a) => {
             let p = cx.operand(fb, a.ptr)?;
@@ -899,9 +913,9 @@ pub fn read(
                 None => Err(cx.fail("an arena load without a value")),
             }
         }
-        Base::Blob { off, checked } => {
+        Base::Blob { off } => {
             let off = plus(cx, fb, off, d)?;
-            blob::load_at(cx, fb, &leaf, off, checked)
+            blob::load_at(cx, fb, &leaf, off)
         }
         Base::Wide { b, .. } => {
             let d = wide_delta(fb, d)?;

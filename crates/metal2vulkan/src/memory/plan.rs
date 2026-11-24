@@ -8,9 +8,9 @@
 //!   (`super::roots::wide_roots`), so a pointer and its operands share one width. On a profile with
 //!   device addresses (Profile A), a buffer slot root whose pointer escapes (stored as a value, or
 //!   `ptrtoint`) joins that component: its address may come back as a loaded pointer, and a wide
-//!   pointer's guest address is exact. On Profile F it stays static, and its stored or converted
-//!   address is `SlotGuestBase` plus its displacement. Such a slot's window is `Whole` when its own
-//!   accesses give none.
+//!   pointer's guest address is exact. On Profile F, and under the identity domains, it stays
+//!   static, and its stored or converted address is `SlotGuestBase` plus its displacement. Such a
+//!   slot's window is `Whole` when its own accesses give none.
 //! - **Slots**: every buffer or argument-buffer parameter an instruction reaches, and every
 //!   accessed element of a buffer table (an `array_ref` of buffers), with its access set, its
 //!   proven [`Window`], and whether it needs its guest base (`PushField::SlotGuestBase`:
@@ -60,7 +60,7 @@ use crate::air::ir::{
 };
 use crate::air::Entry;
 use crate::budget::{tree_bytes, vec_bytes, Meter};
-use crate::device::profile::BufferAccess;
+use crate::device::profile::{BufferAccess, PointerDomain};
 use crate::device::DeviceProfile;
 use crate::error::{Error, Feature, InternalError, InternalKind, Limit, LowerFamily, Unsupported};
 use crate::pipeline::interface::{AccessSet, Window};
@@ -155,6 +155,10 @@ pub struct ArenaLayout {
     /// bytes hold. The private arena keeps it when some pointer into it may be null
     /// (`lower::access::local`).
     pub null_word: bool,
+    /// The private arena lives in device memory the runtime owns, one slot a thread
+    /// (`RuntimeFact::PrivateArena`), not in the driver's scratch: a kernel's private memory past
+    /// the floor ([`Planner::private_memory`]).
+    pub device: bool,
 }
 
 impl ArenaLayout {
@@ -351,9 +355,12 @@ pub struct MemoryPlan {
     pub typed_allocas: Vec<AllocaPlan>,
     /// The bytes of private memory a thread holds where a driver backs it with scratch memory,
     /// which selection holds to the device's Function storage: the private arena (its pointers
-    /// merge, escape, or reinterpret its bytes), and each typed alloca (a recursion's call stacks
+    /// merge, escape, or reinterpret its bytes) unless it lives in device memory
+    /// ([`ArenaLayout::device`]), and each typed alloca (a recursion's call stacks
     /// among them) and each constant held as a `Private` variable that some access indexes at run
-    /// time, each at its allocation size. An object reached only at constant offsets counts
+    /// time, each at its allocation size, and under the identity domains the constant blob, the
+    /// module's `Private` words (`memory::blob`), where some access reaches it at an offset only
+    /// the run knows, at their size. An object reached only at constant offsets counts
     /// nothing: a driver holds its parts in registers. Nothing is shared between objects whose
     /// lives do not overlap, so the sum is conservative.
     pub private_bytes: u64,
@@ -673,7 +680,8 @@ pub fn analyze_memory(e: &Entry, p: &DeviceProfile, m: &mut Meter) -> Result<Mem
 
 fn analyze(e: &Entry, p: &DeviceProfile, m: &mut Meter) -> Result<MemoryPlan, Error> {
     let layouts = TypeLayouts::new(&e.layout, e.module.types(), m)?;
-    let prov = provenance::analyze(e, &layouts, m)?;
+    let words = p.fields().pointer_domain == PointerDomain::Identity;
+    let prov = provenance::analyze(e, &layouts, words, m)?;
     if let (Some((b, id)), BufferAccess::Floor) = (prov.dynamic_deref, p.fields().buffer_access) {
         let err: Error =
             Unsupported::needs_any_of(Feature::DereferenceLoadedPointer, vec![p.addressed_needs()])
@@ -771,10 +779,11 @@ impl Planner<'_> {
         let mut room = super::alloca::MAX_UNSHARED;
         let (const_globals, blob) = self.const_globals(&mut room, m)?;
         let tg_arena = self.threadgroup_arena(&[], m)?;
-        let (priv_arena, typed_allocas, fragment_values) = self.allocas(&mut room, m)?;
+        let consts = (&const_globals[..], blob.as_ref());
+        let (priv_arena, typed_allocas, fragment_values, private_bytes) =
+            self.private_memory(&mut room, consts, m)?;
         let tg_metal_static = tg_arena.static_size;
         let (tg_arena, typed_shared) = self.typed_threadgroup(tg_arena, &mut room, m)?;
-        let private_bytes = self.private_bytes(&priv_arena, &typed_allocas, &const_globals, m)?;
         let Reprs {
             repr,
             offsets,
@@ -814,19 +823,51 @@ impl Planner<'_> {
         })
     }
 
+    /// The private arena, the typed allocas, the `<64 x T>` instructions that are fragments
+    /// ([`Planner::allocas`]) and the private bytes ([`Planner::private_bytes`]). Under the
+    /// identity domains, whose consumer supplies the memory (`PushField::PrivateArenaAddress`), a
+    /// kernel without a call stack whose private bytes pass the floor every device holds
+    /// (`device::function_storage::FLOOR`) keeps its private memory in device memory instead: every
+    /// alloca an access indexes at run time goes in the arena, which lives in the runtime's memory
+    /// ([`ArenaLayout::device`]) and leaves the private bytes. The kernel's own bytes decide, never
+    /// a device fact; the bytes left are held to the floor as before.
+    fn private_memory(
+        &self,
+        room: &mut u64,
+        consts: (&[ConstGlobalPlan], Option<&ConstantBlob>),
+        m: &mut Meter,
+    ) -> Result<(ArenaLayout, Vec<AllocaPlan>, Vec<InstId>, u64), Error> {
+        let start = *room;
+        let (arena, typed, values) = self.allocas(room, false, m)?;
+        let bytes = self.private_bytes(&arena, &typed, consts, m)?;
+        let kernel = super::static_root::stage_of(self.e) == crate::pipeline::sym::Stage::Kernel;
+        let floor = crate::device::function_storage::FLOOR;
+        let identity = crate::lower::access::identity(self.p);
+        if !kernel || !identity || self.e.call_stack.is_some() || bytes <= floor {
+            return Ok((arena, typed, values, bytes));
+        }
+        *room = start;
+        let (mut arena, typed, values) = self.allocas(room, true, m)?;
+        arena.device = true;
+        let bytes = self.private_bytes(&arena, &typed, consts, m)?;
+        Ok((arena, typed, values, bytes))
+    }
+
     /// The bytes of private memory a thread holds where a driver backs it with scratch memory
-    /// ([`MemoryPlan::private_bytes`]): the private arena's size, and the allocation size of each
-    /// typed alloca and each `Private` constant some access indexes at run time. An alloca that
-    /// holds simdgroup matrices as fragments holds each as its two elements
-    /// ([`super::fragment::bytes`]).
+    /// ([`MemoryPlan::private_bytes`]): the private arena's size where it is not in device memory,
+    /// and the allocation size of each
+    /// typed alloca and each `Private` constant some access indexes at run time, the blob among
+    /// them under the identity domains, where it is the module's `Private` words
+    /// (`memory::blob`), at their size. An alloca that holds simdgroup matrices as fragments
+    /// holds each as its two elements ([`super::fragment::bytes`]).
     fn private_bytes(
         &self,
         arena: &ArenaLayout,
         typed: &[AllocaPlan],
-        consts: &[ConstGlobalPlan],
+        (consts, blob): (&[ConstGlobalPlan], Option<&ConstantBlob>),
         m: &mut Meter,
     ) -> Result<u64, Error> {
-        let mut bytes = arena.static_size;
+        let mut bytes = if arena.device { 0 } else { arena.static_size };
         for a in typed
             .iter()
             .filter(|a| self.uses(Root::Alloca(a.inst)).indexed)
@@ -852,6 +893,19 @@ impl Planner<'_> {
                 .alloc_size(global.value_ty)
                 .ok_or_else(not_lowered)?;
             bytes = bytes.saturating_add(size);
+        }
+        // A blob offset only the run knows: an index, or a pointer that merges with another
+        // root's or is read back from a cell.
+        let run_time = |c: &ConstGlobalPlan| {
+            let u = self.uses(Root::Global(c.global));
+            u.indexed || u.merged || u.stored
+        };
+        let in_blob = |c: &&ConstGlobalPlan| matches!(c.form, ConstGlobalForm::Blob { .. });
+        if let Some(blob) = blob.filter(|_| crate::lower::access::identity(self.p)) {
+            if consts.iter().filter(in_blob).any(run_time) {
+                let size = super::blob::module_bytes(blob.bytes.len() as u64);
+                bytes = bytes.saturating_add(size);
+            }
         }
         Ok(bytes)
     }
@@ -910,13 +964,14 @@ impl Planner<'_> {
 
     /// Every buffer slot root (a parameter or a buffer-table element) whose pointer escapes,
     /// paired with the dynamic root: the sets that join it to the dynamic component, on a profile
-    /// with device addresses only (Profile F has no root entries; its escaping roots stay static).
-    /// A constant global's address has no guest address to escape as (the blob is no resident
-    /// allocation), so it stays out and its stored pointer is refused. A working table charged to
-    /// the ledger.
+    /// with root entries only. Profile F has none, and the identity domains no root table, where a
+    /// loaded pointer is the device address it holds: there an escaping root stays static, and its
+    /// stored or converted address is `SlotGuestBase` plus its displacement. A constant global's
+    /// address has no guest address to escape as (the blob is no resident allocation), so it stays
+    /// out and its stored pointer is refused. A working table charged to the ledger.
     fn escaping_roots(&self, m: &mut Meter) -> Result<Vec<[Root; 2]>, Error> {
         let mut out = Vec::new();
-        if !self.addressed {
+        if !self.addressed || crate::lower::access::identity(self.p) {
             return Ok(out);
         }
         for (r, u) in &self.prov.uses {
@@ -1905,7 +1960,8 @@ impl Planner<'_> {
     }
 
     /// The private arena and the typed allocas, in instruction order. An alloca a typed object
-    /// cannot hold, or one past `room`, has its place in the arena.
+    /// cannot hold, or one past `room`, has its place in the arena; so, where `device`, does one an
+    /// access indexes at run time ([`Planner::private_memory`]).
     ///
     /// An alloca that holds simdgroup matrices is typed only when they hold fragments
     /// (`memory::fragment`): the candidates are found in a first pass over the room, and the held
@@ -1915,6 +1971,7 @@ impl Planner<'_> {
     fn allocas(
         &self,
         room: &mut u64,
+        device: bool,
         m: &mut Meter,
     ) -> Result<(ArenaLayout, Vec<AllocaPlan>, Vec<InstId>), Error> {
         let body = self
@@ -1924,7 +1981,7 @@ impl Planner<'_> {
             .and_then(|f| f.body.as_ref())
             .ok_or_else(|| invariant("the entry function has no body"))?;
         let mut charged = 0;
-        let placed = self.place_allocas(body, room, &mut charged, m);
+        let placed = self.place_allocas(body, (room, device), &mut charged, m);
         m.release(charged);
         placed
     }
@@ -1932,7 +1989,7 @@ impl Planner<'_> {
     fn place_allocas(
         &self,
         body: &crate::air::ir::Body,
-        room: &mut u64,
+        (room, device): (&mut u64, bool),
         charged: &mut usize,
         m: &mut Meter,
     ) -> Result<(ArenaLayout, Vec<AllocaPlan>, Vec<InstId>), Error> {
@@ -1971,6 +2028,7 @@ impl Planner<'_> {
             let fragments = held.contains(&id);
             let typed_here = match shape {
                 Some(_) if fragments => true,
+                Some(_) if device && self.uses(Root::Alloca(id)).indexed => false,
                 Some((_, size, false)) => match room.checked_sub(size) {
                     Some(left) => {
                         *room = left;

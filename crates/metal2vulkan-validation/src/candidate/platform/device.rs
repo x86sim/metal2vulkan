@@ -1,13 +1,11 @@
 //! Vulkan device creation, enabled capabilities, and per-thread context lifetime.
 
 use super::enables::{self, Available, FeatureChain};
+use super::ignored_drivers::IgnoredDrivers;
 use super::loader_word::LoaderWord;
 use super::profiles::{
-    self, ActiveTool, ProfileRestriction, ProfilesLayer, ProfilesSettings, RestrictionError,
-    PROFILES_LAYER,
+    self, ProfileRestriction, ProfilesLayer, ProfilesSettings, RestrictionError, PROFILES_LAYER,
 };
-use crate::candidate::runtime_case::IgnoredDrivers;
-use crate::coverage::{ExecutionClass, Leg};
 use crate::gpu::wait::{self, SubmissionBackend};
 use crate::gpu::DeviceType;
 use ash::{vk, Device, Entry, Instance};
@@ -20,40 +18,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// What a row's environment records as its context's `layers`
-/// (`device_facts::RECORDED_LAYERS`). Every context runs under `VK_LAYER_KHRONOS_validation` with
-/// core and synchronization validation, and a message sink ([`VulkanContext::take_messages`])
-/// that fails the row: every engine candidate run and every L4 acceptance run. It enables the
-/// engine's list on top of the base list ([`enables::engine_list`]).
-pub(super) use crate::candidate::device_facts::RECORDED_LAYERS;
-
-/// The validation layer every engine run enables.
+/// The validation layer every context enables. Every context runs under it with core and
+/// synchronization validation, and a message sink ([`VulkanContext::take_messages`]) that fails
+/// the row of an L4 acceptance run. It enables the engine's list ([`enables::engine_list`]): what
+/// the runtime enables of the device.
 pub(super) const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-/// The robustness leg of every engine context this process opens: decided once, by
-/// [`run_robustness_off`] or by the first context opened without it.
-static LEG: OnceLock<Leg> = OnceLock::new();
-
-/// Run every engine context this process opens in the robustness-off leg (a command's
-/// `--robustness-off`): enable no robustness feature, so the product compiles the in-shader
-/// containment encodings. Call it once, before any device opens: the leg is decided once per
-/// process, and a context already opened in the stated leg refuses it.
-pub fn run_robustness_off() -> Result<(), String> {
-    LEG.set(Leg::RobustnessOff).map_err(|_| {
-        "the robustness leg is already decided: pass --robustness-off once, before any device \
-         opens"
-            .to_string()
-    })
-}
-
-/// The leg of every engine context this process opens ([`run_robustness_off`]); reading it
-/// decides that it is the stated leg if none was set.
-pub fn requested_leg() -> Leg {
-    *LEG.get_or_init(|| Leg::Stated)
-}
-
 /// Run `body` against this thread's Vulkan context for `device_type`, under the validation layer
-/// ([`RECORDED_LAYERS`]), creating the device on first use. One device of each type serves every
+/// (`device_facts::RECORDED_LAYERS`), creating the device on first use. One device of each type serves every
 /// call on the thread: device creation dominates the cost of a single case, and a corpus sweep
 /// makes thousands of calls. The layer must be installed: without it this fails, and nothing
 /// runs unvalidated.
@@ -289,90 +261,15 @@ fn device_selection_never_crosses_device_kinds() {
     assert!(select_physical_device(DeviceType::Cpu, old_cpu).is_err());
 }
 
-/// The commands that record the extended dynamic states: Vulkan 1.3's core entry points in a
-/// context at 1.3 or later, where the functionality is core without a feature (a profile of that
-/// version need not list the extension), else `VK_EXT_extended_dynamic_state`'s, where the context
-/// enabled it, with `VK_EXT_extended_dynamic_state2`'s primitive restart where it enabled that too.
-/// vk.xml aliases each command of the extensions to the core one, so the tables hold the same
-/// signatures.
-#[derive(Clone, Copy)]
-pub(super) struct ExtendedDynamicState {
-    pub(super) cull_mode: vk::PFN_vkCmdSetCullMode,
-    pub(super) front_face: vk::PFN_vkCmdSetFrontFace,
-    pub(super) primitive_topology: vk::PFN_vkCmdSetPrimitiveTopology,
-    pub(super) depth_test_enable: vk::PFN_vkCmdSetDepthTestEnable,
-    pub(super) depth_write_enable: vk::PFN_vkCmdSetDepthWriteEnable,
-    pub(super) depth_compare_op: vk::PFN_vkCmdSetDepthCompareOp,
-    pub(super) stencil_test_enable: vk::PFN_vkCmdSetStencilTestEnable,
-    pub(super) stencil_op: vk::PFN_vkCmdSetStencilOp,
-    /// Binds vertex buffers with their strides, for a pipeline whose strides are dynamic state
-    /// (`VERTEX_INPUT_BINDING_STRIDE`).
-    pub(super) bind_vertex_buffers2: vk::PFN_vkCmdBindVertexBuffers2,
-    /// `vkCmdSetPrimitiveRestartEnable`, Vulkan 1.3's core command or
-    /// `VK_EXT_extended_dynamic_state2`'s where the context enabled it, for a pipeline that makes
-    /// the topology and restart dynamic.
-    pub(super) primitive_restart_enable: Option<vk::PFN_vkCmdSetPrimitiveRestartEnable>,
-}
-
-impl ExtendedDynamicState {
-    /// Vulkan 1.3's commands, which `device` loaded when it was created.
-    fn core(device: &Device) -> ExtendedDynamicState {
-        let f = device.fp_v1_3();
-        ExtendedDynamicState {
-            cull_mode: f.cmd_set_cull_mode,
-            front_face: f.cmd_set_front_face,
-            primitive_topology: f.cmd_set_primitive_topology,
-            depth_test_enable: f.cmd_set_depth_test_enable,
-            depth_write_enable: f.cmd_set_depth_write_enable,
-            depth_compare_op: f.cmd_set_depth_compare_op,
-            stencil_test_enable: f.cmd_set_stencil_test_enable,
-            stencil_op: f.cmd_set_stencil_op,
-            bind_vertex_buffers2: f.cmd_bind_vertex_buffers2,
-            primitive_restart_enable: Some(f.cmd_set_primitive_restart_enable),
-        }
-    }
-
-    /// `VK_EXT_extended_dynamic_state`'s commands, from `extension`'s table, with
-    /// `VK_EXT_extended_dynamic_state2`'s restart from `second`'s where the context enabled it.
-    fn extension(
-        extension: &ash::ext::extended_dynamic_state::Device,
-        second: Option<&ash::ext::extended_dynamic_state2::Device>,
-    ) -> ExtendedDynamicState {
-        let f = extension.fp();
-        ExtendedDynamicState {
-            cull_mode: f.cmd_set_cull_mode_ext,
-            front_face: f.cmd_set_front_face_ext,
-            primitive_topology: f.cmd_set_primitive_topology_ext,
-            depth_test_enable: f.cmd_set_depth_test_enable_ext,
-            depth_write_enable: f.cmd_set_depth_write_enable_ext,
-            depth_compare_op: f.cmd_set_depth_compare_op_ext,
-            stencil_test_enable: f.cmd_set_stencil_test_enable_ext,
-            stencil_op: f.cmd_set_stencil_op_ext,
-            bind_vertex_buffers2: f.cmd_bind_vertex_buffers2_ext,
-            primitive_restart_enable: second.map(|s| s.fp().cmd_set_primitive_restart_enable_ext),
-        }
-    }
-}
-
 pub(super) struct VulkanContext {
     /// The backend every wait on this device reports in a hang record.
     pub(super) backend: SubmissionBackend,
     _entry: Entry,
     pub(super) instance: Instance,
     pub(super) device: Device,
-    /// The commands of the extended dynamic states, where the context has them
-    /// ([`ExtendedDynamicState`]): the render executor records a pipeline's extended dynamic
-    /// states through them.
-    pub(super) extended_dynamic_state: Option<ExtendedDynamicState>,
     pub(super) physical: vk::PhysicalDevice,
     pub(super) queue_family: u32,
     pub(super) queue: vk::Queue,
-    pub(super) sampler_anisotropy: bool,
-    shader_subgroup_extended_types: bool,
-    multisample_array_image: bool,
-    pub(super) max_sampler_anisotropy: f32,
-    pub(super) storage_buffer_alignment: u64,
-    pub(super) max_storage_buffer_range: u64,
     /// What this device enabled, in the engine's vocabulary.
     pub(super) enabled: EnableSet,
     /// The profile of this device as opened: its queried properties, limits, formats, and float
@@ -390,29 +287,12 @@ pub(super) struct VulkanContext {
     queried_description: Result<metal2vulkan::device::DeviceDescription, String>,
     /// The ICD's `VkPhysicalDeviceDriverProperties`, the backend identity of every row.
     pub(super) driver: DriverIdentity,
-    /// The class of the device that executes ([`ExecutionClass::of_description`] of its queried
-    /// identity): the device every census names, also under a restriction, whose description
-    /// ([`VulkanContext::opened_description`]) is P's and may name no device.
-    pub(super) execution_class: Option<ExecutionClass>,
-    /// The tools active on the device (`vkGetPhysicalDeviceToolPropertiesEXT`), recorded with
-    /// every row.
-    pub(super) tools: Vec<ActiveTool>,
     /// The committed profile `VK_LAYER_KHRONOS_profiles` restricts the device to, checked
     /// ([`profiles::check_restricted`]).
     pub(super) restriction: Option<&'static ProfileRestriction>,
-    /// The extensions the restricted context hides ([`ProfileRestriction::hidden`]; empty when
-    /// unrestricted).
-    hidden: BTreeSet<String>,
-    /// The robustness leg the context runs under ([`requested_leg`]).
-    pub(super) leg: Leg,
-    /// The robustness features the stated leg could not enable
+    /// The robustness features the context could not enable
     /// (`enables::Enables::unmet_robustness`): every run on the context is refused naming them.
     pub(super) unmet_robustness: BTreeSet<VkFeature>,
-    /// What the context can do with a sparse case texture.
-    pub(super) sparse_images: SparseImages,
-    /// Whether the context enabled `VK_EXT_device_generated_commands` with its
-    /// `deviceGeneratedCommands` ([`enables::enable_generated_commands`]).
-    pub(super) generated_commands: bool,
     /// What the runtime probe's context enabled beyond the engine's list
     /// ([`with_runtime_probe_context`]); `None` on every other context.
     pub(super) runtime_probe: Option<enables::RuntimeProbeExtensions>,
@@ -423,16 +303,6 @@ pub(super) struct VulkanContext {
     /// The loader's word at the start of [`VulkanContext::device`]'s handle, as `vkCreateDevice`
     /// left it, put back before every call the loader serves itself ([`LoaderWord`]).
     loader_word: LoaderWord,
-}
-
-/// What a context can do with a sparse case texture: the executor features it enabled
-/// (`sparseBinding`, `sparseResidencyImage2D`, `sparseResidencyImage3D`, each where the device
-/// supports it, on an engine context only), and whether its queue binds sparse memory.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct SparseImages {
-    pub(super) features: BTreeSet<enables::ExecutorFeature>,
-    /// The context's queue family has `VK_QUEUE_SPARSE_BINDING_BIT`.
-    pub(super) queue: bool,
 }
 
 /// Which Vulkan implementation a context opened: rows from different ICDs are different backends,
@@ -460,35 +330,99 @@ pub fn echo_validation_messages() {
 /// What the validation layer reported that fails a row: every `ERROR` message, and every
 /// `WARNING` of the validation type. Bounded so a flood cannot grow without limit. The loader's
 /// own reports, at `vkCreateInstance`, of the driver manifests it ignored are the host's listing
-/// of its drivers, not the run's work: they pass as the runtime lane's `Messages` passes them
-/// ([`MessageSink::take`]).
+/// of its drivers, not the run's work: they pass ([`MessageSink::take`]).
 ///
-/// But for one message about the driver: on a context whose opened profile takes
-/// `DriverDeviation::MetalVertexSimdgroups` ([`MessageSink::unadvertised_vertex`]), the layer's
-/// report of a vertex module's subgroup operations outside `subgroupSupportedStages`
-/// (`candidate/unadvertised_stage.rs`) fails nothing: the translation relies on the driver's
-/// measured answer there, as the module's requirements state. Nor does a driver diagnostic every
-/// pipeline making of the opened device is measured to report ([`MessageSink::making`]), nor, on a
-/// device whose driver runs the set layouts its support query refuses
+/// But for MoltenVK's own reports: a warning it is measured to report as it makes every pipeline
+/// of the opened device ([`MessageSink::making`]) fails nothing, nor, inside the call that makes
+/// it, its warning of a pipeline whose primitive restart is dynamic ([`expecting_diagnostics`]);
+/// and on a device whose driver runs the set layouts its support query refuses
 /// ([`MessageSink::unsupported_sets`]), the layer's report of such a layout
-/// (`candidate/unsupported_set.rs`).
+/// (`candidate/unsupported_set.rs`) fails nothing.
 pub(super) struct MessageSink {
     messages: Mutex<Vec<Recorded>>,
-    /// Whether the context's opened profile takes `DriverDeviation::MetalVertexSimdgroups`, set
-    /// once it is derived.
-    unadvertised_vertex: AtomicBool,
-    /// The diagnostics the opened device's driver facts measure every pipeline making to report,
-    /// whatever its state: its warning of each color attachment it cannot blend
-    /// (`DriverFact::BlendlessColorAttachmentsWarn`), for each format the device lists as a color
-    /// attachment without blending (`DeviceDescription::blendless_color_formats`). The driver
-    /// reports one only as it makes a render pipeline, naming the format, so a message of exactly
-    /// one of them fails no row; set once the opened description is known.
-    making: OnceLock<Vec<metal2vulkan::device::DriverDiagnostic>>,
+    /// The warnings MoltenVK reports as it makes every pipeline of the opened device, whatever its
+    /// state: one for each format the device lists as a color attachment without blending
+    /// ([`blendless_warnings`]). It names the format, so a message of exactly one of them fails no
+    /// row; set once the opened description is known, empty off MoltenVK.
+    making: OnceLock<Vec<DriverDiagnostic>>,
     /// Whether the opened device's driver runs the descriptor set layouts its
-    /// `vkGetDescriptorSetLayoutSupport` refuses, as the runtime makes them there
-    /// (`metal2vulkan_runtime::makes_layouts_past_support`: a heap's set 1 on MoltenVK), set once
-    /// the opened description is known.
+    /// `vkGetDescriptorSetLayoutSupport` refuses ([`makes_layouts_past_support`]: a heap's set 1
+    /// on MoltenVK), set once the opened description is known.
     unsupported_sets: AtomicBool,
+}
+
+/// A message MoltenVK reports through `VK_EXT_debug_utils` where Vulkan states nothing wrong, at
+/// `WARNING` severity as a `VALIDATION` message: the sink passes it only where it is expected
+/// ([`MessageSink::making`], [`expecting_diagnostics`]) and it matches every field exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DriverDiagnostic {
+    /// The message's id name.
+    pub(super) id_name: &'static str,
+    /// The message's id number.
+    pub(super) id: i32,
+    /// The message's text.
+    pub(super) text: String,
+}
+
+/// MoltenVK's id name for its own warnings.
+const MVK_WARN: &str = "mvk-warn";
+
+/// Whether the device `description` names runs MoltenVK.
+pub(super) fn runs_moltenvk(description: &DeviceDescription) -> bool {
+    description.driver_id == Some(metal2vulkan::vk::DriverId::MOLTENVK)
+}
+
+/// MoltenVK's warning of a pipeline whose primitive restart may be disabled, which MoltenVK 1.4.1
+/// reports inside `vkCreateGraphicsPipelines` where the pipeline makes `PRIMITIVE_RESTART_ENABLE`
+/// dynamic and draws a strip or a fan, or makes its topology dynamic too: Metal cannot disable
+/// restart.
+pub(super) fn restart_warning(
+    dynamic_states: &[metal2vulkan::vk::DynamicState],
+    topology: metal2vulkan::vk::PrimitiveTopology,
+) -> Option<DriverDiagnostic> {
+    use metal2vulkan::vk::{DynamicState as D, PrimitiveTopology as T};
+    let strip = matches!(
+        topology,
+        T::LINE_STRIP | T::TRIANGLE_STRIP | T::TRIANGLE_FAN
+    );
+    (dynamic_states.contains(&D::PRIMITIVE_RESTART_ENABLE)
+        && (strip || dynamic_states.contains(&D::PRIMITIVE_TOPOLOGY)))
+    .then(|| DriverDiagnostic {
+        id_name: MVK_WARN,
+        id: 0,
+        text: "VK_ERROR_FEATURE_NOT_PRESENT: Metal does not support disabling primitive restart."
+            .to_owned(),
+    })
+}
+
+/// MoltenVK's warnings of each format the device `description` lists as a color attachment of
+/// optimal tiling without `COLOR_ATTACHMENT_BLEND`, which MoltenVK 1.4.1 reports as it makes every
+/// pipeline, naming the format.
+fn blendless_warnings(description: &DeviceDescription) -> Vec<DriverDiagnostic> {
+    use metal2vulkan::vk::FormatFeatureFlags2 as F;
+    (description.formats.formats.iter())
+        .filter(|(_, p)| {
+            p.optimal_tiling.contains(F::COLOR_ATTACHMENT)
+                && !p.optimal_tiling.contains(F::COLOR_ATTACHMENT_BLEND)
+        })
+        .filter_map(|(format, _)| format.name())
+        .map(|name| DriverDiagnostic {
+            id_name: MVK_WARN,
+            id: 0,
+            text: format!(
+                "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format \
+                 {name}, which does not support it."
+            ),
+        })
+        .collect()
+}
+
+/// Whether the driver of the device `description` names runs a descriptor set layout its
+/// `vkGetDescriptorSetLayoutSupport` refuses: MoltenVK's, which runs a heap's set 1 its query
+/// refuses. The executor makes its own heap sets so there, and its sink passes the validation
+/// layer's report of such a layout ([`MessageSink::unsupported_sets`]).
+fn makes_layouts_past_support(description: &DeviceDescription) -> bool {
+    runs_moltenvk(description)
 }
 
 /// One message the sink kept: its id name and text, which tell the loader's reports apart
@@ -531,7 +465,7 @@ impl MessageSink {
 
     /// The lines kept since the last call, removed: all but the loader's own reports of the
     /// driver manifests it ignored (`IgnoredDrivers`), each printed as a line of its own
-    /// (`LOADER-DRIVER`), as the runtime lane's `Messages` passes them.
+    /// (`LOADER-DRIVER`).
     fn take(&self) -> Vec<String> {
         let recorded: Vec<Recorded> = {
             let mut messages = self.messages.lock().unwrap_or_else(|p| p.into_inner());
@@ -605,14 +539,6 @@ unsafe extern "system" fn record_validation_message(
                 .into_owned()
         }
     };
-    if sink.unadvertised_vertex.load(Ordering::Relaxed)
-        && crate::candidate::unadvertised_stage::shape(
-            &text(data.p_message_id_name),
-            &text(data.p_message),
-        )
-    {
-        return vk::FALSE;
-    }
     if sink.unsupported_sets.load(Ordering::Relaxed)
         && crate::candidate::unsupported_set::shape(
             &text(data.p_message_id_name),
@@ -642,19 +568,17 @@ unsafe extern "system" fn record_validation_message(
 }
 
 thread_local! {
-    /// The driver diagnostics the thread's current driver call is measured to report
+    /// The MoltenVK diagnostics the thread's current driver call is expected to report
     /// ([`expecting_diagnostics`]).
-    static EXPECTED_DIAGNOSTICS: RefCell<Vec<metal2vulkan::device::DriverDiagnostic>> =
-        const { RefCell::new(Vec::new()) };
+    static EXPECTED_DIAGNOSTICS: RefCell<Vec<DriverDiagnostic>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Run `call`, a driver call on this thread that the executing driver's facts measure to report
-/// `diagnostics` (`DriverFact::pipeline_creation_diagnostics`), withholding exactly those messages
-/// from the context's sink while it runs, as the runtime does (`runtime/src/driver_facts.rs`):
-/// the driver reports them from the calling thread inside the call, so a message reported on
+/// Run `call`, a driver call on this thread that MoltenVK is measured to report `diagnostics`
+/// in ([`restart_warning`]), withholding exactly those messages from the context's sink while it
+/// runs: the driver reports them from the calling thread inside the call, so a message reported on
 /// another thread, or after the call returns, still fails the row.
 pub(super) fn expecting_diagnostics<T>(
-    diagnostics: Vec<metal2vulkan::device::DriverDiagnostic>,
+    diagnostics: Vec<DriverDiagnostic>,
     call: impl FnOnce() -> T,
 ) -> T {
     if diagnostics.is_empty() {
@@ -672,7 +596,7 @@ pub(super) fn expecting_diagnostics<T>(
     call()
 }
 
-/// Whether the message is a diagnostic the thread's current driver call is measured to report
+/// Whether the message is a diagnostic the thread's current driver call is expected to report
 /// ([`expecting_diagnostics`]): a warning of the validation kind whose name, number and text are
 /// the diagnostic's exactly.
 fn withholds(
@@ -742,7 +666,6 @@ fn only_errors_and_validation_warnings_fail_a_row() {
     assert!(!fails_row(S::VERBOSE, T::VALIDATION));
     let sink = MessageSink {
         messages: Mutex::new(Vec::new()),
-        unadvertised_vertex: AtomicBool::new(false),
         making: OnceLock::new(),
         unsupported_sets: AtomicBool::new(false),
     };
@@ -762,7 +685,6 @@ fn only_errors_and_validation_warnings_fail_a_row() {
 fn the_loaders_reports_of_ignored_drivers_fail_no_row() {
     let sink = MessageSink {
         messages: Mutex::new(Vec::new()),
-        unadvertised_vertex: AtomicBool::new(false),
         making: OnceLock::new(),
         unsupported_sets: AtomicBool::new(false),
     };
@@ -782,24 +704,23 @@ fn the_loaders_reports_of_ignored_drivers_fail_no_row() {
     assert_eq!(kept, [format!("error VUID-test: {ignored}")]);
 }
 
-/// The executor's callback withholds a diagnostic the executing driver is measured to report
-/// (MoltenVK 1.4.1's warning of a pipeline whose restart is dynamic) inside the call that
-/// expects it alone: the same message outside it, from another thread while it runs, at another
-/// severity, or with another text fails the row, as the runtime's callback relays it.
+/// The executor's callback withholds MoltenVK's warning of a pipeline whose restart is dynamic
+/// inside the call that expects it alone: the same message outside it, from another thread while
+/// it runs, at another severity, or with another text fails the row.
 #[test]
-fn a_measured_diagnostic_fails_no_row_inside_its_call_alone() {
-    use metal2vulkan::device::DriverFact;
+fn an_expected_diagnostic_fails_no_row_inside_its_call_alone() {
     use metal2vulkan::vk::{DynamicState as D, PrimitiveTopology as P};
     use std::ffi::CString;
     use vk::DebugUtilsMessageSeverityFlagsEXT as S;
     use vk::DebugUtilsMessageTypeFlagsEXT as T;
-    let warning = DriverFact::DynamicRestartWarns
-        .pipeline_creation_diagnostics(&[D::PRIMITIVE_RESTART_ENABLE], P::TRIANGLE_STRIP, &[])
-        .pop()
+    let warning = restart_warning(&[D::PRIMITIVE_RESTART_ENABLE], P::TRIANGLE_STRIP)
         .expect("the warning of a dynamic restart");
+    assert_eq!(
+        restart_warning(&[D::PRIMITIVE_RESTART_ENABLE], P::TRIANGLE_LIST),
+        None
+    );
     let sink = MessageSink {
         messages: Mutex::new(Vec::new()),
-        unadvertised_vertex: AtomicBool::new(false),
         making: OnceLock::new(),
         unsupported_sets: AtomicBool::new(false),
     };
@@ -1114,7 +1035,7 @@ fn a_validated_instance_reports_every_repeated_message() {
     assert!(settings.is_empty());
 
     // Restricted: the profiles layer below the validation layer, configured with the file.
-    let restriction = ProfileRestriction::committed("vk12-floor").unwrap();
+    let restriction = ProfileRestriction::committed("runtime-floor").unwrap();
     let hidden: BTreeSet<String> = ["VK_EXT_shader_viewport_index_layer".to_owned()].into();
     let restrict = ProfilesSettings::new(ProfilesLayer::Restrict(&restriction, &hidden)).unwrap();
     let (extensions, layers, settings) = with_instance_create_info(
@@ -1161,7 +1082,7 @@ fn a_validated_instance_reports_every_repeated_message() {
                 string,
                 &[&restriction.file.to_string_lossy()]
             ),
-            profiles("profile_name", string, &["VP_M2V_vk12_floor"]),
+            profiles("profile_name", string, &["VP_M2V_runtime_floor"]),
             profiles(
                 "simulate_capabilities",
                 string,
@@ -1179,7 +1100,8 @@ fn a_validated_instance_reports_every_repeated_message() {
                 &["DEFAULT_FEATURE_VALUES_FALSE"]
             ),
             profiles("debug_fail_on_error", bool32, &["0"]),
-            profiles("debug_reports", string, &[]),
+            profiles("debug_actions", string, &["DEBUG_ACTION_FILE_BIT"]),
+            profiles("debug_filename", string, &["/dev/null"]),
             profiles("emulate_portability", bool32, &["0"]),
             profiles(
                 "exclude_device_extensions",
@@ -1251,11 +1173,7 @@ fn create_instance(
         // SAFETY: every pointer in `info` outlives the call. A validated context's layer provides
         // the extensions it enables through it (`require_validation_layer`), and so does the
         // profiles layer of a restricted context or a probe (`require_profiles_layer`).
-        let instance = unsafe { entry.create_instance(info, None) };
-        // A layer registered an exit handler as the call began: the runtime's, where a runtime
-        // device lives in this process (a lane's), registers again after it.
-        metal2vulkan_runtime::program_instance_made();
-        instance
+        unsafe { entry.create_instance(info, None) }
     })
 }
 
@@ -1312,233 +1230,6 @@ fn native_probe(
     described
 }
 
-/// A restriction the device cannot take: this process is restricted to a profile that states
-/// capabilities the device `device_type` selects, as it is, lacks. What a typed refusal of it
-/// records: the profile and the members, the device as the native probe describes it, and its
-/// identity as a context's environment records it.
-pub(super) struct RefusedRestriction {
-    pub(super) restriction: &'static ProfileRestriction,
-    pub(super) gaps: Vec<String>,
-    pub(super) native: DeviceDescription,
-    pub(super) identity: serde_json::Value,
-}
-
-/// The restricted context's first check ([`profiles::check_within`]), made before any context
-/// opens: `Some` when this process is restricted to a profile the device lacks capabilities of,
-/// `None` when it is unrestricted or the device takes the profile. A context makes the same check
-/// and fails without a record; an engine executor asks here first, so that the refusal is
-/// typed and recorded with the device's facts. Every other failure of the check is an error, as
-/// in the context.
-pub(super) fn refused_restriction(
-    device_type: DeviceType,
-) -> Result<Option<RefusedRestriction>, String> {
-    let Some(restriction) = profiles::current_restriction() else {
-        return Ok(None);
-    };
-    if device_type == DeviceType::Gpu {
-        crate::gpu::tripwire::refuse_if_tripped()?;
-    }
-    let entry = load_entry()?;
-    let available = unsafe { entry.enumerate_instance_extension_properties(None) }
-        .map_err(|error| format!("enumerate Vulkan instance extensions: {error}"))?;
-    let portability = available.iter().any(|extension| {
-        extension_name(&extension.extension_name) == ash::khr::portability_enumeration::NAME
-    });
-    require_profiles_layer(&entry)?;
-    let version = restriction.context_version();
-    let (native, identity) = native_probe(&entry, device_type, portability, version)?;
-    match profiles::check_within(restriction, &native, version) {
-        Ok(()) => Ok(None),
-        Err(RestrictionError::Exceeds { gaps, .. }) => Ok(Some(RefusedRestriction {
-            restriction,
-            gaps,
-            native,
-            identity,
-        })),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// This process's restriction as the runtime path opens its device under it: the restricted
-/// context's steps before its device, on the device `device_type` selects.
-pub(crate) enum Restricting {
-    /// The device takes P: what the runtime device's options and its second check need.
-    Takes(Box<RuntimeRestriction>),
-    /// The device lacks capabilities P states: the typed refusal, recorded as the executor's
-    /// context records it ([`restriction_refusal`](super::compute::restriction_refusal)).
-    Refused(Box<crate::candidate::engine::RunAttempt>),
-}
-
-/// What a runtime device restricted to P is made with: P, the device as it is (read through the
-/// layer with its emulation off, which the second check compares the layer's kept members with)
-/// and its identity, and the extensions the layer presents for P that P does not list, which it
-/// hides.
-pub(crate) struct RuntimeRestriction {
-    restriction: &'static ProfileRestriction,
-    native: DeviceDescription,
-    identity: serde_json::Value,
-    hidden: BTreeSet<String>,
-}
-
-/// The restricted context's steps before its device, for the runtime path's `executor`: `None`
-/// when this process runs unrestricted; else the first check ([`profiles::check_within`])
-/// decides between a typed refusal and a restriction the device takes, whose hidden extensions
-/// are read as a context reads them. Every other failure is an error, as in the context.
-pub(crate) fn runtime_restriction(
-    device_type: DeviceType,
-    executor: &str,
-) -> Result<Option<Restricting>, String> {
-    let Some(restriction) = profiles::current_restriction() else {
-        return Ok(None);
-    };
-    restricting(restriction, device_type, executor).map(Some)
-}
-
-/// [`runtime_restriction`]'s steps for `restriction`: the first check decides between a typed
-/// refusal, recorded as `executor`'s context records it, and a restriction the device takes.
-fn restricting(
-    restriction: &'static ProfileRestriction,
-    device_type: DeviceType,
-    executor: &str,
-) -> Result<Restricting, String> {
-    Ok(match first_check(restriction, device_type)? {
-        FirstCheck::Takes(restriction) => Restricting::Takes(restriction),
-        FirstCheck::Lacks(refused) => Restricting::Refused(Box::new(
-            super::compute::restriction_refusal(&refused, executor),
-        )),
-    })
-}
-
-/// The first check's ([`profiles::check_within`]) verdict on a restriction.
-enum FirstCheck {
-    /// The device takes P.
-    Takes(Box<RuntimeRestriction>),
-    /// The device lacks capabilities P states: what a typed refusal of it records.
-    Lacks(Box<RefusedRestriction>),
-}
-
-/// The restricted context's steps before its device for `restriction`, on the device
-/// `device_type` selects: the first check ([`profiles::check_within`]) decides between a refusal
-/// and a restriction the device takes, whose hidden extensions are read as a context reads them.
-/// Every other failure is an error, as in the context.
-fn first_check(
-    restriction: &'static ProfileRestriction,
-    device_type: DeviceType,
-) -> Result<FirstCheck, String> {
-    if device_type == DeviceType::Gpu {
-        crate::gpu::tripwire::refuse_if_tripped()?;
-    }
-    let entry = load_entry()?;
-    // SAFETY: a global command of a loaded entry.
-    let available = unsafe { entry.enumerate_instance_extension_properties(None) }
-        .map_err(|error| format!("enumerate Vulkan instance extensions: {error}"))?;
-    let portability = available.iter().any(|extension| {
-        extension_name(&extension.extension_name) == ash::khr::portability_enumeration::NAME
-    });
-    require_profiles_layer(&entry)?;
-    let version = restriction.context_version();
-    let (native, identity) = native_probe(&entry, device_type, portability, version)?;
-    match profiles::check_within(restriction, &native, version) {
-        Ok(()) => {}
-        Err(RestrictionError::Exceeds { gaps, .. }) => {
-            return Ok(FirstCheck::Lacks(Box::new(RefusedRestriction {
-                restriction,
-                gaps,
-                native,
-                identity,
-            })));
-        }
-        Err(error) => return Err(error.to_string()),
-    }
-    let presented = presented_extensions(&entry, device_type, portability, restriction)?;
-    let hidden = restriction.hidden(presented.iter().map(String::as_str));
-    Ok(FirstCheck::Takes(Box::new(RuntimeRestriction {
-        restriction,
-        native,
-        identity,
-        hidden,
-    })))
-}
-
-impl RuntimeRestriction {
-    /// The committed profile's stem.
-    pub(crate) fn stem(&self) -> &str {
-        &self.restriction.stem
-    }
-
-    /// `options` restricted to P as a restricted context's instance is: the profiles layer below
-    /// the validation layer (which `options` stacks first), configured with P and the hidden
-    /// extensions, and the instance at P's version ([`ProfileRestriction::context_version`]).
-    pub(crate) fn restrict(
-        &self,
-        options: &mut metal2vulkan_runtime::DeviceOptions,
-    ) -> Result<(), String> {
-        let settings =
-            ProfilesSettings::new(ProfilesLayer::Restrict(self.restriction, &self.hidden))?;
-        options.layers.push(PROFILES_LAYER.to_owned());
-        options.layer_settings.extend(settings.runtime_settings());
-        options.instance_api_version = Some(self.restriction.context_version());
-        Ok(())
-    }
-
-    /// What `executor`'s typed refusal of the restricted device itself, before it opened (a
-    /// device the runtime refuses at creation), records of the device as it is, with the
-    /// restriction it was made under (`compute::native_refused_on`, as a refusal of the
-    /// restriction records it).
-    pub(crate) fn refused_on(
-        &self,
-        executor: &str,
-    ) -> Result<crate::candidate::engine::RefusedOn, String> {
-        let layer = serde_json::json!({
-            "profile": self.restriction.stem,
-            "profile_name": self.restriction.profile_name,
-            "profile_sha256": self.restriction.sha256,
-            "hidden_extensions": self.hidden,
-        });
-        super::compute::native_refused_on(&self.native, &self.identity, executor, layer)
-    }
-
-    /// The restricted context's second check ([`profiles::check_restricted`]) on `device`,
-    /// opened with [`RuntimeRestriction::restrict`]'s options, read through its raw handles: the
-    /// layer active, its kept members the native device's, and every other member P's.
-    pub(crate) fn check(
-        &self,
-        device: &metal2vulkan_runtime::Device,
-    ) -> Result<crate::candidate::RestrictedDevice, String> {
-        let version = self.restriction.context_version();
-        // SAFETY: only physical-device queries of the device's own instance, created at P's
-        // version; nothing is created, destroyed, or submitted, and the handles are not kept.
-        let (tools, queried) = unsafe {
-            let handles = device.raw();
-            let tools =
-                profiles::active_tools(handles.entry, handles.instance, handles.physical_device)?;
-            let queried =
-                DeviceDescription::query(handles.instance, handles.physical_device, version)
-                    .map_err(|error| format!("query the restricted device: {error}"))?;
-            (tools, queried)
-        };
-        let translated =
-            profiles::check_restricted(self.restriction, &self.native, &tools, &queried, version)
-                .map_err(|error| error.to_string())?;
-        let record = serde_json::json!({
-            "tool": profiles::profiles_tool(&tools),
-            "profile": self.restriction.stem,
-            "profile_name": self.restriction.profile_name,
-            "profile_sha256": self.restriction.sha256,
-            "hidden_extensions": self.hidden,
-        });
-        let kept = profiles::differences(&translated, &queried)
-            .into_iter()
-            .map(|difference| difference.path)
-            .collect();
-        Ok(crate::candidate::RestrictedDevice {
-            translated,
-            kept,
-            record,
-        })
-    }
-}
-
 /// The device extensions the device `device_type` selects presents under `restriction`, read
 /// through an instance whose profiles layer restricts it and hides nothing, then destroyed: P's
 /// extensions and the ones the layer adds for P's version.
@@ -1571,26 +1262,10 @@ fn presented_extensions(
 }
 
 impl VulkanContext {
-    /// The runtime's driver facts of the driver that executes: its queried description's (the
-    /// device as it is, under a restriction too); none where the query failed.
-    pub(super) fn executing_driver_facts(&self) -> BTreeSet<metal2vulkan::device::DriverFact> {
-        self.queried_description
-            .as_ref()
-            .map(DeviceDescription::driver_facts)
-            .unwrap_or_default()
-    }
-
-    /// Whether the device replay's generated-commands executions are preprocessed apart, as the
-    /// runtime's are on the driver that executes (`generated_commands::preprocess_apart` of its
-    /// queried description, the device as it is, under a restriction too); also where the query
-    /// failed, since preprocessing apart runs right on every driver.
-    pub(super) fn preprocesses_generated_commands_apart(&self) -> bool {
-        match &self.queried_description {
-            Ok(description) => {
-                metal2vulkan_runtime::generated_commands::preprocess_apart(description)
-            }
-            Err(_) => true,
-        }
+    /// Whether the driver that executes is MoltenVK: its queried description's (false where the
+    /// query failed).
+    pub(super) fn executes_moltenvk(&self) -> bool {
+        self.queried_description.as_ref().is_ok_and(runs_moltenvk)
     }
 
     /// Open a device of `device_type` for `purpose`: the only Vulkan device creation in this crate,
@@ -1628,7 +1303,6 @@ impl VulkanContext {
         // the messenger's user pointer can never dangle, whatever path creation takes.
         let messages: &'static MessageSink = Box::leak(Box::new(MessageSink {
             messages: Mutex::new(Vec::new()),
-            unadvertised_vertex: AtomicBool::new(false),
             making: OnceLock::new(),
             unsupported_sets: AtomicBool::new(false),
         }));
@@ -1695,21 +1369,15 @@ impl VulkanContext {
         // SAFETY: `physical` was enumerated from `instance`, created at API `version`, and
         // `available` is what the device lists, at the version the instance and device share.
         let supported = unsafe { FeatureChain::query(&instance, physical, &available) };
-        // What the device supports, in the product's vocabulary: the engine's list is the
-        // product's recommendation for it, and the opened description is it restricted to what
-        // was enabled.
+        // What the device supports, in the product's vocabulary: the engine's list is what the
+        // runtime enables of it, and the opened description is it restricted to what was
+        // enabled.
         // SAFETY: `physical` was enumerated from `instance`, which was created with API
         // `version`, the version passed here; the query only calls physical-device entry points.
         let mut description = unsafe { DeviceDescription::query(&instance, physical, version) }
             .map_err(|error| format!("query the device: {error}"));
         // The device as it is, which a venue's run holds to the venue's profile.
         let queried_description = description.clone();
-        // The device that executes, from the queried identity: under a restriction the layer
-        // keeps it from the device, and `check_restricted` proves it the native device's.
-        let execution_class = description
-            .as_ref()
-            .ok()
-            .and_then(ExecutionClass::of_description);
         // A restricted context runs only where, through the layer, the device reports P: checked
         // before the device is created. It translates for P (`check_restricted`).
         if let (Some(restriction), Some(native)) = (restriction, &native) {
@@ -1733,20 +1401,12 @@ impl VulkanContext {
                 }
             }
         }
-        let leg = requested_leg();
         let mut enables = enables::engine_list(
-            enables::old_engine_list(&supported, &available),
             description.as_ref().map_err(Clone::clone)?,
             &supported,
             &available,
-            leg,
         )
         .map_err(|error| format!("the engine's enable list: {error}"))?;
-        // The device replay's generated-commands path: an engine context enables
-        // `VK_EXT_device_generated_commands` where its device supports it, unless this process runs
-        // without it.
-        let generated_commands = crate::candidate::requested_generated_commands()
-            && enables::enable_generated_commands(&mut enables, &supported, &available);
         // The runtime probe's own context enables what it measures.
         let runtime_probe = (purpose == Purpose::RuntimeProbe)
             .then(|| enables::enable_runtime_probe(&mut enables, &available));
@@ -1781,42 +1441,10 @@ impl VulkanContext {
             reason = "the loader word was recorded from the handle just returned"
         )]
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
-        let extended_dynamic_state = match enables::dynamic_state_commands(
-            enables.version,
-            enables
-                .extensions
-                .contains(ash::ext::extended_dynamic_state::NAME),
-        ) {
-            Some(enables::DynamicStateCommands::Core) => Some(ExtendedDynamicState::core(&device)),
-            Some(enables::DynamicStateCommands::Extension) => {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "the loader word was recorded from the handle just returned"
-                )]
-                let extension = ash::ext::extended_dynamic_state::Device::new(&instance, &device);
-                let second = if enables
-                    .extensions
-                    .contains(ash::ext::extended_dynamic_state2::NAME)
-                {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "the loader word was recorded from the handle just returned"
-                    )]
-                    let second = ash::ext::extended_dynamic_state2::Device::new(&instance, &device);
-                    Some(second)
-                } else {
-                    None
-                };
-                Some(ExtendedDynamicState::extension(&extension, second.as_ref()))
-            }
-            None => None,
-        };
         let mut driver_properties = vk::PhysicalDeviceDriverProperties::default();
         let mut properties =
             vk::PhysicalDeviceProperties2::default().push_next(&mut driver_properties);
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-        let limits = properties.properties.limits;
-        let max_sampler_anisotropy = limits.max_sampler_anisotropy;
         let driver = DriverIdentity {
             driver_id: driver_properties.driver_id.as_raw(),
             driver_name: extension_name(&driver_properties.driver_name)
@@ -1830,80 +1458,39 @@ impl VulkanContext {
         let opened_description = description
             .and_then(|description| crate::acceptance::opened_description(description, &enabled))
             .map(|mut description| {
-                // The description records what the context enabled: the generated-commands
-                // facts only where it enabled the extension.
-                if !generated_commands {
-                    description.generated_commands = None;
-                }
+                // The description records what the context enabled: no context enables
+                // `VK_EXT_device_generated_commands`, so it states no generated-commands facts.
+                description.generated_commands = None;
                 description
             });
         if let Ok(description) = &opened_description {
-            let blendless = description.blendless_color_formats();
-            let making = (description.driver_facts().into_iter())
-                .flat_map(|fact| {
-                    fact.pipeline_creation_diagnostics(
-                        &[],
-                        metal2vulkan::vk::PrimitiveTopology::TRIANGLE_LIST,
-                        &blendless,
-                    )
-                })
-                .collect();
+            let making = match runs_moltenvk(description) {
+                true => blendless_warnings(description),
+                false => Vec::new(),
+            };
             let _ = messages.making.set(making);
-            messages.unsupported_sets.store(
-                metal2vulkan_runtime::makes_layouts_past_support(description),
-                Ordering::Relaxed,
-            );
+            messages
+                .unsupported_sets
+                .store(makes_layouts_past_support(description), Ordering::Relaxed);
         }
         let opened = opened_description
             .clone()
             .and_then(crate::acceptance::derived_profile);
-        if opened.as_ref().is_ok_and(|profile| {
-            profile
-                .takes_driver_deviation(metal2vulkan::error::DriverDeviation::MetalVertexSimdgroups)
-        }) {
-            messages.unadvertised_vertex.store(true, Ordering::Relaxed);
-        }
-        let on = |value: vk::Bool32| value == vk::TRUE;
-        // The portability subset's `multisampleArrayImage`, recorded in the row environment
-        // (false where the device lists no subset).
-        let multisample_array_image = available.has(ash::khr::portability_subset::NAME)
-            && on(supported.portability_subset.multisample_array_image);
-        // SAFETY: `physical` belongs to the live instance.
-        let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
-        let sparse_images = SparseImages {
-            features: enables::executor_features(&enables),
-            queue: families
-                .get(queue_family as usize)
-                .is_some_and(|family| family.queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)),
-        };
         Ok(Self {
             backend: SubmissionBackend::vulkan(device_type),
             _entry: entry,
             instance,
             device,
-            extended_dynamic_state,
             physical,
             queue_family,
             queue,
-            sampler_anisotropy: on(enables.chain.core.sampler_anisotropy),
-            shader_subgroup_extended_types: on(supported.v12.shader_subgroup_extended_types),
-            multisample_array_image,
-            max_sampler_anisotropy,
-            storage_buffer_alignment: limits.min_storage_buffer_offset_alignment,
-            max_storage_buffer_range: u64::from(limits.max_storage_buffer_range),
             enabled,
             opened,
             opened_description,
             queried_description,
             driver,
-            execution_class,
-            tools,
             restriction,
-            hidden,
-            leg,
             unmet_robustness: enables.unmet_robustness,
-            sparse_images,
-            generated_commands,
             runtime_probe,
             messenger,
             messages,
@@ -1926,33 +1513,6 @@ impl VulkanContext {
             self.loader_word.restore();
             self.device.allocate_command_buffers(info)
         }
-    }
-
-    /// `VK_EXT_device_generated_commands`'s commands, loaded through the loader's
-    /// `vkGetDeviceProcAddr`, which reads the device's loader word ([`LoaderWord`]): the word is
-    /// put back first. `None` where the context did not enable the extension (or a command does not
-    /// load).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the one call site, after the loader word is put back"
-    )]
-    pub(super) fn generated_commands(
-        &self,
-    ) -> Option<metal2vulkan_runtime::generated_commands::Commands> {
-        if !self.generated_commands {
-            return None;
-        }
-        let handle = self.device.handle();
-        let load = |name: &CStr| {
-            // SAFETY: the device is live, its context is used by its own thread only, and the
-            // word is put back before each load.
-            unsafe {
-                self.loader_word.restore();
-                self.instance.get_device_proc_addr(handle, name.as_ptr())
-            }
-        };
-        // SAFETY: each name is the extension's command of this device, which enabled it.
-        unsafe { metal2vulkan_runtime::generated_commands::Commands::load(handle, load) }
     }
 
     /// `vkGetMemoryHostPointerPropertiesEXT` (`VK_EXT_external_memory_host`), loaded through the
@@ -1990,121 +1550,9 @@ impl VulkanContext {
         })
     }
 
-    /// `VK_KHR_acceleration_structure`'s commands, loaded through the loader's
-    /// `vkGetDeviceProcAddr`, which reads the device's loader word ([`LoaderWord`]): the word is
-    /// put back first. The commands work only where the context enabled the extension; otherwise
-    /// each loads as a stub that panics when called.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the one call site, after the loader word is put back"
-    )]
-    pub(super) fn acceleration_structure(&self) -> ash::khr::acceleration_structure::Device {
-        // SAFETY: the device is live, and its context is used by its own thread only.
-        unsafe { self.loader_word.restore() };
-        ash::khr::acceleration_structure::Device::new(&self.instance, &self.device)
-    }
-
     /// Everything the validation layer reported since the last call, and clear the sink.
     pub(super) fn take_messages(&self) -> Vec<String> {
         self.messages.take()
-    }
-
-    /// What the environment records of the robustness leg: the leg and the robustness features the
-    /// context enabled.
-    pub(super) fn robustness(&self) -> serde_json::Value {
-        serde_json::json!({
-            "leg": self.leg,
-            "enabled": crate::coverage::ROBUSTNESS_FEATURES
-                .iter()
-                .filter(|feature| self.enabled.features.contains(feature))
-                .map(|feature| format!("{feature:?}"))
-                .collect::<Vec<_>>(),
-            "unmet": self
-                .unmet_robustness
-                .iter()
-                .map(|feature| format!("{feature:?}"))
-                .collect::<Vec<_>>(),
-        })
-    }
-
-    /// What the environment records of the profiles layer: `null` unrestricted, else the layer's
-    /// tool as the device reports it and the committed profile it restricts to.
-    pub(super) fn profiles_layer(&self) -> serde_json::Value {
-        match self.restriction {
-            None => serde_json::Value::Null,
-            Some(restriction) => serde_json::json!({
-                "tool": profiles::profiles_tool(&self.tools),
-                "profile": restriction.stem,
-                "profile_name": restriction.profile_name,
-                "profile_sha256": restriction.sha256,
-                "hidden_extensions": self.hidden,
-            }),
-        }
-    }
-
-    pub(super) fn environment(&self) -> serde_json::Value {
-        let properties = unsafe { self.instance.get_physical_device_properties(self.physical) };
-        let device = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        serde_json::json!({
-            "device": device,
-            "device_id": properties.device_id,
-            "vendor_id": properties.vendor_id,
-            "driver_version": properties.driver_version,
-            "api_version": properties.api_version,
-            "shader_subgroup_extended_types": self.shader_subgroup_extended_types,
-            "multisample_array_image": self.multisample_array_image,
-            "sampler_anisotropy": self.sampler_anisotropy,
-            "max_sampler_anisotropy": self.max_sampler_anisotropy,
-            "storage_buffer_alignment": self.storage_buffer_alignment,
-            "max_storage_buffer_range": self.max_storage_buffer_range,
-            "architecture": std::env::consts::ARCH,
-            "os": std::env::consts::OS,
-            "tools": self.tools,
-        })
-    }
-
-    pub(super) fn memory_type(
-        &self,
-        bits: u32,
-        required: vk::MemoryPropertyFlags,
-    ) -> Result<u32, String> {
-        let properties = unsafe {
-            self.instance
-                .get_physical_device_memory_properties(self.physical)
-        };
-        (0..properties.memory_type_count)
-            .find(|index| {
-                bits & (1 << index) != 0
-                    && properties.memory_types[*index as usize]
-                        .property_flags
-                        .contains(required)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "no Vulkan memory type satisfies property flags {:#x}",
-                    required.as_raw()
-                )
-            })
-    }
-}
-
-impl VulkanContext {
-    /// Wait, under the hang protocol, for `fence` of a submission `operation` just made.
-    pub(super) fn wait_for_fence(&self, fence: vk::Fence, operation: &str) -> Result<(), String> {
-        wait::vulkan::wait_for_fence(&self.device, fence, self.backend, operation)
-    }
-
-    /// The device's viewport limits, which each region of a rate-mapped pass's plan must respect:
-    /// `maxViewportDimensions` and `viewportBoundsRange`.
-    pub(super) fn region_limits(&self) -> metal2vulkan::bind::RegionLimits {
-        // SAFETY: `physical` was enumerated from `instance`, which is live.
-        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
-        metal2vulkan::bind::RegionLimits::new(
-            limits.max_viewport_dimensions,
-            limits.viewport_bounds_range,
-        )
     }
 }
 
@@ -2354,13 +1802,11 @@ mod tests {
     }
 
     /// The loader's own entry points the context calls after a driver overwrote the loader's word
-    /// of the device still run. They are `vkAllocateCommandBuffers`, `vkGetDeviceProcAddr`
-    /// (`VK_KHR_acceleration_structure`'s commands, which load whether or not the extension is
-    /// enabled: an absent command loads as one that panics), and `vkDestroyDevice` when the context
-    /// drops. Without the context putting the word back, the loader reads `ICD_LOADER_MAGIC` as its
-    /// dispatch table and faults at `0x1cdc0de`. Our probe measured this at 9caf79a2, before
-    /// the `vkGetDeviceProcAddr` step was added: the test passed on lavapipe and on MoltenVK, and
-    /// on lavapipe a build without the allocation's and `Drop`'s restores failed it by `SIGSEGV`.
+    /// of the device still run. They are `vkAllocateCommandBuffers`, and `vkDestroyDevice` when the
+    /// context drops. Without the context putting the word back, the loader reads
+    /// `ICD_LOADER_MAGIC` as its dispatch table and faults at `0x1cdc0de`. Our probe measured this
+    /// at 9caf79a2: the test passed on lavapipe and on MoltenVK, and on lavapipe a build without the
+    /// allocation's and `Drop`'s restores failed it by `SIGSEGV`.
     /// Other drivers are expected to behave the same, since the context has no layer and no driver
     /// reads the word, so the overwrite reaches only the loader.
     #[test]
@@ -2379,9 +1825,6 @@ mod tests {
         assert_eq!(buffers.len(), 1);
         // SAFETY: nothing was recorded into or submitted from the pool's buffer.
         unsafe { context.device.destroy_command_pool(pool, None) };
-        overwrite_loader_word(&context);
-        let commands = context.acceleration_structure();
-        assert_eq!(commands.device(), context.device.handle());
         overwrite_loader_word(&context);
         drop(context);
     }

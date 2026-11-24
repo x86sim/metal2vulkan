@@ -570,7 +570,7 @@ pub fn define_divide(mb: &mut ModuleBuilder, d: Divide) -> BResult<FuncId> {
     else {
         return Err(BuildError::Type(TypeRule::FunctionSignature));
     };
-    let mut fb = mb.routine(ret)?;
+    let mut fb = mb.function(ret)?;
     let (a, b) = (fb.param(t)?, fb.param(t)?);
     let (x, y) = (split(&mut fb, a)?, split(&mut fb, b)?);
     let (q, r) = udivrem(&mut fb, d.lanes, x, y)?;
@@ -2138,7 +2138,7 @@ fn select_convert(
             .insert(crate::pipeline::artifact::PrecisionNote::Fp8Value);
         return Ok(ArithStrategy::Wide(WideOp::Convert {
             kind: ConvertKind::Fp8ToInt {
-                fp8: narrow::Fp8Layout::on(fmt, cx.profile),
+                fp8: narrow::Fp8Layout::of(fmt),
                 signed: c.dst_kind == NumKind::Signed,
             },
             from,

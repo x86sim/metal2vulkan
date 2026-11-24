@@ -15,27 +15,23 @@
 
 use std::sync::Arc;
 
-use crate::bind::{BindState, DrawCall};
-use crate::budget::{Budget, SPIRV_WORDS};
+use crate::budget::SPIRV_WORDS;
 use crate::device::requirements::VkFeature;
-use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
+use crate::device::{DevicePolicy, DeviceProfile};
 use crate::error::{Error, Feature};
-use crate::library::{FunctionArtifact, FunctionConstantValues, Library};
+use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
-use crate::pipeline::descriptor::{
-    FunctionDescriptor, RenderPipelineDescriptor, StageSource, TessellationDescriptor,
-};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::lower_inputs::LoweringInputs;
 use crate::pipeline::stage_io::StageBuiltin;
 use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
-    engine_dir, link_and_validate, llvm_assemble, meter, typed_module_with, AssembleError,
+    engine_dir, link_and_validate, llvm_assemble, meter, profile_without, typed_module_with,
+    AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::testing::committed_profiles;
-use crate::vk;
 
 const WIDE: &str = "draw_bases_in_a_vertex_function";
 const NARROW: &str = "narrow_draw_bases_in_a_vertex_function";
@@ -71,13 +67,24 @@ fn placed(a: &FunctionArtifact, f: PushField) -> bool {
 /// On every committed profile with `vertexPipelineStoresAndAtomics` (the fixture stores from its
 /// vertex functions), both vertex entries pass L3 and state the draw's bases as the binder must
 /// supply them: `BaseVertex` and `BaseInstance` (needing `shaderDrawParameters`) on a profile with
-/// it, the `BaseVertexInstance` push field on one without it; the runtime fact either way. A
-/// profile without the stores refuses the entries for them alone.
+/// it, the `BaseVertexInstance` push field on one without it (`runtime-floor` without it, below
+/// the runtime's floor); the runtime fact either way. A profile without the stores refuses the
+/// entries for them alone.
 #[test]
 fn vertex_entries_read_the_builtins_or_the_push_lanes() {
     let Some(bc) = fixture() else { return };
     let (mut builtins, mut pushed) = (0, 0);
-    for (stem, p) in committed_profiles().expect("committed profiles") {
+    let mut profiles = committed_profiles().expect("committed profiles");
+    profiles.push((
+        "runtime-floor without shaderDrawParameters".into(),
+        profile_without(
+            "runtime-floor",
+            &[VkFeature::ShaderDrawParameters],
+            DevicePolicy::RESIDENT_TABLES,
+        )
+        .expect("below the runtime's floor"),
+    ));
+    for (stem, p) in profiles {
         let draw = p.fields().draw_parameters;
         for entry in [WIDE, NARROW] {
             let what = format!("{stem} {entry}");
@@ -236,65 +243,4 @@ fn the_base_instance_after_tessellation_is_the_push_lane() {
         ran += 1;
     }
     assert!(ran > 0, "no profile has tessellationShader");
-}
-
-fn device(stem: &str) -> Device {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
-}
-
-/// A draw of patches from base instance 7 writes `[patch_start, 7]` into the evaluation stage's
-/// `BaseVertexInstance` lanes, so the post-tessellation function reads 7.
-#[test]
-fn a_draw_of_patches_pushes_its_base_instance() {
-    let Some(bc) = fixture() else { return };
-    let lib = Library::from_air(&bc).expect("library");
-    for stem in ["moltenvk-m3", "lavapipe", "lunarg-desktop-baseline-2023"] {
-        let dev = device(stem);
-        let mut d = RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(
-            lib.function(TESSELLATED).expect("function"),
-        )));
-        d.rasterization_enabled = false;
-        d.tessellation = Some(TessellationDescriptor::default());
-        let p = dev
-            .compile_render_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        // Without a factor buffer the zero buffer stands in: the patches are culled, and the
-        // push lanes are written all the same.
-        let state = BindState::default();
-        let plan = p.plan(&dev, &state.shape()).expect("plan");
-        let draw = DrawCall::Patches {
-            control_points: 3,
-            patch_start: 2,
-            patch_count: 5,
-            patch_index: None,
-            instance_count: 2,
-            base_instance: 7,
-            control_point_index: None,
-        };
-        let cmds = plan.instantiate_draw(&state, &draw).expect("draw");
-        let field = p
-            .interface
-            .push
-            .iter()
-            .filter(|pl| pl.stage == Stage::Vertex)
-            .flat_map(|pl| &pl.fields)
-            .find(|f| f.field == PushField::BaseVertexInstance)
-            .unwrap_or_else(|| panic!("{stem}: no BaseVertexInstance field"));
-        let PushLoc::Push { offset } = field.loc else {
-            panic!("{stem}: the field spilled: {:?}", field.loc);
-        };
-        let write = cmds
-            .push_constants
-            .iter()
-            .find(|w| w.stages == vk::ShaderStage::TESSELLATION_EVALUATION.flags())
-            .unwrap_or_else(|| panic!("{stem}: no evaluation push"));
-        let at = (offset - write.offset) as usize;
-        assert_eq!(words(&write.bytes[at..at + 8]), [2, 7], "{stem}: the lanes");
-        assert!(!cmds.indirect_needs_arguments, "{stem}");
-    }
 }

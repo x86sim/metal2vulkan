@@ -20,8 +20,8 @@
 //! (`lower::dispatch`, measured for the threadgroups the binder alone runs, up to 32x32).
 //!
 //! **Tile staging.** The tile's cells are the threadgroup arena's imageblock region: its extent is
-//! the tile size (`SpecKey::ImageblockWidth`/`Height`, which the binder specializes from
-//! `BindState::imageblock_size`), and a cell holds each attachment's texel at its layout's offset
+//! the tile size (`SpecKey::ImageblockWidth`/`Height`, which the consumer specializes from the
+//! pass's tile size), and a cell holds each attachment's texel at its layout's offset
 //! (`memory::plan`: the aliased layout's, or the implicit layout's). The entry is a new function
 //! ([`wrap_entry`]) that loads the tile's pixels of every attachment the function reaches into the
 //! cells (a cell past the render area, `SpecKey::RenderAreaWidth`/`Height`, is zeroed: Metal leaves
@@ -89,9 +89,8 @@
 //! is not aliased onto one. Metal keeps it in the tile memory a fragment function's
 //! `[[imageblock_data]]` is in, each pixel's same bytes, for the whole pass (measured on an M4,
 //! `runtime::fragment_imageblock`). Its cells are the pass's imageblock storage
-//! (`SyntheticBinding::Imageblock`, a fragment imageblock's `R32Uint` 2D-array storage image,
-//! layer `w` word `w` of pixel `(x, y)`'s cell at texel `(x, y)`, which covers every pixel of
-//! every tile): the entry stages each word of every cell of its tile from the storage into the
+//! (`SyntheticBinding::Imageblock`, an `R32Uint` 2D-array storage image, layer `w` word `w` of
+//! pixel `(x, y)`'s cell at texel `(x, y)`, which covers every pixel of every tile): the entry stages each word of every cell of its tile from the storage into the
 //! threadgroup cells before the function runs, and back after it where the function may write
 //! them, as it stages attachments, a cell past the render area too. The function records
 //! `RuntimeFact::TileImageblock`, its size and alignment, which the consumer matches against the
@@ -118,7 +117,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::air::abi::{ImageblockArg, ImageblockKind, ParamBinding, ParamRole};
 use crate::air::intrinsics::{Imageblock, PackDir, PackFormat};
 use crate::air::ir::{Call, Const, Value};
-use crate::device::profile::FloatFunctions;
 use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::error::{
     Attachment, Capability, DescriptorError, Error, Feature, MetalAnswer, RuntimeInput, Unsupported,
@@ -328,8 +326,8 @@ pub struct TilePlan {
 }
 
 /// A tile function's explicit imageblock that stands alone (`TilePlan::pass_cells`): the pass's
-/// imageblock storage, `SyntheticBinding::Imageblock`, which the pass's fragment functions'
-/// imageblocks are in, each cell's words staged into the tile's cells and back.
+/// imageblock storage, `SyntheticBinding::Imageblock`, each cell's words staged into the tile's
+/// cells and back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PassCells {
     /// The function reaches its cells: the staging loads them.
@@ -347,26 +345,6 @@ impl TilePlan {
     /// The pass's imageblock storage the staging loads, where the function reaches its cells.
     pub fn pass_cells(&self) -> Option<PassCells> {
         self.pass_cells.filter(|c| c.staged)
-    }
-
-    /// An upper estimate of the words the staging adds: two loops, two barriers, the call, and
-    /// per staged slot its image, a read, a guarded leaf store, and a leaf load and write; per
-    /// word of the pass's imageblock storage, a read, a word store, a word load and a write.
-    pub fn words_estimate(&self) -> u64 {
-        let pass = match self.pass_cells() {
-            Some(_) => 96 + 64 * u64::from(self.cell_bytes / 4),
-            None => 0,
-        };
-        let per: u64 = pass
-            + self
-                .staged()
-                .map(|s| 96 + 4 * u64::from(s.leaf.cost()))
-                .sum::<u64>();
-        if per == 0 {
-            0
-        } else {
-            256 + per
-        }
     }
 }
 
@@ -878,20 +856,9 @@ pub(super) fn select_texel(
     slot.staged = true;
     slot.stored |= store;
     let (offset, leaf) = (slot.offset, slot.leaf);
-    // The device's conversion, but a `float` one of a format `GLSL.std.450` names on a device
-    // whose `float` functions are Metal's (Metal's own `pack_float_to_*` and `unpack_*_to_float`,
-    // as `air.pack`'s strategy notes it); a `half` load rounds the unpacked `float` once more.
-    if let Some(n) = norm {
-        let dir = match store {
-            true => PackDir::Pack,
-            false => PackDir::Unpack,
-        };
-        let own = cx.profile.fields().float_functions == FloatFunctions::Metal
-            && (store || !n.half)
-            && pack::instruction(n.norm.format, dir).is_some();
-        if !own {
-            cx.precision.insert(PrecisionNote::DevicePackConversion);
-        }
+    // The device's conversion; a `half` load rounds the unpacked `float` once more.
+    if norm.is_some() {
+        cx.precision.insert(PrecisionNote::DevicePackConversion);
     }
     imageblock::place_region(cx, cell_bytes)?;
     let coord = imageblock::operand(cx, coord)?;
@@ -1046,9 +1013,7 @@ fn image_decl(s: &TileSlot) -> ImageDecl {
         level_views: None,
         extended: None,
         x_channel: false,
-        in_place: false,
-        planes_sampler: None,
-        rows: false,
+        parts: None,
     }
 }
 
@@ -1074,8 +1039,7 @@ pub fn declare(mb: &mut ModuleBuilder, access: &super::AccessPlan) -> BResult<Ti
             kind: ResourceKind::Synthetic(SyntheticBinding::TileMemory),
             index: 0,
         };
-        let view =
-            crate::memory::views::declare_at(mb, slot, crate::memory::views::ViewKind::Storage)?;
+        let view = crate::memory::views::declare_at(mb, slot)?;
         let u32_ = mb.ty(SType::Int {
             width: 32,
             signed: false,
@@ -1103,8 +1067,8 @@ pub fn declare(mb: &mut ModuleBuilder, access: &super::AccessPlan) -> BResult<Ti
         signed: false,
     })?;
     if plan.pass_cells().is_some() {
-        // The fragment functions' `R32Uint` 2D-array storage image (`lower::fragment::imageblock`):
-        // layer `w` is word `w` of every pixel's cell.
+        // The pass's `R32Uint` 2D-array storage image: layer `w` is word `w` of every pixel's
+        // cell.
         let ty = mb.ty(SType::Image(ImageType {
             sampled_type: u32_,
             dim: Dim::D2,
@@ -1538,9 +1502,7 @@ fn memory_pass<'c>(cx: &mut EmitCx<'c>, fb: &mut FunctionBuilder<'_>, pass: Pass
         let next = fb.binary(BinOp::IAdd, k, n)?;
         fb.store(counter, next, MemAccess::default())?;
         let at = fb.binary(BinOp::IAdd, base, k)?;
-        let Some(stored) = crate::memory::views::word_ptr(fb, view, at)? else {
-            return Err(cx.fail("a tile memory buffer that is not a storage view"));
-        };
+        let stored = crate::memory::views::word_ptr(fb, view, at)?;
         let mut mem = ArenaMem(arena, WordOps::of(coherence));
         match pass {
             Pass::Load => {

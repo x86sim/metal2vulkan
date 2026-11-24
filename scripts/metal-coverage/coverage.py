@@ -36,17 +36,20 @@ SIZES = ["S", "M", "L", "XL"]
 # call cannot answer wrongly (it does not exist); calls that exist and refuse are in
 # REFUSALS.md.
 ORDER = [
-    "labels", "cmdbuf", "queue", "passdesc", "library", "queries", "barriers", "reflection",
+    "labels", "cmdbuf", "queue", "passdesc", "library", "queries", "values", "buffers",
+    "pipelines", "render-pass", "encoder-calls", "barriers", "reflection",
     "function-handles", "functions", "archive", "events", "mesh-descriptor", "sparse",
     "parallel", "icb-depth-stencil", "depthbounds", "min-lod", "specialization",
-    "sparsebuf", "counters", "residency", "colormap", "viewpool", "logging", "notifications",
+    "sparsebuf", "sharing", "library-objects", "argument-encoders", "resource-state", "icb",
+    "function-tables", "rasterization", "mesh", "tile",
+    "counters", "residency", "colormap", "viewpool", "logging", "notifications",
     "compression", "capture", "persistent", "shadervalidation", "stitching", "io", "tensor",
     "mtl4", "ml", "access-counters",
 ]
 
 GROUP_NAMES = {
     "labels": "labels, debug groups and signposts",
-    "cmdbuf": "command buffer options (descriptor, unretained references, `enqueue`, encoder error status)",
+    "cmdbuf": "command buffer options (descriptor, retained references, encoder error status)",
     "queue": "command queue descriptor",
     "passdesc": "compute, blit and resource-state pass descriptors",
     "library": "libraries from a file path or URL",
@@ -81,6 +84,20 @@ GROUP_NAMES = {
     "mtl4": "Metal 4's command model",
     "ml": "machine learning encoding",
     "access-counters": "texture access counters (not scheduled)",
+    "values": "plain-value constructors (`MTLOriginMake` and the rest)",
+    "buffers": "a buffer made with bytes",
+    "pipelines": "pipeline creation forms (from a function, with a completion handler)",
+    "render-pass": "render pass descriptor fields",
+    "encoder-calls": "encoder calls (stride setters, indirect draws, store action options, a render encoder's heap uses)",
+    "sharing": "texture and event handles shared across processes",
+    "library-objects": "a function's options (`MTLFunctionOptions`)",
+    "argument-encoders": "argument encoders",
+    "resource-state": "the resource state encoder",
+    "icb": "indirect command buffers",
+    "function-tables": "function tables, function handles and dynamic libraries",
+    "rasterization": "rasterization rate maps",
+    "mesh": "mesh render pipelines and their encoder calls",
+    "tile": "tile render pipelines and their encoder calls",
 }
 
 
@@ -150,7 +167,9 @@ def render(table):
       "days, L: a week or more, XL: a new subsystem). A missing call cannot answer wrongly: a "
       "program that needs it does not build.")
     w("- **out of scope**: ray tracing, multi-GPU and macOS-only services, IOSurface, drawables "
-      "and source compiles, which the consumer owns, and items macOS does not offer.")
+      "and source compiles, which the consumer owns, what the runtime's README gives its "
+      "consumer (labels, heaps, binary archives, a resource's options), and items macOS does "
+      "not offer.")
     w("")
     w("## Totals")
     w("")

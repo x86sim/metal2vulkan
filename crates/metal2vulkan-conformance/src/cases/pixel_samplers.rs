@@ -4,29 +4,24 @@
 //! 800 coordinates in and past it (`grid`: per integer from -1 to 6 the texel edge and one ulp
 //! either side, `i + 1/512`, the quarter, the centre and one ulp either side, three quarters and
 //! `255/256`, across ten rows from -0.5 to 3.25). Each case is one format, one filter and one
-//! address mode, and holds a site per **source** — the four ways the lane sweeps:
+//! address mode, and holds a site per **source**, four of them:
 //!
 //! - `slot`: the texture at texture slot 0, through a runtime sampler state of pixel coordinates
 //!   at sampler slot 0 (the owned fixture `xr_samples`' `xr_sample_runtime`);
 //! - `arg`: the texture and that same pixel state inside an argument buffer (the owned fixture
 //!   `px_samplers`' `px_sample_argument`);
 //! - `norm`: the same argument buffer holding a **normalized** state of the same filter and mode,
-//!   sampled at the coordinate divided by the size — the control the lane compares against;
+//!   sampled at the coordinate divided by the size — the control the others compare against;
 //! - `const`: the texture at slot 0 through the fixture's constexpr `coord::pixel` sampler of that
 //!   filter and mode, where MSL can state it (not mirror clamp to edge, which it cannot).
 //!
-//! **What the port changes.** `runtime_lane::pixel_samplers` holds these sixty answers as sixty
-//! SHA-256 constants taken on an Apple M4, and compares a digest; on a difference it prints the
-//! cells that differ from the device's own `norm` control, which is a device-against-device check,
-//! not a check against Metal. Worse, the lane's AIR is an inline `&str` in the opaque-pointer
-//! dialect, which `xcrun metal-as` does not read, so the lane could have no Metal leg at all. The
-//! owned fixture `px_samplers` is the two shapes it needed, and record mode now runs all sixty
+//! The owned fixture `px_samplers` holds the two shapes, and record mode runs all sixty
 //! configurations on native Metal and keeps every one of the 800 results of each, so a comparison
 //! names the coordinate and the lane rather than saying a hash moved.
 //!
 //! The digest stays beside each value as a projection of it, which is what lets the module's own
-//! `the_recorded_digests_are_the_lanes_m4_answers` hold the recorded M3 answers against the lane's
-//! M4 constants: same question, two chips.
+//! `the_recorded_digests_are_the_m4_answers` hold the recorded M3 answers against the digests an
+//! Apple M4 answered: same question, two chips.
 //!
 //! **What may differ, and what justifies it.** A `const` site hands the device's unnormalized
 //! sampler the coordinate itself, and a nearest `slot` or `arg` site hands the device's normalized
@@ -34,10 +29,10 @@
 //! `slot` or `arg` site hands it the coordinate divided by the size, which the device's sampler
 //! reads in its own arithmetic: at a sub-texel step it may read the neighbouring step, which the
 //! runtime announces on every device (`pixel-sampler-scaling`, and
-//! `argument-pixel-sampler-scaling` for `arg`). A device that converts an 8-bit texel to a float
-//! its own way announces `float-sample-filter`.
+//! `argument-pixel-sampler-scaling` for `arg`). The `slot` site announces it under a nearest
+//! state too, as the function does not know the bound state.
 //! Each notice is declared at the notices site alone, so a texel that differs still fails the case
-//! where it differs, and is a `known-gaps.tsv` row naming the note.
+//! where it differs, and is a `known-gaps-rt.tsv` row naming the note.
 //!
 //! **Subnormal coordinates.** Four more cases (`pixel-samplers-subnormal-*`, [`subnormals`]) ask
 //! the same four sources of the `RGBA8Unorm` texture, through a nearest filter under each address
@@ -56,6 +51,7 @@ use crate::case::{
     made, Abort, ArgumentSlot, Bindings, Case, Failure, Handle, Input, MetalSource, SamplerSpec,
     Side, TextureRole, TextureSpec,
 };
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::replay::notice_allowance;
@@ -63,7 +59,6 @@ use crate::transcript::{ByteLayout, Digest, Element, Gaps, Node, Observed, Regio
 use metal2vulkan::metal::{
     PixelFormat, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
 };
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture whose kernel samples a texture slot through the runtime sampler at slot 0.
 const SLOT_FIXTURE: &str = "xr_samples";
@@ -78,7 +73,7 @@ const PIXEL_FIXTURE: &str = "px_samplers";
 /// Its argument-buffer kernel.
 const ARGUMENT_ENTRY: &str = "px_sample_argument";
 
-/// The texture's size: neither side a power of two, as the lane's is.
+/// The texture's size: neither side a power of two.
 const WIDTH: u32 = 5;
 const HEIGHT: u32 = 3;
 
@@ -238,7 +233,7 @@ fn layout_of(samples: usize) -> ByteLayout {
     }
 }
 
-/// An address mode the cases sweep: the lane's name for it, the mode, and the constexpr kernel of
+/// An address mode the cases sweep: its name, the mode, and the constexpr kernel of
 /// that mode, where MSL can state one.
 ///
 /// A constexpr sampler states clamp to zero and clamp to the border as one addressing mode under
@@ -249,7 +244,7 @@ struct Address {
     constexpr_entries: Option<[&'static str; 2]>,
 }
 
-/// The four address modes, in the lane's order.
+/// The four address modes, in order.
 const ADDRESSES: [Address; 4] = [
     Address {
         mode: SamplerAddressMode::ClampToEdge,
@@ -292,7 +287,7 @@ const NAMES: [&str; 16] = [
 ];
 
 /// The site an argument buffer's pixel sampler answers at, and the site its normalized control
-/// answers at: the two a device without Metal's own sampler may differ at.
+/// answers at: the two a device's own sampler may differ at.
 const ARGUMENT_SITE: &str = "arg";
 const CONTROL_SITE: &str = "norm";
 
@@ -315,7 +310,7 @@ pub struct PixelSamplers {
     subnormal: bool,
 }
 
-/// Every pairing of format, filter and address mode, as the lane sweeps them.
+/// Every pairing of format, filter and address mode.
 pub fn all() -> Vec<PixelSamplers> {
     let mut cases = Vec::new();
     let mut names = NAMES.iter();
@@ -533,32 +528,22 @@ impl Case for PixelSamplers {
 
     fn allowances(&self) -> Vec<Allowance> {
         // Metal announces nothing, so a notice of ours is a difference at the notices site.
-        // Every venue hands a linear `slot` site's sampler the pixel coordinate divided by the
-        // size (`pixel-sampler-scaling`); a nearest one reads its texel's centre and announces
-        // nothing. The `arg` site's state is unknown where the shader is made, so it announces
-        // `argument-pixel-sampler-scaling` whatever its filter. A venue that announces another
-        // kind reads as divergent at that site until whoever adds the venue names it with a run
-        // behind it. The device's own conversion of a texel, its filter and its sRGB decode are
-        // native notes the suite declares for every case (`crate::replay::NATIVE_NOTES`).
+        // The `slot` site's state is the bound one, which the function does not know, so it
+        // announces `pixel-sampler-scaling` whatever its filter, nearest included
+        // (`crate::replay::pixel_sampler_scaling_notice` holds why); measured through the rt side
+        // on lavapipe (Mesa 26.2.4), every nearest case announced it. The `arg` site's state is
+        // unknown where the shader is made too, so it announces `argument-pixel-sampler-scaling`
+        // whatever its filter. A venue that announces another kind reads as divergent at that site
+        // until whoever adds the venue names it with a run behind it. The device's own conversion
+        // of a texel, its filter and its sRGB decode are native notes the suite declares for every
+        // case (`crate::replay::NATIVE_NOTES`).
         //
         // **Each is a declaration and loosens nothing.** Each sits at the notices site alone, so
         // a texel that differs still fails the case wherever it differs.
-        let scaled = (self.filter == SamplerMinMagFilter::Linear)
-            .then(|| notice_allowance(Degradation::PixelSamplerScaling.code()));
-        scaled
-            .into_iter()
-            .chain([
-                notice_allowance(Degradation::ArgumentPixelSamplerScaling.code()),
-                // The buffer each pass writes its sampled texels into is `Shared`
-                // ([`crate::replay::shared_memory_notice`]).
-                crate::replay::shared_memory_notice(),
-                // The `arg` source samples a texture and a sampler held in an argument buffer, whose
-                // heap set MoltenVK's layout query refuses
-                // ([`crate::replay::set_past_layout_notice`]): announced by all 16 cases of the family
-                // on the M3 Max under MoltenVK 1.4.2, by none on lavapipe.
-                crate::replay::set_past_layout_notice(),
-            ])
-            .collect()
+        vec![
+            crate::replay::pixel_sampler_scaling_notice(),
+            notice_allowance(Degradation::ArgumentPixelSamplerScaling.code()),
+        ]
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
@@ -716,8 +701,8 @@ mod tests {
     /// The coordinates each subnormal case samples at ([`subnormal_grid`]).
     const SUBNORMAL_SAMPLES: usize = 16;
 
-    /// What an Apple M4 answered for each configuration, as `runtime_lane::pixel_samplers`' own
-    /// probe measured it (macOS 27.0.1, two processes, identical): the case, the source, and the
+    /// What an Apple M4 answered for each configuration (macOS 27.0.1, two processes, identical):
+    /// the case, the source, and the
     /// SHA-256 of its 800 `float4` results. Our own measurement over our own inputs, carried here
     /// so the recorded M3 answers can be held against it.
     const M4: [(&str, &str, &str); 60] = [
@@ -1023,12 +1008,12 @@ mod tests {
         ),
     ];
 
-    /// The SHA-256 of the lane's coordinates, `x` then `y` little-endian: the constant
-    /// `pixel_samplers::GRID_SHA` pins, so the case asks Metal the lane's question.
+    /// The SHA-256 of the coordinates, `x` then `y` little-endian, so the case asks Metal the
+    /// question the M4's digests answer.
     const GRID_SHA: &str = "10064f01ccb480a13ee9b0853ba41bbc5e2dfa3d490ffaef9cbcc987f75249b9";
 
     #[test]
-    fn the_coordinates_are_the_lanes() {
+    fn the_coordinates_hash_to_grid_sha() {
         let grid = grid();
         assert_eq!(grid.len(), SAMPLES);
         let bytes: Vec<u8> = grid
@@ -1081,7 +1066,7 @@ mod tests {
         format!("case/output/{source}")
     }
 
-    /// The lane's name for a format and for a filter, as the case names spell them.
+    /// The name of a format and of a filter, as the case names spell them.
     fn format_name(format: PixelFormat) -> &'static str {
         match format {
             PixelFormat::RGBA8Unorm => "rgba8",
@@ -1096,7 +1081,7 @@ mod tests {
         }
     }
 
-    /// The lane's name for an address mode.
+    /// The name of an address mode.
     fn address_name(mode: SamplerAddressMode) -> &'static str {
         match mode {
             SamplerAddressMode::ClampToEdge => "edge",
@@ -1163,8 +1148,8 @@ mod tests {
             }
         }
         assert_eq!(with_constexpr, 12);
-        // Sixty configurations in all, which is the lane's sweep: four sources where a constexpr
-        // sampler exists, three where it does not.
+        // Sixty configurations in all: four sources where a constexpr sampler exists, three where
+        // it does not.
         let configurations: usize = cases
             .iter()
             .map(|case| 3 + usize::from(case.constexpr_entry().is_some()))
@@ -1197,12 +1182,12 @@ mod tests {
         }
     }
 
-    /// The recorded M3 answers are the lane's M4 ones, digest for digest: the same sixty
+    /// The recorded M3 answers are an Apple M4's, digest for digest: the same sixty
     /// configurations, the same 800 coordinates, two chips. A difference here is a finding — the
-    /// chips disagree, or the fixture no longer asks the lane's question — and the comparison that
+    /// chips disagree, or the fixture no longer asks the M4's question — and the comparison that
     /// matters is the suite's own, against the recording, not against this table.
     #[test]
-    fn the_recorded_digests_are_the_lanes_m4_answers() {
+    fn the_recorded_digests_are_the_m4_answers() {
         let mut checked = 0;
         for case in all() {
             let recording = crate::recording::read(case.name())
@@ -1230,7 +1215,7 @@ mod tests {
                 assert_eq!(
                     digest.hex,
                     m4,
-                    "{} {source}: this M3 Max and the lane's M4 disagree",
+                    "{} {source}: this M3 Max and the M4 disagree",
                     case.name()
                 );
                 checked += 1;

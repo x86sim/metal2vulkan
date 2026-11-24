@@ -1,62 +1,66 @@
 //! Simdgroups emulated through workgroup memory.
 //!
 //! A kernel whose device cannot run a 32-lane simdgroup on subgroups (`lavapipe` cannot pin 32
-//! lanes; `vk12-floor` has no subgroup operations) is planned in the `Emulated` tier: simdgroup
+//! lanes, nor `roadmap-2022`, whose subgroups are 4 lanes; `vk12-floor` has no subgroup
+//! operations) is planned in the `Emulated` tier: simdgroup
 //! `k` is the linear threads `[32k, 32k + 32)`, and every operation that reads other lanes
-//! publishes through a workgroup scratch between workgroup barriers. The owned fixtures
+//! publishes through a workgroup scratch between workgroup barriers. A kernel whose every
+//! cross-lane operation stays inside its quad takes lavapipe's 8-lane subgroups instead
+//! (`SimdPlan::quad_free`); it is checked here on its emulated-simdgroups variant, which a
+//! dispatch whose threadgroup is not a multiple of 8 runs. The owned fixtures
 //! `engine/simd_uniform` and the workgroup-uniform kernels of `engine/simd_ops` go
 //! through the whole pipeline, pass L3 (`spirv-val` under each profile), and run on the CPU
 //! interpreter at 8, 16, 32, and 64 subgroup lanes in both scheduling orders. Every kernel's
 //! output is checked against an expectation derived from the thread index and the threadgroup
-//! size, including threadgroups whose last simdgroup or quad is partially occupied (a source lane
-//! outside the threadgroup reads zero bits, Metal's answer; `engine_simd_past_n` checks its
-//! readings). An operation outside workgroup-uniform control flow runs predicated: `engine/
+//! size, including threadgroups whose last simdgroup or quad is partially occupied, where a word
+//! read from a source lane outside the threadgroup is not promised (a thread reads only from an
+//! active thread, MSL 4.1 section 6.10.2), so the expectation gives none and only the run is
+//! checked. An operation outside workgroup-uniform control flow runs predicated: `engine/
 //! simd_divergent`, the divergent kernels of `simd_ops`, `a3_quad_votes_divergent`, and
 //! `a3_multi_level_break_tail` check that exactly the lanes that execute an operation take part in
 //! it, after early returns, in branch arms, in loops with per-thread trip counts, breaks,
 //! continues, and returns, and in the tail of a two-level break. A matrix multiply-add in a
-//! divergent block reads the cells of a lane that is not live as zero, Metal's answer
-//! (`engine_simd_partly_live` checks its readings), and a kernel whose threadgroup memory and
+//! divergent block compiles on every emulating profile (`engine_simd_partly_live` runs it), and a
+//! kernel whose threadgroup memory and
 //! scratch exceed `maxComputeSharedMemorySize` as `ThreadgroupMemorySize`, at compile or at plan
 //! time. On a profile whose kernels run their simdgroups on whole subgroups (`moltenvk-m3`), a
 //! dispatch with a partial simdgroup asks for the kernel's emulated-simdgroups variant, which gives
 //! the same reading at 1 to 32 threads. Every run takes Vulkan's barrier rule
 //! (`BarrierRule::Vulkan`): an invocation that returned while others wait at a workgroup barrier
-//! traps. No GPU is used.
+//! traps. Under the identity domains every one of those kernels gives the same readings, with one
+//! scratch region and as many barriers as under the resident-table domains. No GPU is used.
 //!
 //! `llvm-as` assembles the fixtures; a missing tool skips visibly.
 
 use std::collections::BTreeMap;
 
-use crate::bind::{BindState, BoundBuffer, Dispatch, StageTable};
 use crate::budget::Budget;
 use crate::cache::VariantKey;
-use crate::device::profile::DeviceProfile;
+use crate::device::profile::{DeviceProfile, HandleDomain, PointerDomain};
 use crate::device::subgroup::{OpBits, SimdClass, SubgroupRequirement, Tier};
 use crate::device::{Device, DeviceDescription, DevicePolicy};
-use crate::error::{BindError, Error, Feature};
+use crate::error::{Error, Feature};
 use crate::library::Library;
-use crate::lower::dispatch::LocalSizeForm;
+use crate::lower::dispatch::{region_bytes, LocalSizeForm};
 use crate::lower::select::Plan;
 use crate::pipeline::facts::{Mechanism, RuntimeFact};
 use crate::pipeline::interface::PushLoc;
 
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
-    compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
+    compile, compile_with, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
     typed_module_with, AssembleError, Scratch,
 };
 use crate::pipeline::{
-    ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor, LoweringInputs, Reconvergence,
-    StageSource,
+    ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor, LoweringInputs, PrecisionNote,
+    Reconvergence, StageSource,
 };
 use crate::spirv::interp::{run, BarrierRule, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::spirv_dis;
-use crate::vk;
 
 /// The committed profiles whose kernels' simdgroups are emulated.
-const PROFILES: [&str; 2] = ["lavapipe", "vk12-floor"];
+const PROFILES: [&str; 2] = ["lavapipe", "runtime-floor"];
 
 const WIDTHS: [SubgroupSize; 4] = [
     SubgroupSize::W8,
@@ -101,9 +105,24 @@ fn assemble_text(tag: &str, text: &str) -> Option<Vec<u8>> {
     assemble_file(&path, tag)
 }
 
+/// The policy of the identity domains: the guest's own addresses and handles.
+fn identity() -> DevicePolicy {
+    DevicePolicy {
+        pointer_domain: PointerDomain::Identity,
+        handle_domain: HandleDomain::Identity,
+        ..DevicePolicy::RESIDENT_TABLES
+    }
+}
+
+/// The device address of buffer `index` under the identity domains.
+fn guest_base(index: u32) -> u64 {
+    (u64::from(index) + 1) << 32
+}
+
 /// Every word of buffer 0 after one workgroup of local size `local` ran `m` (planned as `plan`)
 /// with `lanes`-wide subgroups, identical in both scheduling orders. Buffer 1, when the kernel
-/// binds it, holds `constant`.
+/// binds it, holds `constant`. Under the identity domains each buffer is at its
+/// [`guest_base`], which the push block carries.
 fn run_all(
     plan: &Plan,
     m: &TypedModule,
@@ -112,37 +131,54 @@ fn run_all(
     constant: Option<u32>,
 ) -> Vec<u32> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
+    spec.extend(crate::pipeline::threadgroup_constants(local));
     let n: u32 = local.iter().product();
-    let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
+    let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
+    let mut addressed = false;
     for f in &plan.push.fields {
-        assert!(matches!(f.loc, PushLoc::Push { .. }), "{f:?}");
-        // Zero residuals: each buffer is bound at its start.
-        assert!(
-            matches!(f.field, PushField::SlotBindOffset(_)),
-            "unexpected push field {f:?}"
-        );
+        let PushLoc::Push { offset } = f.loc else {
+            panic!("{f:?} spilled");
+        };
+        let o = offset as usize;
+        match f.field {
+            // Zero residuals: each buffer is bound at its start.
+            PushField::SlotBindOffset(_) => {}
+            PushField::SlotGuestBase(s) => {
+                let word = match plan.families.access.identity {
+                    true => super::engine_word_phases::slot_word(guest_base(s.index)),
+                    false => guest_base(s.index),
+                };
+                push[o..o + 8].copy_from_slice(&word.to_le_bytes());
+                addressed = true;
+            }
+            // The output's word per thread, and the constant's one word.
+            PushField::SlotBounds(s) => {
+                let bytes = [n as usize * 4, 4][s.index as usize];
+                let word = super::engine_word_phases::bounds_word(bytes, 0);
+                push[o..o + 8].copy_from_slice(&word);
+            }
+            PushField::ZeroAddress => {
+                let word = super::engine_word_phases::ZERO_UNMAPPED;
+                push[o..o + 8].copy_from_slice(&word.to_le_bytes());
+            }
+            PushField::DispatchRegion => {
+                push[o..o + 32].copy_from_slice(&region_bytes([0; 3], local, local).expect("packs"))
+            }
+            _ => panic!("unexpected push field {f:?}"),
+        }
     }
-    let slot = |index| {
-        Some(ResourceSlot {
+    let buffer = |index, bytes| Buffer {
+        slot: (!addressed).then_some(ResourceSlot {
             stage: Stage::Kernel,
             kind: ResourceKind::Buffer,
             index,
-        })
+        }),
+        address: addressed.then(|| guest_base(index)),
+        bytes,
     };
-    let mut buffers = vec![Buffer {
-        slot: slot(0),
-        address: None,
-        bytes: vec![0; n as usize * 4],
-    }];
+    let mut buffers = vec![buffer(0, vec![0; n as usize * 4])];
     if let Some(c) = constant {
-        buffers.push(Buffer {
-            slot: slot(1),
-            address: None,
-            bytes: c.to_le_bytes().to_vec(),
-        });
+        buffers.push(buffer(1, c.to_le_bytes().to_vec()));
     }
     let res = Resources {
         buffers,
@@ -206,29 +242,25 @@ impl Group {
         (t & !3)..((t & !3) + 4).min(self.n)
     }
 
-    /// Source thread `src` when it is inside the threadgroup.
+    /// Source thread `src` when it is inside the threadgroup: the thread index a shuffle reads
+    /// from it. Past the thread count the read is not promised (`None`).
     fn get(self, src: u32) -> Option<u32> {
         (src < self.n).then_some(src)
-    }
-
-    /// The thread index `src` holds, as a shuffle reads it: zero bits past the threadgroup's
-    /// thread count, Metal's answer.
-    fn read(self, src: u32) -> u32 {
-        self.get(src).unwrap_or(0)
     }
 }
 
 /// The expected `out[t]` of each workgroup-uniform kernel of `simd_ops` and `simd_uniform` in a
-/// threadgroup of `g.n` threads (see the fixtures' MSL); `steps` is `loop_k`'s trip count.
-fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
+/// threadgroup of `g.n` threads (see the fixtures' MSL); `steps` is `loop_k`'s trip count. `None`
+/// where the word depends on a read of a lane that does not take part, which is not promised.
+fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> Option<u32> {
     let l = Group::lane(t);
     let b = Group::base(t);
     let q = t & 3;
     let qb = t & !3;
-    match kernel {
+    Some(match kernel {
         // simd_ops
-        "simd_shuffle_k" => g.read(b + ((l * 7 + 3) & 31)),
-        "simd_broadcast_k" => g.read(b + 9),
+        "simd_shuffle_k" => g.get(b + ((l * 7 + 3) & 31))?,
+        "simd_broadcast_k" => g.get(b + 9)?,
         "simd_shuffle_up_k" => {
             if l >= 3 {
                 t - 3
@@ -238,27 +270,27 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         "simd_shuffle_down_k" => {
             if l + 5 < 32 {
-                g.read(t + 5)
+                g.get(t + 5)?
             } else {
                 t
             }
         }
-        "simd_shuffle_xor_k" => g.read(t ^ 13),
-        "simd_rotate_k" => g.read(b + ((l + 7) & 31)),
+        "simd_shuffle_xor_k" => g.get(t ^ 13)?,
+        "simd_rotate_k" => g.get(b + ((l + 7) & 31))?,
         "simd_fill_down_k" => {
             let s = l % 8;
-            let src = g.get(t - s + (s + 3) % 8);
+            let src = g.get(t - s + (s + 3) % 8)?;
             if s + 3 < 8 {
-                src.unwrap_or(0)
+                src
             } else {
-                src.map_or(0, |u| u + 1000)
+                src + 1000
             }
         }
         "simd_fill_up_k" => {
             if l >= 2 {
                 t - 2
             } else {
-                g.get(t - l + (l + 30) % 32).map_or(0, |u| u + 1000)
+                g.get(t - l + (l + 30) % 32)? + 1000
             }
         }
         "simd_sum_k" => {
@@ -279,17 +311,17 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         "simd_xor_k" => g.simd(t).fold(0u32, |a, u| a ^ ((u * u) & 0xFFFF)),
         "quad_ops_k" => {
             let sum: u32 = g.quad(t).sum();
-            g.read(t ^ 1) + g.read(qb + 2) * 1000 + sum * 1_000_000
+            g.get(t ^ 1)? + g.get(qb + 2)? * 1000 + sum * 1_000_000
         }
         "quad_relative_k" => {
             let up = if q >= 1 { t - 1 } else { t };
-            let down = if q + 2 < 4 { g.read(t + 2) } else { t };
-            let rot = g.read(qb + ((q + 3) & 3));
+            let down = if q + 2 < 4 { g.get(t + 2)? } else { t };
+            let rot = g.get(qb + ((q + 3) & 3))?;
             up + down * 1000 + rot * 1_000_000
         }
         "quad_dynamic_k" => {
             let max = g.quad(t).max().unwrap_or(t);
-            g.read(t ^ ((t >> 2) & 3)) + max * 1000
+            g.get(t ^ ((t >> 2) & 3))? + max * 1000
         }
         // simd_uniform
         "vote_k" => {
@@ -316,24 +348,25 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
             let has9 = quad.clone().any(|u| u == 9);
             u32::from(t == qb) + mask * 2 + u32::from(!has9) * 64 + u32::from(has9) * 128 + qb * 256
         }
-        "vector_k" => g.get(t ^ 5).map_or(0, |s| {
+        "vector_k" => {
+            let s = g.get(t ^ 5)?;
             s | ((s + 1) << 8) | ((s ^ 0x55) << 16) | ((255 - s) << 24)
-        }),
+        }
         "half_vector_k" => {
-            let s = if l + 3 < 32 { g.read(t + 3) } else { t };
+            let s = if l + 3 < 32 { g.get(t + 3)? } else { t };
             (s & 63) | ((s >> 1) << 16)
         }
         "loop_k" => {
-            let mut v: Vec<u32> = (0..g.n).collect();
+            let mut v: Vec<Option<u32>> = (0..g.n).map(Some).collect();
             for i in 0..steps {
                 v = (0..g.n)
                     .map(|u| {
-                        let src = g.get(Group::base(u) + ((Group::lane(u) + 1) & 31));
-                        src.map_or(0, |s| v[s as usize]) + i
+                        let src = g.get(Group::base(u) + ((Group::lane(u) + 1) & 31))?;
+                        Some(v[src as usize]? + i)
                     })
                     .collect();
             }
-            v[t as usize]
+            v[t as usize]?
         }
         "barrier_k" => {
             let src = b | ((l + 1) & 31);
@@ -348,7 +381,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         "simd_prefix_k" => {
             let active = |u: u32| !Group::lane(u).is_multiple_of(3);
             if !active(t) {
-                return 7;
+                return Some(7);
             }
             let lanes: Vec<u32> = g.simd(t).filter(|&u| active(u)).collect();
             let incl: u32 = lanes.iter().filter(|&&u| u <= t).sum();
@@ -369,7 +402,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         "simd_vote_k" => {
             let active = |u: u32| Group::lane(u) != 6;
             if !active(t) {
-                return 0;
+                return Some(0);
             }
             let lanes: Vec<u32> = g.simd(t).filter(|&u| active(u)).collect();
             u32::from(lanes.iter().all(|&u| Group::lane(u) != 6))
@@ -378,7 +411,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         "simd_ballot_k" => {
             if l < 2 {
-                return 1;
+                return Some(1);
             }
             g.simd(t)
                 .filter(|&u| Group::lane(u) >= 2 && u % 3 == 0)
@@ -396,7 +429,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         // thread 0 (its mask 0xF) and 159 on thread 8 (lane 9 in the mask and the `any`).
         "quad_ballot_k" => {
             if t % 7 == 2 {
-                return 99;
+                return Some(99);
             }
             let quad: Vec<u32> = g.quad(t).collect();
             let mask = quad.iter().fold(0u32, |a, &u| a | (1 << (u & 3)));
@@ -416,21 +449,21 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         // simd_divergent. A thread that returned before its store leaves 0.
         "guard_k" => {
             if t >= LIMIT {
-                return 0;
+                return Some(0);
             }
             let s: u32 = g.simd(t).filter(|&u| u < LIMIT).sum();
             s + u32::from(t == b) * 100_000 + b * 1_000_000
         }
         "guard_shuffle_k" => {
             if t >= LIMIT {
-                return 0;
+                return Some(0);
             }
-            // The source lane when it is active; zero past the thread count and where it returned
-            // (Metal's answer for a lane that does not take part).
+            // The source lane when it is active; past the thread count and where it returned the
+            // read is not promised.
             let src = if l + 1 >= 32 {
                 t
             } else if t + 1 >= g.n || t + 1 >= LIMIT {
-                0
+                return None;
             } else {
                 t + 1
             };
@@ -448,7 +481,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         "nested_k" => {
             if t & 1 == 0 {
-                return 5;
+                return Some(5);
             }
             let min = g.simd(t).filter(|&u| u & 1 == 1).min().unwrap_or(0);
             let inner = if t & 3 == 3 {
@@ -483,7 +516,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         "guard_barrier_k" => {
             if t >= LIMIT {
-                return 0;
+                return Some(0);
             }
             let live = LIMIT.min(g.n);
             ((t + 1) % live) * 3 + g.simd(t).filter(|&u| u < LIMIT).count() as u32 * 1000
@@ -496,16 +529,15 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         "quad_guard_k" => {
             let active = |u: u32| u % 5 != 3 && u < g.n;
             if !active(t) {
-                return 0;
+                return Some(0);
             }
             let quad: Vec<u32> = g.quad(t).filter(|&u| active(u)).collect();
             let sum: u32 = quad.iter().sum();
-            // Zero past the thread count and where the source is not live (Metal's answer for a
-            // lane that does not take part).
+            // Past the thread count and where the source is not live the read is not promised.
             let src = if t ^ 1 < g.n && active(t ^ 1) {
                 t ^ 1
             } else {
-                0
+                return None;
             };
             let first = quad.first().copied() == Some(t);
             let mask = quad.iter().fold(0u32, |a, &u| a | (1 << (u & 3)));
@@ -513,7 +545,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         }
         "guard_simd_barrier_k" => {
             if t >= LIMIT {
-                return 0;
+                return Some(0);
             }
             let src = (t & !31) | ((t + 1) & 31);
             if src < LIMIT.min(g.n) {
@@ -538,7 +570,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         // Every thread leaves at `i == 5` through its own exit, after six sums and five steps.
         "uniform_exit_k" => {
             let all = g.simd(t).count() as u32;
-            let xor = g.get(t ^ 1).map_or(0, |s| 2 * s + 3);
+            let xor = 2 * g.get(t ^ 1)? + 3;
             let odd = g.simd(t).filter(|&u| u & 1 == 1).count() as u32;
             6 * all + 5 * 1000 + xor + (t & 1) * odd * 100_000
         }
@@ -546,7 +578,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         "a3_quad_votes_divergent" => {
             let active = |u: u32| u < g.n && (((u >> 2) & 15) >> (u & 3)) & 1 != 0;
             if !active(t) {
-                return 0xFF00_0000;
+                return Some(0xFF00_0000);
             }
             let quad: Vec<u32> = g.quad(t).filter(|&u| active(u)).collect();
             let mask = quad.iter().fold(0u32, |a, &u| a | (1 << (u & 3)));
@@ -564,7 +596,7 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
         // answers 2 on thread 8, the skipping lane 9's).
         "mask_quad_ballot_k" | "mask_quad_ballot_divergent_k" => {
             if kernel == "mask_quad_ballot_divergent_k" && t % 7 == 2 {
-                return 99;
+                return Some(99);
             }
             g.quad(t)
                 .filter(|&u| u % 3 == 0)
@@ -574,14 +606,14 @@ fn expected(kernel: &str, g: Group, t: u32, steps: u32) -> u32 {
             let divergent = kernel == "mask_simd_active_divergent_k";
             let active = |u: u32| !divergent || Group::lane(u) >= 3;
             if !active(t) {
-                return 1;
+                return Some(1);
             }
             g.simd(t)
                 .filter(|&u| active(u))
                 .fold(0u32, |a, u| a | (1 << Group::lane(u)))
         }
         other => panic!("no expectation for {other}"),
-    }
+    })
 }
 
 /// The workgroup-uniform kernels of `simd_ops`: every simdgroup and quad operation runs on every
@@ -659,10 +691,32 @@ const SIMD_UNIFORM: [(&str, u32); 9] = [
 /// Plan `kernel` of `bc` on profile `stem`, check its emulated tier, and check the expectation
 /// at every width and local size.
 fn run_kernel(stem: &str, bc: &[u8], kernel: &str, words: Option<u32>) {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
-    let (plan, m) = typed_module(bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
+    run_kernel_under(stem, DevicePolicy::RESIDENT_TABLES, bc, kernel, words);
+}
+
+/// [`run_kernel`] on profile `stem` under `policy`.
+fn run_kernel_under(stem: &str, policy: DevicePolicy, bc: &[u8], kernel: &str, words: Option<u32>) {
+    let p = profile(stem, policy).expect("profile");
+    let inputs = emulating_inputs(stem, &p, bc, kernel);
+    let (plan, m) = typed_module_with(bc, kernel, &p, &inputs)
+        .unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
     check_emulated(stem, kernel, &plan, words);
     run_expected(stem, kernel, &plan, &m, &LOCALS);
+}
+
+/// The lowering inputs under which `kernel` of `bc` runs its simdgroups emulated on `p`: its own,
+/// or, for a kernel whose every cross-lane operation stays inside its quad and which `p` runs on
+/// subgroups at the size it gives (`SimdPlan::quad_free`, lavapipe's quad kernels), the
+/// emulated-simdgroups variant, the one a dispatch whose threadgroup is not a multiple of that
+/// size runs.
+fn emulating_inputs(stem: &str, p: &DeviceProfile, bc: &[u8], kernel: &str) -> LoweringInputs {
+    let (own, _) = typed_module(bc, kernel, p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
+    if own.families.simd.quad_free {
+        assert_eq!(own.simd.1, Tier::Direct, "{stem} {kernel}");
+        emulated_inputs()
+    } else {
+        LoweringInputs::new()
+    }
 }
 
 /// `plan` is `kernel`'s in the emulated tier: no subgroup requirement, the local size kept, and
@@ -691,8 +745,8 @@ fn check_emulated(stem: &str, kernel: &str, plan: &Plan, words: Option<u32>) {
     }
 }
 
-/// `kernel`'s module `m` (planned as `plan`) gives the expectation at every width and each of
-/// `locals`.
+/// `kernel`'s module `m` (planned as `plan`) runs at every width and each of `locals`, and gives
+/// every word the expectation promises.
 fn run_expected(stem: &str, kernel: &str, plan: &Plan, m: &TypedModule, locals: &[[u32; 3]]) {
     let steps = 5;
     let constant = match kernel {
@@ -713,25 +767,21 @@ fn run_expected(stem: &str, kernel: &str, plan: &Plan, m: &TypedModule, locals: 
             };
             let out = run_all(plan, m, local, lanes, constant);
             for (t, got) in out.iter().enumerate() {
-                let want = expected(kernel, g, t as u32, steps);
-                assert_eq!(*got, want, "{stem} {kernel} {local:?} {lanes:?} thread {t}");
+                if let Some(want) = expected(kernel, g, t as u32, steps) {
+                    assert_eq!(*got, want, "{stem} {kernel} {local:?} {lanes:?} thread {t}");
+                }
             }
         }
     }
 }
 
 /// L3: the kernel links, relocates, and passes `spirv-val` under the profile, and uses no
-/// subgroup instruction or capability. The plan's size estimate bounds the emitted words.
+/// subgroup instruction or capability.
 fn validate(stem: &str, bc: &[u8], kernel: &str) {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
-    let a = compile(bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
-    let (plan, _) = typed_module(bc, kernel, &p).expect("plan");
-    let emitted = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= emitted,
-        "{stem} {kernel}: estimate {} < emitted {emitted}",
-        plan.estimate.words
-    );
+    let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
+    let inputs = emulating_inputs(stem, &p, bc, kernel);
+    let a =
+        compile_with(bc, kernel, &p, &inputs).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
     let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
     let text = spirv_dis(&words);
     assert!(
@@ -782,10 +832,10 @@ fn simd_uniform_runs_emulated_at_every_width() {
 /// instead of exchanging a flag in every round (1,275 words on `lavapipe`, 2.59x, with the flag;
 /// 1,163, 2.36x, seeded; held at 2.5x). Each push field loads once at entry, which took one reload
 /// out of both forms (1,145 against 462 words, 2.48x, to 1,136 against 453, 2.51x): the emulation's
-/// 683 words over the subgroup form did not change, so the hold moved to 2.55x, still below the
-/// flag form's 112 extra words (about 2.75x against 453). The subgroup form is `moltenvk-m3`'s
-/// without its driver's measured deviation (`MetalCanonicalNans`), which neither emulated profile
-/// has, so both forms carry the same NaN selects (the input's `fadd` before the reduction: 14
+/// 683 words over the subgroup form did not change, so the hold moved to 2.55x. Through
+/// `Device::from_queries` the kernel is 1,164 words on `lavapipe` against 453 (2.57x), held at
+/// 2.6x, still below the flag form's 112 extra words (about 2.75x against 453). The subgroup form is
+/// `moltenvk-m3`'s, so both forms carry the same NaN selects (the input's `fadd` before the reduction: 14
 /// words, 1,150 against 467 on `lavapipe`, 2.46x) and the ratio stays the emulation's. A profile
 /// with no measured half-rounding fact (`lavapipe`, `vk12-floor`) rounds each `half` add in integer
 /// arithmetic, twenty instructions, where `moltenvk-m3`'s measured conversion takes three. That
@@ -811,7 +861,7 @@ fn emulated_reductions_scans_and_votes_stay_compact() {
     let direct = whole_subgroups_without_the_nan_fact();
     // The divergent float min, the only kernel held below 3x, and the `half` scan the integer
     // rounding put above it.
-    let tight = (&float_min, "simd_float_prefix_k", 2.55);
+    let tight = (&float_min, "simd_float_prefix_k", 2.6);
     let rounded = (&uniform, "float_prefix_k", 3.2);
     let kernels = [
         (&float_min, "simd_minmax_k"),
@@ -834,7 +884,7 @@ fn emulated_reductions_scans_and_votes_stay_compact() {
     ];
     let mut over = Vec::new();
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for (bc, kernel) in kernels {
             let emulated = compile(bc, kernel, &p).expect("compile").module.words.len();
             let whole = compile(bc, kernel, &direct)
@@ -862,21 +912,14 @@ fn emulated_reductions_scans_and_votes_stay_compact() {
     );
 }
 
-/// `moltenvk-m3`'s profile (whole subgroups) without its driver's deviation `MetalCanonicalNans`,
-/// as [`PROFILES`] lack it: a float result's NaN select is then the same on both sides of a ratio.
+/// `moltenvk-m3`'s profile (whole subgroups), whose NaN encoding is the device's: a float result's
+/// NaN select is then the same on both sides of a ratio.
 fn whole_subgroups_without_the_nan_fact() -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(&path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    let nans = crate::error::DriverDeviation::MetalCanonicalNans;
-    let with = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
-    assert_eq!(
-        with.profile().fields().nan_encoding,
-        crate::device::profile::NanEncoding::MetalCanonical,
-        "moltenvk-m3's driver has the deviation"
-    );
-    Device::with_deviation(desc, DevicePolicy::default(), nans, false)
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -1068,7 +1111,7 @@ fn no_nan_reaches_an_emulated_float_min_or_max() {
             return;
         };
         for stem in PROFILES {
-            let p = profile(stem, DevicePolicy::default()).expect("profile");
+            let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
             for kernel in ["simd_minmax_k", "simd_float_prefix_k"] {
                 validate(stem, &bc, kernel);
                 let a = compile(&bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
@@ -1107,7 +1150,7 @@ fn emulated_float_reductions_and_scans_take_exactly_the_active_lanes() {
             return;
         };
         for stem in PROFILES {
-            let p = profile(stem, DevicePolicy::default()).expect("profile");
+            let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
             for kernel in ["simd_minmax_k", "simd_float_prefix_k"] {
                 let divergent = kernel == "simd_float_prefix_k";
                 let (plan, m) = typed_module(&bc, kernel, &p)
@@ -1187,7 +1230,7 @@ fn an_emulated_float_exclusive_sum_keeps_the_sign_of_zero() {
     };
     let neg = (-0.0f32).to_bits();
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for (bc, kernel) in [
             (&uniform, "float_prefix_k"),
             (&divergent, "simd_float_prefix_k"),
@@ -1228,7 +1271,7 @@ fn emulated_barriers_are_workgroup_barriers() {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for kernel in ["barrier_k", "vote_k"] {
             let a = compile(&bc, kernel, &p).expect("compile");
             let (_, words) = link_and_validate(&a, &p).expect("valid");
@@ -1276,7 +1319,7 @@ fn divergent_operations_run_predicated_on_lavapipe() {
 
 #[test]
 fn divergent_operations_run_predicated_on_vk12_floor() {
-    divergent_operations_run_predicated("vk12-floor");
+    divergent_operations_run_predicated("runtime-floor");
 }
 
 /// Operations in divergent control flow of every shape the walk predicates run exactly on the lanes
@@ -1297,8 +1340,53 @@ fn simd_divergent_runs_predicated_on_lavapipe() {
 }
 
 #[test]
-fn simd_divergent_runs_predicated_on_vk12_floor() {
-    simd_divergent_runs_predicated("vk12-floor");
+fn simd_divergent_runs_predicated_on_roadmap_2022() {
+    simd_divergent_runs_predicated("runtime-floor");
+}
+
+/// The `OpControlBarrier`s of `kernel` of `bc` compiled emulated on profile `stem` under `policy`
+/// ([`emulating_inputs`]).
+fn barriers(stem: &str, policy: DevicePolicy, bc: &[u8], kernel: &str) -> usize {
+    let p = profile(stem, policy).expect("profile");
+    let inputs = emulating_inputs(stem, &p, bc, kernel);
+    let a =
+        compile_with(bc, kernel, &p, &inputs).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
+    let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
+    spirv_dis(&words).matches("OpControlBarrier").count()
+}
+
+/// Under the identity domains the emulated tier's exchanges and votes use one scratch region and
+/// each closes with a barrier, as under the resident-table domains: every kernel of `simd_ops`,
+/// `simd_uniform` and `simd_divergent` (shuffles, reductions, prefix sums, votes, ballots, quad
+/// operations, vector and `half` values, exchanges in uniform and per-thread loops, after early
+/// returns and in branch arms) gives the same expectation at every subgroup width in both
+/// scheduling orders, in full and partial threadgroups, plans the scratch of one region, and has as
+/// many barriers as under the resident-table domains.
+#[test]
+fn identity_exchanges_keep_one_scratch_region() {
+    const STEM: &str = "lavapipe";
+    let (Some(ops), Some(uniform), Some(divergent)) = (
+        assemble("simd_ops"),
+        assemble("simd_uniform"),
+        assemble("simd_divergent"),
+    ) else {
+        return;
+    };
+    let kernels = SIMD_OPS
+        .iter()
+        .chain(&SIMD_OPS_DIVERGENT)
+        .map(|k| (&ops, *k, None))
+        .chain(SIMD_UNIFORM.iter().map(|(k, w)| (&uniform, *k, Some(*w))))
+        .chain([(&uniform, "divergent_k", None)])
+        .chain(SIMD_DIVERGENT.iter().map(|k| (&divergent, *k, None)));
+    for (bc, kernel, words) in kernels {
+        run_kernel_under(STEM, identity(), bc, kernel, words);
+        assert_eq!(
+            barriers(STEM, identity(), bc, kernel),
+            barriers(STEM, DevicePolicy::RESIDENT_TABLES, bc, kernel),
+            "{kernel}: barriers under the identity domains"
+        );
+    }
 }
 
 /// The tail of `a3_multi_level_break_tail`'s two-level break runs after the inner loop, once per
@@ -1337,7 +1425,7 @@ fn a_multi_level_break_tail_runs_once_per_outer_iteration_emulated() {
     let bytes = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|x| x.to_le_bytes()).collect() };
     for stem in PROFILES {
         validate(stem, &bc, kernel);
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, m) = typed_module(&bc, kernel, &p).expect("plan");
         assert_eq!(plan.simd.1, Tier::Emulated, "{stem}");
         let slot = |kind, index| {
@@ -1357,10 +1445,7 @@ fn a_multi_level_break_tail_runs_once_per_outer_iteration_emulated() {
             })
             .collect();
         let mut spec = BTreeMap::new();
-        spec.insert(SpecKey::LocalSize(Axis::X), u64::from(LANES));
-        spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-        spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-        spec.insert(SpecKey::FlatLocalSize, u64::from(LANES));
+        spec.extend(crate::pipeline::threadgroup_constants([LANES, 1, 1]));
         let res = Resources {
             buffers,
             push: vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)],
@@ -1374,8 +1459,8 @@ fn a_multi_level_break_tail_runs_once_per_outer_iteration_emulated() {
 }
 
 /// A matrix multiply-add in a divergent block compiles and passes L3 on every profile that emulates
-/// the kernel's simdgroups, device addresses or none: a lane that is not live takes part with zero
-/// cells, which needs no runtime input.
+/// the kernel's simdgroups, device addresses or none: a lane that is not live is read through the
+/// calling lane, which needs no runtime input.
 #[test]
 fn a_divergent_matrix_multiply_add_compiles_on_every_emulating_profile() {
     let text = std::fs::read_to_string(engine_dir().join("simd_matrix.ll")).expect("read");
@@ -1395,7 +1480,7 @@ fn a_divergent_matrix_multiply_add_compiles_on_every_emulating_profile() {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a =
             compile(&bc, "matrix_thread_elements", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -1444,15 +1529,14 @@ fn the_static_length_is_rounded_up_to_16_bytes_as_metal_reports_it() {
 /// The scratch takes 128 bytes per simdgroup and word beside the kernel's threadgroup memory. A
 /// kernel whose arena leaves less than one simdgroup's scratch is refused at compile time;
 /// otherwise the pipeline reports the threads whose scratch fits as its maximum and its own
-/// threadgroup memory as its static length, as Metal reports it, and the planner refuses a larger
-/// threadgroup as `ThreadgroupMemorySize`.
+/// threadgroup memory as its static length, as Metal reports it.
 #[test]
 fn the_scratch_must_fit_beside_the_threadgroup_memory() {
-    // vk12-floor: 16 KiB. An arena of exactly 16 KiB leaves nothing for the scratch.
+    // roadmap-2022: 16 KiB. An arena of exactly 16 KiB leaves nothing for the scratch.
     let Some(full) = arena_kernel(4096) else {
         return;
     };
-    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
+    let floor = profile("runtime-floor", DevicePolicy::RESIDENT_TABLES).expect("profile");
     match compile(&full, "barrier_k", &floor) {
         Err(Error::Unsupported(u)) => {
             assert_eq!(u.feature, Feature::ThreadgroupMemorySize);
@@ -1475,19 +1559,13 @@ fn the_scratch_must_fit_beside_the_threadgroup_memory() {
     let pipe = pipeline(&dev, &bc, "barrier_k");
     assert_eq!(pipe.metal_info.max_total_threads_per_threadgroup, 256);
     assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 31 * 1024);
-    let state = bind_state(None);
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    assert!(plan.instantiate_dispatch(&state, &threads(256)).is_ok());
-    assert_memory_refused(plan.instantiate_dispatch(&state, &threads(257)), 32896);
 }
 
 /// A kernel that reads a `[[threadgroup(0)]]` region declares the threadgroup arena, a `u32` array
 /// of at least `MIN_ARENA_BYTES` even when the region is empty, beside the scratch. `region_k`
 /// publishes eight words per lane (1 KiB per simdgroup): lavapipe's 32 KiB fits 31 simdgroups
 /// beside the 32-byte arena, not 32. The reported static length is the kernel's own, 0, as Metal
-/// reports it: neither the arena's minimum nor the scratch, which the planner still counts, so the
-/// remainder a Metal client gives the region beside that length is refused at the most threads
-/// (the device's gap, `ThreadgroupMemorySize`), and a region that fits beside the scratch runs.
+/// reports it: neither the arena's minimum nor the scratch.
 #[test]
 fn an_empty_region_declares_the_arena_beside_the_scratch() {
     let Some(bc) = assemble("simd_uniform") else {
@@ -1495,41 +1573,22 @@ fn an_empty_region_declares_the_arena_beside_the_scratch() {
     };
     let dev = lavapipe();
     let pipe = pipeline(&dev, &bc, "region_k");
-    let state = bind_state(Some(0));
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    assert_memory_refused(
-        plan.instantiate_dispatch(&state, &threads(1024)),
-        32 + 32 * 1024,
-    );
-    assert!(plan.instantiate_dispatch(&state, &threads(31 * 32)).is_ok());
     assert_eq!(pipe.metal_info.max_total_threads_per_threadgroup, 31 * 32);
     assert_eq!(pipe.metal_info.static_threadgroup_memory_length, 0);
-    // The remainder beside the reported static length, at the most threads: the arena and the
-    // scratch of 31 simdgroups do not fit beside it.
-    let remainder = 32 * 1024 - pipe.metal_info.static_threadgroup_memory_length;
-    let state = bind_state(Some(remainder));
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    match plan.instantiate_dispatch(&state, &threads(31 * 32)) {
-        Err(BindError::Unsupported(u)) => assert_eq!(u.feature, Feature::ThreadgroupMemorySize),
-        other => panic!("{other:?}"),
-    }
-    // A region that fits beside the arena and the scratch runs.
-    let state = bind_state(Some(32 * 1024 - 32 - 31 * 1024));
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    assert!(plan.instantiate_dispatch(&state, &threads(31 * 32)).is_ok());
 }
 
 /// An emulated operation exchanges through workgroup memory between workgroup barriers in
-/// workgroup-uniform control flow, so its result does not depend on how subgroups reconverge; a
-/// threadgroup barrier keeps the profile's reconvergence (`vk12-floor` has no maximal
-/// reconvergence).
+/// workgroup-uniform control flow, so its result does not depend on how subgroups reconverge.
+/// `region_k`'s shuffle stands in its entry block and its threadgroup barrier outside any loop, so
+/// on `runtime-floor`, which has no maximal reconvergence, it states no mode and records
+/// `Guaranteed` with no `DeviceReconvergence` (`lower::simd::reentry`).
 #[test]
 fn emulated_operations_do_not_depend_on_reconvergence() {
     let Some(bc) = assemble("simd_uniform") else {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for kernel in ["vote_k", "prefix_k", "quad_vote_k", "barrier_k"] {
             let a = compile(&bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
             assert_eq!(
@@ -1539,14 +1598,21 @@ fn emulated_operations_do_not_depend_on_reconvergence() {
             );
         }
     }
-    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
+    let floor = profile("runtime-floor", DevicePolicy::RESIDENT_TABLES).expect("profile");
     assert!(!floor.fields().subgroup.maximal_reconvergence);
     let a = compile(&bc, "region_k", &floor).expect("region_k");
-    assert_eq!(a.reconvergence, Reconvergence::ImplementationDefined);
+    assert_eq!(
+        (
+            a.reconvergence,
+            a.precision.contains(&PrecisionNote::DeviceReconvergence)
+        ),
+        (Reconvergence::Guaranteed, false)
+    );
 }
 
 /// On lavapipe without maximal reconvergence (its description with `shaderMaximalReconvergence`
-/// cleared, as the runtime lane withholds the feature): the shuffles of `dsm2_shuffle_past_n` run
+/// cleared, as the runtime lane withholds the feature, and with it `shaderQuadControl`, which no
+/// device offers without it): the shuffles of `dsm2_shuffle_past_n` run
 /// on the emulated tier (8-lane subgroups cannot hold Metal's simdgroups), every tangled
 /// instruction is an emulated site, and the kernel's reconvergence is `Guaranteed`, compiled alone
 /// and as the compute pipeline the runtime makes.
@@ -1558,16 +1624,21 @@ fn emulated_shuffles_keep_metals_reconvergence_without_maximal_reconvergence() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/lavapipe.json");
     let text = std::fs::read_to_string(path).expect("profile");
-    let cleared = text.replace(
-        "\"shaderMaximalReconvergence\": true",
-        "\"shaderMaximalReconvergence\": false",
-    );
+    let cleared = text
+        .replace(
+            "\"shaderMaximalReconvergence\": true",
+            "\"shaderMaximalReconvergence\": false",
+        )
+        .replace(
+            "\"shaderQuadControl\": true",
+            "\"shaderQuadControl\": false",
+        );
     assert_ne!(
         cleared, text,
         "the description names shaderMaximalReconvergence"
     );
     let desc = DeviceDescription::from_khronos_json(&cleared, None).expect("description");
-    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+    let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
     let p = dev.profile();
     assert!(!p.fields().subgroup.maximal_reconvergence);
     let a = compile(&bc, "dsm2_shuffle_past_n", p).expect("compile");
@@ -1588,7 +1659,7 @@ fn lavapipe() -> Device {
     let text = std::fs::read_to_string(path).expect("profile");
     let desc =
         crate::device::DeviceDescription::from_khronos_json(&text, None).expect("description");
-    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+    let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
     assert_eq!(
         dev.profile().fields().limits.max_compute_shared_memory_size,
         32 * 1024
@@ -1602,45 +1673,6 @@ fn pipeline(dev: &Device, bc: &[u8], kernel: &str) -> ComputePipeline {
     let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
     dev.compile_compute_pipeline(&d, &Budget::standard())
         .unwrap_or_else(|e| panic!("{kernel}: {e}"))
-}
-
-/// Buffer 0 bound, and `[[threadgroup(0)]]` set to `region` bytes.
-fn bind_state(region: Option<u32>) -> BindState {
-    let mut table = StageTable::default();
-    table.buffers.insert(
-        0,
-        BoundBuffer::Buffer {
-            length: 4096,
-            offset: 0,
-            gpu_address: 0x1_0000,
-            device_address: None,
-            attribute_stride: None,
-        },
-    );
-    if let Some(len) = region {
-        table.threadgroup_lengths.insert(0, len);
-    }
-    let mut state = BindState::default();
-    state.stages.insert(Stage::Kernel, table);
-    state
-}
-
-fn threads(n: u32) -> Dispatch {
-    Dispatch::Threadgroups {
-        groups: [1, 1, 1],
-        threads_per_group: [n, 1, 1],
-    }
-}
-
-fn assert_memory_refused<T: std::fmt::Debug>(r: Result<T, BindError>, required: u64) {
-    match r {
-        Err(BindError::Unsupported(u)) => {
-            assert_eq!(u.feature, Feature::ThreadgroupMemorySize);
-            let needs = format!("{:?}", u.needs);
-            assert!(needs.contains(&format!("required: {required},")), "{needs}");
-        }
-        other => panic!("{other:?}"),
-    }
 }
 
 /// The committed profile whose kernels run their simdgroups on whole 32-lane subgroups
@@ -1671,82 +1703,6 @@ fn emulated_key() -> VariantKey {
     let mut key = VariantKey::new();
     key.emulated_simdgroups = true;
     key
-}
-
-fn one_row_key() -> VariantKey {
-    let mut key = VariantKey::new();
-    key.one_row = true;
-    key
-}
-
-/// `simd_divergent`'s `guard_k` (a simdgroup sum in divergent control flow) followed by `stages`
-/// diamonds of plain arithmetic, each a branch on a per-thread value and a phi: a large body whose
-/// predicated walk synchronizes in one block.
-fn large_body(stages: u32) -> Option<Vec<u8>> {
-    let text = std::fs::read_to_string(engine_dir().join("simd_divergent.ll")).expect("read");
-    let start = text.find("define void @guard_k(").expect("guard_k");
-    let merge = start + text[start..].find("\n16:").expect("guard_k's merge") + 1;
-    let end = merge + text[merge..].find("\n}\n").expect("guard_k's end") + 1;
-    let mut body = String::from("16:\n  br label %s0\n");
-    let mut prev = String::from("%2");
-    for i in 0..stages {
-        let next = i + 1;
-        body += &format!(
-            "s{i}:\n  %k{i} = and i32 {prev}, 7\n  %c{i} = icmp ult i32 %k{i}, 3\n  \
-             br i1 %c{i}, label %a{i}, label %b{i}\n\
-             a{i}:\n  %y{i} = mul i32 {prev}, 3\n  br label %m{i}\n\
-             b{i}:\n  %z{i} = add i32 {prev}, {next}\n  br label %m{i}\n\
-             m{i}:\n  %w{i} = phi i32 [ %y{i}, %a{i} ], [ %z{i}, %b{i} ]\n  br label %s{next}\n"
-        );
-        prev = format!("%w{i}");
-    }
-    body += &format!(
-        "s{stages}:\n  %at = zext i32 %2 to i64\n  \
-         %out = getelementptr inbounds i32, ptr addrspace(1) %0, i64 %at\n  \
-         store i32 {prev}, ptr addrspace(1) %out, align 4\n  ret void\n"
-    );
-    let text = format!("{}{body}{}", &text[..merge], &text[end..]);
-    assemble_text(&format!("large-body-{stages}"), &text)
-}
-
-/// A large body under the emulated-simdgroups input ([`large_body`]): its estimate bounds the
-/// words it emits and stays within a small multiple of them (the walk is charged per construct it
-/// emits), so it compiles under a words cap of that multiple of its emitted size.
-#[test]
-fn a_large_predicated_body_compiles_under_a_cap_it_fits() {
-    let Some(bc) = large_body(256) else {
-        return;
-    };
-    let p = profile("lavapipe", DevicePolicy::default()).expect("profile");
-    let inputs = emulated_inputs();
-    let (plan, _) = typed_module_with(&bc, "guard_k", &p, &inputs).expect("plan");
-    assert!(
-        plan.families.simd.predication.is_some(),
-        "walked predicated"
-    );
-    let a = crate::pipeline::testing::compile_with(&bc, "guard_k", &p, &inputs).expect("compile");
-    let emitted = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= emitted,
-        "estimate {} < emitted {emitted}",
-        plan.estimate.words
-    );
-    let cap = 8 * emitted;
-    let capped = crate::pipeline::compile::compile_bitcode(
-        &bc,
-        crate::pipeline::compile::EntryRef::Name("guard_k"),
-        &crate::library::FunctionConstantValues::defaults(),
-        &p,
-        &inputs,
-        &mut crate::pipeline::testing::meter(),
-        cap,
-    );
-    assert!(
-        capped.is_ok(),
-        "estimate {} under cap {cap} (emitted {emitted}): {:?}",
-        plan.estimate.words,
-        capped.err()
-    );
 }
 
 /// `kernel` of `bc` on `DIRECT`: its own tier is `Direct` with a multiple-of-32 constraint, and
@@ -1789,10 +1745,6 @@ fn run_variant(bc: &[u8], kernel: &str, words: Option<u32>) {
         )
         .unwrap_or_else(|e| panic!("{kernel}: {e}"));
     let a = compiled.artifact();
-    assert!(
-        plan.estimate.words >= a.module.words.len() as u64,
-        "{kernel}"
-    );
     assert_eq!(a.subgroup, SubgroupRequirement::NONE, "{kernel}");
     let (_, words) = link_and_validate(a, p).unwrap_or_else(|e| panic!("{kernel}: {e}"));
     let text = spirv_dis(&words);
@@ -1832,251 +1784,6 @@ fn partial_simdgroups_run_on_the_emulated_variant_of_a_direct_kernel() {
     }
 }
 
-/// Through the public API on `DIRECT`: the plan of a kernel whose simdgroups run on whole subgroups
-/// asks for the emulated-simdgroups variant exactly for the dispatches with a partial simdgroup
-/// (and a `dispatchThreads` grid whose edge has one), instead of refusing them; the pipeline
-/// compiled under that key states it in its plan and runs each of them, and a full one, with
-/// Metal's local size and no subgroup requirement. A profile that emulates every kernel's
-/// simdgroups never asks.
-#[test]
-fn the_plan_asks_for_the_emulated_variant_only_for_partial_simdgroups() {
-    let Some(bc) = assemble("simd_ops") else {
-        return;
-    };
-    let dev = direct();
-    let budget = Budget::standard();
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("simd_sum_k"))
-        .expect("kernel");
-    let fd = FunctionDescriptor::new(f);
-    let base = pipeline(&dev, &bc, "simd_sum_k");
-    let state = bind_state(None);
-    let shape = state.shape();
-    let plan = base.plan(&dev, &shape).expect("plan");
-    assert!(plan.variant.is_empty());
-    let key = emulated_key();
-    let edge = Dispatch::Threads {
-        threads: [40, 1, 1],
-        threads_per_group: [32, 1, 1],
-    };
-    for d in [threads(1), threads(4), threads(8), threads(16), edge] {
-        assert_eq!(plan.dispatch_variant(&d), Ok(key.clone()), "{d:?}");
-        assert_eq!(
-            plan.instantiate_dispatch(&state, &d),
-            Err(BindError::NeedsVariant {
-                variant: Box::new(key.clone())
-            }),
-            "{d:?}"
-        );
-    }
-    // Whole simdgroups keep the flattened pipeline.
-    for n in [32, 64] {
-        assert_eq!(plan.dispatch_variant(&threads(n)), Ok(VariantKey::new()));
-        let c = plan
-            .instantiate_dispatch(&state, &threads(n))
-            .expect("full");
-        assert!(c.regions[0]
-            .stage_flags
-            .contains(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS));
-    }
-
-    // The variant the plan asked for.
-    let compiled = dev
-        .compile_function(&fd, &key.lowering_inputs(Stage::Kernel), &budget)
-        .expect("variant");
-    assert_ne!(
-        *compiled.key(),
-        dev.function_compile_key(&fd, &LoweringInputs::new())
-    );
-    let variant = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &budget,
-        )
-        .expect("variant pipeline");
-    assert_ne!(variant.key, base.key);
-    assert!(variant
-        .dependencies
-        .iter()
-        .any(|d| d.fact == RuntimeFact::EmulatedSimdgroups && d.mechanism == Mechanism::Variant));
-    assert_eq!(variant.stage.required_subgroup_size, None);
-    assert!(variant.stage.stage_flags.is_empty());
-    let vplan = variant.plan(&dev, &shape).expect("variant plan");
-    assert_eq!(vplan.variant, key, "the variant's plan states its key");
-    for d in [threads(1), threads(4), threads(16), threads(32), edge] {
-        assert_eq!(vplan.dispatch_variant(&d), Ok(key.clone()), "{d:?}");
-        let c = vplan.instantiate_dispatch(&state, &d).expect("runs");
-        for r in &c.regions {
-            assert!(r.stage_flags.is_empty(), "{d:?}");
-            assert_eq!(r.required_subgroup_size, None, "{d:?}");
-        }
-    }
-
-    // lavapipe emulates every kernel's simdgroups: no dispatch asks for a variant.
-    let lava = lavapipe();
-    let own = pipeline(&lava, &bc, "simd_sum_k");
-    let lplan = own.plan(&lava, &shape).expect("plan");
-    assert_eq!(lplan.dispatch_variant(&threads(16)), Ok(VariantKey::new()));
-    assert!(lplan.instantiate_dispatch(&state, &threads(16)).is_ok());
-}
-
-/// The emulated tier's own limits stay refusals when a partial simdgroup asks for the variant. A
-/// matrix multiply-add in a divergent block compiles in both; a kernel whose threadgroup memory
-/// leaves no room for one simdgroup's scratch is `ThreadgroupMemorySize` at the variant's compile;
-/// and one that leaves room for some is refused at the variant's plan for a threadgroup whose
-/// scratch does not fit, which the `Direct` pipeline runs when its simdgroups are whole.
-#[test]
-fn the_emulated_tiers_limits_stay_refused_for_partial_simdgroups() {
-    let dev = direct();
-    let p = dev.profile();
-    let emulated = |bc: &[u8], kernel: &str| {
-        let f = Library::from_air(bc)
-            .and_then(|lib| lib.function(kernel))
-            .expect("kernel");
-        dev.compile_function(
-            &FunctionDescriptor::new(f),
-            &emulated_inputs(),
-            &Budget::standard(),
-        )
-    };
-
-    let text = std::fs::read_to_string(engine_dir().join("simd_matrix.ll")).expect("read");
-    let text = text.replacen(
-        "  %5 = shl i32 %3, 1\n",
-        "  %c = icmp ult i32 %3, 16\n  br i1 %c, label %go, label %done\n\ngo:\n  %5 = shl i32 %3, 1\n",
-        1,
-    );
-    let text = text.replacen(
-        "<2 x i64> zeroinitializer) #5\n  ret void\n}",
-        "<2 x i64> zeroinitializer) #5\n  br label %done\n\ndone:\n  ret void\n}",
-        1,
-    );
-    assert!(text.contains("label %go") && text.contains("\ndone:\n"));
-    let Some(bc) = assemble_text("direct-divergent-matrix", &text) else {
-        return;
-    };
-    compile(&bc, "matrix_thread_elements", p).expect("Direct");
-    let variant = emulated(&bc, "matrix_thread_elements").expect("the variant");
-    assert!(variant
-        .artifact()
-        .facts
-        .contains(&RuntimeFact::EmulatedSimdgroups));
-
-    // 32 KiB of shared memory: an arena of 32 KiB leaves nothing for the scratch.
-    assert_eq!(p.fields().limits.max_compute_shared_memory_size, 32 * 1024);
-    let Some(full) = arena_kernel(8192) else {
-        return;
-    };
-    compile(&full, "barrier_k", p).expect("Direct");
-    match emulated(&full, "barrier_k") {
-        Err(Error::Unsupported(u)) => {
-            assert_eq!(u.feature, Feature::ThreadgroupMemorySize);
-            let needs = format!("{:?}", u.needs);
-            assert!(needs.contains("required: 32896"), "{needs}");
-        }
-        other => panic!("{other:?}"),
-    }
-
-    // An arena of 31 KiB leaves the scratch of 8 simdgroups.
-    let Some(bc) = arena_kernel(31 * 256) else {
-        return;
-    };
-    let state = bind_state(None);
-    let shape = state.shape();
-    let base = pipeline(&dev, &bc, "barrier_k");
-    let plan = base.plan(&dev, &shape).expect("plan");
-    assert!(plan.instantiate_dispatch(&state, &threads(512)).is_ok());
-    assert_eq!(
-        plan.dispatch_variant(&threads(260)),
-        Ok(emulated_key()),
-        "a partial simdgroup"
-    );
-    let variant = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(
-                emulated(&bc, "barrier_k").expect("variant"),
-            )),
-            &Budget::standard(),
-        )
-        .expect("variant pipeline");
-    let vplan = variant.plan(&dev, &shape).expect("variant plan");
-    assert!(vplan.instantiate_dispatch(&state, &threads(250)).is_ok());
-    assert_memory_refused(
-        vplan.instantiate_dispatch(&state, &threads(260)),
-        31 * 1024 + 9 * 128,
-    );
-}
-
-/// A `dispatchThreads` grid whose edge is a partial simdgroup runs whole on the variant, so its
-/// interior is checked against the variant's limits, not the flattened tier's. On
-/// nvidia-rtx50-linux (`Direct`, z at most 64), an interior of `[1, 1, 96]`, which the flattened
-/// pipeline runs alone, is a `LocalSize` refusal up front, as the variant's plan refuses it; an
-/// interior of `[1, 1, 64]` asks for the variant, whose plan runs both regions.
-#[test]
-fn a_mixed_dispatch_is_checked_against_the_variants_limits() {
-    let Some(bc) = assemble("simd_ops") else {
-        return;
-    };
-    let dev = device("nvidia-rtx50-linux");
-    assert_eq!(
-        dev.profile().fields().limits.max_compute_work_group_size[2],
-        64
-    );
-    let (own, _) = typed_module(&bc, "simd_sum_k", dev.profile()).expect("simd_sum_k");
-    assert_eq!(own.simd.1, Tier::Direct);
-    let budget = Budget::standard();
-    let state = bind_state(None);
-    let shape = state.shape();
-    let plan = pipeline(&dev, &bc, "simd_sum_k")
-        .plan(&dev, &shape)
-        .expect("plan");
-    let f = Library::from_air(&bc)
-        .and_then(|lib| lib.function("simd_sum_k"))
-        .expect("kernel");
-    let compiled = dev
-        .compile_function(&FunctionDescriptor::new(f), &emulated_inputs(), &budget)
-        .expect("variant");
-    let vplan = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &budget,
-        )
-        .expect("variant pipeline")
-        .plan(&dev, &shape)
-        .expect("variant plan");
-    let mixed = |z| Dispatch::Threads {
-        threads: [1, 1, 100],
-        threads_per_group: [1, 1, z],
-    };
-
-    let interior = Dispatch::Threads {
-        threads: [1, 1, 96],
-        threads_per_group: [1, 1, 96],
-    };
-    assert_eq!(plan.dispatch_variant(&interior), Ok(VariantKey::new()));
-    assert!(plan.instantiate_dispatch(&state, &interior).is_ok());
-    for r in [
-        plan.dispatch_variant(&mixed(96)).map(drop),
-        plan.instantiate_dispatch(&state, &mixed(96)).map(drop),
-        vplan.instantiate_dispatch(&state, &mixed(96)).map(drop),
-    ] {
-        match r {
-            Err(BindError::Unsupported(u)) => assert_eq!(
-                u.feature,
-                Feature::LocalSize {
-                    axis: Some(Axis::Z)
-                }
-            ),
-            other => panic!("{other:?}"),
-        }
-    }
-    assert_eq!(plan.dispatch_variant(&mixed(64)), Ok(emulated_key()));
-    let c = vplan
-        .instantiate_dispatch(&state, &mixed(64))
-        .expect("the variant runs both regions");
-    assert_eq!(c.regions.len(), 2);
-}
-
 /// The committed moltenvk-m3 profile (32-lane subgroups that require whole subgroups).
 fn direct() -> Device {
     device(DIRECT)
@@ -2090,7 +1797,7 @@ fn device(name: &str) -> Device {
     let text = std::fs::read_to_string(path).expect("profile");
     let desc =
         crate::device::DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// `quad_ballot` and `simd_active_threads_mask` on emulated simdgroups, uniform and divergent (run
@@ -2118,7 +1825,7 @@ fn simd_masks_run_emulated_on_lavapipe() {
 
 #[test]
 fn simd_masks_run_emulated_on_vk12_floor() {
-    simd_masks_run_emulated("vk12-floor");
+    simd_masks_run_emulated("runtime-floor");
 }
 
 /// The scratch holds one `u32[W]` slot per lane, so an exchange reaches a lane's word with one
@@ -2135,7 +1842,7 @@ fn an_emulated_exchange_reaches_a_word_with_one_access_chain() {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let words = compile(&bc, "guard_shuffle_k", &p)
             .expect("compile")
             .module
@@ -2225,36 +1932,13 @@ attributes #0 = {{ convergent mustprogress nounwind willreturn }}
     )
 }
 
-/// Buffers 0 and 1 bound.
-fn two_buffers() -> BindState {
-    let mut state = bind_state(None);
-    if let Some(table) = state.stages.get_mut(&Stage::Kernel) {
-        table.buffers.insert(
-            1,
-            BoundBuffer::Buffer {
-                length: 4,
-                offset: 0,
-                gpu_address: 0x2_0000,
-                device_address: None,
-                attribute_stride: None,
-            },
-        );
-    }
-    state
-}
-
 /// A kernel whose only simdgroup semantics are the barrier its lockstep order took, between a
 /// read and a write of `b[gid]` that two threads of one simdgroup meet at only where the
 /// simdgroup spans two rows of its threadgroup (the shape of OpenCL C's `if (i < n) b[i] *= k`),
-/// keeps the RTX 5080's `Direct` tier and records `RowLockstep`. A threadgroup of one row (1, 16
-/// or 48 threads, or a whole 32) asks for its one-row variant (`VariantKey::one_row`), and the
-/// planned pipeline still runs one without whole subgroups: no emulated-simdgroups variant is
-/// compiled, so none is announced. A threadgroup of two rows that is not whole subgroups still
-/// asks for the emulated variant. The same kernel at `b[gid >> 1]` (two threads of a row meet) or
-/// reading its simdgroup lane keeps every partial threadgroup on the emulated variant and a whole
-/// one on its pinned pipeline.
+/// keeps the RTX 5080's `Direct` tier and records `RowLockstep`. The same kernel at `b[gid >> 1]`
+/// (two threads of a row meet) or reading its simdgroup lane does not record it.
 #[test]
-fn a_row_of_a_lockstep_only_kernel_takes_one_compile() {
+fn a_row_of_a_lockstep_only_kernel_records_its_row_lockstep() {
     let x = "%x = zext i32 %gid to i64";
     let none = "%e = add i32 0, 0";
     let kernels = [
@@ -2269,8 +1953,6 @@ fn a_row_of_a_lockstep_only_kernel_takes_one_compile() {
     ];
     let dev = device("nvidia-rtx5080-laptop");
     let p = dev.profile();
-    let state = two_buffers();
-    let shape = state.shape();
     for (name, index, extra, rows) in kernels {
         let Some(bc) = assemble_text(name, &row_kernel(name, index, extra)) else {
             return;
@@ -2287,53 +1969,6 @@ fn a_row_of_a_lockstep_only_kernel_takes_one_compile() {
             rows,
             "{name}"
         );
-        let base = pipeline(&dev, &bc, name);
-        let plan = base.plan(&dev, &shape).expect("plan");
-        for n in [1, 16, 48] {
-            let want = if rows { one_row_key() } else { emulated_key() };
-            assert_eq!(
-                plan.dispatch_variant(&threads(n)),
-                Ok(want),
-                "{name} at {n}"
-            );
-        }
-        for n in [32, 64] {
-            let want = if rows {
-                one_row_key()
-            } else {
-                VariantKey::new()
-            };
-            assert_eq!(
-                plan.dispatch_variant(&threads(n)),
-                Ok(want),
-                "{name} at {n}"
-            );
-        }
-        let two_rows = Dispatch::Threadgroups {
-            groups: [1, 1, 1],
-            threads_per_group: [8, 2, 1],
-        };
-        assert_eq!(
-            plan.dispatch_variant(&two_rows),
-            Ok(emulated_key()),
-            "{name}"
-        );
-        if rows {
-            let c = plan
-                .instantiate_dispatch(&state, &threads(16))
-                .expect("one row on the planned pipeline");
-            assert_eq!(
-                c.regions[0].stage_flags,
-                vk::PipelineShaderStageCreateFlags::empty()
-            );
-            assert_eq!(c.regions[0].required_subgroup_size, Some(32));
-            let c = plan
-                .instantiate_dispatch(&state, &threads(32))
-                .expect("whole subgroups");
-            assert!(c.regions[0]
-                .stage_flags
-                .contains(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS));
-        }
     }
 }
 
@@ -2478,11 +2113,8 @@ fn row_tile_words(local: [u32; 3]) -> Vec<u32> {
 /// pinned tiers' Vulkan workgroup).
 fn run_local(plan: &Plan, m: &TypedModule, local: [u32; 3], lanes: SubgroupSize) -> Vec<u32> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
+    spec.extend(crate::pipeline::threadgroup_constants(local));
     let n: u32 = local.iter().product();
-    spec.insert(SpecKey::FlatLocalSize, u64::from(n));
     let res = Resources {
         buffers: vec![Buffer {
             slot: Some(ResourceSlot {
@@ -2504,11 +2136,11 @@ fn run_local(plan: &Plan, m: &TypedModule, local: [u32; 3], lanes: SubgroupSize)
 /// 32-lane subgroups makes that barrier a tangle barrier). Its own pipeline keeps the barrier,
 /// takes `CrossLane(BASIC)` and `Direct` (32 lanes pinned), records `RowLockstep`, and leaves
 /// Metal's words in a threadgroup 144 wide and 2 tall, which runs on it, the shared lane's word
-/// included. A dispatch of one row (128 or 48 threads) asks for the one-row variant, which keeps
-/// the threadgroup barrier the `@nb` pair takes, has no simdgroup barrier, no simd class and no
-/// pinned subgroup, states `OneRow`, and leaves Metal's words at every width; its plan sends a
-/// threadgroup of two rows back. The same kernel with a simdgroup sum keeps its pinned pipeline
-/// for every threadgroup of whole simdgroups, one row or not.
+/// included. Its one-row variant (`LoweringInputs::one_row`) keeps the threadgroup barrier the
+/// `@nb` pair takes, has no simdgroup barrier, no simd class and no pinned subgroup, states
+/// `OneRow`, and leaves Metal's words in a threadgroup of one row (128 or 48 threads) at every
+/// width. The same kernel with a simdgroup sum keeps its pinned pipeline and records no
+/// `RowLockstep`.
 #[test]
 fn a_one_row_dispatch_drops_the_lockstep_simdgroup_barriers() {
     let dev = device("intel-irisxe-rplp-anv");
@@ -2575,52 +2207,6 @@ fn a_one_row_dispatch_drops_the_lockstep_simdgroup_barriers() {
         }
     }
 
-    // The binder's choice.
-    let state = bind_state(None);
-    let shape = state.shape();
-    let plan = pipeline(&dev, &bc, name).plan(&dev, &shape).expect("plan");
-    let two_rows = Dispatch::Threadgroups {
-        groups: [1, 1, 1],
-        threads_per_group: wide,
-    };
-    assert_eq!(plan.dispatch_variant(&threads(128)), Ok(one_row_key()));
-    assert_eq!(plan.dispatch_variant(&threads(48)), Ok(one_row_key()));
-    assert_eq!(plan.dispatch_variant(&two_rows), Ok(VariantKey::new()));
-    let f = Library::from_air(&bc)
-        .ok()
-        .and_then(|lib| lib.function(name).ok())
-        .expect("kernel");
-    let budget = Budget::standard();
-    let compiled = dev
-        .compile_function(
-            &FunctionDescriptor::new(f),
-            &one_row_key().lowering_inputs(Stage::Kernel),
-            &budget,
-        )
-        .expect("variant");
-    let variant = dev
-        .compile_compute_pipeline(
-            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-            &budget,
-        )
-        .expect("variant pipeline");
-    assert_eq!(variant.stage.required_subgroup_size, None);
-    let vplan = variant.plan(&dev, &shape).expect("variant plan");
-    assert_eq!(
-        vplan.variant,
-        one_row_key(),
-        "the variant's plan states its key"
-    );
-    assert_eq!(vplan.dispatch_variant(&threads(128)), Ok(one_row_key()));
-    assert!(vplan.instantiate_dispatch(&state, &threads(48)).is_ok());
-    assert_eq!(vplan.dispatch_variant(&two_rows), Ok(VariantKey::new()));
-    assert_eq!(
-        vplan.instantiate_dispatch(&state, &two_rows),
-        Err(BindError::NeedsVariant {
-            variant: Box::new(VariantKey::new())
-        })
-    );
-
     // With a simdgroup operation of its own the kernel keeps its pinned pipeline.
     let summed = "row_tile_sum";
     let Some(bc) = assemble_text(
@@ -2636,24 +2222,18 @@ fn a_one_row_dispatch_drops_the_lockstep_simdgroup_barriers() {
     let (own, _) = typed_module(&bc, summed, p).unwrap_or_else(|e| panic!("{summed}: {e}"));
     assert_eq!(own.simd.1, Tier::Direct);
     assert!(!own.facts.contains(&RuntimeFact::RowLockstep));
-    let plan = pipeline(&dev, &bc, summed)
-        .plan(&dev, &shape)
-        .expect("plan");
-    for d in [threads(32), threads(128), two_rows] {
-        assert_eq!(plan.dispatch_variant(&d), Ok(VariantKey::new()), "{d:?}");
-    }
 }
 
 /// A wave64-only device: the committed RDNA3 description, which reconverges maximally, with its
 /// subgroup size range narrowed to 64, where a simdgroup is half a subgroup (`Cluster32`).
 fn wave64() -> Device {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/amd-rdna3-radv.json");
+        .join("../metal2vulkan-validation/profiles/amd-780m-radv.json");
     let text = std::fs::read_to_string(path).expect("profile");
     let narrowed = text.replace("\"minSubgroupSize\": 32", "\"minSubgroupSize\": 64");
     assert_ne!(narrowed, text, "the description names minSubgroupSize");
     let desc = DeviceDescription::from_khronos_json(&narrowed, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// `kernel void name(texture2d_ms<uint> t [[texture(0)]], device uint *out [[buffer(0)]], uint2
@@ -2727,26 +2307,6 @@ attributes #0 = {{ convergent mustprogress nounwind willreturn }}
     )
 }
 
-/// A multisampled texture of four samples in `format` bound at texture 0 for reading, and
-/// buffer 0.
-fn samples_state(format: crate::metal::PixelFormat) -> BindState {
-    let mut state = bind_state(None);
-    let mut facts =
-        crate::bind::TextureFacts::new(crate::metal::TextureType::Type2DMultisample, format);
-    facts.sample_count = 4;
-    facts.usage = crate::metal::TextureUsage::SHADER_READ;
-    if let Some(table) = state.stages.get_mut(&Stage::Kernel) {
-        table.textures.insert(
-            0,
-            crate::bind::BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-    }
-    state
-}
-
 /// A texel's samples read into a buffer, `out[(y * w + x) * n + s]` over `s < n` with `n` the
 /// texture's sample count (`wsm_samples`'s kernels, as the Metal compiler emits them): the store
 /// meets itself in a later iteration only where two threads of a simdgroup share a pixel, which
@@ -2755,25 +2315,20 @@ fn samples_state(format: crate::metal::PixelFormat) -> BindState {
 /// `Cluster32` tier, and a multiple of 64 threads. In a row its threads' `x` differ and their `y`
 /// are equal, and each thread's cells `(y * w + x) * n + s` lie below the next pixel's, `s` a
 /// counter that starts at 0 below `n` (the branch before the loop tested `n != 0`, as a `select`
-/// or an `and`) and leaves the loop on reaching it: the kernel records `RowLockstep`, and a
-/// threadgroup of one row (1, 16, 32 or 48 threads) asks for its one-row variant, not the
-/// emulated-simdgroups variant. Two rows of 16 still ask for the latter. Negative controls keep
-/// every partial threadgroup on the variant: the row scaled by the width rather than by `n`
-/// (cells of two pixels may meet), the latch testing the counter rather than the next value (the
-/// body runs at `s == n`, the next pixel's first cell), and the loop entered without the `n != 0`
-/// test (at `n == 0` every pixel writes cell 0).
+/// or an `and`) and leaves the loop on reaching it: the kernel records `RowLockstep`. Negative
+/// controls do not: the row scaled by the width rather than by `n` (cells of two pixels may meet),
+/// the latch testing the counter rather than the next value (the body runs at `s == n`, the next
+/// pixel's first cell), and the loop entered without the `n != 0` test (at `n == 0` every pixel
+/// writes cell 0).
 #[test]
 fn a_texel_s_samples_in_a_row_need_no_emulated_simdgroups_on_wave64() {
     let compiler = "select i1 %iny, i1 %some, i1 false";
-    let mut kernels: Vec<(String, Vec<u8>, crate::metal::PixelFormat, bool)> = Vec::new();
+    let mut kernels: Vec<(String, Vec<u8>, bool)> = Vec::new();
     let Some(fixture) = assemble("wsm_samples") else {
         return;
     };
-    for (name, format) in [
-        ("wsm_read_f", crate::metal::PixelFormat::RGBA32Float),
-        ("wsm_read_u", crate::metal::PixelFormat::R32Uint),
-    ] {
-        kernels.push((name.into(), fixture.clone(), format, true));
+    for name in ["wsm_read_f", "wsm_read_u"] {
+        kernels.push((name.into(), fixture.clone(), true));
     }
     for (name, guard, mult, tested, rows) in [
         ("cells", compiler, "%n", "%next", true),
@@ -2791,11 +2346,11 @@ fn a_texel_s_samples_in_a_row_need_no_emulated_simdgroups_on_wave64() {
         let Some(bc) = assemble_text(name, &cells_kernel(name, guard, mult, tested)) else {
             return;
         };
-        kernels.push((name.into(), bc, crate::metal::PixelFormat::R32Uint, rows));
+        kernels.push((name.into(), bc, rows));
     }
     let dev = wave64();
     let p = dev.profile();
-    for (name, bc, format, rows) in kernels {
+    for (name, bc, rows) in kernels {
         let (own, _) = typed_module(&bc, &name, p).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(own.simd.1, Tier::Cluster32, "{name}");
         assert!(
@@ -2809,26 +2364,347 @@ fn a_texel_s_samples_in_a_row_need_no_emulated_simdgroups_on_wave64() {
             rows,
             "{name}"
         );
-        let state = samples_state(format);
-        let plan = pipeline(&dev, &bc, &name)
-            .plan(&dev, &state.shape())
-            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        let want = if rows { one_row_key() } else { emulated_key() };
-        for n in [1, 16, 32, 48] {
-            assert_eq!(
-                plan.dispatch_variant(&threads(n)),
-                Ok(want.clone()),
-                "{name} at {n}"
+    }
+}
+
+/// What a [`row_store_kernel`] stores.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowStores {
+    /// The three words `3 cell + k` of its cell `cell = y * stride + x`, in `int` arithmetic as
+    /// Apple compiles it (`nsw` on every step, the index sign-extended), which two threads of one
+    /// simdgroup in different rows may share for all the IR shows.
+    Cells,
+    /// The same words in `uint` arithmetic, whose steps carry no flags: a step may wrap, and the
+    /// order does not prove two threads of one row apart in such an index.
+    WrappingCells,
+    /// 1 at `x` and 2 at `x + 1`, which two threads of one row share.
+    Neighbours,
+}
+
+/// A kernel over its position in the grid `(x, y)` that loads `src[x]` and stores to `dst`, of
+/// buffers 0 and 1 and the uniform `stride` at buffer 2, what `stores` says; where `guarded`, only
+/// a thread whose `x` is under `stride` does, past a branch on that test, as a kernel that bounds
+/// its grid is compiled.
+fn row_store_kernel(name: &str, stores: RowStores, guarded: bool) -> String {
+    let cells = |flags: &str, ext: &str| {
+        let mut body = format!(
+            "%row = mul{flags} i32 %w, %y
+  %cell = add{flags} i32 %row, %x
+  %d0 = mul{flags} i32 %cell, 3"
+        );
+        for k in 0..3 {
+            if k > 0 {
+                body += &format!("\n  %d{k} = add{flags} i32 %d0, {k}");
+            }
+            body += &format!(
+                "\n  %e{k} = {ext} i32 %d{k} to i64
+  %p{k} = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %e{k}
+  store i32 %v, ptr addrspace(1) %p{k}, align 4"
             );
         }
-        let two_rows = Dispatch::Threadgroups {
-            groups: [1, 1, 1],
-            threads_per_group: [16, 2, 1],
+        body
+    };
+    let body = match stores {
+        RowStores::Cells => cells(" nsw", "sext"),
+        RowStores::WrappingCells => cells("", "zext"),
+        RowStores::Neighbours => "%e0 = zext i32 %x to i64
+  %p0 = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %e0
+  store i32 1, ptr addrspace(1) %p0, align 4
+  %x1 = add i32 %x, 1
+  %e1 = zext i32 %x1 to i64
+  %p1 = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %e1
+  store i32 2, ptr addrspace(1) %p1, align 4"
+            .to_owned(),
+    };
+    let (test, body) = match guarded {
+        true => (
+            "%inside = icmp ult i32 %x, %w
+  br i1 %inside, label %body, label %done
+
+body:
+  ",
+            format!("{body}\n  br label %done\n\ndone:"),
+        ),
+        false => ("", body),
+    };
+    format!(
+        r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+define void @{name}(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(2) %stride, <2 x i32> %position) {{
+  %y = extractelement <2 x i32> %position, i64 1
+  %w = load i32, ptr addrspace(2) %stride, align 4
+  %x = extractelement <2 x i32> %position, i64 0
+  {test}%c = zext i32 %x to i64
+  %ps = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %c
+  %v = load i32, ptr addrspace(1) %ps, align 4
+  {body}
+  ret void
+}}
+
+!air.kernel = !{{!0}}
+!air.version = !{{!20}}
+!air.language_version = !{{!21}}
+
+!0 = !{{ptr @{name}, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3, !4, !5, !6}}
+!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"src"}}
+!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"dst"}}
+!5 = !{{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"stride"}}
+!6 = !{{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"position"}}
+!20 = !{{i32 2, i32 8, i32 0}}
+!21 = !{{!"Metal", i32 4, i32 0, i32 0}}
+"#
+    )
+}
+
+/// On lavapipe's `Device::from_queries` profile the lockstep order gives the stores of every
+/// [`row_store_kernel`] barriers under the resident-table domains, and none under the identity
+/// domains (the runtime's), whose kernels take no order: there each kernel's module has no lockstep
+/// barrier, states no `RowLockstep` and takes no simd class, it does not observe its threadgroup
+/// partition with partial threadgroups, and that variant's pipeline runs its grid in tiles
+/// (`GridTiles`). The identity domains' module records the pair it leaves unordered
+/// (`PrecisionNote::SimdgroupAccessOrder`); the ordered one records none.
+#[test]
+fn the_identity_domains_order_no_lockstep_pair() {
+    let desc = crate::pipeline::testing::description("lavapipe").unwrap_or_else(|e| panic!("{e}"));
+    let resident = Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let dev = Device::from_queries(desc, identity()).unwrap_or_else(|e| panic!("{e}"));
+    let budget = Budget::standard();
+    let lockstep = |plan: &Plan| {
+        (plan.census().keys())
+            .filter(|name| name.starts_with("barrier.lockstep"))
+            .count()
+    };
+    for (name, stores, guarded) in [
+        ("row_cells", RowStores::Cells, false),
+        ("row_cells_wrapping", RowStores::WrappingCells, false),
+        ("row_neighbours", RowStores::Neighbours, false),
+        ("row_cells_guarded", RowStores::Cells, true),
+        ("row_cells_wrapping_guarded", RowStores::WrappingCells, true),
+        ("row_neighbours_guarded", RowStores::Neighbours, true),
+    ] {
+        let Some(bc) = assemble_text(name, &row_store_kernel(name, stores, guarded)) else {
+            return;
         };
-        assert_eq!(
-            plan.dispatch_variant(&two_rows),
-            Ok(emulated_key()),
-            "{name}"
+        let (ordered, _) =
+            typed_module(&bc, name, resident.profile()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(lockstep(&ordered) > 0, "{name}: {:?}", ordered.census());
+        let (plain, _) =
+            typed_module(&bc, name, dev.profile()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(lockstep(&plain), 0, "{name}: {:?}", plain.census());
+        let note = PrecisionNote::SimdgroupAccessOrder;
+        assert!(
+            plain.precision.contains(&note),
+            "{name}: {:?}",
+            plain.precision
+        );
+        assert!(
+            !ordered.precision.contains(&note),
+            "{name}: {:?}",
+            ordered.precision
+        );
+        assert!(!plain.facts.contains(&RuntimeFact::RowLockstep), "{name}");
+        assert_eq!(plain.simd, (SimdClass::None, Tier::NoSubgroup), "{name}");
+        let f = Library::from_air(&bc)
+            .ok()
+            .and_then(|lib| lib.function(name).ok())
+            .map(FunctionDescriptor::new)
+            .expect("kernel");
+        let entries = crate::pipeline::StageEntries::new();
+        let mut partial = LoweringInputs::new();
+        partial.partial_threadgroups = true;
+        let observes = dev
+            .kernel_observes_partition(&f, &partial, &budget, &entries)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!observes, "{name}: the partial variant");
+        let compiled = dev
+            .compile_function(&f, &partial, &budget)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(!compiled.observes_threadgroup_partition(), "{name}");
+        let pipeline = dev
+            .compile_compute_pipeline(
+                &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
+                &budget,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            (pipeline.dependencies.iter()).any(|d| d.fact == RuntimeFact::GridTiles),
+            "{name}: {:?}",
+            pipeline.dependencies
         );
     }
+}
+
+/// A kernel whose threads each read and write their own word of one buffer, `dst[t]` at `t` their
+/// index in the threadgroup: two threads of one simdgroup touch different words.
+fn own_word_kernel(name: &str) -> String {
+    r#"target datalayout = "DATALAYOUT"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+define void @NAME(ptr addrspace(1) %dst, i32 %tid) {
+  %c = zext i32 %tid to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %c
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %w = add i32 %v, 1
+  store i32 %w, ptr addrspace(1) %p, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!air.version = !{!20}
+!air.language_version = !{!21}
+
+!0 = !{ptr @NAME, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!20 = !{i32 2, i32 8, i32 0}
+!21 = !{!"Metal", i32 4, i32 0, i32 0}
+"#
+    .replace("DATALAYOUT", "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32")
+    .replace("NAME", name)
+}
+
+/// A kernel without a pair only lockstep orders ([`own_word_kernel`]) takes no lockstep barrier
+/// under the resident-table domains on lavapipe's profile, and records no
+/// `PrecisionNote::SimdgroupAccessOrder` under either domains.
+#[test]
+fn a_kernel_without_a_lockstep_pair_records_no_access_order_note() {
+    let desc = crate::pipeline::testing::description("lavapipe").unwrap_or_else(|e| panic!("{e}"));
+    let resident = Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let dev = Device::from_queries(desc, identity()).unwrap_or_else(|e| panic!("{e}"));
+    let name = "own_word";
+    let Some(bc) = assemble_text(name, &own_word_kernel(name)) else {
+        return;
+    };
+    let (ordered, _) =
+        typed_module(&bc, name, resident.profile()).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let lockstep = (ordered.census().keys())
+        .filter(|name| name.starts_with("barrier.lockstep"))
+        .count();
+    assert_eq!(lockstep, 0, "{:?}", ordered.census());
+    let (plain, _) =
+        typed_module(&bc, name, dev.profile()).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let note = PrecisionNote::SimdgroupAccessOrder;
+    assert!(!plain.precision.contains(&note), "{:?}", plain.precision);
+    assert!(
+        !ordered.precision.contains(&note),
+        "{:?}",
+        ordered.precision
+    );
+}
+
+/// Through the public API on `DIRECT`, a kernel whose simdgroups run on whole subgroups compiled
+/// under the emulated-simdgroups key is another function and another pipeline, which states the
+/// variant as its mechanism for `EmulatedSimdgroups` and runs with no subgroup requirement and no
+/// stage flags.
+#[test]
+fn the_emulated_simdgroups_variant_compiles_without_a_subgroup_requirement() {
+    let Some(bc) = assemble("simd_ops") else {
+        return;
+    };
+    let dev = direct();
+    let budget = Budget::standard();
+    let f = Library::from_air(&bc)
+        .and_then(|lib| lib.function("simd_sum_k"))
+        .expect("kernel");
+    let fd = FunctionDescriptor::new(f);
+    let base = pipeline(&dev, &bc, "simd_sum_k");
+    let key = emulated_key();
+    let compiled = dev
+        .compile_function(&fd, &key.lowering_inputs(Stage::Kernel), &budget)
+        .expect("variant");
+    assert_ne!(
+        *compiled.key(),
+        dev.function_compile_key(&fd, &LoweringInputs::new())
+    );
+    let variant = dev
+        .compile_compute_pipeline(
+            &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
+            &budget,
+        )
+        .expect("variant pipeline");
+    assert_ne!(variant.key, base.key);
+    assert!(variant
+        .dependencies
+        .iter()
+        .any(|d| d.fact == RuntimeFact::EmulatedSimdgroups && d.mechanism == Mechanism::Variant));
+    assert_eq!(variant.stage.required_subgroup_size, None);
+    assert!(variant.stage.stage_flags.is_empty());
+}
+
+/// The emulated tier's own limits stay refusals in the emulated-simdgroups variant. A matrix
+/// multiply-add in a divergent block compiles in both; a kernel whose threadgroup memory leaves no
+/// room for one simdgroup's scratch is `ThreadgroupMemorySize` at the variant's compile; and one
+/// that leaves room for some states as its maximum the threads whose scratch fits.
+#[test]
+fn the_emulated_tiers_limits_stay_refused_for_partial_simdgroups() {
+    let dev = direct();
+    let p = dev.profile();
+    let emulated = |bc: &[u8], kernel: &str| {
+        let f = Library::from_air(bc)
+            .and_then(|lib| lib.function(kernel))
+            .expect("kernel");
+        dev.compile_function(
+            &FunctionDescriptor::new(f),
+            &emulated_inputs(),
+            &Budget::standard(),
+        )
+    };
+
+    let text = std::fs::read_to_string(engine_dir().join("simd_matrix.ll")).expect("read");
+    let text = text.replacen(
+        "  %5 = shl i32 %3, 1\n",
+        "  %c = icmp ult i32 %3, 16\n  br i1 %c, label %go, label %done\n\ngo:\n  %5 = shl i32 %3, 1\n",
+        1,
+    );
+    let text = text.replacen(
+        "<2 x i64> zeroinitializer) #5\n  ret void\n}",
+        "<2 x i64> zeroinitializer) #5\n  br label %done\n\ndone:\n  ret void\n}",
+        1,
+    );
+    assert!(text.contains("label %go") && text.contains("\ndone:\n"));
+    let Some(bc) = assemble_text("direct-divergent-matrix", &text) else {
+        return;
+    };
+    compile(&bc, "matrix_thread_elements", p).expect("Direct");
+    let variant = emulated(&bc, "matrix_thread_elements").expect("the variant");
+    assert!(variant
+        .artifact()
+        .facts
+        .contains(&RuntimeFact::EmulatedSimdgroups));
+
+    // 32 KiB of shared memory: an arena of 32 KiB leaves nothing for the scratch.
+    assert_eq!(p.fields().limits.max_compute_shared_memory_size, 32 * 1024);
+    let Some(full) = arena_kernel(8192) else {
+        return;
+    };
+    compile(&full, "barrier_k", p).expect("Direct");
+    match emulated(&full, "barrier_k") {
+        Err(Error::Unsupported(u)) => {
+            assert_eq!(u.feature, Feature::ThreadgroupMemorySize);
+            let needs = format!("{:?}", u.needs);
+            assert!(needs.contains("required: 32896"), "{needs}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // An arena of 31 KiB leaves the scratch of 8 simdgroups.
+    let Some(bc) = arena_kernel(31 * 256) else {
+        return;
+    };
+    let variant = dev
+        .compile_compute_pipeline(
+            &ComputePipelineDescriptor::new(StageSource::Compiled(
+                emulated(&bc, "barrier_k").expect("variant"),
+            )),
+            &Budget::standard(),
+        )
+        .expect("variant pipeline");
+    assert_eq!(variant.metal_info.max_total_threads_per_threadgroup, 256);
 }

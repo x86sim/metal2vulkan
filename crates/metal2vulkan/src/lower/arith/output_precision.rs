@@ -22,15 +22,9 @@
 //! (`color_writes::stores_output`): one whose write mask stores none holds nothing the output could
 //! differ by. A module naming no math mode keeps the note at any attachment: what Metal's compiler
 //! does there was not measured.
-//!
-//! **A blended extended-range output** ([`note_extended_range_sources`]): the function blends it by
-//! the device's arithmetic, where Metal's compiler folds the blend into the function.
 
-use crate::air::ir::Type;
-use crate::error::Error;
 use crate::lower::select::SelectCx;
 use crate::pipeline::artifact::PrecisionNote;
-use crate::pipeline::sym::Stage;
 
 /// The note a `half` color output records where Metal may hand it to the attachment otherwise
 /// than the function stores it (the module docs): `PrecisionNote::HalfOutputFastMathBlend` in a
@@ -53,23 +47,11 @@ pub(crate) fn half_output_note(cx: &SelectCx<'_>) -> PrecisionNote {
 /// under every blend and format); in a module compiled with fast math the attachment too
 /// (`StageIo::half_fast_colors`), whose note the pipeline decides by whether the attachment stores
 /// some channel, since one that stores none (its write mask none, or absent from the pipeline)
-/// holds nothing the output could differ by, but [`half_output_note`] itself for an attachment
-/// the function writes in the storage form, which the pipeline's color attachments do not show;
-/// in a module naming no math mode [`half_output_note`] itself. Nothing where the function
-/// computes Metal's 16-bit float blend there itself (a fetched attachment's blend), which stores
-/// Metal's value, nor where it writes the attachment in the
-/// storage form under a write mask that names none of the format's channels, which stores nothing.
+/// holds nothing the output could differ by; in a module naming no math mode
+/// [`half_output_note`] itself.
 pub(crate) fn note_half_output(cx: &mut SelectCx<'_>, color: u32) {
-    // Metal's 16-bit float blend, computed by the function: the attachment stores Metal's value.
-    // A storage write of no channel stores nothing.
-    if crate::lower::fragment::blends_half_in_storage(cx, color)
-        || crate::lower::fragment::stores_nothing_in_storage(cx, color)
-    {
-        return;
-    }
     let math = cx.entry.compile.fast_math;
-    let in_storage = crate::lower::fragment::written_in_storage(cx, color);
-    if math.is_none() || (math == Some(true) && in_storage) {
+    if math.is_none() {
         let note = half_output_note(cx);
         cx.precision.insert(note);
         return;
@@ -82,52 +64,4 @@ pub(crate) fn note_half_output(cx: &mut SelectCx<'_>, color: u32) {
     if let Err(at) = colors.binary_search(&color) {
         colors.insert(at, color);
     }
-}
-
-/// Record `PrecisionNote::ExtendedRangeBlendSource` (a `half` output) or
-/// `PrecisionNote::ExtendedRangeFloatBlendSource` (a `float` one) for each color output the
-/// function blends into an extended-range attachment, where the write stores some channel: the
-/// function computes that blend by the device's arithmetic (`extended_range::blend::native`),
-/// where Metal's compiler folds the blend into the function in forms of its own (each sum and
-/// product rounded to `half`, lerps, common factors and fused pairs chosen by the factors and the
-/// function's own arithmetic), so a blended channel may store a value apart from Metal's.
-pub fn note_extended_range_sources(cx: &mut SelectCx<'_>) -> Result<(), Error> {
-    use crate::air::abi::{AbiInt, OutputRole};
-    if cx.stage != Stage::Fragment {
-        return Ok(());
-    }
-    let (_, tys) = crate::lower::stage_io::output_types(cx)?;
-    let types = cx.entry.module.types();
-    let mut notes = Vec::new();
-    for (o, ty) in cx.entry.ep.outputs.iter().zip(tys) {
-        let OutputRole::RenderTarget {
-            attachment: AbiInt::Const(color),
-            index: 0,
-            ..
-        } = o.role
-        else {
-            continue;
-        };
-        let blended = cx
-            .inputs
-            .extended_range_colors
-            .get(&color)
-            .is_some_and(|e| e.blended);
-        // A write of none of the attachment's channels blends nothing.
-        let stores = crate::lower::fragment::shader_blend(cx, color)
-            .is_none_or(|(eq, _, nothing)| eq.is_some() || !nothing);
-        if !blended || !stores {
-            continue;
-        }
-        let elem = match types.get(ty) {
-            Some(Type::Vector { elem, .. }) => types.get(*elem),
-            other => other,
-        };
-        notes.push(match elem {
-            Some(Type::Float) => PrecisionNote::ExtendedRangeFloatBlendSource,
-            _ => PrecisionNote::ExtendedRangeBlendSource,
-        });
-    }
-    cx.precision.extend(notes);
-    Ok(())
 }

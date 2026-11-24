@@ -1,14 +1,13 @@
 //! Whether a gather and a nearest sample of 32-bit float texels keep a **denormal's exact word**.
 //!
 //! This is the one family where the interesting answer is a driver's habit rather than a format's
-//! rule: `runtime_lane::denormal_word_fetches` measured that Metal keeps a denormal texel through
-//! its samplers, while RADV's gathers and nearest samples, NVIDIA's gathers and ANV's nearest
-//! samples hand back **the zero of the texel's sign** — and every one of those devices' plain
-//! fetches keeps it. A denormal flushed to zero is a value a comparison in floats would call
-//! almost right, so every site here records unsigned words and compares them exactly. This case's
-//! replay on RADV (Mesa 26.2.6, the RX 7900 XTX and the Radeon 780M, 2026-11-07) differed at the
-//! four nearest-sample sites alone: its gathers kept the word there. The device's flush is its
-//! native answer, `device-texel-conversion`.
+//! rule: Metal keeps a denormal texel through its samplers, while RADV's gathers and nearest
+//! samples, NVIDIA's gathers and ANV's nearest samples hand back **the zero of the texel's sign** —
+//! and every one of those devices' plain fetches keeps it. A denormal flushed to zero is a value a
+//! comparison in floats would call almost right, so every site here records unsigned words and
+//! compares them exactly. This case's replay on RADV (Mesa 26.2.6, the RX 7900 XTX and the Radeon
+//! 780M, 2026-11-07) differed at the four nearest-sample sites alone: its gathers kept the word
+//! there. The device's flush is its native answer, `device-texel-conversion`.
 //!
 //! The owned fixture `denormal_texels` is the one written for this question. Lane `i` reads the
 //! coordinate `in[i].xy` and writes eight `float4`s, each a site of its own because each is its own
@@ -25,19 +24,16 @@
 //! | `sample-rgba-repeat-offset` | `rgba.sample` at a texel offset of `(1, -1)`, repeating |
 //! | `sample-array-layer1-edge` | `arr.sample` of layer 1 of a two-slice array |
 //!
-//! The coordinates are the lane's own: a gather at each of the nine interior texel corners of the
-//! 4 by 4 texture, where a gather's four taps are four different texels, and a nearest sample at
-//! each of the sixteen texel centres, where the word states one texel. The two sets are one buffer
-//! and every access runs over both, so a gather's answer at a texel centre and a sample's at a
-//! corner are recorded too rather than being left out as uninteresting — they are the rows that
-//! would catch a tie broken the other way.
+//! The coordinates: a gather at each of the nine interior texel corners of the 4 by 4 texture,
+//! where a gather's four taps are four different texels, and a nearest sample at each of the
+//! sixteen texel centres, where the word states one texel. The two sets are one buffer and every
+//! access runs over both, so a gather's answer at a texel centre and a sample's at a corner are
+//! recorded too rather than being left out as uninteresting — they are the rows that would catch a
+//! tie broken the other way.
 //!
-//! The lane also read the texture through a **runtime** sampler slot, through an argument buffer's
-//! sampler, and as a heap texture, on its own generated AIR; `denormal_texels` holds constexpr
-//! samplers only and no committed fixture reads a denormal texture through the other three with
-//! one texture bound. They are not ported here, and the module docs of
-//! `runtime_lane::denormal_word_fetches` record that Metal's runtime and argument-buffer samplers
-//! filtered exactly as its constexpr samplers of the same state.
+//! `denormal_texels` holds constexpr samplers only, and no committed fixture reads a denormal
+//! texture through a runtime sampler slot, an argument buffer's sampler or a heap texture with one
+//! texture bound, so those three are not cases here.
 //!
 //! Every output word holds [`BLANK`] before the dispatch, so a word the kernel did not reach is a
 //! recorded value rather than whatever the allocator left.
@@ -55,7 +51,7 @@ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
 /// The fixture the kernel lives in, and its entry point.
 const FIXTURE: &str = "denormal_texels";
 
-/// The textures' side: 4 by 4, which the lane's corners and centres are of.
+/// The textures' side: 4 by 4.
 const SIDE: u32 = 4;
 
 /// The texels of one level.
@@ -70,8 +66,8 @@ const RESULTS: usize = 8;
 /// The byte every output word holds before the dispatch.
 pub const BLANK: u8 = 0xab;
 
-/// The texels of the 4 by 4 `R32Float` texture, row by row, as the lane wrote them: denormals of
-/// both signs, signed zeros, the smallest normal, and ordinary values.
+/// The texels of the 4 by 4 `R32Float` texture, row by row: denormals of both signs, signed zeros,
+/// the smallest normal, and ordinary values.
 const WORDS: [u32; TEXELS] = [
     0x0000_0001,
     0x8000_0002,
@@ -131,8 +127,8 @@ fn slice_bytes(slice: u32) -> Vec<u8> {
         .collect()
 }
 
-/// The nine interior texel corners, in the lane's own order: a gather at one of these reads four
-/// different texels.
+/// The nine interior texel corners, in a fixed order: a gather at one of these reads four different
+/// texels.
 fn corners() -> Vec<(u32, u32)> {
     (0..SIDE - 1)
         .flat_map(|down| (0..SIDE - 1).map(move |across| (across, down)))
@@ -146,8 +142,7 @@ fn centres() -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Every coordinate the case reads at: the corners first, then the centres, as the lane's two
-/// sweeps ran.
+/// Every coordinate the case reads at: the corners first, then the centres.
 fn coordinates() -> Vec<[f32; 2]> {
     let side = SIDE as f32;
     let corner = corners()
@@ -268,17 +263,6 @@ impl Case for DenormalWordFetches {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: every value of this family still compares against Metal's exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09), where it fired for all this case
-        // and each row was divergent on that field and nothing else (replay-nvidia.log).
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -486,19 +470,18 @@ mod tests {
         }
     }
 
-    /// Metal's recorded words are the texels themselves, for the two accesses whose answer the
-    /// lane pins: a clamp-to-edge gather at an interior corner reads the four texels around it in
+    /// Metal's recorded words are the texels themselves, for the two accesses whose answer is
+    /// pinned: a clamp-to-edge gather at an interior corner reads the four texels around it in
     /// Metal's gather order, and a clamp-to-edge nearest sample at a texel centre reads that texel
     /// with 0, 0 and 1 beside it.
     ///
-    /// This is the cross-check the port exists for. The lane asserts the same rule against a live
-    /// device, which says nothing on a host with no Metal; here it is held against Metal's own
-    /// recorded answer, so a driver that starts flushing shows as the texel that moved.
+    /// The rule is held against Metal's own recorded answer, so a driver that starts flushing
+    /// shows as the texel that moved.
     #[test]
-    fn metals_recorded_words_are_the_texels_the_lane_pins() {
+    fn metals_recorded_words_are_the_pinned_texels() {
         let case = DenormalWordFetches;
         let Ok(recording) = crate::recording::read(case.name()) else {
-            // Recorded in a later commit of this batch.
+            // No recording to check.
             return;
         };
         let answer = recording.answer().unwrap_or_else(|why| panic!("{why}"));

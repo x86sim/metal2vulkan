@@ -61,9 +61,9 @@ fn fixture(stem: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Committed profile `stem` as a device with the default policy.
+/// Committed profile `stem` as a device with the resident-table domains.
 fn device(stem: &str) -> Device {
-    Device::new(description(stem), DevicePolicy::default()).expect("device")
+    Device::from_queries(description(stem), DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// Committed profile `stem` as the Khronos reader describes it.
@@ -206,7 +206,7 @@ fn a_metallib_parses_from_its_tags_alone() {
         ));
     }
     // Compiling the broken function fails at decode, typed.
-    let dev = device("lunarg-desktop-baseline-2023");
+    let dev = device("runtime-floor");
     let broken = lib.function("broken").expect("broken");
     assert!(matches!(
         dev.compile_compute_pipeline(&kernel(broken), &Budget::standard()),
@@ -221,7 +221,7 @@ fn a_metallib_function_compiles_after_its_container_check() {
     let Some(bc) = fixture("store_const") else {
         return;
     };
-    let dev = device("lunarg-desktop-baseline-2023");
+    let dev = device("runtime-floor");
     let bytes = metallib(&[MtlbFunction {
         name: "store_const",
         type_code: 2,
@@ -287,7 +287,7 @@ fn a_compute_pipeline_compiles_from_a_function() {
     };
     let lib = Library::from_air(&bc).expect("library");
     let f = lib.function("store_const").expect("function");
-    for stem in ["moltenvk-m3", "lunarg-desktop-baseline-2023", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let dev = device(stem);
         let mut d = kernel(f.clone());
         d.max_total_threads_per_threadgroup = Some(64);
@@ -407,7 +407,7 @@ fn a_compiled_stage_links_without_decoding() {
     assert_eq!(from_compiled.key, dev.compute_pipeline_key(&d));
 
     // A function compiled for another profile is refused, not linked.
-    let other = device("vk12-floor");
+    let other = device("runtime-floor");
     assert_eq!(
         other.compile_compute_pipeline(&d, &Budget::standard()),
         Err(Error::InvalidDescriptor(
@@ -474,7 +474,7 @@ fn function_keys_cover_their_inputs() {
         .expect("library")
         .function("stage_io_vertex_gated")
         .expect("function");
-    let (a, b) = (device("moltenvk-m3"), device("vk12-floor"));
+    let (a, b) = (device("moltenvk-m3"), device("runtime-floor"));
     let mut fd = FunctionDescriptor::new(f);
     let none = LoweringInputs::new();
     let base = a.function_compile_key(&fd, &none);
@@ -497,12 +497,6 @@ fn function_keys_cover_their_inputs() {
     let mut emulated = LoweringInputs::new();
     emulated.emulated_simdgroups = true;
     assert_ne!(with_true, a.function_compile_key(&fd, &emulated));
-    // So is the dropped vertex `Layer` output.
-    let mut dropped = LoweringInputs::new();
-    dropped.dropped_vertex_layer = true;
-    let dropped = a.function_compile_key(&fd, &dropped);
-    assert_ne!(with_true, dropped);
-    assert_ne!(a.function_compile_key(&fd, &emulated), dropped);
     // So are the signed-integer color attachments, by attachment.
     let signed = |a_: &[u32]| {
         let mut i = LoweringInputs::new();
@@ -511,13 +505,11 @@ fn function_keys_cover_their_inputs() {
     };
     assert_ne!(with_true, signed(&[0]));
     assert_ne!(signed(&[0]), signed(&[1]));
-    assert_ne!(dropped, signed(&[0]));
     // So is a multisampled pipeline's fragment input.
     let mut multisampled = LoweringInputs::new();
     multisampled.multisampled = true;
     let multisampled = a.function_compile_key(&fd, &multisampled);
     assert_ne!(with_true, multisampled);
-    assert_ne!(dropped, multisampled);
     assert_ne!(signed(&[0]), multisampled);
     // So is a device-replay variant.
     let mut replay = LoweringInputs::new();
@@ -532,25 +524,6 @@ fn function_keys_cover_their_inputs() {
     let cl = a.function_compile_key(&fd, &cl);
     assert_ne!(with_true, cl);
     assert_ne!(replay, cl);
-    // So is the interlocked framebuffer fetch's pipeline state, by its attachments' state.
-    let fetch = |format| {
-        let mut i = LoweringInputs::new();
-        let colors = [Some(
-            crate::pipeline::descriptor::ColorAttachmentDescriptor::new(format),
-        )];
-        i.framebuffer_fetch = Some(crate::pipeline::FramebufferFetchInputs::of(
-            [0],
-            &colors,
-            false,
-            false,
-            1,
-        ));
-        a.function_compile_key(&fd, &i)
-    };
-    let r32 = fetch(metal::PixelFormat::R32Float);
-    assert_ne!(with_true, r32);
-    assert_ne!(replay, r32);
-    assert_ne!(r32, fetch(metal::PixelFormat::RGBA8Unorm));
     // So is the raw viewport index's varying.
     let mut viewport = LoweringInputs::new();
     viewport.viewport_index_varying = true;
@@ -578,7 +551,6 @@ fn function_keys_cover_their_inputs() {
     let layer = a.function_compile_key(&fd, &layer);
     assert_ne!(with_true, layer);
     assert_ne!(viewport, layer);
-    assert_ne!(dropped, layer);
     // So are draws of one amplification each, by what the vertex function writes.
     let draws = |layered, viewports| {
         let mut i = LoweringInputs::new();
@@ -636,20 +608,10 @@ fn function_keys_cover_their_inputs() {
     assert_ne!(with_true, maps(&[(0, edges)]));
     assert_ne!(maps(&[(0, edges)]), maps(&[(1, edges)]));
     assert_ne!(maps(&[(0, edges)]), maps(&[(0, mirrored)]));
-    // So are the extended-range colors whose `half` shadow the draw's instance holds.
-    let shadowed = |colors: &[u32]| {
-        let mut i = LoweringInputs::new();
-        i.extended_shadows = colors.iter().copied().collect();
-        a.function_compile_key(&fd, &i)
-    };
-    assert_eq!(with_true, shadowed(&[]));
-    assert_ne!(with_true, shadowed(&[0]));
-    assert_ne!(shadowed(&[0]), shadowed(&[1]));
-    assert_ne!(shadowed(&[0]), shadowed(&[0, 1]));
 }
 
-/// A key without the emulated-simdgroups and dropped-vertex-layer inputs hashes the inputs as it
-/// did before those inputs existed, the derived `Debug` of the three earlier fields, so no cached
+/// A key without the emulated-simdgroups input and the later ones hashes the inputs as it did
+/// before those inputs existed, the derived `Debug` of the three earlier fields, so no cached
 /// function of the common path changes key.
 #[test]
 fn the_inputs_encoding_is_the_earlier_derived_debug() {
@@ -680,20 +642,14 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
             derived
                 .replace(", emulated_simdgroups: false", "")
                 .replace(", one_row: false", "")
-                .replace(", dropped_vertex_layer: false", "")
                 .replace(", stage_input: None", "")
-                .replace(", storage_view_slots: {}", "")
                 .replace(", signed_color_attachments: {}", "")
                 .replace(", tile_attachments: None", "")
                 .replace(", multisampled: false", "")
                 .replace(", replay_bindings: false", "")
                 .replace(", merged_draws: false", "")
-                .replace(", framebuffer_fetch: None", "")
                 .replace(", srgb_textures: {}", "")
-                .replace(", snapshot_textures: {}", "")
-                .replace(", ycbcr_in_place: {}", "")
-                .replace(", ycbcr_planes_sampled: {}", "")
-                .replace(", texel_rows: {}", "")
+                .replace(", texel_buffer_parts: {}", "")
                 .replace(", viewport_index_varying: false", "")
                 .replace(", max_call_stack_depth: None", "")
                 .replace(", open_cl_mode: false", "")
@@ -704,11 +660,11 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", primitive_id_indices: None", "")
                 .replace(", quad_primitive_ids: false", "")
                 .replace(", private_list: false", "")
+                .replace(", indirect_range: false", "")
                 .replace(", amplification_draws: None", "")
                 .replace(", color_writes: {}", "")
                 .replace(", primitive_varyings: {}", "")
                 .replace(", absent_varyings: {}", "")
-                .replace(", viewport_compensation: None", "")
                 .replace(", folded_groups: false", "")
                 .replace(", partial_threadgroups: false", "")
                 .replace(", extended_range: {}", "")
@@ -724,12 +680,8 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", unattached_colors: {}", "")
                 .replace(", sample_mask: None", "")
                 .replace(", alpha_test: None", "")
-                .replace(", logic_operation: None", "")
                 .replace(", depth_compare_clamp_mask: 0", "")
                 .replace(", read_only_tests: false", "")
-                .replace(", shader_tests: false", "")
-                .replace(", shader_stencil: false", "")
-                .replace(", window_depth_varying: false", "")
                 .replace(", rotated_colors: {}", "")
                 .replace(", alpha_in_red_colors: {}", "")
                 .replace(", rotated_factors: {}", "")
@@ -737,18 +689,17 @@ fn the_inputs_encoding_is_the_earlier_derived_debug() {
                 .replace(", address_maps: {}", "")
                 .replace(", cubic_samplers: {}", "")
                 .replace(", rotated_blends: {}", "")
-                .replace(", extended_shadows: {}", "")
                 .replace(", cross_class: {}", "")
                 .replace(", texture_write_rounding: TowardZero", "")
                 .replace(", anisotropic_samplers: {}", "")
+                .replace(", open_cl_lines: {}", "")
                 .replace(", uniform_varyings: {}", "")
                 .replace(", instanced_attributes: {}", "")
-                .replace(", color_group: None", "")
                 .replace(", object_payload: None", "")
                 .replace(", tessellation: None", "")
                 .replace(", region_viewports: false", "")
-                .replace(", region_copies: false", "")
-                .replace(", unit_axes: 0", ""),
+                .replace(", unit_axes: 0", "")
+                .replace(", push_base: 0", ""),
             "{derived}"
         );
     }
@@ -790,7 +741,7 @@ fn concurrent_compiles_of_one_function_agree() {
     let Some(bc) = fixture("store_const") else {
         return;
     };
-    let dev = device("lunarg-desktop-baseline-2023");
+    let dev = device("runtime-floor");
     let f = Library::from_air(&bc)
         .expect("library")
         .function("store_const")
@@ -832,7 +783,7 @@ fn determinism_stage_words() -> Option<Vec<(String, Vec<u32>)>> {
     let vertex = lib.function("colored_vertex").expect("vertex");
     let fragment = lib.function("sampled_fragment").expect("fragment");
     let mut out = Vec::new();
-    for stem in ["moltenvk-m3", "lunarg-desktop-baseline-2023"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         for format in [
             metal::PixelFormat::RGBA8Unorm,
             metal::PixelFormat::BGRA8Unorm,
@@ -1049,7 +1000,7 @@ fn a_render_pipeline_compiles_from_functions() {
     };
     let lib = Library::from_air(&bc).expect("library");
     let vertex = lib.function("stage_io_vertex_position").expect("vertex");
-    for stem in ["moltenvk-m3", "lunarg-desktop-baseline-2023"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let dev = device(stem);
         let mut d = RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(
             vertex.clone(),
@@ -1241,11 +1192,14 @@ fn one_entry_set_specializes_a_sweeps_stages_once() {
     assert_eq!(apart, 16, "two stages specialized for each of the eight");
 }
 
-/// A render descriptor's key is the same for an equal descriptor and on another device of the
-/// same profile, and differs where a field, a stage, a private field, or the profile does: a
-/// consumer keeping answers under it never takes another descriptor's.
+/// The key on `Device::from_queries`' path is the same for an equal descriptor and on another
+/// device of the same profile, and differs from the descriptor's where one field group of it
+/// changes: the stages, the vertex descriptor, a colour attachment's every field, the depth and
+/// stencil formats, the sample and rasterization state, the topology class and amplification,
+/// tessellation, indirect command buffers, the call-stack depths, binary functions, buffer
+/// mutability, the rounding mode, each private field group, and the profile.
 #[test]
-fn a_render_descriptor_key_covers_its_fields() {
+fn a_queried_render_descriptor_key_covers_each_field_group() {
     let Some(bc) = fixture("stage_io") else {
         return;
     };
@@ -1264,61 +1218,222 @@ fn a_render_descriptor_key_covers_its_fields() {
     d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(
         metal::PixelFormat::RGBA8Unorm,
     ));
-    let key = dev.render_descriptor_key(&d);
-    assert_eq!(dev.render_descriptor_key(&d.clone()), key);
-    assert_eq!(device("moltenvk-m3").render_descriptor_key(&d), key);
+    let key = dev.queried_render_descriptor_key(&d);
+    assert_eq!(dev.queried_render_descriptor_key(&d.clone()), key);
+    assert_eq!(device("moltenvk-m3").queried_render_descriptor_key(&d), key);
     assert_ne!(
-        device("lunarg-desktop-baseline-2023").render_descriptor_key(&d),
+        device("runtime-floor").queried_render_descriptor_key(&d),
         key,
         "the profile"
     );
-    type Change = fn(&mut RenderPipelineDescriptor, &crate::library::Function);
-    let changes: [(&str, Change); 11] = [
-        ("no fragment", |e, _| e.fragment = None),
-        ("the fragment's function", |e, v| {
-            e.fragment = Some(StageSource::Function(FunctionDescriptor::new(v.clone())));
-        }),
-        ("constants", |e, _| {
-            if let StageSource::Function(f) = &mut e.vertex {
-                f.constants = has_tint(true);
-            }
-        }),
-        ("depth", |e, _| {
-            e.depth_format = Some(metal::PixelFormat::Depth32Float);
-        }),
-        ("a color format", |e, _| {
-            e.color_attachments[0] = Some(ColorAttachmentDescriptor::new(
-                metal::PixelFormat::BGRA8Unorm,
-            ));
-        }),
-        ("rasterization", |e, _| e.rasterization_enabled = false),
-        ("indirect command buffers", |e, _| {
-            e.support_indirect_command_buffers = true;
-        }),
-        ("a buffer's mutability", |e, _| {
-            e.vertex_buffers.insert(0, metal::Mutability::Immutable);
-        }),
-        ("coverage 0.0", |e, _| {
-            e.private.sample_coverage = 0.0;
-        }),
-        ("a private flag", |e, _| e.private.two_side_enabled = true),
-        ("OpenGL mode", |e, _| e.private.open_gl_mode_enabled = true),
+    let with_layout = |e: &mut RenderPipelineDescriptor, stride| {
+        let mut v = VertexDescriptor::new();
+        v.layouts
+            .insert(0, VertexBufferLayoutDescriptor::new(stride));
+        v.attributes.insert(
+            0,
+            VertexAttributeDescriptor::new(metal::VertexFormat::Float4, 0, 0),
+        );
+        e.vertex_descriptor = Some(v);
+    };
+    let color = |e: &RenderPipelineDescriptor| e.color_attachments[0].expect("the attachment");
+    type Change<'a> = Box<dyn Fn(&mut RenderPipelineDescriptor) + 'a>;
+    let changes: Vec<(&str, Change<'_>)> = vec![
+        ("no fragment", Box::new(|e| e.fragment = None)),
+        (
+            "the fragment's function",
+            Box::new(|e| {
+                e.fragment = Some(StageSource::Function(FunctionDescriptor::new(
+                    vertex.clone(),
+                )));
+            }),
+        ),
+        (
+            "constants",
+            Box::new(|e| {
+                if let StageSource::Function(f) = &mut e.vertex {
+                    f.constants = has_tint(true);
+                }
+            }),
+        ),
+        (
+            "a vertex descriptor",
+            Box::new(|e| with_layout(e, Some(16))),
+        ),
+        ("another stride", Box::new(|e| with_layout(e, Some(32)))),
+        ("the dynamic stride", Box::new(|e| with_layout(e, None))),
+        (
+            "a step function",
+            Box::new(|e| {
+                with_layout(e, Some(16));
+                if let Some(v) = &mut e.vertex_descriptor {
+                    if let Some(l) = v.layouts.get_mut(&0) {
+                        l.step_function = metal::VertexStepFunction::PerInstance;
+                    }
+                }
+            }),
+        ),
+        (
+            "an attribute's offset",
+            Box::new(|e| {
+                with_layout(e, Some(16));
+                if let Some(v) = &mut e.vertex_descriptor {
+                    if let Some(a) = v.attributes.get_mut(&0) {
+                        a.offset = 4;
+                    }
+                }
+            }),
+        ),
+        (
+            "a color format",
+            Box::new(|e| {
+                e.color_attachments[0] = Some(ColorAttachmentDescriptor::new(
+                    metal::PixelFormat::BGRA8Unorm,
+                ));
+            }),
+        ),
+        (
+            "a second attachment",
+            Box::new(|e| {
+                e.color_attachments[1] = Some(color(e));
+            }),
+        ),
+        (
+            "blending",
+            Box::new(|e| {
+                let mut c = color(e);
+                c.blending_enabled = true;
+                e.color_attachments[0] = Some(c);
+            }),
+        ),
+        (
+            "a blend factor",
+            Box::new(|e| {
+                let mut c = color(e);
+                c.destination_alpha_blend_factor = metal::BlendFactor::One;
+                e.color_attachments[0] = Some(c);
+            }),
+        ),
+        (
+            "a blend operation",
+            Box::new(|e| {
+                let mut c = color(e);
+                c.alpha_blend_operation = metal::BlendOperation::Max;
+                e.color_attachments[0] = Some(c);
+            }),
+        ),
+        (
+            "a write mask",
+            Box::new(|e| {
+                let mut c = color(e);
+                c.write_mask = metal::ColorWriteMask::RED;
+                e.color_attachments[0] = Some(c);
+            }),
+        ),
+        (
+            "depth",
+            Box::new(|e| e.depth_format = Some(metal::PixelFormat::Depth32Float)),
+        ),
+        (
+            "stencil",
+            Box::new(|e| e.stencil_format = Some(metal::PixelFormat::Stencil8)),
+        ),
+        ("samples", Box::new(|e| e.raster_sample_count = 4)),
+        (
+            "alpha to coverage",
+            Box::new(|e| e.alpha_to_coverage = true),
+        ),
+        ("alpha to one", Box::new(|e| e.alpha_to_one = true)),
+        (
+            "rasterization",
+            Box::new(|e| e.rasterization_enabled = false),
+        ),
+        (
+            "the topology class",
+            Box::new(|e| e.input_primitive_topology = metal::PrimitiveTopologyClass::Line),
+        ),
+        (
+            "amplification",
+            Box::new(|e| e.max_vertex_amplification_count = 2),
+        ),
+        (
+            "tessellation",
+            Box::new(|e| e.tessellation = Some(TessellationDescriptor::default())),
+        ),
+        (
+            "indirect command buffers",
+            Box::new(|e| e.support_indirect_command_buffers = true),
+        ),
+        (
+            "a call-stack depth",
+            Box::new(|e| e.max_fragment_call_stack_depth = 2),
+        ),
+        (
+            "binary functions",
+            Box::new(|e| e.support_adding_vertex_binary_functions = true),
+        ),
+        (
+            "a buffer's mutability",
+            Box::new(|e| {
+                e.fragment_buffers.insert(0, metal::Mutability::Immutable);
+            }),
+        ),
+        (
+            "the rounding mode",
+            Box::new(|e| {
+                e.texture_write_rounding_mode = metal::TextureWriteRoundingMode::NearestEven
+            }),
+        ),
+        ("the sample mask", Box::new(|e| e.private.sample_mask = 1)),
+        (
+            "coverage 0.0",
+            Box::new(|e| e.private.sample_coverage = 0.0),
+        ),
+        (
+            "coverage -0.0",
+            Box::new(|e| e.private.sample_coverage = -0.0),
+        ),
+        (
+            "the alpha test",
+            Box::new(|e| e.private.alpha_test_function = 3),
+        ),
+        (
+            "the logic operation",
+            Box::new(|e| e.private.logic_operation = 5),
+        ),
+        (
+            "a clip distance",
+            Box::new(|e| e.private.clip_distance_enable_mask = 1),
+        ),
+        (
+            "a private flag",
+            Box::new(|e| e.private.two_side_enabled = true),
+        ),
+        (
+            "a clamp mask",
+            Box::new(|e| e.private.fragment_depth_compare_clamp_mask = 1),
+        ),
+        (
+            "the amplification mode",
+            Box::new(|e| e.private.vertex_amplification_mode = 1),
+        ),
+        (
+            "a visibility group",
+            Box::new(|e| e.private.explicit_visibility_group_id = 0),
+        ),
+        (
+            "OpenGL mode",
+            Box::new(|e| e.private.open_gl_mode_enabled = true),
+        ),
     ];
     let mut seen = vec![key];
-    for (what, change) in changes {
+    for (what, change) in &changes {
         let mut e = d.clone();
-        change(&mut e, &vertex);
-        let k = dev.render_descriptor_key(&e);
+        change(&mut e);
+        let k = dev.queried_render_descriptor_key(&e);
         assert!(!seen.contains(&k), "{what} changes the key");
         seen.push(k);
     }
-    // Coverage 0.0 and -0.0 are different descriptors.
-    let mut e = d.clone();
-    e.private.sample_coverage = -0.0;
-    assert!(
-        !seen.contains(&dev.render_descriptor_key(&e)),
-        "coverage -0.0"
-    );
 }
 
 /// A render pipeline requires `extendedDynamicState` exactly when its graphics state makes a state
@@ -1349,7 +1464,8 @@ fn a_render_pipeline_requires_extended_dynamic_state_exactly_when_it_makes_one_d
     )));
     d.rasterization_enabled = false;
     let compile = |desc: &DeviceDescription| {
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+        let dev =
+            Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES).expect("device");
         let pipe = dev
             .compile_render_pipeline(&d, &Budget::standard())
             .expect("render pipeline");
@@ -1368,8 +1484,10 @@ fn a_render_pipeline_requires_extended_dynamic_state_exactly_when_it_makes_one_d
         l3(&pipe.stages[0].spirv, &pipe.requirements, &dev);
         pipe
     };
-    // Vulkan 1.2 without the extension: static states, no requirement.
-    let floor = description("lunarg-desktop-baseline-2023");
+    // Vulkan 1.2 without the extension (`runtime-floor` as a 1.2 context reads it): static states,
+    // no requirement.
+    let floor = crate::pipeline::testing::description_at_1_2("runtime-floor", false)
+        .expect("runtime-floor");
     assert!(!floor.has(VkFeature::ExtendedDynamicState));
     let plain = compile(&floor);
     assert!(plain
@@ -1400,7 +1518,7 @@ fn a_render_pipeline_requires_extended_dynamic_state_exactly_when_it_makes_one_d
     );
 
     // From Vulkan 1.3 the states are core without a feature member: required, nothing to enable.
-    for stem in ["lavapipe", "moltenvk-m3", "roadmap-2022"] {
+    for stem in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let desc = description(stem);
         assert!(desc.api_version >= crate::device::requirements::ApiVersion::V1_3);
         let pipe = compile(&desc);
@@ -1445,7 +1563,8 @@ fn a_vertex_pipeline_makes_its_input_assembly_dynamic_exactly_with_both_extended
     )));
     d.rasterization_enabled = false;
     let compile = |desc: &DeviceDescription| {
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+        let dev =
+            Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES).expect("device");
         dev.compile_render_pipeline(&d, &Budget::standard())
             .expect("render pipeline")
     };
@@ -1466,7 +1585,9 @@ fn a_vertex_pipeline_makes_its_input_assembly_dynamic_exactly_with_both_extended
         );
         topology
     };
-    let floor = description("lunarg-desktop-baseline-2023");
+    // `runtime-floor` as a Vulkan 1.2 context reads it, without either extension.
+    let floor = crate::pipeline::testing::description_at_1_2("runtime-floor", false)
+        .expect("runtime-floor");
     assert!(!floor.has(VkFeature::ExtendedDynamicState));
     assert!(!floor.has(VkFeature::ExtendedDynamicState2));
     assert!(!assembly(&compile(&floor)));
@@ -1503,7 +1624,7 @@ fn a_vertex_pipeline_makes_its_input_assembly_dynamic_exactly_with_both_extended
         Err(Capability::Feature(VkFeature::ExtendedDynamicState2))
     );
     // From Vulkan 1.3: dynamic, nothing to enable.
-    for stem in ["lavapipe", "moltenvk-m3", "roadmap-2022"] {
+    for stem in ["lavapipe", "moltenvk-m3", "runtime-floor"] {
         let desc = description(stem);
         let pipe = compile(&desc);
         assert!(assembly(&pipe), "{stem}");
@@ -1515,22 +1636,16 @@ fn a_vertex_pipeline_makes_its_input_assembly_dynamic_exactly_with_both_extended
     }
 }
 
-/// A render pipeline whose fragment function reads its color attachment orders the read exactly
-/// where the device can. With rasterization-order attachment access it states that access and
-/// requires `rasterizationOrderColorAttachmentAccess` (enabled with its extension). With only the
-/// ordered pixel interlock it reads and writes the attachment as a storage image inside the
-/// interlock: no input attachment, no color attachment state for it, the interlock, the
-/// fragment-stage store, and the format's storage access required; a blending attachment's blend
-/// the shader computes (`R32Float`'s the generic one, noted). Where the pipeline's state blocks
-/// that form (alpha to coverage), the pipeline is refused with the blocker. With neither form it
-/// reads the input attachment without rasterization-order access, which the consumer's barriers
-/// order between draws alone, and its fragment stage records
-/// `PrecisionNote::UnorderedFetchWithinDraw`, which neither ordered form records. A raster order
-/// group on the color input (`fetch_ordered`) takes the interlock where the device has it, and
-/// with neither form orders that read alone: no interlock, noted.
+/// A render pipeline whose fragment function reads its color attachment reads the input
+/// attachment without rasterization-order access on every device, lavapipe (which has
+/// `rasterizationOrderColorAttachmentAccess`) included, with the ordered pixel interlock or not:
+/// the consumer's barriers order it between draws alone, a blend is the device's, and its fragment
+/// stage records `PrecisionNote::UnorderedFetchWithinDraw`. A raster order group on the color
+/// input (`fetch_ordered`) orders that read alone: no interlock, noted. No requirement names
+/// either feature.
 #[test]
-fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() {
-    use crate::device::requirements::{FormatUsage, VkExtension, VkFeature};
+fn a_framebuffer_fetch_pipeline_is_ordered_between_draws_on_every_device() {
+    use crate::device::requirements::VkFeature;
     use crate::pipeline::{PrecisionNote, RenderPipeline};
     const ORDERED: VkFeature = VkFeature::RasterizationOrderColorAttachmentAccess;
     const INTERLOCK: VkFeature = VkFeature::FragmentShaderPixelInterlock;
@@ -1549,15 +1664,21 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
         RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(vertex)));
     d.fragment = Some(StageSource::Function(FunctionDescriptor::new(fragment)));
     d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(metal::PixelFormat::R32Float));
-    // Blended, adding the destination (a blend of one and zero, added, stores the source as no
-    // blending does).
+    // Blended, adding the destination.
     let mut blended = d.clone();
     if let Some(c) = blended.color_attachments[0].as_mut() {
         c.blending_enabled = true;
         c.destination_rgb_blend_factor = metal::BlendFactor::One;
     }
+    let mut grouped = d.clone();
+    grouped.fragment = Some(StageSource::Function(FunctionDescriptor::new(
+        Library::from_air(&fetch)
+            .expect("library")
+            .function("fetch_ordered")
+            .expect("fragment"),
+    )));
     let compile = |desc: &DeviceDescription, policy: DevicePolicy, d: &RenderPipelineDescriptor| {
-        let dev = Device::new(desc.clone(), policy).expect("device");
+        let dev = Device::from_queries(desc.clone(), policy).expect("device");
         let pipe = dev.compile_render_pipeline(d, &Budget::standard())?;
         for s in &pipe.stages {
             l3(&s.spirv, &pipe.requirements, &dev);
@@ -1576,109 +1697,133 @@ fn a_framebuffer_fetch_pipeline_is_ordered_exactly_where_the_device_orders_it() 
             })
     };
     let lavapipe = description("lavapipe");
-    assert!(lavapipe.has(ORDERED));
-    {
-        let pipe = compile(&lavapipe, DevicePolicy::default(), &d).expect("lavapipe");
-        assert!(!unordered(&pipe));
-        assert_eq!(pipe.graphics.input_attachments.len(), 1);
-        assert!(pipe.graphics.storage_attachments.is_empty());
-        assert!(pipe.graphics.rasterization_order_attachment_access);
-        assert!(pipe.requirements.features.contains(&ORDERED));
-        let enables = lavapipe
-            .required_enables(&pipe.requirements)
-            .expect("enables");
-        assert!(enables.features.contains(&ORDERED));
-        assert!(enables
-            .extensions
-            .contains(&VkExtension::ExtRasterizationOrderAttachmentAccess));
-    }
-
-    let mut interlocked = lavapipe.clone();
-    interlocked.features.remove(&ORDERED);
-    assert!(interlocked.has(INTERLOCK));
-    {
-        let pipe = compile(&interlocked, DevicePolicy::default(), &d).expect("interlocked");
-        assert!(!unordered(&pipe));
-        assert!(pipe.graphics.input_attachments.is_empty());
-        assert!(pipe.graphics.color_attachments.iter().all(Option::is_none));
-        let [s] = pipe.graphics.storage_attachments.as_slice() else {
-            panic!("{:?}", pipe.graphics.storage_attachments);
-        };
-        // Declared without a format where the device grants that: lavapipe does.
-        assert_eq!(
-            (s.color_index, s.format, s.writes, s.formatless),
-            (0, vk::Format::R32_SFLOAT, true, true)
-        );
-        // The capability, which the device resolves (`DeviceProfile::check`), not its feature.
-        assert!(pipe.requirements.spirv_capabilities.contains(
-            &crate::device::requirements::SpirvCapability::of(
-                crate::spv::Capability::StorageImageReadWithoutFormat
-            )
-        ));
-        assert!(!pipe
-            .requirements
-            .features
-            .contains(&VkFeature::ShaderStorageImageReadWithoutFormat));
-        assert!(!pipe.graphics.rasterization_order_attachment_access);
-        for f in [INTERLOCK, VkFeature::FragmentStoresAndAtomics] {
-            assert!(pipe.requirements.features.contains(&f), "{f:?}");
+    assert!(lavapipe.has(ORDERED) && lavapipe.has(INTERLOCK));
+    let mut without = lavapipe.clone();
+    without.features.remove(&INTERLOCK);
+    for desc in [&lavapipe, &without] {
+        for pd in [&d, &blended, &grouped] {
+            let pipe = compile(desc, DevicePolicy::RESIDENT_TABLES, pd).expect("unordered");
+            assert!(unordered(&pipe));
+            assert_eq!(pipe.graphics.input_attachments.len(), 1);
+            for f in [ORDERED, INTERLOCK] {
+                assert!(!pipe.requirements.features.contains(&f), "{f:?}");
+            }
         }
-        assert!(!pipe.requirements.features.contains(&ORDERED));
-        assert!(pipe
-            .requirements
-            .formats
-            .contains(&(vk::Format::R32_SFLOAT, FormatUsage::StorageImage)));
     }
-    // The blend, which the shader computes: the generic one of `R32Float`, noted.
-    {
-        let pipe = compile(&interlocked, DevicePolicy::default(), &blended).expect("blended");
-        let [s] = pipe.graphics.storage_attachments.as_slice() else {
-            panic!("{:?}", pipe.graphics.storage_attachments);
+}
+
+/// Under the identity domains (rt's, on a device without the pixel interlock), a color read takes
+/// no input attachment and no descriptor: the fragment fetches the
+/// sampled-texture array's element pushed for the attachment (`PushField::FetchedColor`), in the
+/// attachment's own numeric class (an unsigned read of a signed-integer attachment as `int`, which
+/// the element's view takes), noted `UnorderedFetchWithinDraw`. A read of another class than the
+/// attachment's is Metal's pipeline error, at link.
+#[test]
+fn an_identity_fetch_reads_its_attachments_pushed_texture_in_the_attachments_class() {
+    use crate::device::requirements::VkFeature;
+    use crate::device::{HandleDomain, PointerDomain};
+    use crate::error::MetalAnswer;
+    use crate::pipeline::sym::{PushField, SampledType, Stage};
+    use crate::pipeline::{PrecisionNote, RenderPipeline};
+    let (Some(io), Some(fetch), Some(count)) = (
+        fixture("stage_io"),
+        fixture("fragment_fetch"),
+        fixture("exf_fetch_count"),
+    ) else {
+        return;
+    };
+    let function = |bytes: &[u8], name: &str| {
+        StageSource::Function(FunctionDescriptor::new(
+            (Library::from_air(bytes).expect("library").function(name)).expect(name),
+        ))
+    };
+    let pipeline = |fragment: StageSource, format: metal::PixelFormat| {
+        let mut d = RenderPipelineDescriptor::new(function(&io, "stage_io_vertex_position"));
+        d.fragment = Some(fragment);
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
+        d
+    };
+    let mut without = description("lavapipe");
+    without
+        .features
+        .remove(&VkFeature::FragmentShaderPixelInterlock);
+    let policy = DevicePolicy {
+        pointer_domain: PointerDomain::Identity,
+        handle_domain: HandleDomain::Identity,
+        ..DevicePolicy::RESIDENT_TABLES
+    };
+    let dev = Device::from_queries(without, policy).expect("device");
+    let compile =
+        |d: &RenderPipelineDescriptor| dev.compile_render_pipeline(d, &Budget::standard());
+    let fetched = |pipe: &RenderPipeline| -> Vec<PushField> {
+        (pipe.interface.push.iter())
+            .filter(|p| p.stage == Stage::Fragment)
+            .flat_map(|p| p.fields.iter().map(|f| f.field))
+            .filter(|f| matches!(f, PushField::FetchedColor { .. }))
+            .collect()
+    };
+    for (fragment, format, texels) in [
+        (
+            "fetch_scalar",
+            metal::PixelFormat::R32Float,
+            SampledType::Float,
+        ),
+        (
+            "exf_fetch_count",
+            metal::PixelFormat::RGBA32Uint,
+            SampledType::Uint,
+        ),
+        (
+            "exf_fetch_count",
+            metal::PixelFormat::RGBA32Sint,
+            SampledType::Sint,
+        ),
+    ] {
+        let bytes = match fragment {
+            "fetch_scalar" => &fetch,
+            _ => &count,
         };
-        assert_eq!((s.color_index, s.writes), (0, true));
-        let fragment = (pipe.stages.iter())
+        let pipe = compile(&pipeline(function(bytes, fragment), format))
+            .unwrap_or_else(|e| panic!("{fragment} {format:?}: {e:?}"));
+        assert_eq!(
+            fetched(&pipe),
+            [PushField::FetchedColor { color: 0, texels }],
+            "{fragment} {format:?}: the element pushed for attachment 0, of its class"
+        );
+        assert!(
+            pipe.graphics.input_attachments.is_empty(),
+            "{fragment} {format:?}"
+        );
+        assert!(
+            (pipe.layout.sets.iter())
+                .filter(|s| s.set == 0)
+                .all(|s| s.bindings.is_empty()),
+            "{fragment} {format:?}: no descriptor in set 0"
+        );
+        let fragment_stage = (pipe.stages.iter())
             .find(|s| s.stage == vk::ShaderStage::FRAGMENT)
             .expect("a fragment stage");
-        assert!(fragment
+        assert!(fragment_stage
             .precision_notes
-            .contains(&PrecisionNote::UnmeasuredFetchBlend));
+            .contains(&PrecisionNote::UnorderedFetchWithinDraw));
+        for s in &pipe.stages {
+            l3(&s.spirv, &pipe.requirements, &dev);
+        }
     }
-    // Alpha to coverage, which can drop the fragment's samples, blocks the form.
-    let mut covered = d.clone();
-    covered.alpha_to_coverage = true;
-    match compile(&interlocked, DevicePolicy::default(), &covered) {
-        Err(Error::Unsupported(u)) => assert_eq!(
-            (u.feature, u.needs),
-            (Feature::FramebufferFetch, Needs::NotImplemented)
-        ),
-        other => panic!("{:?}", other.map(|_| ())),
-    }
-
-    let mut without = interlocked.clone();
-    without.features.remove(&INTERLOCK);
-    let pipe = compile(&without, DevicePolicy::default(), &d).expect("neither");
-    assert!(unordered(&pipe));
-    assert_eq!(pipe.graphics.input_attachments.len(), 1);
-    assert!(pipe.graphics.storage_attachments.is_empty());
-    assert!(!pipe.graphics.rasterization_order_attachment_access);
-    for f in [ORDERED, INTERLOCK] {
-        assert!(!pipe.requirements.features.contains(&f), "{f:?}");
-    }
-    let mut grouped = d.clone();
-    grouped.fragment = Some(StageSource::Function(FunctionDescriptor::new(
-        Library::from_air(&fetch)
-            .expect("library")
-            .function("fetch_ordered")
-            .expect("fragment"),
-    )));
-    let pipe = compile(&interlocked, DevicePolicy::default(), &grouped).expect("grouped");
-    assert!(!unordered(&pipe));
-    assert!(pipe.requirements.features.contains(&INTERLOCK));
-    let pipe = compile(&without, DevicePolicy::default(), &grouped).expect("grouped, neither");
-    assert!(unordered(&pipe));
-    assert_eq!(pipe.graphics.input_attachments.len(), 1);
-    for f in [ORDERED, INTERLOCK] {
-        assert!(!pipe.requirements.features.contains(&f), "{f:?}");
+    for (fragment, format) in [
+        ("fetch_scalar", metal::PixelFormat::R32Uint),
+        ("exf_fetch_count", metal::PixelFormat::RGBA32Float),
+    ] {
+        let bytes = match fragment {
+            "fetch_scalar" => &fetch,
+            _ => &count,
+        };
+        match compile(&pipeline(function(bytes, fragment), format)) {
+            Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment { index, metal })) => {
+                assert_eq!((index, metal), (0, MetalAnswer::NilWithError), "{fragment}")
+            }
+            other => panic!("{fragment} {format:?}: {:?}", other.map(|_| ())),
+        }
     }
 }
 
@@ -1705,80 +1850,19 @@ fn images_and_sample_id(words: &[u32]) -> (Vec<(u32, u32, u32)>, bool) {
     (images, sample_id)
 }
 
-/// The guard of the one storage write in `words` where a returned sample mask's bit gates it:
-/// `Some(shift)` where the write's block is the true arm of a branch on
-/// `((mask >> shift) & 1) != 0`, `shift` the shift's constant (`Some(0)` where no shift is left),
-/// or `None` where the shift is not a constant (the invocation's `SampleId`); `None` where no
-/// such branch guards the write.
-fn mask_gate(words: &[u32]) -> Option<Option<u32>> {
-    const IMAGE_WRITE: u32 = 99;
-    const CONSTANT: u32 = 43;
-    const I_NOT_EQUAL: u32 = 171;
-    const SHIFT_RIGHT_LOGICAL: u32 = 194;
-    const BITWISE_AND: u32 = 199;
-    const LABEL: u32 = 248;
-    const BRANCH_CONDITIONAL: u32 = 250;
-    let mut defs = std::collections::HashMap::new();
-    let (mut branches, mut writes, mut label) = (Vec::new(), Vec::new(), 0);
-    let mut at = 5;
-    while at < words.len() {
-        let (count, op) = ((words[at] >> 16) as usize, words[at] & 0xFFFF);
-        let inst = &words[at..at + count.max(1)];
-        match op {
-            CONSTANT | I_NOT_EQUAL | SHIFT_RIGHT_LOGICAL | BITWISE_AND => {
-                defs.insert(inst[2], (op, &inst[3..]));
-            }
-            LABEL => label = inst[1],
-            BRANCH_CONDITIONAL => branches.push((inst[1], inst[2])),
-            IMAGE_WRITE => writes.push(label),
-            _ => {}
-        }
-        at += count.max(1);
-    }
-    let def = |id: &u32, want: u32| match defs.get(id) {
-        Some(&(op, operands)) if op == want => Some(operands),
-        _ => None,
-    };
-    let constant = |id: &u32| def(id, CONSTANT).and_then(|v| v.first().copied());
-    let [write] = writes.as_slice() else {
-        return None;
-    };
-    let (condition, _) = branches.iter().find(|(_, arm)| arm == write)?;
-    let [bit, zero] = def(condition, I_NOT_EQUAL)? else {
-        return None;
-    };
-    let [shifted, one] = def(bit, BITWISE_AND)? else {
-        return None;
-    };
-    if (constant(zero), constant(one)) != (Some(0), Some(1)) {
-        return None;
-    }
-    Some(match def(shifted, SHIFT_RIGHT_LOGICAL) {
-        Some([_, shift]) => constant(shift),
-        _ => Some(0),
-    })
-}
-
 /// Metal runs a function that reads a color attachment of a multisampled pass once per covered
 /// sample, reading its own sample. Compiled for a pipeline of 4 samples, the fragment reads each
-/// color at its `SampleId` (which runs it once per covered sample under sample shading): on
-/// lavapipe through a multisampled `SubpassData` image under rasterization-order access, on a
-/// device that orders fetch only through the pixel interlock through a multisampled storage image
-/// of the pipeline's samples (`shaderStorageImageMultisample`, `storageImageSampleCounts`), and,
-/// where that device has no multisampled storage image (ANV, MoltenVK), through planes: a
-/// single-sample 2D-array storage image of one layer per sample, which needs neither. Where the
-/// device lacks what the form needs, the refusal names it; a returned sample mask is exact per
-/// sample (the storage write is gated on the sample's bit) and at one sample (gated on bit 0, as
-/// Metal stores); `[[sample_mask]]` in is the pixel's coverage, which no device gives a per-sample
-/// invocation. One sample compiles as before: no `SampleId`, a single-sample image.
+/// color at its `SampleId` (which runs it once per covered sample under sample shading) through a
+/// multisampled `SubpassData` image, unordered within a draw (noted). Where the device lacks
+/// sample-rate shading, the
+/// refusal names it; `[[sample_mask]]` in is the pixel's coverage, which no device gives a
+/// per-sample invocation. One sample compiles as before: no `SampleId`, a single-sample image.
 #[test]
 fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
-    use crate::device::requirements::{VkFeature, VkProperty};
-    use crate::error::{Capability, Unsupported};
-    use crate::pipeline::{RenderPipeline, StorageAttachmentView};
-    const ORDERED: VkFeature = VkFeature::RasterizationOrderColorAttachmentAccess;
+    use crate::device::requirements::VkFeature;
+    use crate::error::Capability;
+    use crate::pipeline::{PrecisionNote, RenderPipeline};
     const SUBPASS_DATA: u32 = 6;
-    const D2: u32 = 1;
     let (Some(io), Some(blend), Some(ms)) = (
         fixture("stage_io"),
         fixture("exf_fetch_blend"),
@@ -1806,7 +1890,8 @@ fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
         d
     };
     let compile = |desc: &DeviceDescription, d: &RenderPipelineDescriptor| {
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+        let dev =
+            Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES).expect("device");
         let pipe = dev.compile_render_pipeline(d, &Budget::standard())?;
         for s in &pipe.stages {
             l3(&s.spirv, &pipe.requirements, &dev);
@@ -1820,162 +1905,42 @@ fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
         Err(Error::Unsupported(u)) => (u.feature, u.needs),
         other => panic!("{:?}", other.map(|_| ())),
     };
+    let unordered = |pipe: &RenderPipeline| {
+        pipe.stages[1]
+            .precision_notes
+            .contains(&PrecisionNote::UnorderedFetchWithinDraw)
+    };
 
-    // Raster order: the input attachment's own sample.
+    // The input attachment's own sample, ordered between draws alone.
     let lavapipe = description("lavapipe");
-    let pipe = compile(&lavapipe, &descriptor(&blend, "exf_fetch_blend", 4)).expect("lavapipe");
-    assert_eq!(pipe.graphics.input_attachments.len(), 1);
-    assert!(pipe.graphics.storage_attachments.is_empty());
-    assert!(pipe.graphics.rasterization_order_attachment_access);
-    assert_eq!(
-        pipe.graphics.rasterization_samples,
-        vk::SampleCountFlags::COUNT_4
-    );
-    for f in [ORDERED, VkFeature::SampleRateShading] {
-        assert!(pipe.requirements.features.contains(&f), "{f:?}");
-    }
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&pipe)),
-        (vec![(SUBPASS_DATA, 0, 1)], true)
-    );
-    let one = compile(&lavapipe, &descriptor(&blend, "exf_fetch_blend", 1)).expect("one");
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&one)),
-        (vec![(SUBPASS_DATA, 0, 0)], false)
-    );
-    // The returned mask and alpha to coverage stay the fixed function's.
-    compile(&lavapipe, &descriptor(&ms, "msf_fetch_mask_out", 4)).expect("mask out");
-
-    // The pixel interlock: a multisampled storage image of the pipeline's samples.
-    let mut interlocked = lavapipe.clone();
-    interlocked.features.remove(&ORDERED);
-    let pipe = compile(&interlocked, &descriptor(&blend, "exf_fetch_blend", 4)).expect("storage");
-    assert!(pipe.graphics.input_attachments.is_empty());
-    let [s] = pipe.graphics.storage_attachments.as_slice() else {
-        panic!("{:?}", pipe.graphics.storage_attachments);
-    };
-    assert_eq!(
-        (s.color_index, s.format, s.writes, s.view),
-        (
-            0,
-            vk::Format::R32G32B32A32_SFLOAT,
-            true,
-            StorageAttachmentView::Attachment
-        )
-    );
-    for f in [
-        VkFeature::FragmentShaderPixelInterlock,
-        VkFeature::ShaderStorageImageMultisample,
-        VkFeature::SampleRateShading,
-    ] {
-        assert!(pipe.requirements.features.contains(&f), "{f:?}");
-    }
-    assert!(pipe
-        .requirements
-        .properties
-        .contains(&VkProperty::StorageImageSampleCount(4)));
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&pipe)),
-        (vec![(D2, 0, 1)], true)
-    );
-    let one = compile(&interlocked, &descriptor(&blend, "exf_fetch_blend", 1)).expect("one");
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&one)),
-        (vec![(D2, 0, 0)], false)
-    );
-    assert!(!one
-        .requirements
-        .properties
-        .contains(&VkProperty::StorageImageSampleCount(1)));
-    // A returned mask (`msf_fetch_mask_out` returns 0x5) gates the write on the invocation's own
-    // sample's bit; at one sample, where no `SampleId` is read, on bit 0, as Metal stores no color
-    // without it (before, refused `NotImplemented(FramebufferFetch)`).
-    let four = compile(&interlocked, &descriptor(&ms, "msf_fetch_mask_out", 4)).expect("mask out");
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&four)),
-        (vec![(D2, 0, 1)], true)
-    );
-    assert_eq!(mask_gate(&fragment_words(&four)), Some(None));
-    let one = compile(&interlocked, &descriptor(&ms, "msf_fetch_mask_out", 1)).expect("one mask");
-    let [s] = one.graphics.storage_attachments.as_slice() else {
-        panic!("{:?}", one.graphics.storage_attachments);
-    };
-    assert_eq!(
-        (s.color_index, s.writes, s.view),
-        (0, true, StorageAttachmentView::Attachment)
-    );
-    assert_eq!(
-        images_and_sample_id(&fragment_words(&one)),
-        (vec![(D2, 0, 0)], false)
-    );
-    assert_eq!(mask_gate(&fragment_words(&one)), Some(Some(0)));
-    // Without multisampled storage images: planes, one single-sample layer per sample, which
-    // need neither the feature nor a sample count of storage images. ANV and MoltenVK.
-    let mut no_storage_ms = interlocked.clone();
-    no_storage_ms
-        .features
-        .remove(&VkFeature::ShaderStorageImageMultisample);
-    no_storage_ms.limits.storage_image_sample_counts = vk::SampleCountFlags::COUNT_1;
-    for desc in [
-        &no_storage_ms,
-        &description("moltenvk-m3"),
-        &description("intel-arl-anv"),
-    ] {
-        let pipe = compile(desc, &descriptor(&blend, "exf_fetch_blend", 4)).expect("planes");
-        let [s] = pipe.graphics.storage_attachments.as_slice() else {
-            panic!("{:?}", pipe.graphics.storage_attachments);
-        };
+    {
+        let desc = &lavapipe;
+        let pipe = compile(desc, &descriptor(&blend, "exf_fetch_blend", 4)).expect("four");
+        assert_eq!(pipe.graphics.input_attachments.len(), 1);
+        assert!(unordered(&pipe));
         assert_eq!(
-            (s.color_index, s.format, s.writes, s.view),
-            (
-                0,
-                vk::Format::R32G32B32A32_SFLOAT,
-                true,
-                StorageAttachmentView::SamplePlanes { layers: 4 }
-            )
+            pipe.graphics.rasterization_samples,
+            vk::SampleCountFlags::COUNT_4
         );
-        for f in [
-            VkFeature::FragmentShaderPixelInterlock,
-            VkFeature::SampleRateShading,
-        ] {
-            assert!(pipe.requirements.features.contains(&f), "{f:?}");
-        }
-        assert!(!pipe
+        assert!(pipe
             .requirements
             .features
-            .contains(&VkFeature::ShaderStorageImageMultisample));
-        assert!(!pipe
-            .requirements
-            .properties
-            .iter()
-            .any(|p| matches!(p, VkProperty::StorageImageSampleCount(_))));
+            .contains(&VkFeature::SampleRateShading));
         assert_eq!(
             images_and_sample_id(&fragment_words(&pipe)),
-            (vec![(D2, 1, 0)], true)
+            (vec![(SUBPASS_DATA, 0, 1)], true)
         );
-        compile(desc, &descriptor(&ms, "msf_fetch_mask_out", 4)).expect("mask out");
         let one = compile(desc, &descriptor(&blend, "exf_fetch_blend", 1)).expect("one");
         assert_eq!(
-            one.graphics.storage_attachments[0].view,
-            StorageAttachmentView::Attachment
-        );
-        assert_eq!(
             images_and_sample_id(&fragment_words(&one)),
-            (vec![(D2, 0, 0)], false)
+            (vec![(SUBPASS_DATA, 0, 0)], false)
         );
+        // The returned mask and alpha to coverage stay the fixed function's.
+        compile(desc, &descriptor(&ms, "msf_fetch_mask_out", 4)).expect("mask out");
     }
-    let mut no_count = interlocked.clone();
-    no_count.limits.storage_image_sample_counts = vk::SampleCountFlags::COUNT_1;
-    assert_eq!(
-        compile(&no_count, &descriptor(&blend, "exf_fetch_blend", 4)).map(|_| ()),
-        Err(Error::Unsupported(Unsupported::needs(
-            Feature::FramebufferFetch,
-            Capability::Property(VkProperty::StorageImageSampleCount(4))
-        )))
-    );
     // Without sample-rate shading no form reads a sample.
-    for desc in [&lavapipe, &interlocked, &no_storage_ms] {
-        let mut no_rate = desc.clone();
+    {
+        let mut no_rate = lavapipe.clone();
         no_rate.features.remove(&VkFeature::SampleRateShading);
         let (feature, needs) =
             refusal(compile(&no_rate, &descriptor(&blend, "exf_fetch_blend", 4)));
@@ -1989,9 +1954,9 @@ fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
             .any(|c| *c == Capability::Feature(VkFeature::SampleRateShading)));
     }
     // `[[sample_mask]]` in beside a fetch reads the pixel's coverage (measured): no device.
-    for desc in [&lavapipe, &interlocked, &no_storage_ms] {
+    {
         assert_eq!(
-            refusal(compile(desc, &descriptor(&ms, "msf_fetch_mask_in", 4))),
+            refusal(compile(&lavapipe, &descriptor(&ms, "msf_fetch_mask_in", 4))),
             (Feature::PixelCoverageAtSampleRate, Needs::NotRepresentable)
         );
     }
@@ -2000,7 +1965,7 @@ fn a_multisampled_framebuffer_fetch_reads_each_samples_own_color() {
 /// A render pipeline requires `independentBlend` exactly when the elements of its `pAttachments`
 /// differ, and `dualSrcBlend` exactly when a blend reads the second output. `exf2_skip_one` writes
 /// color attachments 0 and 2, not 1: on `lavapipe` attachment 1 is masked and the feature required
-/// (and enabled); on `vk12-floor`, without the feature, every element is identical, an absent
+/// (and enabled); on `runtime-floor` without the feature, every element is identical, an absent
 /// attachment 1's included, and a written attachment that blends differently is refused typed. A
 /// blend of one and zero, added, of an attachment whose channels convert by a rule other than the
 /// device's (`StageIo::color_writes`) takes no Vulkan blend, so it differs from no other element.
@@ -2034,9 +1999,9 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
         ));
         d
     };
-    let compile = |stem: &str, d: &RenderPipelineDescriptor| {
-        let desc = description(stem);
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+    let compile = |desc: &DeviceDescription, d: &RenderPipelineDescriptor| {
+        let dev =
+            Device::from_queries(desc.clone(), DevicePolicy::RESIDENT_TABLES).expect("device");
         let pipe = dev.compile_render_pipeline(d, &Budget::standard())?;
         let enables = desc
             .required_enables(&pipe.requirements)
@@ -2062,21 +2027,24 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
         | vk::ColorComponentFlags::B
         | vk::ColorComponentFlags::A;
     let none = vk::ColorComponentFlags::empty();
-    assert!(description("lavapipe").has(INDEPENDENT));
-    assert!(!description("vk12-floor").has(INDEPENDENT));
+    let lavapipe = description("lavapipe");
+    assert!(lavapipe.has(INDEPENDENT));
+    // `runtime-floor` without `independentBlend`, which the runtime's floor requires.
+    let mut floor = description("runtime-floor");
+    floor.features.remove(&INDEPENDENT);
 
     // The unwritten attachment.
     let d = descriptor(&fragment, true);
-    let pipe = compile("lavapipe", &d).expect("lavapipe");
+    let pipe = compile(&lavapipe, &d).expect("lavapipe");
     assert_eq!(masks(&pipe), [all, none, all]);
     assert!(pipe.requirements.features.contains(&INDEPENDENT));
-    let pipe = compile("vk12-floor", &d).expect("vk12-floor");
+    let pipe = compile(&floor, &d).expect("the floor");
     assert_eq!(masks(&pipe), [all, all, all]);
     assert!(!pipe.requirements.features.contains(&INDEPENDENT));
     // An absent attachment 1: its element is the others'.
     let d = descriptor(&fragment, false);
-    for stem in ["lavapipe", "vk12-floor"] {
-        let pipe = compile(stem, &d).expect(stem);
+    for (stem, desc) in [("lavapipe", &lavapipe), ("the floor", &floor)] {
+        let pipe = compile(desc, &d).expect(stem);
         assert!(pipe.graphics.color_attachments[1].is_none());
         assert_eq!(masks(&pipe), [all, all, all], "{stem}");
         assert!(!pipe.requirements.features.contains(&INDEPENDENT), "{stem}");
@@ -2087,7 +2055,7 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
     if let Some(a) = d.color_attachments[0].as_mut() {
         a.blending_enabled = true;
     }
-    let pipe = compile("lavapipe", &d).expect("lavapipe");
+    let pipe = compile(&lavapipe, &d).expect("lavapipe");
     let blend = |pipe: &RenderPipeline, at: usize| {
         pipe.graphics.color_attachments[at]
             .as_ref()
@@ -2100,7 +2068,7 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
     if let Some(a) = d.color_attachments[0].as_mut() {
         a.destination_rgb_blend_factor = metal::BlendFactor::OneMinusSourceAlpha;
     }
-    let pipe = compile("lavapipe", &d).expect("lavapipe");
+    let pipe = compile(&lavapipe, &d).expect("lavapipe");
     assert!(blend(&pipe, 0).is_some());
     assert_eq!(blend(&pipe, 2), None);
     assert!(pipe.requirements.features.contains(&INDEPENDENT));
@@ -2108,7 +2076,7 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
     let at_2 = crate::error::Location::render_pipeline()
         .with_attachment(crate::error::Attachment::Color(2));
     assert_eq!(
-        compile("vk12-floor", &d).unwrap_err(),
+        compile(&floor, &d).unwrap_err(),
         Error::Unsupported(
             Unsupported::needs(
                 Feature::IndependentBlending,
@@ -2132,7 +2100,7 @@ fn a_render_pipeline_requires_the_blend_features_its_attachments_need() {
             a.blending_enabled = true;
             a.source_rgb_blend_factor = factor;
         }
-        let pipe = compile("lavapipe", &d).expect("lavapipe");
+        let pipe = compile(&lavapipe, &d).expect("lavapipe");
         assert_eq!(
             pipe.requirements
                 .features
@@ -2312,12 +2280,7 @@ fn each_stage_carries_its_own_constant_blob() {
     let lib = Library::from_air(&bc).expect("library");
     let vertex = lib.function("blob_vertex").expect("vertex");
     let fragment = lib.function("blob_fragment").expect("fragment");
-    for stem in [
-        "moltenvk-m3",
-        "lunarg-desktop-baseline-2023",
-        "lavapipe",
-        "vk12-floor",
-    ] {
+    for stem in ["moltenvk-m3", "runtime-floor", "lavapipe"] {
         let dev = device(stem);
         let mut d = RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(
             vertex.clone(),
@@ -2427,8 +2390,10 @@ fn linked_functions_decode_once_per_module_and_defer_their_errors() {
 /// `vertexAttributeAccessBeyondStride` for a fixed-function attribute ending past its stride.
 /// The Khronos reader takes them from MoltenVK's capture (which withholds `samplerMipLodBias`);
 /// a device without the subset neither lists nor needs them. Where the subset withholds one, the
-/// requirements never name it (the blend under an empty mask is dropped, a static stride's
-/// attribute pulled, a per-bind stride left to the binder), so they stay within the profile.
+/// requirements never name it (the blend under an empty mask is dropped, a per-bind stride left
+/// to the binder), so they stay within the profile, and a static stride's attribute past its
+/// stride is refused (`VertexInputLayout`). The pipelines compile under the identity domains, the
+/// runtime's, the only ones where an attribute is fetched in fixed function.
 #[test]
 fn a_render_pipeline_requires_the_portability_features_it_uses() {
     use crate::device::requirements::{VkExtension, VkFeature};
@@ -2460,7 +2425,7 @@ fn a_render_pipeline_requires_the_portability_features_it_uses() {
     };
     // Every pipeline that compiles requires only what its device enabled.
     let compile = |desc: &DeviceDescription, d: &RenderPipelineDescriptor| {
-        let dev = Device::new(desc.clone(), DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc.clone(), DevicePolicy::default()).expect("device");
         dev.compile_render_pipeline(d, &Budget::standard())
             .map(|p| {
                 assert_eq!(dev.profile().check(&p.requirements), Ok(()));
@@ -2502,8 +2467,10 @@ fn a_render_pipeline_requires_the_portability_features_it_uses() {
     assert!(features.contains(&beyond) && fixed(&vi));
     let (features, vi) = compile(&lavapipe, &d).expect("lavapipe");
     assert!(!features.contains(&beyond) && fixed(&vi));
-    let (features, vi) = compile(&without(beyond), &d).expect("withheld");
-    assert!(!features.contains(&beyond) && !fixed(&vi));
+    assert!(matches!(
+        compile(&without(beyond), &d),
+        Err(Error::Unsupported(u)) if u.feature == Feature::VertexInputLayout
+    ));
 
     // A per-bind stride is the bind's: the pipeline relies on the feature where the device has
     // it, and where the subset withholds it the binder pulls a stride below the attribute's end,
@@ -2548,7 +2515,8 @@ fn a_render_pipeline_requires_its_framebuffer_sample_counts() {
         ),
     ] {
         d.raster_sample_count = count;
-        let dev = Device::new(description("lavapipe"), DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(description("lavapipe"), DevicePolicy::RESIDENT_TABLES)
+            .expect("device");
         let pipe = dev
             .compile_render_pipeline(&d, &Budget::standard())
             .expect("lavapipe");
@@ -2573,24 +2541,39 @@ fn a_render_pipeline_requires_its_framebuffer_sample_counts() {
 /// The interface states the texture slots a fragment function reads only at its own pixel
 /// (`spirv::requirements::own_pixel`): owned fixture `tob_renders`'s `tob_read`
 /// (`t.read(uint2(in.position.xy))`) on every profile, whether the device's robustness returns
-/// Metal's out-of-bounds texel or the shader clamps the read (both kinds of profile are among
-/// them); not `tob_sample` (a sample at the pixel's center), `tob_read_buffer` (a texture
-/// buffer's texel by arithmetic), nor `tob_solid`, which reads no texture.
+/// Metal's out-of-bounds texel or the shader clamps the read (the runtime's floor without
+/// `robustImageAccess2`, a device below that floor); not `tob_sample` (a sample at the pixel's
+/// center), `tob_read_buffer` (a texture buffer's texel by arithmetic), nor `tob_solid`, which
+/// reads no texture.
 #[test]
 fn the_interface_states_the_textures_read_at_the_fragments_own_pixel() {
+    use crate::device::requirements::VkFeature;
     let Some(bc) = fixture("tob_renders") else {
         return;
     };
     let mut checks = std::collections::BTreeSet::new();
-    for stem in [
+    let mut profiles: Vec<(&str, crate::device::profile::DeviceProfile)> = [
         "intel-irisxe-anv",
         "nvidia-rtx5080-laptop",
         "amd-780m-radv",
         "lavapipe",
         "moltenvk-m3",
-        "vk12-floor",
-    ] {
-        let p = crate::pipeline::testing::profile(stem, DevicePolicy::default()).expect("profile");
+        "runtime-floor",
+    ]
+    .map(|stem| {
+        let p = crate::pipeline::testing::profile(stem, DevicePolicy::RESIDENT_TABLES)
+            .expect("profile");
+        (stem, p)
+    })
+    .into();
+    let clamped = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::RobustImageAccess2],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
+    profiles.push(("runtime-floor without robustImageAccess2", clamped));
+    for (stem, p) in profiles {
         checks.insert(crate::memory::contain::device_reads_texels(&p, false));
         for (entry, own) in [
             ("tob_read", &[0u32][..]),
@@ -2606,193 +2589,6 @@ fn the_interface_states_the_textures_read_at_the_fragments_own_pixel() {
     assert_eq!(checks.len(), 2, "both read checks");
 }
 
-/// The interface states why it leaves an own-pixel slot out of those a draw can read through a
-/// snapshot (`StageInterface::snapshot_refusals`, `spirv::requirements::snapshot`): owned fixture
-/// `snapshot_discard`'s `sd_read_discarding`, which discards by the texel it read, states none on
-/// the Radeon 780M's profile, where the discard demotes the invocation and the slot qualifies, and
-/// its branch alone where the profile withholds `shaderDemoteToHelperInvocation` and the discard
-/// ends the invocation; `tob_renders`'s `tob_read` states none on either. The stage module of a
-/// render pipeline of it states the same.
-#[test]
-fn the_interface_states_why_a_slot_takes_no_snapshot() {
-    use crate::device::requirements::VkFeature;
-    use crate::pipeline::interface::SnapshotRefusal;
-    let (Some(discarding), Some(reading)) = (fixture("snapshot_discard"), fixture("tob_renders"))
-    else {
-        return;
-    };
-    let demotes = device("amd-780m-radv");
-    let mut d = description("amd-780m-radv");
-    assert!(
-        (d.features).remove(&VkFeature::ShaderDemoteToHelperInvocation),
-        "the 780M's profile demotes"
-    );
-    let ends = Device::new(d, DevicePolicy::default()).expect("device");
-    for (name, dev, refusals) in [
-        ("demote", &demotes, Vec::new()),
-        ("no demote", &ends, vec![(0, SnapshotRefusal::Branch)]),
-    ] {
-        let p = dev.profile();
-        let a = crate::pipeline::testing::compile(&discarding, "sd_read_discarding", p)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(a.interface.own_pixel_textures, [0u32], "{name}");
-        let slots: &[u32] = if refusals.is_empty() { &[0] } else { &[] };
-        assert_eq!(a.interface.snapshot_textures, slots, "{name}");
-        assert_eq!(a.interface.snapshot_refusals, refusals, "{name}");
-        let read = crate::pipeline::testing::compile(&reading, "tob_read", p)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(read.interface.snapshot_textures, [0u32], "{name}: tob_read");
-        assert!(
-            read.interface.snapshot_refusals.is_empty(),
-            "{name}: tob_read"
-        );
-        let rect = Library::from_air(&reading).expect("library");
-        let rect = rect.function("tob_rect").expect("vertex");
-        let discard = Library::from_air(&discarding).expect("library");
-        let discard = discard.function("sd_read_discarding").expect("fragment");
-        let mut d =
-            RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(rect)));
-        d.fragment = Some(StageSource::Function(FunctionDescriptor::new(discard)));
-        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(
-            metal::PixelFormat::RGBA8Unorm,
-        ));
-        let pipe = (dev.compile_render_pipeline(&d, &Budget::standard()))
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        let fragment = (pipe.stages.iter())
-            .find(|s| s.stage == vk::ShaderStage::FRAGMENT)
-            .expect("a fragment stage");
-        assert_eq!(fragment.snapshot_textures, slots, "{name}: the stage");
-        assert_eq!(fragment.snapshot_refusals, refusals, "{name}: the stage");
-    }
-}
-
-/// The interface states the own-pixel slots a draw can read through a snapshot
-/// (`spirv::requirements::snapshot`): `tob_read`'s, whose texel reaches only its output. Its
-/// snapshot variant (`LoweringInputs::snapshot_textures`) links and validates on every profile with
-/// the pixel interlock, which it requires; binds the slot's snapshot; places the phase in the
-/// fragment window; still states the slot, as read at the own pixel and through a snapshot; and
-/// writes no memory of the function's. A profile without the interlock refuses it, naming the
-/// feature. A variant asked for `tob_sample`'s slot, which the fact does not list, would sample the
-/// texture beside the copy: refused, never compiled so. All of it holds under the exact answers
-/// too.
-#[test]
-fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
-    use crate::device::requirements::VkFeature;
-    use crate::error::Capability;
-    use crate::pipeline::interface::PushLoc;
-    use crate::pipeline::sym::{PushField, ResourceKind, SlotClass, SlotRef, SnapshotForm, Stage};
-    let Some(bc) = fixture("tob_renders") else {
-        return;
-    };
-    let inputs = |form: SnapshotForm| {
-        let mut inputs = LoweringInputs::new();
-        let slot = SlotRef {
-            stage: Stage::Fragment,
-            class: SlotClass::Texture,
-            index: 0,
-        };
-        inputs.snapshot_textures.insert(slot, form);
-        inputs
-    };
-    let mut interlocked = 0;
-    let policies = [
-        ("default", DevicePolicy::default()),
-        ("exact", DevicePolicy::default().exact_answers()),
-    ];
-    for (stem, name, policy) in [
-        "intel-irisxe-anv",
-        "nvidia-rtx5080-laptop",
-        "amd-780m-radv",
-        "lavapipe",
-        "moltenvk-m3",
-        "vk12-floor",
-    ]
-    .into_iter()
-    .flat_map(|stem| policies.map(|(name, policy)| (stem, name, policy)))
-    {
-        let p = crate::pipeline::testing::profile(stem, policy).expect("profile");
-        let stem = format!("{stem} {name}");
-        let base = crate::pipeline::testing::compile(&bc, "tob_read", &p)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(base.interface.snapshot_textures, [0u32], "{stem}");
-        let sampled = crate::pipeline::testing::compile(&bc, "tob_sample", &p)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert!(sampled.interface.snapshot_textures.is_empty(), "{stem}");
-        let variant = crate::pipeline::testing::compile_with(
-            &bc,
-            "tob_read",
-            &p,
-            &inputs(SnapshotForm::Bits),
-        );
-        if !p.fields().fragment.pixel_interlock {
-            assert_eq!(
-                variant.map(|_| ()),
-                Err(Error::Unsupported(crate::error::Unsupported::needs(
-                    Feature::RasterOrderGroups,
-                    Capability::Feature(VkFeature::FragmentShaderPixelInterlock),
-                ))),
-                "{stem}"
-            );
-            continue;
-        }
-        interlocked += 1;
-        // Each form of a float slot's codes compiles, its copy alone reading the texture.
-        for form in [
-            SnapshotForm::Unorm8,
-            SnapshotForm::Snorm8,
-            SnapshotForm::Unorm16,
-            SnapshotForm::Snorm16,
-            SnapshotForm::Half,
-        ] {
-            let narrow = crate::pipeline::testing::compile_with(&bc, "tob_read", &p, &inputs(form))
-                .unwrap_or_else(|e| panic!("{stem} {form:?}: {e}"));
-            assert_eq!(
-                narrow.interface.snapshot_textures,
-                [0u32],
-                "{stem} {form:?}"
-            );
-        }
-        let a = variant.unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(a.interface.snapshot_textures, [0u32], "{stem}");
-        assert_eq!(a.interface.own_pixel_textures, [0u32], "{stem}");
-        assert!(!a.interface.writes_memory, "{stem}");
-        assert!(
-            a.interface
-                .descriptors
-                .iter()
-                .any(|d| d.slot.kind == ResourceKind::SnapshotTexels(0)),
-            "{stem}"
-        );
-        assert!(
-            a.interface.push.fields.iter().any(|f| {
-                f.field == PushField::SnapshotPhase && matches!(f.loc, PushLoc::Push { .. })
-            }),
-            "{stem}"
-        );
-        assert!(
-            a.requirements
-                .features
-                .contains(&VkFeature::FragmentShaderPixelInterlock),
-            "{stem}"
-        );
-        crate::pipeline::testing::link_and_validate(&a, &p)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        match crate::pipeline::testing::compile_with(
-            &bc,
-            "tob_sample",
-            &p,
-            &inputs(SnapshotForm::Bits),
-        ) {
-            Err(Error::Internal(e)) if e.kind == InternalKind::Invariant => {}
-            other => panic!("{stem} tob_sample: {other:?}"),
-        }
-    }
-    assert!(
-        interlocked >= 8,
-        "the interlocked profiles, under both policies"
-    );
-}
-
 /// The interface states whether the function writes memory another invocation or a later command
 /// can read: a buffer store, an image write (through an argument buffer's handle too), in a
 /// fragment function or a kernel alike; a function that only reads does not, nor does one that only
@@ -2801,8 +2597,8 @@ fn a_snapshot_variant_reads_its_texture_in_the_copy_alone() {
 /// `the_status_words_are_not_the_functions_writes`).
 #[test]
 fn the_interface_states_whether_the_function_writes_memory() {
-    let p =
-        crate::pipeline::testing::profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
     for (stem, entry, writes) in [
         ("a3_rog_buffer_rmw", "a3_rog_buffer_rmw", true),
         ("fragment_rog", "rog_loop", true),
@@ -2833,15 +2629,87 @@ fn the_interface_states_whether_the_function_writes_memory() {
     assert!(!a.interface.writes_memory);
 }
 
+/// A kernel over `out` (buffer 0, read-write) and `params` (buffer 1, read), with
+/// `thread_position_in_grid` as `%2`; `body` holds the entry's instructions and its blocks, `extra`
+/// any function it calls.
+fn effects_kernel(name: &str, body: &str, extra: &str) -> String {
+    format!(
+        "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\n\
+         target triple = \"air64_v28-apple-macosx26.0.0\"\n\n\
+         {extra}\
+         define void @{name}(ptr addrspace(1) noundef \"air-buffer-no-alias\" %0, ptr addrspace(1) noundef \"air-buffer-no-alias\" %1, i32 noundef %2) {{\nentry:\n{body}}}\n\n\
+         !air.kernel = !{{!9}}\n!air.version = !{{!17}}\n!air.language_version = !{{!18}}\n\
+         !9 = !{{ptr @{name}, !10, !11}}\n!10 = !{{}}\n!11 = !{{!12, !13, !14}}\n\
+         !12 = !{{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}}\n\
+         !13 = !{{i32 1, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"params\"}}\n\
+         !14 = !{{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"t\"}}\n\
+         !17 = !{{i32 2, i32 8, i32 0}}\n!18 = !{{!\"Metal\", i32 4, i32 0, i32 0}}\n"
+    )
+}
+
+/// A compute pipeline's interface states whether its kernel writes memory, which the runtime reads
+/// to record nothing for a dispatch of a kernel that does not: a kernel that returns at once, one
+/// that only reads its buffers, and one that writes only its own thread's array write none; one that
+/// stores to its buffer behind a branch, and one whose callee (kept a call, `noinline`) stores
+/// through the pointer it is passed, write memory.
+#[test]
+fn a_compute_pipeline_states_whether_its_kernel_writes_memory() {
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
+    let callee = "define void @put(ptr addrspace(1) noundef %p, i32 noundef %v) #0 {\nentry:\n  store i32 %v, ptr addrspace(1) %p, align 4\n  ret void\n}\n\nattributes #0 = { noinline }\n\n";
+    for (name, body, extra, writes) in [
+        ("bare_return", "  ret void\n", "", false),
+        (
+            "only_reads",
+            "  %p = load i32, ptr addrspace(1) %1, align 4\n  %q = load i32, ptr addrspace(1) %0, align 4\n  %s = add i32 %p, %q\n  ret void\n",
+            "",
+            false,
+        ),
+        (
+            "local_only",
+            "  %a = alloca [4 x i32], align 4\n  %i = and i32 %2, 3\n  %ie = zext i32 %i to i64\n  %e = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 %ie\n  store i32 %2, ptr %e, align 4\n  %j = xor i32 %i, 1\n  %je = zext i32 %j to i64\n  %f = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 %je\n  %v = load i32, ptr %f, align 4\n  ret void\n",
+            "",
+            false,
+        ),
+        (
+            "branch_store",
+            "  %p = load i32, ptr addrspace(1) %1, align 4\n  %c = icmp ne i32 %p, 0\n  br i1 %c, label %then, label %done\nthen:\n  store i32 %2, ptr addrspace(1) %0, align 4\n  br label %done\ndone:\n  ret void\n",
+            "",
+            true,
+        ),
+        (
+            "callee_store",
+            "  call void @put(ptr addrspace(1) noundef %0, i32 noundef %2)\n  ret void\n",
+            callee,
+            true,
+        ),
+    ] {
+        let Some(bc) = assemble_text(name, &effects_kernel(name, body, extra)) else {
+            return;
+        };
+        let a = crate::pipeline::testing::compile(&bc, name, &p)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(a.interface.writes_memory, writes, "{name}");
+        let linked = crate::pipeline::link::link(
+            &[&*a],
+            &crate::pipeline::link::LinkInputs::standalone(),
+            &p,
+        )
+        .unwrap_or_else(|e| panic!("{name}: link: {e}"));
+        assert_eq!(linked.interface.writes_memory, writes, "{name}: pipeline");
+        crate::pipeline::testing::link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
 /// The interface states whether the function takes an indirect command buffer, from the AIR's
 /// metadata: an argument buffer's `command_buffer` member the kernel never encodes through
-/// (`kernel_icb_declared_handle_is_inert`), and one it encodes compute commands through
-/// (`icb_replay_encode`), count; a kernel that takes none (`icb_replay_template`, which a
-/// command runs) does not. A pipeline's interface states it where one of its stages does.
+/// (`kernel_icb_declared_handle_is_inert`) counts; a kernel that takes none
+/// (`icb_replay_template`, which a command runs) does not. A pipeline's interface states it where
+/// one of its stages does.
 #[test]
 fn the_interface_states_whether_the_function_takes_a_command_buffer() {
-    let p =
-        crate::pipeline::testing::profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
     let dirs = [crate::pipeline::testing::fixtures_dir(), engine_dir()];
     for (dir, stem, entry, reaches) in [
         (
@@ -2850,7 +2718,6 @@ fn the_interface_states_whether_the_function_takes_a_command_buffer() {
             "kernel_icb_declared_handle_is_inert",
             true,
         ),
-        (&dirs[1], "icb_replay_encode", "icb_replay_encode", true),
         (
             &dirs[1],
             "icb_replay_template",
@@ -2880,44 +2747,33 @@ fn the_interface_states_whether_the_function_takes_a_command_buffer() {
 }
 
 /// The interface states what the function may write into indirect command buffers, from its
-/// AIR: a kernel that encodes compute commands (`icb_replay_encode`) its operations' bits, no
-/// primitive type and the compute kind; kernels that draw (`icb_render_replay_encode_draw_only`,
-/// `icb_render_indexed_encode`) their draws' bits, the constant primitive type they pass
-/// (points) and the render kind; a kernel that takes no command buffer (`icb_replay_template`)
-/// nothing. A pipeline's interface holds its stages' together.
+/// AIR: a kernel that binds each command's buffers and draws indexed triangles into it
+/// (`icb_indexed_16`, under the identity domains, which lower such a kernel) its operations'
+/// bits, the constant primitive type it passes (triangles) and the render kind; a kernel that
+/// takes no command buffer (`icb_replay_template`) nothing. A pipeline's interface holds its
+/// stages' together.
 #[test]
 fn the_interface_states_what_the_function_may_write_into_command_buffers() {
     use crate::pipeline::interface::CommandWrites as W;
     let p =
         crate::pipeline::testing::profile("lavapipe", DevicePolicy::default()).expect("profile");
-    for (entry, operations, primitive_types, kinds) in [
+    for (fixture, entry, operations, primitive_types, kinds) in [
         (
-            "icb_replay_encode",
-            W::PIPELINE | W::BUFFER | W::THREADGROUP_MEMORY | W::DISPATCH | W::BARRIER,
-            0,
-            W::COMPUTE_COMMANDS,
-        ),
-        (
-            "icb_render_replay_encode_draw_only",
-            W::DRAW,
-            0b1,
+            "icb_merged_indexed",
+            "icb_indexed_16",
+            W::BUFFER | W::DRAW_INDEXED,
+            1 << 3,
             W::RENDER_COMMANDS,
         ),
-        (
-            "icb_render_indexed_encode",
-            W::DRAW_INDEXED,
-            0b1,
-            W::RENDER_COMMANDS,
-        ),
-        ("icb_replay_template", 0, 0, 0),
+        ("icb_replay_template", "icb_replay_template", 0, 0, 0),
     ] {
-        let bc = match llvm_assemble(&engine_dir().join(format!("{entry}.ll"))) {
+        let bc = match llvm_assemble(&engine_dir().join(format!("{fixture}.ll"))) {
             Ok(b) => b,
             Err(AssembleError::Missing(why)) => {
                 eprintln!("SKIPPED: {why}");
                 return;
             }
-            Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected {entry}.ll: {why}"),
+            Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected {fixture}.ll: {why}"),
         };
         let a = crate::pipeline::testing::compile(&bc, entry, &p)
             .unwrap_or_else(|e| panic!("{entry}: {e}"));
@@ -2946,8 +2802,8 @@ fn the_interface_states_what_the_function_may_write_into_command_buffers() {
 /// stage where the function writes.
 #[test]
 fn the_interface_states_whether_the_function_writes_textures() {
-    let p =
-        crate::pipeline::testing::profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
     for (stem, entry, writes) in [
         ("fragment_rog", "rog_texture", true),
         ("handles", "argument_buffer_array_write", true),
@@ -2977,6 +2833,74 @@ fn the_interface_states_whether_the_function_writes_textures() {
                 Vec::new()
             };
             assert_eq!(linked.interface.texture_writing_stages, stages, "{entry}");
+        }
+    }
+}
+
+/// The interface states whether the function reads or writes a resource through anything but
+/// its bound slots, from its AIR and memory plan. Through bound slots alone: textures selected
+/// between two arguments or between an argument and null, a texture array argument indexed at
+/// run time (`handles`), and atomics on a bound buffer (`rd_touch`, and a fragment function's
+/// `a3_rog_buffer_rmw`). Through an argument buffer's texture: a read (`argument_buffer_read`)
+/// and a write (`argument_buffer_array_write`), the argument buffer's own words being a bound
+/// slot. Through an address the function loads from a buffer: loads and stores
+/// (`ob2_loaded_pointer`) and an atomic, which reads and writes (`rd_tally_fragment`). Of these,
+/// the argument buffer's textures reached through their storage images: the write, and a read
+/// of an `access::read_write` texture (`abt_frag_storage`); a sample of one is not
+/// (`abt_frag_sample`). A standalone kernel's pipeline states its function's.
+#[test]
+fn the_interface_states_what_the_function_reaches_beyond_its_bound_slots() {
+    let p = crate::pipeline::testing::profile("lavapipe", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
+    for (stem, entry, reads, writes, storage) in [
+        ("handles", "select_read", false, false, false),
+        ("handles", "select_null_write", false, false, false),
+        ("handles", "array_read", false, false, false),
+        ("resident_draws", "rd_touch", false, false, false),
+        (
+            "a3_rog_buffer_rmw",
+            "a3_rog_buffer_rmw",
+            false,
+            false,
+            false,
+        ),
+        ("handles", "argument_buffer_read", true, false, false),
+        ("handles", "argument_buffer_array_write", false, true, true),
+        ("abt_descriptor_sets", "abt_frag_storage", true, false, true),
+        ("abt_descriptor_sets", "abt_frag_sample", true, false, false),
+        (
+            "ob2_loaded_pointer",
+            "ob2_loaded_pointer",
+            true,
+            true,
+            false,
+        ),
+        ("resident_draws", "rd_tally_fragment", true, true, false),
+    ] {
+        let Some(bc) = fixture(stem) else {
+            return;
+        };
+        let a = crate::pipeline::testing::compile(&bc, entry, &p)
+            .unwrap_or_else(|e| panic!("{entry}: {e}"));
+        let facts = (
+            a.interface.reads_unbound_resources,
+            a.interface.writes_unbound_resources,
+            a.interface.unbound_storage_textures,
+        );
+        assert_eq!(facts, (reads, writes, storage), "{entry}");
+        if a.interface.stage == crate::pipeline::sym::Stage::Kernel {
+            let linked = crate::pipeline::link::link(
+                &[&*a],
+                &crate::pipeline::link::LinkInputs::standalone(),
+                &p,
+            )
+            .unwrap_or_else(|e| panic!("{entry}: link: {e}"));
+            let linked_facts = (
+                linked.interface.reads_unbound_resources,
+                linked.interface.writes_unbound_resources,
+                linked.interface.unbound_storage_textures,
+            );
+            assert_eq!(linked_facts, (reads, writes, storage), "{entry}: pipeline");
         }
     }
 }
@@ -3027,7 +2951,7 @@ fn a_sample_rate_point_coordinate_is_noted_under_multisampling() {
 /// A vertex function over a two-triangle strip with a center varying `uv`, and a fragment
 /// function that loads `root->next` (a `device uint *` member of its `device Node *` buffer)
 /// and reads through it beside `uv`, writing nothing. Every access through the loaded pointer
-/// counts a resident miss in the `ExecutionStatus` buffer under the default policy.
+/// counts a resident miss in the `ExecutionStatus` buffer under the resident-table domains.
 const WIDE_READ: &str = r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
 target triple = "air64_v28-apple-macosx26.0.0"
 
@@ -3083,11 +3007,12 @@ entry:
 "#;
 
 /// A multisampled render pipeline whose fragment function only reads through a pointer it loads
-/// from a buffer (`WIDE_READ`) runs it at pixel rate: the resident-miss count its access keeps in
-/// the `ExecutionStatus` buffer is the product's write, not the function's, so the pipeline needs
-/// no sample shading and compiles on moltenvk-m3 as on lavapipe.
+/// from a buffer (`WIDE_READ`) does not write memory: the resident-miss count its access keeps in
+/// the `ExecutionStatus` buffer is the product's write, not the function's, so its fragment stage
+/// records nothing of its runs (`PrecisionNote::DeviceFragmentRuns`) and compiles on moltenvk-m3 as
+/// on lavapipe.
 #[test]
-fn a_fragment_reading_through_a_loaded_pointer_runs_at_pixel_rate() {
+fn a_fragment_reading_through_a_loaded_pointer_writes_no_memory() {
     let Some(bc) = assemble_text("wide_read", WIDE_READ) else {
         return;
     };
@@ -3106,25 +3031,146 @@ fn a_fragment_reading_through_a_loaded_pointer_runs_at_pixel_rate() {
         let pipe = device(stem)
             .compile_render_pipeline(&d, &Budget::standard())
             .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert!(!pipe.graphics.sample_shading, "{stem}");
+        assert!(
+            !pipe.stages.iter().any(|m| m
+                .precision_notes
+                .contains(&crate::pipeline::PrecisionNote::DeviceFragmentRuns)),
+            "{stem}"
+        );
+    }
+}
+
+/// Under the identity domains a device-replay variant (`VariantKey::replay_bindings`), which reads
+/// every buffer slot's address from its replayed command's root entry at the stage's
+/// `RootTableAddress`, is refused, typed (`Unsupported{IdentityDomains}` naming the field the
+/// identity domains do not read), never an internal error: a vertex function's buffer arguments
+/// (`icb_render_replay_template`), the attribute of the pulled-vertex-buffer variant
+/// (`icb_render_stride_template`, its layout pulled, as a draw replay pulls every layout), and a
+/// kernel's buffers (`icb_replay_template`) alike.
+#[test]
+fn a_replay_variant_under_the_identity_domains_is_refused_typed() {
+    use crate::cache::VariantKey;
+    let dev =
+        Device::from_queries(description("moltenvk-m3"), DevicePolicy::default()).expect("device");
+    let refused = |what: &str, e: Error| match e {
+        Error::Unsupported(u) => {
+            assert_eq!(
+                (u.feature, u.needs),
+                (Feature::IdentityDomains, Needs::NotImplemented),
+                "{what}"
+            );
+            assert_eq!(
+                u.symbol.map(|f| f.to_string()).as_deref(),
+                Some("an encoder value the function reads as RootTableAddress"),
+                "{what}"
+            );
+        }
+        other => panic!("{what}: {other}"),
+    };
+    for (stem, pulled) in [
+        ("icb_render_replay_template", false),
+        ("icb_render_stride_template", true),
+    ] {
+        let Some(bc) = fixture(stem) else {
+            return;
+        };
+        let vertex = Library::from_air(&bc)
+            .expect("library")
+            .function(stem)
+            .expect("vertex");
+        let mut d =
+            RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(vertex)));
+        d.rasterization_enabled = false;
+        let mut key = VariantKey::new();
+        key.replay_bindings = true;
+        if pulled {
+            d.vertex_descriptor = Some(vertex_descriptor(&[(0, metal::VertexFormat::UInt)]));
+            key.pulled_vertex_buffers.insert(0);
+        }
+        let e = dev
+            .compile_render_variant(&d, &key, &Budget::standard())
+            .map(|_| ())
+            .expect_err(stem);
+        refused(stem, e);
+    }
+    let Some(bc) = fixture("icb_replay_template") else {
+        return;
+    };
+    let lib = Library::from_air(&bc).expect("library");
+    let f = FunctionDescriptor::new(lib.function("icb_replay_template").expect("kernel"));
+    let mut inputs = LoweringInputs::new();
+    inputs.replay_bindings = true;
+    let e = dev
+        .compile_function(&f, &inputs, &Budget::standard())
+        .map(|_| ())
+        .expect_err("icb_replay_template");
+    refused("icb_replay_template", e);
+}
+
+/// A render pipeline made for indirect command buffers links its vertex input as its vertex stage
+/// is compiled: every `[[stage_in]]` attribute pulled (`RenderLinkInputs::pull_every`), as a
+/// command binds its vertex buffers by address alone. `icb_render_stride_template`'s one
+/// attribute links with no fixed-function binding or attribute, pulled at its layout's stride,
+/// static or per bind, and every stage passes L3.
+#[test]
+fn a_pipeline_for_indirect_command_buffers_pulls_its_stage_in() {
+    use crate::pipeline::VertexStride;
+    let Some(bc) = fixture("icb_render_stride_template") else {
+        return;
+    };
+    let vertex = Library::from_air(&bc)
+        .expect("library")
+        .function("icb_render_stride_template")
+        .expect("vertex");
+    for stem in ["moltenvk-m3", "runtime-floor"] {
+        let dev = device(stem);
+        for (stride, pulled) in [
+            (Some(8), VertexStride::Static(8)),
+            (None, VertexStride::PerBind),
+        ] {
+            let mut d = RenderPipelineDescriptor::new(StageSource::Function(
+                FunctionDescriptor::new(vertex.clone()),
+            ));
+            d.rasterization_enabled = false;
+            d.support_indirect_command_buffers = true;
+            // The attribute's layout at buffer 1: buffer 0 is the function's `out`.
+            let mut v = VertexDescriptor::new();
+            v.layouts
+                .insert(1, VertexBufferLayoutDescriptor::new(stride));
+            v.attributes.insert(
+                0,
+                VertexAttributeDescriptor::new(metal::VertexFormat::UInt, 0, 1),
+            );
+            d.vertex_descriptor = Some(v);
+            let p = dev
+                .compile_render_pipeline(&d, &Budget::standard())
+                .unwrap_or_else(|e| panic!("{stem}, stride {stride:?}: {e}"));
+            let input = &p.vertex_input;
+            assert!(input.bindings.is_empty(), "{stem}, stride {stride:?}");
+            assert!(input.attributes.is_empty(), "{stem}, stride {stride:?}");
+            assert_eq!(input.pulled.len(), 1, "{stem}, stride {stride:?}");
+            assert_eq!(input.pulled[0].stride, pulled, "{stem}");
+            for stage in &p.stages {
+                l3(&stage.spirv, &p.requirements, &dev);
+            }
+        }
     }
 }
 
 /// A vertex function that writes `[[viewport_array_index]]` depends on the draw's viewport count,
-/// which its push window holds and each draw writes from `BindState::viewport_count`, and writes
-/// the index as written to a flat varying (`IoRole::ViewportIndex`). In its pipeline a fragment
+/// which its push window holds (`PushField::ViewportCount`), and writes the index as written to a
+/// flat varying (`IoRole::ViewportIndex`). In its pipeline a fragment
 /// function that reads the index compiles under `viewport_index_varying` and reads that varying, as
-/// `render_pipeline_key` names; one that does not read it keeps the key it has without the field. A
-/// reading fragment compiled for the other kind of vertex function is `NeedsInput(ViewportIndex)`
-/// either way. Every module passes L3.
+/// `render_pipeline_key` names, its push fields from the vertex function's push end
+/// (`CompiledFunction::fragment_push_base`); one that does not read it compiles without
+/// `viewport_index_varying`. A reading fragment compiled for the other kind of
+/// vertex function is `NeedsInput(ViewportIndex)` either way. Every module passes L3.
 #[test]
 fn a_fragment_reads_the_viewport_index_its_vertex_function_wrote() {
-    use crate::bind::plan::FieldLocation;
-    use crate::bind::{BindState, DrawCall};
     use crate::error::RuntimeInput;
     use crate::pipeline::facts::RuntimeFact;
     use crate::pipeline::stage_io::{IoRole, StageBuiltin};
-    use crate::pipeline::sym::{PushField, Stage, VaryingKey};
+    use crate::pipeline::sym::{PushField, VaryingKey};
     let (Some(bc), Some(other)) = (fixture("rt6_viewports"), fixture("rt6_render_state")) else {
         return;
     };
@@ -3207,40 +3253,12 @@ fn a_fragment_reads_the_viewport_index_its_vertex_function_wrote() {
             &budget,
         )
         .expect("keys");
+    let inputs = keys.fragment_inputs.clone().expect("fragment inputs");
+    assert!(!inputs.viewport_index_varying);
     assert_eq!(
         keys.fragment,
-        Some(dev.function_compile_key(&white, &LoweringInputs::new()))
+        Some(dev.function_compile_key(&white, &inputs))
     );
-
-    // Each draw writes the encoder's viewport count into the vertex push window.
-    let state = BindState {
-        viewport_count: 3,
-        ..BindState::default()
-    };
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    let placed = plan
-        .push
-        .fields
-        .iter()
-        .find(|f| f.stage == Stage::Vertex && f.field == PushField::ViewportCount)
-        .expect("placed");
-    let FieldLocation::PushWindow { offset } = placed.location else {
-        panic!("the count spilled: {placed:?}");
-    };
-    let draw = DrawCall::Primitives {
-        vertex_start: 0,
-        vertex_count: 3,
-        instance_count: 1,
-        base_instance: 4,
-    };
-    let commands = plan.instantiate_draw(&state, &draw).expect("draw");
-    let write = commands
-        .push_constants
-        .iter()
-        .find(|w| w.stages.contains(crate::vk::ShaderStageFlags::VERTEX))
-        .expect("vertex push");
-    let at = (offset - write.offset) as usize;
-    assert_eq!(write.bytes[at..at + 4], 3u32.to_le_bytes());
 
     // Compiled for the other kind of vertex function: refused, never a wrong read.
     let without = dev
@@ -3261,362 +3279,4 @@ fn a_fragment_reads_the_viewport_index_its_vertex_function_wrote() {
             Some(Error::NeedsInput(RuntimeInput::ViewportIndex))
         );
     }
-}
-
-/// A merged draw replay's vertex function (`VariantKey::merged_draws`) reads its command's slot
-/// table from the header at its `MergedDrawAddress`, a hole of the vertex stage, in place of a
-/// `RootTableAddress`, and its plan states the variant. A fragment function that reads a buffer
-/// reads its command's fragment slot table from the header too, at the command its vertex wrote
-/// (`IoRole::MergedCommand`): `MergedDrawAddress` is its push field, `RootTableAddress` none. One
-/// that reads `[[primitive_id]]`, which Metal counts per command, is refused, as is a merged key
-/// without replay bindings.
-#[test]
-fn a_merged_draw_reads_its_command_s_table_from_its_header() {
-    use crate::cache::VariantKey;
-    use crate::pipeline::sym::PushField;
-    let dev = device("moltenvk-m3");
-    let mut key = VariantKey::new();
-    key.replay_bindings = true;
-    key.merged_draws = true;
-    let compile = |vertex: (&str, &str),
-                   fragment: Option<(&str, &str, metal::PixelFormat)>,
-                   key: &VariantKey| {
-        let function = |(file, name): (&str, &str)| {
-            let bc = fixture(file)?;
-            Some(FunctionDescriptor::new(
-                Library::from_air(&bc)
-                    .expect("library")
-                    .function(name)
-                    .expect("function"),
-            ))
-        };
-        let mut d = RenderPipelineDescriptor::new(StageSource::Function(function(vertex)?));
-        match fragment {
-            Some((file, name, format)) => {
-                d.fragment = Some(StageSource::Function(function((file, name))?));
-                d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
-            }
-            None => d.rasterization_enabled = false,
-        }
-        Some(dev.compile_render_variant(&d, key, &Budget::standard()))
-    };
-    let Some(merged) = compile(("primitive_ids", "pi_place"), None, &key) else {
-        return;
-    };
-    let merged = merged.expect("merged");
-    let fields: Vec<PushField> = merged
-        .interface
-        .push
-        .iter()
-        .flat_map(|p| p.fields.iter().map(|f| f.field))
-        .collect();
-    assert!(fields.contains(&PushField::MergedDrawAddress), "{fields:?}");
-    assert!(!fields.contains(&PushField::RootTableAddress), "{fields:?}");
-    assert!(
-        !fields.contains(&PushField::BaseVertexInstance),
-        "{fields:?}"
-    );
-    let plan = merged
-        .plan(&dev, &crate::bind::BindShape::default())
-        .expect("plan");
-    assert!(plan.variant.replay_bindings && plan.variant.merged_draws);
-    let placed: Vec<_> = plan
-        .push
-        .fields
-        .iter()
-        .filter(|f| f.field == PushField::MergedDrawAddress)
-        .map(|f| f.stage)
-        .collect();
-    assert_eq!(placed, [crate::pipeline::sym::Stage::Vertex]);
-    let mut unreplayed = VariantKey::new();
-    unreplayed.merged_draws = true;
-    let plain = compile(("primitive_ids", "pi_place"), None, &unreplayed)
-        .expect("fixture")
-        .expect("merged alone is no variant");
-    assert!(!plain.interface.push.iter().any(|p| p
-        .fields
-        .iter()
-        .any(|f| f.field == PushField::MergedDrawAddress)));
-    let (vertex, fragment) = (
-        ("primitive_ids", "pi_place"),
-        ("primitive_ids", "pi_ids", metal::PixelFormat::RGBA32Uint),
-    );
-    compile(vertex, Some(fragment), &VariantKey::new())
-        .expect("fixture")
-        .expect("plain");
-    let refused = compile(vertex, Some(fragment), &key)
-        .expect("fixture")
-        .expect_err("a fragment's primitive ID under a merged draw");
-    assert!(
-        format!("{refused:?}").contains("GpuEncodedIndirectCommands"),
-        "{fragment:?}: {refused:?}"
-    );
-    let (vertex, fragment) = (
-        ("a8r_targets", "a8r_vertex"),
-        ("a8r_targets", "a8r_fill", metal::PixelFormat::RGBA8Unorm),
-    );
-    let buffered = compile(vertex, Some(fragment), &key)
-        .expect("fixture")
-        .expect("a fragment's buffer under a merged draw");
-    let fragment_fields: Vec<PushField> = (buffered.interface.push.iter())
-        .filter(|p| p.stage == crate::pipeline::sym::Stage::Fragment)
-        .flat_map(|p| p.fields.iter().map(|f| f.field))
-        .collect();
-    assert!(
-        fragment_fields.contains(&PushField::MergedDrawAddress)
-            && !fragment_fields.contains(&PushField::RootTableAddress),
-        "{fragment_fields:?}"
-    );
-}
-
-/// A merged draw replay's functions find their command's slot tables before any entry hook reads
-/// one: a fragment function that loads a pointer from its argument buffer reads that buffer's
-/// root entry at entry (`access::dynamic::emit_entry`), from the fragment slot table the command
-/// its vertex wrote names, and the merged variant of `icb_merged_arguments` (a vertex function
-/// that fetches `[[stage_in]]` attributes, a fragment function whose argument buffer holds two
-/// textures and a constant pointer) compiles on each device that has the replay, every stage
-/// passing L3, its fragment stage reading the header at its `MergedDrawAddress`.
-#[test]
-fn a_merged_fragment_reads_its_argument_buffer_through_its_command_s_table() {
-    use crate::cache::VariantKey;
-    use crate::pipeline::sym::{PushField, Stage};
-    let Some(bc) = fixture("icb_merged_arguments") else {
-        return;
-    };
-    let lib = Library::from_air(&bc).expect("library");
-    let function = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(lib.function(name).expect(name)))
-    };
-    let mut d = RenderPipelineDescriptor::new(function("ica_vertex"));
-    d.fragment = Some(function("ica_fragment"));
-    d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(
-        metal::PixelFormat::RGBA32Uint,
-    ));
-    let mut input = VertexDescriptor::new();
-    input
-        .layouts
-        .insert(0, VertexBufferLayoutDescriptor::new(Some(8)));
-    input
-        .layouts
-        .insert(1, VertexBufferLayoutDescriptor::new(Some(4)));
-    input.attributes.insert(
-        0,
-        VertexAttributeDescriptor::new(metal::VertexFormat::Float2, 0, 0),
-    );
-    input.attributes.insert(
-        1,
-        VertexAttributeDescriptor::new(metal::VertexFormat::UInt, 0, 1),
-    );
-    d.vertex_descriptor = Some(input);
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe"] {
-        let dev = device(stem);
-        let base = dev
-            .compile_render_variant(&d, &VariantKey::new(), &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: base: {e}"));
-        let layouts = crate::bind::draw_replay_vertex_layouts(&base.vertex_input).expect("layouts");
-        let shape = crate::bind::BindShape {
-            far_vertex_buffers: layouts,
-            ..Default::default()
-        };
-        let mut key = base.plan(&dev, &shape).expect("base plan").variant;
-        key.replay_bindings = true;
-        key.merged_draws = true;
-        let merged = dev
-            .compile_render_variant(&d, &key, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: merged: {e}"));
-        for stage in &merged.stages {
-            l3(&stage.spirv, &merged.requirements, &dev);
-        }
-        let fragment: Vec<PushField> = (merged.interface.push.iter())
-            .filter(|p| p.stage == Stage::Fragment)
-            .flat_map(|p| p.fields.iter().map(|f| f.field))
-            .collect();
-        assert!(
-            fragment.contains(&PushField::MergedDrawAddress)
-                && !fragment.contains(&PushField::RootTableAddress),
-            "{stem}: {fragment:?}"
-        );
-    }
-}
-
-/// A render pipeline compiled as a device-replay variant (`VariantKey::replay_bindings`) reads
-/// every buffer its vertex function reaches through its root entry (`BufferForm::Psb`), from the
-/// slot table at the stage's own `RootTableAddress`, and needs no `SlotGuestBase`
-/// (`icb_render_replay_template`); its plan states the variant. A vertex function that fetches
-/// a `[[stage_in]]` attribute (`icb_render_stride_template`) in fixed function is refused:
-/// fixed-function input reads no slot table. A draw replay names its layout among those the draw
-/// pulls (`bind::draw_replay_vertex_layouts`, `BindShape::far_vertex_buffers`) with no buffer
-/// bound there: the base plan asks for the pulled-vertex-buffer variant, whose replay variant
-/// compiles, one draw per command and merged, binds no layout and pulls the attribute, whose
-/// read reaches the slot table; every stage passes L3, and its plan states its key.
-#[test]
-fn a_replayed_draw_reads_its_buffers_through_the_slot_table() {
-    use crate::cache::VariantKey;
-    use crate::pipeline::interface::{BufferForm, SlotInterface};
-    use crate::pipeline::sym::PushField;
-    let dev = device("moltenvk-m3");
-    let mut key = VariantKey::new();
-    key.replay_bindings = true;
-    let Some(bc) = fixture("icb_render_replay_template") else {
-        return;
-    };
-    let vertex = Library::from_air(&bc)
-        .expect("library")
-        .function("icb_render_replay_template")
-        .expect("vertex");
-    let mut d =
-        RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(vertex)));
-    d.rasterization_enabled = false;
-    let plain = dev
-        .compile_render_variant(&d, &VariantKey::new(), &Budget::standard())
-        .expect("plain");
-    let replayed = dev
-        .compile_render_variant(&d, &key, &Budget::standard())
-        .expect("replayed");
-    let forms = |p: &crate::pipeline::artifact::RenderPipeline| -> Vec<BufferForm> {
-        p.interface
-            .slots
-            .values()
-            .filter_map(|s| match s {
-                SlotInterface::Buffer(b) => Some(b.form),
-                _ => None,
-            })
-            .collect()
-    };
-    assert_eq!(forms(&replayed).len(), 2);
-    assert!(forms(&replayed).iter().all(|f| *f == BufferForm::Psb));
-    assert!(forms(&plain).iter().any(|f| *f != BufferForm::Psb));
-    let fields: Vec<PushField> = replayed
-        .interface
-        .push
-        .iter()
-        .flat_map(|p| p.fields.iter().map(|f| f.field))
-        .collect();
-    assert!(fields.contains(&PushField::RootTableAddress));
-    assert!(!fields
-        .iter()
-        .any(|f| matches!(f, PushField::SlotGuestBase(_))));
-    let plan = replayed
-        .plan(&dev, &crate::bind::BindShape::default())
-        .expect("plan");
-    assert!(plan.variant.replay_bindings);
-
-    let Some(bc) = fixture("icb_render_stride_template") else {
-        return;
-    };
-    let vertex = Library::from_air(&bc)
-        .expect("library")
-        .function("icb_render_stride_template")
-        .expect("vertex");
-    let mut d =
-        RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(vertex)));
-    d.rasterization_enabled = false;
-    d.vertex_descriptor = Some(vertex_descriptor(&[(0, metal::VertexFormat::UInt)]));
-    let base = dev
-        .compile_render_variant(&d, &VariantKey::new(), &Budget::standard())
-        .expect("fetched");
-    let refused = dev
-        .compile_render_variant(&d, &key, &Budget::standard())
-        .expect_err("a fetch under replay bindings");
-    assert!(
-        format!("{refused:?}").contains("GpuEncodedIndirectCommands"),
-        "{refused:?}"
-    );
-    // The replay names the base's layouts in the shape, no buffer bound at them: the base plan
-    // asks for the pulled-vertex-buffer variant, whose replay forms' plans state themselves.
-    let layouts = crate::bind::draw_replay_vertex_layouts(&base.vertex_input).expect("layouts");
-    assert_eq!(layouts, std::collections::BTreeSet::from([0]));
-    let shape = crate::bind::BindShape {
-        far_vertex_buffers: layouts.clone(),
-        ..Default::default()
-    };
-    let plan = base
-        .plan(&dev, &shape)
-        .expect("the base plan, no buffer bound");
-    assert_eq!(plan.variant.pulled_vertex_buffers, layouts);
-    for merged in [false, true] {
-        let mut pulled = plan.variant.clone();
-        pulled.replay_bindings = true;
-        pulled.merged_draws = merged;
-        let p = dev
-            .compile_render_variant(&d, &pulled, &Budget::standard())
-            .unwrap_or_else(|e| panic!("merged {merged}: {e}"));
-        let input = &p.vertex_input;
-        assert!(input.bindings.is_empty(), "merged {merged}");
-        assert_eq!(input.pulled.len(), 1, "merged {merged}");
-        assert_eq!(input.variant_pulled, layouts);
-        // The pulled layout's buffer is read through its root entry, as every other slot.
-        let slots = forms(&p);
-        assert!(
-            !slots.is_empty() && slots.iter().all(|f| *f == BufferForm::Psb),
-            "merged {merged}: {slots:?}"
-        );
-        for stage in &p.stages {
-            l3(&stage.spirv, &p.requirements, &dev);
-        }
-        let replayed = p.plan(&dev, &shape).expect("the variant's plan");
-        assert_eq!(replayed.variant, pulled, "merged {merged}");
-        assert!(replayed.vertex_buffers.is_empty(), "merged {merged}");
-    }
-}
-
-/// A draw replay's variant reads every buffer through the slot table its replay's preprocess
-/// writes, so inline bytes the encoder bound at a slot it reads are no refusal: commands that
-/// inherit the encoder's buffers read them at the consumer's upload of them, whose address the
-/// preprocess's entry takes (`bind::DrawReplayPreprocess::inherited_bytes`). Its plan for a shape
-/// with inline bytes at every buffer slot plans; one with a buffer bound without a device
-/// address there, which no entry can name, stays `MissingDeviceAddress`.
-#[test]
-fn a_replayed_draw_plans_inline_bytes_at_its_slots() {
-    use crate::bind::{BindShape, BufferShape, StageShape};
-    use crate::cache::VariantKey;
-    use crate::error::BindError;
-    use crate::pipeline::interface::SlotInterface;
-    let dev = device("moltenvk-m3");
-    let mut key = VariantKey::new();
-    key.replay_bindings = true;
-    let Some(bc) = fixture("icb_render_replay_template") else {
-        return;
-    };
-    let vertex = Library::from_air(&bc)
-        .expect("library")
-        .function("icb_render_replay_template")
-        .expect("vertex");
-    let mut d =
-        RenderPipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(vertex)));
-    d.rasterization_enabled = false;
-    let replayed = dev
-        .compile_render_variant(&d, &key, &Budget::standard())
-        .expect("replayed");
-    let slots: Vec<_> = (replayed.interface.slots.iter())
-        .filter(|(_, s)| matches!(s, SlotInterface::Buffer(_)))
-        .map(|(slot, _)| *slot)
-        .collect();
-    assert!(!slots.is_empty());
-    let shape_with = |bound: BufferShape| {
-        let mut shape = BindShape::default();
-        for slot in &slots {
-            let stage: &mut StageShape = shape.stages.entry(slot.stage).or_default();
-            stage.buffers.insert(slot.index, bound);
-        }
-        shape
-    };
-    let bytes = BufferShape::Bytes {
-        attribute_stride: None,
-    };
-    let plan = replayed
-        .plan(&dev, &shape_with(bytes))
-        .expect("inline bytes");
-    assert!(plan.variant.replay_bindings);
-    let unaddressed = BufferShape::Buffer {
-        attribute_stride: None,
-        device_address: false,
-        length_class: 0,
-        offset_alignment: 4,
-    };
-    let refused = replayed.plan(&dev, &shape_with(unaddressed));
-    assert!(
-        matches!(refused, Err(BindError::MissingDeviceAddress { .. })),
-        "{refused:?}"
-    );
 }

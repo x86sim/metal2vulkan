@@ -87,9 +87,7 @@ jobs:
       # may build it. `--all-features` compiles every gated item, but an import or item that only
       # another feature (or only a test) uses is unused, or missing, without it; `--workspace`
       # cannot check that either, since the validation member enables most features for every
-      # build. Feature gates combine with platform cfgs, so both hosts run it. The runtime crate
-      # (`metal2vulkan-runtime`) has no feature and reaches the translator only
-      # through its public API: it is checked the same way.
+      # build. Feature gates combine with platform cfgs, so both hosts run it.
       - name: Clippy under each feature alone (warnings denied)
         run: |
           set -euo pipefail
@@ -98,9 +96,6 @@ jobs:
             cargo clippy -p metal2vulkan --all-targets --no-default-features --features "$features" -- -D warnings
             echo "::endgroup::"
           done
-          echo "::group::metal2vulkan-runtime"
-          cargo clippy -p metal2vulkan-runtime --all-targets -- -D warnings
-          echo "::endgroup::"
           # The AIR front end's crate as a consumer of `metal2vulkan-air` builds it
           # alone, with no feature and with `serde`, so nothing the translator or
           # validation enables in a workspace build hides an unused import or a missing item.
@@ -120,6 +115,35 @@ jobs:
           RUSTFLAGS: -Dwarnings --cfg m2v_gpu
           CARGO_TARGET_DIR: target/gpucfg
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # The published crates (and devtools, which their tests use) and the conformance suite, which
+      # the Windows host replays, for Windows, checked from Linux: clippy links nothing, so neither
+      # target needs a Windows SDK or linker. gnullvm is the primary Windows target, msvc the second.
+      - name: Clippy for Windows (warnings denied, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-gnullvm x86_64-pc-windows-msvc
+          for target in x86_64-pc-windows-gnullvm x86_64-pc-windows-msvc; do
+            echo "::group::$target"
+            cargo clippy --target "$target" -p metal2vulkan-air -p metal2vulkan -p metal2vulkan-runtime -p metal2vulkan-devtools -p metal2vulkan-conformance --all-targets --all-features -- -D warnings
+            echo "::endgroup::"
+          done
+
+      # rt's documentation for both Windows targets, from Linux as above: a doc link to an item
+      # only one host has (a Unix host's dma-buf import, Windows' Direct3D 11 import) is
+      # unresolved on the other host.
+      - name: Build rt's documentation for Windows (warnings denied, Linux)
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: |
+          set -euo pipefail
+          for target in x86_64-pc-windows-gnullvm x86_64-pc-windows-msvc; do
+            echo "::group::$target"
+            cargo doc --target "$target" -p metal2vulkan-runtime --all-features --no-deps
+            echo "::endgroup::"
+          done
 
       - name: Build public documentation (warnings denied)
         env:
@@ -153,7 +177,8 @@ jobs:
             metal2vulkan-runtime=0 \
             metal2vulkan-validation=0 \
             metal2vulkan-conformance=0 \
-            metal2vulkan-devtools=0
+            metal2vulkan-devtools=0 \
+            metal2vulkan-harness=0
           do
             crate=${row%=*}
             ceiling=${row#*=}
@@ -180,12 +205,12 @@ jobs:
       # builds alone against the others' packages, so none reads a file outside its own directory.
       # Validation and the dev-tools crate are not published.
       - name: Package the published crates
-        run: cargo package --workspace --exclude metal2vulkan-validation --exclude metal2vulkan-conformance --exclude metal2vulkan-devtools
+        run: cargo package --workspace --exclude metal2vulkan-validation --exclude metal2vulkan-conformance --exclude metal2vulkan-devtools --exclude metal2vulkan-harness
 
       # With the AIR front end's crate's own tests, and the dev-tools crate's:
       # its tool runner and L3 checks.
       - name: Test metal2vulkan
-        run: cargo nextest run -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime -p metal2vulkan-devtools --all-features
+        run: cargo nextest run -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime -p metal2vulkan-devtools -p metal2vulkan-harness --all-features
 
       # GPU-free on every host: tests that open a device compile only under `--cfg m2v_gpu` or
       # `--cfg m2v_cpu_icd`, and no device-opening code runs without one of them.
@@ -202,20 +227,21 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --all-features --doc
 
-      # Device-executing validation tests on lavapipe. `DeviceType::Cpu` matches only a CPU
-      # physical device, so this never reaches a GPU even on a runner that has one. macOS CI runs
-      # no device tests.
-      - name: Test validation suite on the CPU Vulkan ICD (Linux)
+      # Device-executing validation tests, and the runtime's floor check, on lavapipe.
+      # `DeviceType::Cpu` matches only a CPU physical device, and the runtime's device tests under
+      # `m2v_cpu_icd` check only CPU devices, so this never reaches a GPU even on a runner that has
+      # one. macOS CI runs no device tests.
+      - name: Test validation suite and the runtime on the CPU Vulkan ICD (Linux)
         if: runner.os == 'Linux'
         env:
           RUSTFLAGS: -Dwarnings --cfg m2v_cpu_icd
           LP_NUM_THREADS: "1"
-        run: cargo nextest run -p metal2vulkan-validation --all-features
+        run: cargo nextest run -p metal2vulkan-validation -p metal2vulkan-runtime --all-features
 
       # The conformance suite's replay leg on lavapipe: it reads the committed recordings, runs the
       # runtime side and compares, with no Metal present. Its exit status is 0 only where the run
       # holds no surprise: no unrecorded case, no stale recording, and exactly the gaps
-      # crates/metal2vulkan-conformance/known-gaps.tsv expects on this venue. A refusal or a
+      # crates/metal2vulkan-conformance/known-gaps-rt.tsv expects on this venue. A refusal or a
       # divergence that ledger does not list fails here, and so does a row it lists that the run no
       # longer holds, so closing a gap forces the ledger edit. A venue that lacks a feature a case
       # needs does not spoil it.

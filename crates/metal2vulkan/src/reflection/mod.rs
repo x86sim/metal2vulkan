@@ -407,22 +407,6 @@ impl ComputePipelineDescriptor {
         Ok(ComputePipelineReflection { bindings })
     }
 
-    /// Whether the kernel uses a direct texture or sampler argument (`[[texture(n)]]`,
-    /// `[[sampler(n)]]`, a texture array among them) that the pipeline's
-    /// [`reflection`](Self::reflection) lists as used, of the entry its constants specialize where
-    /// they decide one: what `newComputePipelineStateWithDescriptor:` refuses with
-    /// `supportIndirectCommandBuffers`. It decides from the arguments' roles and use alone, so an
-    /// argument whose reflection Metal's answer has not been measured for, which `reflection`
-    /// refuses, decides nothing here. It decodes the kernel's AIR under `budget`; a kernel the
-    /// compile layer already compiled (`StageSource::Compiled`) answers from what its compile kept.
-    ///
-    /// Refused: a compiled kernel that kept no reflection (`Unsupported` with
-    /// `Feature::Reflection`), and the decode's and specialization's own errors.
-    pub fn uses_direct_arguments(&self, budget: &crate::Budget) -> Result<bool, Error> {
-        let mut m = Meter::new(budget);
-        stage_direct(&self.kernel, self.max_call_stack_depth, &mut m)
-    }
-
     /// What the kernel may store through each slot its arguments bind
     /// ([`writes`](crate::reflection::SlotWrite), whose rules are
     /// [`reflection`](crate::reflection)'s), of the entry its constants specialize where they
@@ -541,8 +525,8 @@ impl MeshPipelineDescriptor {
 
     /// What each stage of the mesh pipeline this descriptor describes may store through each slot
     /// its arguments bind ([`ComputePipelineDescriptor::slot_writes`]'s answer per stage):
-    /// [`SlotWrites::object_slots`], [`SlotWrites::mesh_slots`] and
-    /// [`SlotWrites::fragment_slots`], an object or mesh function's payload among them. Each
+    /// [`SlotWrites::mesh_slots`] and [`SlotWrites::fragment_slots`], a mesh function's payload
+    /// among them. Each
     /// stage's calls nest Metal's default depth of 1, as `Device::compile_mesh_pipeline` compiles
     /// it. Refused only by the decode's and specialization's own errors.
     pub fn slot_writes(&self, budget: &crate::Budget) -> Result<SlotWrites, Error> {
@@ -582,7 +566,7 @@ impl TileRenderPipelineDescriptor {
 
     /// What the tile function of the pipeline this descriptor describes may store through each
     /// slot its arguments bind ([`ComputePipelineDescriptor::slot_writes`]'s answer for the tile
-    /// stage): [`SlotWrites::tile_slots`], a tile function's implicit imageblock among them.
+    /// stage), a tile function's implicit imageblock among them.
     /// Refused only by the decode's and specialization's own errors.
     pub fn slot_writes(&self, budget: &crate::Budget) -> Result<SlotWrites, Error> {
         let mut m = Meter::new(budget);

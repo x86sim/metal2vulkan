@@ -76,30 +76,12 @@ pub struct CompiledFunction(Arc<FunctionArtifact>, Arc<LastRelocation>);
 #[derive(Default)]
 pub(crate) struct LastRelocation(std::sync::Mutex<Option<Relocated>>);
 
-/// One relocation: what link assigned, the words that came out, and a digest of those words a
-/// caller asked for.
+/// One relocation: what link assigned, and the words that came out.
 struct Relocated {
     /// The value link assigned to each of the module's relocation slots, in `relocs` order: the
     /// whole of what the words depend on besides the module itself.
     assigned: Vec<u32>,
     words: Arc<[u32]>,
-    /// The digest of `words`, with the function that derived it: a caller that hashes words some
-    /// other way derives again rather than reading a digest its own function did not make
-    /// ([`CompiledFunction::relocated_words_digest`]). Cleared with the words it describes, so
-    /// it can never name another relocation's.
-    digest: Option<(fn(&[u32]) -> Hash256, Hash256)>,
-}
-
-/// What a relocation slot can say about a digest of some words by some function
-/// ([`LastRelocation::digest_of`]).
-enum DigestOf {
-    /// It holds those very words and that function's digest of them.
-    Kept(Hash256),
-    /// It holds those very words and no digest of them by that function, so one derived now
-    /// belongs in it.
-    Wanted,
-    /// The words are not the ones it holds, so it has nothing to say about them.
-    Other,
 }
 
 impl LastRelocation {
@@ -110,46 +92,13 @@ impl LastRelocation {
         (kept.assigned == assigned).then(|| Arc::clone(&kept.words))
     }
 
-    /// Keep `words` as the relocation that assigned `assigned`, replacing what the slot held
-    /// (and the digest of the words it held).
+    /// Keep `words` as the relocation that assigned `assigned`, replacing what the slot held.
     pub(crate) fn keep(&self, assigned: Vec<u32>, words: &Arc<[u32]>) {
         let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
         *slot = Some(Relocated {
             assigned,
             words: Arc::clone(words),
-            digest: None,
         });
-    }
-
-    /// What the slot has for a digest of `words` by `derive` ([`DigestOf`]). The words are the
-    /// slot's only if they are the same allocation: a relocation hands back the very `Arc` it
-    /// kept, so an equal copy of the words is a different caller's and answers `Other`.
-    fn digest_of(&self, words: &Arc<[u32]>, derive: fn(&[u32]) -> Hash256) -> DigestOf {
-        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(kept) = slot.as_ref() else {
-            return DigestOf::Other;
-        };
-        if !Arc::ptr_eq(&kept.words, words) {
-            return DigestOf::Other;
-        }
-        match kept.digest {
-            Some((made_by, digest)) if std::ptr::fn_addr_eq(made_by, derive) => {
-                DigestOf::Kept(digest)
-            }
-            _ => DigestOf::Wanted,
-        }
-    }
-
-    /// Keep `digest`, which `derive` produced over `words`, if the slot still holds those very
-    /// words; drop it if the slot has moved on, since a digest only ever describes the words
-    /// beside it.
-    fn keep_digest(&self, words: &Arc<[u32]>, derive: fn(&[u32]) -> Hash256, digest: Hash256) {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(kept) = slot.as_mut() {
-            if Arc::ptr_eq(&kept.words, words) {
-                kept.digest = Some((derive, digest));
-            }
-        }
     }
 }
 
@@ -181,56 +130,6 @@ impl CompiledFunction {
     /// fills.
     pub(crate) fn last_relocation(&self) -> &LastRelocation {
         &self.1
-    }
-
-    /// The digest `derive` gives for `words`, where `words` are the final SPIR-V of this
-    /// function's last relocation -- the very `Arc` a pipeline's stage took from it -- and
-    /// `None` where they are not.
-    ///
-    /// A pipeline state that names a stage's module by a digest of its words asks here first: a
-    /// sweep of states over one function pair takes the same words on every creation (the
-    /// relocation slot gives back the same allocation), so without this each creation hashes
-    /// words byte-identical to the previous creation's. Pass the words a stage of the pipeline
-    /// holds and the function that would have hashed them.
-    ///
-    /// **A miss costs no `derive` call at all.** `None` is answered from the slot alone: no
-    /// hash is taken, and the caller is free to derive or not. That is what a caller in a hot
-    /// path needs to know, and it is also why the caller's own function stays the only
-    /// derivation of a stage's words that ever runs -- nothing here hashes words any other way,
-    /// so nothing keyed on such a digest can take a different value from this.
-    ///
-    /// **The digest a caller gets is always one its own `derive` produced.** The slot keeps the
-    /// function beside the digest and answers only where that function is this call's, so two
-    /// callers that hash differently never read each other's digest: a mismatch derives again
-    /// and replaces what the slot held.
-    ///
-    /// **On comparing `fn` pointers**, which is not guaranteed stable: identical-code folding
-    /// may merge two functions into one address, and one `fn` item may have several addresses
-    /// across codegen units. Both directions are harmless here. Two addresses for one function
-    /// make a mismatch, which costs a hash and gives the same digest. The dangerous direction --
-    /// two *different* hash functions reading as one -- cannot occur, because folding merges
-    /// only identical machine code and identical machine code cannot produce different digests.
-    ///
-    /// `derive` is the caller's, so it is **never called while the slot is locked**: one that
-    /// reached back into this compiled function would otherwise deadlock. The slot is locked and
-    /// read, released, `derive` is called, and the digest is stored only if the slot still holds
-    /// those words. Two threads deriving at once is benign -- the same words give the same
-    /// digest, and the last store wins.
-    pub fn relocated_words_digest(
-        &self,
-        words: &Arc<[u32]>,
-        derive: fn(&[u32]) -> crate::cache::Hash256,
-    ) -> Option<crate::cache::Hash256> {
-        match self.1.digest_of(words, derive) {
-            DigestOf::Kept(digest) => Some(digest),
-            DigestOf::Other => None,
-            // Derived with the slot released: `derive` is the caller's and may reach anywhere.
-            DigestOf::Wanted => {
-                let digest = derive(words);
-                self.1.keep_digest(words, derive, digest);
-                Some(digest)
-            }
-        }
     }
 
     /// The key the function was compiled under.
@@ -307,23 +206,27 @@ impl CompiledFunction {
         !self.0.kernel.partition_oblivious
     }
 
-    /// Whether the function, a kernel, observes its threadgroup partition through its simdgroups
-    /// alone: its only observations are barriers of simdgroup execution scope, fences and atomics
-    /// of simdgroup scope, simdgroup and quad functions, `is_uniform`, the simdgroup size, and the
-    /// builtins `thread_index_in_simdgroup`, `thread_index_in_quadgroup` and
-    /// `threads_per_simdgroup`. It computes the same in any partition that keeps its threadgroups,
-    /// so a one-row grid in threadgroups of one row may run flat in the call's threadgroups
-    /// (`LoweringInputs`'s `call_threadgroups`). `false` for a kernel that does not observe its
-    /// partition ([`observes_threadgroup_partition`](Self::observes_threadgroup_partition)).
-    /// Decided as that one is.
-    pub fn observes_partition_through_simdgroups_alone(&self) -> bool {
-        self.0.kernel.partition_simdgroups
+    /// Whether the function, a kernel, is image-only: it samples, gathers or reads a texture, and
+    /// loads, stores and updates atomically nothing in device memory, through no load, store,
+    /// atomic or call but a texture or sampler operation on a pointer into the `device` address
+    /// space. Loads of `constant` memory and texture writes are allowed. Decided from its AIR
+    /// alone. A runtime may run such a kernel that does not observe its threadgroup partition
+    /// ([`observes_threadgroup_partition`](Self::observes_threadgroup_partition)) in square
+    /// workgroups. `false` for a function that is not a kernel.
+    pub fn is_image_only(&self) -> bool {
+        self.0.kernel.image_only
     }
 
-    /// The function's own `[[max_total_threads_per_threadgroup(n)]]` (`air.max_work_group_size`),
-    /// `None` without one: the most threads Metal compiles a threadgroup of the function for.
-    pub fn max_total_threads_attribute(&self) -> Option<u32> {
-        self.0.kernel.max_total_threads.filter(|&n| n > 0)
+    /// Where a fragment function linked after this vertex function pushes its fields on
+    /// `Device::from_queries`' profile (`LoweringInputs::push_base`): this function's push end, a
+    /// multiple of 4; where it pushes nothing, 24 for a post-tessellation function (past its
+    /// pipeline's control stage's push range) and 0 for any other. Each fragment field is placed
+    /// at the next offset aligned to it, so a four-byte field may take the bytes below an
+    /// eight-byte one. A consumer compiling a render pipeline's fragment function on its own
+    /// compiles it under this offset.
+    pub fn fragment_push_base(&self) -> u32 {
+        let interface = &self.0.interface;
+        crate::lower::push::fragment_base(&interface.push, interface.tessellation.is_some())
     }
 
     /// Whether the function is a vertex function whose module writes its `[[point_size]]`
@@ -359,7 +262,7 @@ impl CompiledFunction {
             VertexFetch::Pulled { buffer_index, .. } => {
                 Some((input.index, AttributeFetch::Pulled { buffer_index }))
             }
-            VertexFetch::FixedFunction => None,
+            VertexFetch::FixedFunction | VertexFetch::SignedFixedFunction => None,
         });
         let stage_in = io.stage_in.iter().map(|input| {
             (
@@ -373,9 +276,7 @@ impl CompiledFunction {
     }
 
     /// Whether the function writes memory another invocation or a later command can read: it
-    /// stores to a buffer or a texture, or updates one atomically. A render pipeline whose colors
-    /// the device draws in more than one group refuses such a function, which each group's draw
-    /// would run again ([`ColorGroup`](crate::pipeline::ColorGroup)).
+    /// stores to a buffer or a texture, or updates one atomically.
     pub fn writes_memory(&self) -> bool {
         self.0.interface.writes_memory
     }
@@ -440,9 +341,9 @@ pub struct FunctionArtifact {
     pub specialized: Vec<crate::pipeline::artifact::SpecializedNote>,
 }
 
-/// What a kernel's `ComputePipelineMetalInfo`, and an object or mesh function's
-/// `MeshPipelineMetalInfo`, need from its compile. A vertex or fragment function has the default:
-/// no attribute, not flattened, no threadgroup memory.
+/// What a kernel's `ComputePipelineMetalInfo`, and an object or mesh function's checks against its
+/// mesh descriptor, need from its compile. A vertex or fragment function has the default: no
+/// attribute, not flattened, no threadgroup memory.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct KernelFacts {
@@ -473,4 +374,10 @@ pub struct KernelFacts {
     /// `false` for a kernel that does not observe its partition
     /// ([`partition_oblivious`](Self::partition_oblivious)). Decided as that one is.
     pub partition_simdgroups: bool,
+    /// The kernel reads an image and loads, stores and updates atomically nothing in device
+    /// memory (`pipeline::compile`'s `images`): it samples, gathers or reads a texture, and no
+    /// load, store or atomic, and no call but a texture or sampler operation, goes through a
+    /// pointer into the `device` address space. Loads of `constant` memory and texture writes are
+    /// allowed. Decided from the entry's AIR alone; `false` for a function that is not a kernel.
+    pub image_only: bool,
 }

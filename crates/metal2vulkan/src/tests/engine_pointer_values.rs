@@ -18,21 +18,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::status::ExecutionStatus;
 use crate::budget::SPIRV_WORDS;
 use crate::device::profile::{BufferAccess, DeviceProfile};
-use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{Error, Feature, Needs};
 use crate::library::FunctionConstantValues;
 use crate::lower::select::{LowerInputs, Plan};
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
-};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage, SyntheticBinding};
 use crate::pipeline::testing::{
-    compile, link_and_validate, llvm_assemble, meter, typed_module_with, AssembleError,
+    compile, device_f, link_and_validate, llvm_assemble, meter, typed_module_with, AssembleError,
+    PROFILE_F,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources};
 use crate::spirv::ir::{Inst, StorageClass, Type, TypedModule};
@@ -52,37 +49,31 @@ const fn slot_guest(i: u64) -> u64 {
     0x0000_0001_0000_0000 + i * 0x1_0000
 }
 
+/// Committed profile `stem`, or [`PROFILE_F`]'s (`runtime-floor` without `bufferDeviceAddress`).
 fn profile(stem: &str) -> DeviceProfile {
+    if stem == PROFILE_F {
+        return device_f(DevicePolicy::RESIDENT_TABLES)
+            .expect(PROFILE_F)
+            .profile()
+            .clone();
+    }
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
 }
 
-/// Profile A with and without robust descriptors, and Profile F with and without device
-/// addresses (none of the committed Profile-F profiles has `shaderInt64`).
+/// Profile A, and Profile F ([`PROFILE_F`], below the runtime's floor).
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in ["moltenvk-m3", "lavapipe", "vk12-floor", "roadmap-2022"] {
-        out.push((stem.to_owned(), profile(stem)));
-    }
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
-    let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.features.remove(&VkFeature::RobustBufferAccess);
-    desc.features.remove(&VkFeature::RobustBufferAccess2);
-    let p = Device::new(desc, DevicePolicy::default())
-        .expect("device")
-        .profile()
-        .clone();
-    out.push(("moltenvk-m3 robust=false".to_owned(), p));
-    out
+    ["moltenvk-m3", "lavapipe", PROFILE_F]
+        .into_iter()
+        .map(|stem| (stem.to_owned(), profile(stem)))
+        .collect()
 }
 
 fn addressed(p: &DeviceProfile) -> bool {
@@ -203,10 +194,7 @@ fn resources(
     guest: &dyn Fn(usize) -> u64,
 ) -> Resources {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(threads));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         let PushLoc::Push { offset } = f.loc else {
@@ -250,7 +238,7 @@ fn resources(
     buffers.push(Buffer {
         slot: None,
         address: Some(STATUS),
-        bytes: ExecutionStatus::initial().to_vec(),
+        bytes: vec![0; crate::bind::status::StatusWord::SeqCstFences.byte_offset() as usize + 4],
     });
     if let Some(b) = &plan.families.access.blob {
         let mut bytes = b.bytes.to_vec();
@@ -272,8 +260,8 @@ fn resources(
     }
 }
 
-/// Compile entry `entry` of `bc` for `p`, pass L3, check that the plan's size estimate bounds
-/// the emitted words, and return the plan and the typed module the interpreter runs.
+/// Compile entry `entry` of `bc` for `p`, pass L3, and return the plan and the typed module the
+/// interpreter runs.
 fn checked(bc: &[u8], entry: &str, p: &DeviceProfile, what: &str) -> (Plan, TypedModule) {
     let inputs = LowerInputs::new();
     let a = compile_bitcode(
@@ -288,12 +276,6 @@ fn checked(bc: &[u8], entry: &str, p: &DeviceProfile, what: &str) -> (Plan, Type
     .unwrap_or_else(|e| panic!("{what}: {e}"));
     link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
     let (plan, m) = typed_module_with(bc, entry, p, &inputs).expect("module");
-    let words = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= words,
-        "{what}: estimate {} < emitted {words}",
-        plan.estimate.words
-    );
     (plan, m)
 }
 
@@ -843,21 +825,20 @@ fn profile_f_refuses_a_pointer_made_from_an_integer() {
     let Some(bc) = assemble("from_int", &kernel("from_int", 2, body, "")) else {
         return;
     };
-    for stem in ["vk12-floor", "roadmap-2022", "swiftshader"] {
-        let p = profile(stem);
-        let e = compile(&bc, "from_int", &p).expect_err("refused");
-        let Error::Unsupported(u) = e else {
-            panic!("{stem}: {e:?}");
-        };
-        assert_eq!(
-            (u.feature, u.needs),
-            (
-                Feature::DereferenceLoadedPointer,
-                Needs::AnyOf(vec![p.addressed_needs()])
-            ),
-            "{stem}"
-        );
-    }
+    let stem = PROFILE_F;
+    let p = profile(stem);
+    let e = compile(&bc, "from_int", &p).expect_err("refused");
+    let Error::Unsupported(u) = e else {
+        panic!("{stem}: {e:?}");
+    };
+    assert_eq!(
+        (u.feature, u.needs),
+        (
+            Feature::DereferenceLoadedPointer,
+            Needs::AnyOf(vec![p.addressed_needs()])
+        ),
+        "{stem}"
+    );
 }
 
 /// The null root is a device or constant pointer's. A threadgroup or private pointer merged with
@@ -912,7 +893,7 @@ fn a_null_threadgroup_or_private_select_side_is_no_internal_error() {
         let Some(bc) = assemble(name, &kernel(name, 1, body, globals)) else {
             return;
         };
-        for stem in ["moltenvk-m3", "vk12-floor"] {
+        for stem in ["moltenvk-m3", PROFILE_F] {
             match compile(&bc, name, &profile(stem)) {
                 Ok(_) | Err(Error::Unsupported(_)) => {}
                 Err(e) => panic!("{name} on {stem}: {e:?}"),

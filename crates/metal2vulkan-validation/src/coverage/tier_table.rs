@@ -11,7 +11,7 @@ use crate::check::loop_free::DecodedModule;
 use crate::engine::{bounded_detail, Outcome};
 use crate::executor_contract::out_of_bounds::{self, Mechanism};
 use crate::literal::LiteralResources;
-use metal2vulkan::device::{Device, DevicePolicy};
+use metal2vulkan::device::{Device, DevicePolicy, DeviceProfile};
 use metal2vulkan::error::Error;
 use metal2vulkan::library::FunctionConstantValues;
 use metal2vulkan::pipeline::{EntryDescriptor, EntryRef, LoweringInputs};
@@ -28,9 +28,6 @@ pub struct TierProfile {
     pub class: Option<ExecutionClass>,
     /// `subgroupSize`: the width of a module that asks for full subgroups without pinning one.
     pub subgroup_size: u32,
-    /// The leg enables `robustBufferAccess` or `robustBufferAccess2`, so its buffers take the
-    /// robust encoding and are left to the device.
-    pub robust_buffers: bool,
 }
 
 impl TierProfile {
@@ -41,18 +38,6 @@ impl TierProfile {
             leg,
             class: ExecutionClass::of_description(description),
             subgroup_size: description.subgroup.size,
-            robust_buffers: description.has(VkFeature::RobustBufferAccess)
-                || description.has(VkFeature::RobustBufferAccess2),
-        }
-    }
-
-    /// The forms this entry leaves to a device that does not contain them: its class's
-    /// ([`ExecutionClass::robust_buffers_uncontained`]) where the leg enables buffer robustness,
-    /// else none (the in-shader encoding contains them).
-    pub fn robust_buffers_uncontained(&self) -> &'static [RobustBufferForm] {
-        match self.class {
-            Some(class) if self.robust_buffers => class.robust_buffers_uncontained(),
-            _ => &[],
         }
     }
 
@@ -65,8 +50,9 @@ impl TierProfile {
     }
 }
 
-/// A tier-table entry: a committed profile in one leg, and the profile lowering compiles for (the
-/// default untrusted policy, as every engine census row).
+/// A tier-table entry: a committed profile in one leg, and the profile lowering compiles for: the
+/// resident-table domains, whose containment mechanisms (the root table, descriptor views, the
+/// robustness legs) these tests check.
 pub struct CommittedProfile {
     pub tier: TierProfile,
     pub profile: DeviceProfile,
@@ -79,7 +65,7 @@ pub fn committed_profiles() -> Result<Vec<CommittedProfile>, String> {
     for stem in crate::engine::committed_profiles()? {
         let description = crate::engine::load_description(&stem)?;
         let derive = |description: DeviceDescription| {
-            Device::new(description, DevicePolicy::default())
+            Device::from_queries(description, DevicePolicy::RESIDENT_TABLES)
                 .map(|device| device.profile().clone())
                 .map_err(|error| format!("{stem}: {error}"))
         };
@@ -277,6 +263,8 @@ pub fn compile_module(
         attributes: &attributes,
         resident_roots: function.reads_resident_roots(),
         handle_table: function.resolves_handles(),
+        // Every committed profile's device takes the resident-table domains (`committed_profiles`).
+        policy: DevicePolicy::RESIDENT_TABLES,
         strategies: function.strategies(),
     };
     let out_of_bounds = inputs
@@ -295,14 +283,118 @@ pub fn compile_module(
     Ok(CompiledModule {
         census: ModuleCensus {
             stage,
-            subgroup: SubgroupShape {
+            subgroup: Some(SubgroupShape {
                 required_size: function.required_subgroup_size(),
                 full_subgroups: function.requires_full_subgroups(),
-            },
+            }),
             strategies: function.strategies().entries.keys().cloned().collect(),
             precision: function.precision_notes().iter().copied().collect(),
             containment: Some(Containment::of_compile(profile, &linked.words)),
         },
         out_of_bounds,
     })
+}
+
+impl Containment {
+    /// The encodings of a module of SPIR-V `words` compiled for `profile`.
+    pub(crate) fn of_compile(profile: &DeviceProfile, words: &[u32]) -> Containment {
+        let declared = Declared::of(words);
+        Containment {
+            buffers: if !declared.buffers {
+                BufferEncoding::Unused
+            } else {
+                BufferEncoding::Checked
+            },
+            images: if !declared.images {
+                ImageEncoding::Unused
+            } else if profile.device_reads_texels(false) {
+                ImageEncoding::Robust
+            } else if profile.device_drops_texel_writes(false) {
+                ImageEncoding::RobustWrites
+            } else {
+                ImageEncoding::Checked
+            },
+        }
+    }
+
+    /// `buffers:<b>,images:<i>`, as the report prints it.
+    pub(crate) fn label(self) -> String {
+        format!(
+            "buffers:{},images:{}",
+            match self.buffers {
+                BufferEncoding::Unused => "unused",
+                BufferEncoding::Checked => "checked",
+                BufferEncoding::Robust => "robust",
+            },
+            match self.images {
+                ImageEncoding::Unused => "unused",
+                ImageEncoding::Checked => "checked",
+                ImageEncoding::RobustWrites => "robust_writes",
+                ImageEncoding::Robust => "robust",
+            },
+        )
+    }
+}
+
+/// The resources a SPIR-V module declares that a containment encoding can apply to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Declared {
+    /// A variable in the `StorageBuffer` or `Uniform` storage class, or a texel buffer
+    /// (`OpTypeImage` of `Dim` `Buffer`, contained by buffer robustness).
+    pub(crate) buffers: bool,
+    /// An image type other than a texel buffer's (`OpTypeImage` of a `Dim` other than `Buffer`),
+    /// contained by image robustness.
+    pub(crate) images: bool,
+}
+
+impl Declared {
+    /// What `words` declare. Words that do not parse as instructions after the header declare
+    /// both: the reading that never merges one encoding into another.
+    pub(crate) fn of(words: &[u32]) -> Declared {
+        const OP_TYPE_IMAGE: u32 = 25;
+        const OP_VARIABLE: u32 = 59;
+        const DIM_BUFFER: u32 = 5;
+        const UNIFORM: u32 = 2;
+        const STORAGE_BUFFER: u32 = 12;
+        let mut out = Declared {
+            buffers: false,
+            images: false,
+        };
+        let mut at = 5;
+        while let Some(&word) = words.get(at) {
+            let count = (word >> 16) as usize;
+            let Some(operands) = words.get(at + 1..at + count).filter(|_| count > 0) else {
+                break;
+            };
+            match word & 0xffff {
+                OP_TYPE_IMAGE if operands.get(2) == Some(&DIM_BUFFER) => out.buffers = true,
+                OP_TYPE_IMAGE => out.images = true,
+                OP_VARIABLE => {
+                    out.buffers |= matches!(operands.get(2), Some(&(UNIFORM | STORAGE_BUFFER)));
+                }
+                _ => {}
+            }
+            at += count;
+        }
+        if at != words.len() || words.len() < 5 {
+            return Declared {
+                buffers: true,
+                images: true,
+            };
+        }
+        out
+    }
+}
+
+impl ExecutionClass {
+    /// The class of a device, or `None` for a description that names no device (a capability
+    /// profile, such as `runtime-floor`, that no host is).
+    pub(crate) fn of_description(description: &DeviceDescription) -> Option<ExecutionClass> {
+        if description.device_type == Some(vk::PhysicalDeviceType::CPU) {
+            return Some(ExecutionClass::CpuIcd);
+        }
+        description
+            .driver_id
+            .map(|driver| ExecutionClass::Host(HostClass(driver)))
+    }
 }

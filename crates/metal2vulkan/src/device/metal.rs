@@ -18,8 +18,9 @@ pub struct MetalDeviceProperties {
     /// Always 32: the consumer answers 32 on both reply paths (info-encoder `0x1c2` and
     /// `CmdGetComputeInfo` key 3).
     pub thread_execution_width: u32,
-    /// Per axis: `maxComputeWorkGroupSize[i]` capped by `maxComputeWorkGroupInvocations`, and by an
-    /// Apple GPU's 1024.
+    /// `maxComputeWorkGroupInvocations` capped by an Apple GPU's 1024, on every axis: a threadgroup
+    /// deeper than `maxComputeWorkGroupSize` allows on an axis runs as one row
+    /// (`SpecKey::DeepThreadgroup`).
     pub max_threads_per_threadgroup: [u32; 3],
     /// `maxComputeWorkGroupInvocations` (pipelines report a flattened-tier cap of their own),
     /// capped by an Apple GPU's 1024.
@@ -106,6 +107,35 @@ pub const READ_WRITE_TIER2_FORMATS: &[PixelFormat] = &[
     PixelFormat::R8Sint,
 ];
 
+/// Metal's read-write texture tier on `profile`: a tier holds when each of its formats can be a
+/// storage image on the profile, by the same choice lowering and the binder make.
+pub(crate) fn read_write_texture_tier(profile: &DeviceProfile) -> ReadWriteTextureTier {
+    let read_write = |formats: &[PixelFormat]| {
+        formats
+            .iter()
+            .all(|&pf| storage_image_choice(pf, profile).is_ok())
+    };
+    if !read_write(READ_WRITE_TIER1_FORMATS) {
+        ReadWriteTextureTier::None
+    } else if !read_write(READ_WRITE_TIER2_FORMATS) {
+        ReadWriteTextureTier::Tier1
+    } else {
+        ReadWriteTextureTier::Tier2
+    }
+}
+
+/// The formats whose `read_write` texture reads Metal defines on `profile`: those of its
+/// read-write texture tier ([`read_write_texture_tier`]) and the tiers below it.
+pub(crate) fn read_write_tier_formats(
+    profile: &DeviceProfile,
+) -> &'static [&'static [PixelFormat]] {
+    match read_write_texture_tier(profile) {
+        ReadWriteTextureTier::Tier2 => &[READ_WRITE_TIER1_FORMATS, READ_WRITE_TIER2_FORMATS],
+        ReadWriteTextureTier::Tier1 => &[READ_WRITE_TIER1_FORMATS],
+        _ => &[],
+    }
+}
+
 /// Which simd usage classes each stage can tier.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -139,7 +169,7 @@ impl MetalDeviceProperties {
         let threads = l
             .max_compute_work_group_invocations
             .min(apple_gpu::MAX_THREADS_PER_THREADGROUP);
-        let per_axis = l.max_compute_work_group_size.map(|axis| axis.min(threads));
+        let per_axis = [threads; 3];
         let d = &f.descriptors;
         let argument_buffers_tier = if f.buffer_access == BufferAccess::Addressed
             && d.runtime_descriptor_array
@@ -151,20 +181,7 @@ impl MetalDeviceProperties {
         } else {
             ArgumentBuffersTier::Tier1
         };
-        // A tier holds when each of its formats can be a storage image on this profile, by the
-        // same choice lowering and the binder make.
-        let read_write = |formats: &[PixelFormat]| {
-            formats
-                .iter()
-                .all(|&pf| storage_image_choice(pf, profile).is_ok())
-        };
-        let read_write_texture_tier = if !read_write(READ_WRITE_TIER1_FORMATS) {
-            ReadWriteTextureTier::None
-        } else if !read_write(READ_WRITE_TIER2_FORMATS) {
-            ReadWriteTextureTier::Tier1
-        } else {
-            ReadWriteTextureTier::Tier2
-        };
+        let read_write_texture_tier = read_write_texture_tier(profile);
         let max_buffer_length = match f.buffer_access {
             BufferAccess::Floor => u64::from(l.max_storage_buffer_range),
             _ => match allocation.max_buffer_size {
@@ -238,27 +255,19 @@ fn unsupported_features(profile: &DeviceProfile) -> Vec<Unsupported> {
             vec![profile.addressed_needs()],
         ));
     }
-    if !f.fragment.pixel_interlock && !f.fragment.sample_interlock {
+    if !f.fragment.pixel_interlock {
         out.push(Unsupported::needs_any_of(
             Feature::RasterOrderGroups,
-            vec![
-                vec![feature(VkFeature::FragmentShaderPixelInterlock)],
-                vec![feature(VkFeature::FragmentShaderSampleInterlock)],
-            ],
+            vec![vec![feature(VkFeature::FragmentShaderPixelInterlock)]],
         ));
     }
-    // Framebuffer fetch refuses on no device: ordered by rasterization-order access, by the pixel
-    // interlock's storage form, or, with neither, through input attachments ordered between draws
+    // Framebuffer fetch refuses on no device: input attachments ordered between draws
     // (`PrecisionNote::UnorderedFetchWithinDraw`).
-    // `[[barycentric_coord]]`: the device's builtins, or varyings a generated geometry stage
-    // writes (`pipeline::link::geometry`).
-    if !f.fragment.barycentric && !f.fragment.geometry_shader {
-        out.push(Unsupported::needs_any_of(
+    // `[[barycentric_coord]]`: the device's builtins.
+    if !f.fragment.barycentric {
+        out.push(Unsupported::needs(
             Feature::Barycentrics,
-            vec![
-                vec![feature(VkFeature::FragmentShaderBarycentric)],
-                vec![feature(VkFeature::GeometryShader)],
-            ],
+            feature(VkFeature::FragmentShaderBarycentric),
         ));
     }
     for stage in [Stage::Vertex, Stage::Fragment, Stage::Kernel] {

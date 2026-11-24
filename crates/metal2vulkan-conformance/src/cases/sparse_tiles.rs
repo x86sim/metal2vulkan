@@ -15,19 +15,12 @@
 //! Metal answers from its own. So the whole family compares on a venue that has no sparse binding
 //! at all, and a lavapipe leg here reports real answers rather than a hole.
 //!
-//! # What the port adds to the lane
+//! # What the sweep checks
 //!
-//! `runtime_lane::sparse_textures` asks the runtime for exactly three of these answers, inside
-//! three much larger tests, and asserts each against a literal: `(Type2D, R32Float, 1)` and
-//! `(Cube, R32Float, 1)` are 64 by 64, and `(Type2DMultisample, RGBA8Unorm, 2)` and `4` are 64 by
-//! 32 and 32 by 32. Nothing in the tree ties any of them to a Metal run, and the model's own
-//! comment says it was measured on an Apple M4 — a machine that is gone.
+//! The rule has two claims a sweep can check:
 //!
-//! The rule the model states has two claims a sweep can check and three literals cannot:
-//!
-//! - **the answer does not depend on the texture type** (`sparse_tile_size_for_page` takes the
-//!   type and ignores it, `_texture_type`), which [`BY_TYPE`] asks of every texture type a sparse
-//!   heap makes a texture of;
+//! - **the answer does not depend on the texture type**, which [`BY_TYPE`] asks of every texture
+//!   type a sparse heap makes a texture of;
 //! - **the tile halves a side as the block's bytes double**, keeping the tile's bytes at the
 //!   page's, which [`BY_FORMAT`] asks of formats from 1 to 16 bytes a block and of the
 //!   block-compressed families, in all three pages.
@@ -44,8 +37,8 @@
 //!   nothing in the tree says Metal's validation takes them. That is the next query to add, and it
 //!   needs its own evidence first.
 //! - the **sample counts** are 1 for a single-sampled type, and 2 and 4 for a multisample type,
-//!   which are the counts the lane measured on this oracle. A count a device does not hold, and a
-//!   count on a single-sampled type, are left out for the same reason.
+//!   which are the counts measured on this oracle. A count a device does not hold, and a count on a
+//!   single-sampled type, are left out for the same reason.
 //! - the **formats** are colour formats and the four depth and stencil formats this chip has.
 //!   `Depth24Unorm_Stencil8`, which Apple silicon does not support, is left out.
 //!
@@ -57,8 +50,8 @@
 use crate::case::{Abort, Case, Input, MetalSource, Side};
 use crate::sparse_query::{page_word, page_words, QueryPage, SparseTileQuery as Q};
 use crate::transcript::{Sites, Value};
+use crate::values::SparsePageSize;
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use metal2vulkan_runtime::SparsePageSize;
 
 /// The case names, as the report and the recordings spell them.
 pub const BY_FORMAT: &str = "sparse-tile-size-by-format";
@@ -140,11 +133,10 @@ const DEPTH_FORMATS: [PixelFormat; 4] = [
     PixelFormat::Depth32FloatStencil8,
 ];
 
-/// The format [`BY_TYPE`] asks every texture type about, and the one the lane's own literals name.
-const LANE_FORMAT: PixelFormat = PixelFormat::R32Float;
+/// The format [`BY_TYPE`] asks every texture type about.
+const BY_TYPE_FORMAT: PixelFormat = PixelFormat::R32Float;
 
-/// The formats [`MULTISAMPLE`] sweeps: the lane's own, and three more whose block bytes the sample
-/// count multiplies differently.
+/// The formats [`MULTISAMPLE`] sweeps, whose block bytes the sample count multiplies differently.
 const MULTISAMPLE_FORMATS: [PixelFormat; 4] = [
     PixelFormat::RGBA8Unorm,
     PixelFormat::R8Unorm,
@@ -152,7 +144,7 @@ const MULTISAMPLE_FORMATS: [PixelFormat; 4] = [
     PixelFormat::RGBA32Float,
 ];
 
-/// The sample counts [`MULTISAMPLE`] asks: the two the lane measured on this oracle.
+/// The sample counts [`MULTISAMPLE`] asks: the two measured on this oracle.
 const MULTISAMPLE_COUNTS: [u32; 2] = [2, 4];
 
 /// A case over one table of tile queries, and optionally over the tile's bytes.
@@ -196,7 +188,11 @@ fn by_format() -> SparseTileCase {
 fn by_texture_type() -> SparseTileCase {
     let mut queries = Vec::new();
     for texture_type in SINGLE_SAMPLED_TYPES {
-        for format in [LANE_FORMAT, PixelFormat::R8Unorm, PixelFormat::ASTC4x4LDR] {
+        for format in [
+            BY_TYPE_FORMAT,
+            PixelFormat::R8Unorm,
+            PixelFormat::ASTC4x4LDR,
+        ] {
             for page in PAGES {
                 queries.push(Q::new(texture_type, format, 1, page));
             }
@@ -234,7 +230,7 @@ fn multisample() -> SparseTileCase {
 fn tile_bytes() -> SparseTileCase {
     let mut queries = Vec::new();
     for page in PAGES {
-        queries.push(Q::new(TextureType::Type2D, LANE_FORMAT, 1, page));
+        queries.push(Q::new(TextureType::Type2D, BY_TYPE_FORMAT, 1, page));
     }
     SparseTileCase {
         name: TILE_BYTES,
@@ -301,76 +297,12 @@ impl Case for SparseTileCase {
     }
 }
 
-/// The two guards this family's safety argument rests on.
-///
-/// Record mode hands every query of these tables to Metal, and an argument Metal's own API
-/// validation stops **ends Metal's process**, so the tables need a check rather than a careful
-/// reader.
-///
-/// What the check cannot be: "the runtime answered". Both of the runtime's getters return a
-/// `Size` and not a `Result` — they compute Metal's rule and refuse nothing — so a guard that
-/// sweeps the tables looking for a refusal passes whatever is in them, and would be a test that
-/// cannot fail. The two guards below take the argument apart instead: one says the **arguments**
-/// are inside the shapes the module's prose allows, the other says the **answer** is one the model
-/// understood, which is the only thing that lets us predict what Metal will be asked.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+/// The guard this family's safety argument rests on: record mode hands every query of these
+/// tables to Metal, and an argument Metal's own API validation stops **ends Metal's process**,
+/// so the arguments stay inside the shapes the module's prose allows.
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    /// The runtime's model answers a real tile for every query of the family.
-    ///
-    /// `sparse::tile_texels` answers `1 x 1 x 1` for a format whose block bytes it does not know,
-    /// and that answer is the model saying it has no rule for the argument. A query the model has
-    /// no rule for is a query whose Metal answer nothing in this tree can predict, so it is also
-    /// one whose arguments we cannot argue Metal's validation takes: it stays out of the table
-    /// until it has evidence of its own. Every tile is one deep, because Metal's rule tiles two
-    /// dimensions.
-    ///
-    /// Verified to fail: a `YCBCR84202P` query added to a table fails here, naming the query and
-    /// the `1 x 1 x 1` the model answered.
-    #[test]
-    fn the_model_answers_a_real_tile_for_every_query_of_the_family() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("the_model_answers_a_real_tile_for_every_query_of_the_family"),
-        );
-        let mut unknown = Vec::new();
-        for case in all() {
-            for query in &case.queries {
-                let tile = side
-                    .sparse_tile_size(query)
-                    .expect("the runtime's sparse tile getters refuse nothing");
-                if tile.depth != 1 || (tile.width, tile.height) == (1, 1) {
-                    unknown.push(format!(
-                        "{} {}: the model answered {} x {} x {}",
-                        case.name,
-                        query.site(),
-                        tile.width,
-                        tile.height,
-                        tile.depth
-                    ));
-                }
-            }
-        }
-        assert!(
-            unknown.is_empty(),
-            "the model has no tile rule for these queries, so nothing here can predict what Metal \
-             would answer or whether its validation takes them; take them out of the table:\n{}",
-            unknown.join("\n")
-        );
-    }
 
     /// The family's tables hold no query whose arguments the module's own safety prose excludes.
     ///

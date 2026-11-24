@@ -1,10 +1,8 @@
-//! `RuntimeFact`, `Mechanism`, and `UniformViewChoice`.
+//! `RuntimeFact` and `Mechanism`.
 //!
 //! `RuntimeFact` is the single dependency vocabulary: `select` emits facts, the planner supplies
 //! their values, and `device::mechanism(fact, profile)` is a total function with one [`Mechanism`]
 //! per (fact, profile).
-
-use crate::air::container::Hash256;
 
 use crate::pipeline::sym::{ImageHandleClass, SlotRef, Stage};
 
@@ -89,13 +87,12 @@ pub enum RuntimeFact {
     /// threadgroup arena.
     ImageblockSize { cell_bytes: u32 },
     /// The vertex function writes `[[render_target_array_index]]`, which selects a slice only
-    /// in a render pass whose `renderTargetArrayLength` is at least 2: in a pass of at most one
-    /// layer every index renders slice 0, and the function runs on the variant that does not write
-    /// `Layer` (`VariantKey::dropped_vertex_layer`). `layer_dropped` states that it was compiled
-    /// under that variant. Its plans state the variant the shape's length asks for, and refuse
-    /// amplified draws whichever it is. The variant that writes `Layer` also reads the length from
-    /// `PushField::RenderTargetArrayLength`, which the binder writes per draw, and stores 0 for an
-    /// index at or past it, where Metal renders the pass's first layer.
+    /// in a render pass whose `renderTargetArrayLength` is at least 2: it reads the length from
+    /// `PushField::RenderTargetArrayLength`, which the binder writes per draw, and stores `Layer`
+    /// as 0 for an index at or past it, where Metal renders the pass's first layer, so in a pass of
+    /// at most one layer every index renders slice 0. `layer_dropped` states that it was compiled
+    /// to draw one amplification at a time in a pass of one layer
+    /// (`LoweringInputs::amplification_draws`, not layered), which writes no `Layer`.
     RenderTargetArrayLength { layer_dropped: bool },
     /// The kernel reads the compute encoder's stage-in region (`setStageInRegion:`): a
     /// `[[stage_in]]` attribute stepping by thread position clamps its element to the region and
@@ -109,46 +106,11 @@ pub enum RuntimeFact {
     /// without one, as Metal reads it (`MTLAttributeStrideStatic` is its low 32 bits). A layout of a fixed stride reads its own, compiled in,
     /// whatever the bind's, and records nothing.
     StageInStride { layout: u32 },
-    /// A read-only slot that Profile F's per-stage storage-buffer fallback may read through a
-    /// uniform view, whose window does not bound its descriptor range within
-    /// `maxUniformBufferRange` (a `Whole` window, or a longer `Bounded` one): the view is exact
-    /// only where the range the shape binds fits. `choice` states what this compile made of it.
-    /// A plan whose shape does not prove the fit for a `Viewed` slot asks for the variant that
-    /// keeps every such slot a storage view (`VariantKey::storage_view_slots`); instantiation
-    /// refuses a range above the limit (`BindError::DescriptorRangeExceeded`).
-    UniformViewRange {
-        slot: SlotRef,
-        choice: UniformViewChoice,
-    },
-    /// A `device` slot read through a uniform view (Profile F's per-stage storage-buffer
-    /// fallback). A uniform view need not observe what the dispatch or draw itself writes, so no
-    /// buffer slot the pipeline writes may be bound overlapping its window: instantiation checks
-    /// the Metal addresses (`BindError::UniformViewAliased`).
-    UniformViewAliasing { slot: SlotRef },
-    /// The fragment function reads or writes the render pass's imageblock, whose cells take
-    /// `words` 32-bit words per pixel (`air.imageblock_data_size` rounded up to a word): the
-    /// consumer binds the pass's imageblock storage (`SyntheticBinding::Imageblock`), which
-    /// `GraphicsState::fragment_imageblock` describes. `writes`: the function writes the
-    /// imageblock, so the storage holds its write before the pipeline's coverage (alpha to
-    /// coverage) could drop the fragment (the depth and stencil tests run before its write: its
-    /// module declares early tests, or it states [`TestedStorageWrites`](Self::TestedStorageWrites));
-    /// `master`: the fingerprint of the master
-    /// layout its views view (`FragmentImageblock::master`); `data_size`: the cell's bytes
-    /// (`air.imageblock_data_size`); `alignment`: the alignment Metal states for its views
-    /// (`air.arg_type_align_size`, `FragmentImageblock::alignment`).
-    FragmentImageblock {
-        words: u32,
-        writes: bool,
-        master: Hash256,
-        data_size: u32,
-        alignment: u32,
-    },
     /// The kernel is a tile function (`Device::compile_tile_pipeline`): a dispatch covers the
-    /// render pass's render area (`BindState::render_area`, `SpecKey::RenderAreaWidth` and
-    /// `SpecKey::RenderAreaHeight`) in tiles of the imageblock size (`BindState::imageblock_size`),
-    /// one threadgroup per tile, and stages the color attachments it reaches through the
-    /// threadgroup's imageblock. A layered pass is not modeled: the planner refuses a render
-    /// target array length above 1.
+    /// render pass's render area (`renderTargetWidth` and `renderTargetHeight`,
+    /// `SpecKey::RenderAreaWidth` and `SpecKey::RenderAreaHeight`) in tiles of the pass's tile
+    /// size, one threadgroup per tile, and stages the color attachments it reaches through the
+    /// threadgroup's imageblock. A layered pass is not modeled.
     TileFunction,
     /// The tile function stages color attachment `color` as a storage image of pixel format
     /// `format` (`LoweringInputs::tile_attachments`): its texel conversions and declared image
@@ -198,8 +160,8 @@ pub enum RuntimeFact {
     /// resident everywhere, and the status word Metal returns for it is compiled in, exact on
     /// every device. `sparse_arm`: the module also answers a sparse texture, with the device's
     /// sparse residency (`OpImageSparse*` and `OpImageSparseTexelsResident` under
-    /// `shaderResourceResidency`), selected by `SpecKey::SparseTexture`. Without it the binder
-    /// refuses a sparse texture at the slot (`BindError::Unsupported`): naming
+    /// `shaderResourceResidency`), selected by `SpecKey::SparseTexture`. Without it a sparse
+    /// texture at the slot is refused (`Unsupported`): naming
     /// `shaderResourceResidency` where the device lacks it, `NotImplemented` where one of the
     /// slot's accesses has no sparse form (a bicubic sample), and `NotRepresentable` where the
     /// function updates the slot atomically (`SparseTextureWrites`). A slot the function writes
@@ -208,7 +170,7 @@ pub enum RuntimeFact {
     /// `tile_map` (on every device): where the slot's type has a tile map (a single-sample 2D, 2D
     /// array or 3D color texture) and each observed access names its texels, the module answers a
     /// sparse texture from the slot's tile map instead (`ResourceKind::TileMap`,
-    /// `bind::SparseTileMap`), selected by the same `SpecKey::SparseTexture`: each access is the
+    /// `pipeline::tile_map`), selected by the same `SpecKey::SparseTexture`: each access is the
     /// plain one, its residency the bits of the tiles it reads (for a sample or gather, the texels
     /// Metal's footprint rule counts), and a read of a texel that is not resident Metal's unmapped
     /// value, the out-of-bounds texel. At most one of `sparse_arm` and `tile_map` holds:
@@ -229,52 +191,6 @@ pub enum RuntimeFact {
     /// one). A slot read only this way needs no acceleration-structure descriptor, so no ray
     /// tracing feature.
     AccelerationStructureInstanceCount { slot: SlotRef },
-    /// The function reads color attachment `color`, and writes it when `writes`, as a storage
-    /// image inside the ordered pixel interlock: framebuffer fetch on a device that orders it
-    /// only that way (no `rasterizationOrderColorAttachmentAccess`, with
-    /// `fragmentShaderPixelInterlock`), where its render pipeline's state
-    /// (`LoweringInputs::framebuffer_fetch`) lets the form be exact
-    /// (`GraphicsState::storage_attachments`). `format` is the attachment's Vulkan format, which
-    /// the module's storage image declaration serves. `early_tests`: the module declares early
-    /// fragment tests: Metal's function declares them, or its pipeline state has a depth or
-    /// stencil attachment and they keep its writes Metal's (it runs no discard, exports no depth,
-    /// stencil, or coverage, and writes no other memory), or its draws' tests write nothing
-    /// (`TestedStorageWrites`). Link checks the form against the pipeline it links into: one whose
-    /// state would not choose it, would view another format, or needs early tests the module does
-    /// not declare (a depth or stencil attachment where it was compiled without one, but for
-    /// `TestedStorageWrites`) is `NeedsInput(FramebufferFetch)`. `kept`: the format's channels each
-    /// write keeps from the texel it overwrites, those outside the descriptor's write mask, which
-    /// the write takes from the texel it reads first (all four where the mask covers none of the
-    /// format's channels, so it stores nothing; empty where it covers every one, or the function
-    /// does not write the attachment); a pipeline of another mask is `NeedsInput(FramebufferFetch)`
-    /// too. `blend`: the blend the function computes in the shader, from the texel it reads first,
-    /// for an extended-range attachment it writes under blending, which the function then need not
-    /// read, or a 16-bit float one (Metal's blend in the output's arithmetic); a pipeline of another
-    /// blend there is `NeedsInput(FramebufferFetch)` too. `rounded`: that blend is computed
-    /// without fast math, each product rounded before the sum
-    /// (`lower::arith::extended_range::blend::BlendMath::Rounded`), whose model holds blends the
-    /// fast one refuses; link checks the blend under that math.
-    InterlockedFramebufferFetch {
-        color: u32,
-        format: crate::vk::Format,
-        writes: bool,
-        early_tests: bool,
-        kept: crate::vk::ColorComponentFlags,
-        blend: Option<crate::pipeline::lower_inputs::BlendEquation>,
-        rounded: bool,
-    },
-    /// The function's `[[stencil]]` output is a shader-side stencil: on a device without
-    /// `VK_EXT_shader_stencil_export`, with the ordered pixel interlock, the function applies
-    /// Metal's stencil test and operations to a shadow of the stencil attachment inside the
-    /// interlock (`SyntheticBinding::ShadowStencil`, `PushField::ShadowStencilState`) and kills a
-    /// fragment that fails (`GraphicsState::shadow_stencil`). `formatless`: the module declares
-    /// the shadow without a format (`Unknown`), else as `R8ui`. `multisampled`: compiled for a
-    /// pipeline of more than one sample (`LoweringInputs::multisampled`), the shadow is a
-    /// multisampled image and the function tests each sample of its coverage.
-    ShadowStencil {
-        formatless: bool,
-        multisampled: bool,
-    },
     /// The kernel's predicated walk votes in a workgroup word of its own
     /// (`lower::simd::divergent::VOTE_BYTES`, 4 bytes beside its threadgroup arena): it runs a
     /// workgroup barrier that part of the workgroup skips in the source in every invocation, and
@@ -284,15 +200,6 @@ pub enum RuntimeFact {
     /// kernel in the emulated tier votes in its scratch instead
     /// (`RuntimeFact::SimdgroupEmulation`).
     PredicationVote,
-    /// The function reads the class of the texture (or texture buffer) bound to the slot, which
-    /// the binder sets from the bound format: the slot's `SpecKey::TexelFormat` specialization
-    /// (`metal::texel_format::texel_format`). A read, gather or sample with a `half` result on a
-    /// device that samples through Metal's own sampler converts its texel by it, Metal's conversion
-    /// depending on the format (a read of a 32-bit float texel rounds to nearest even, a sample of
-    /// one toward zero; a normalized texel's value is rounded onto its format's grid first); an
-    /// 8-bit sRGB slot's raw read, a fetched gather and a NaN texel's rule (the NaN switch) read
-    /// it too.
-    TexelFormat { slot: SlotRef },
     /// The function reads, samples, or gathers the texture bound to the slot with a `half` or
     /// `float` result, which an 8-bit sRGB format bound there would decode. Bound in such a
     /// format that the device cannot sample, which the runtime holds as the format's UNORM twin
@@ -303,18 +210,11 @@ pub enum RuntimeFact {
     /// Bound in any other format, or unbound, the slot leaves the variant, and the function reads
     /// the device's decode through the texture's own view.
     SrgbTexture { slot: SlotRef },
-    /// A `ulong` atomic (`atomic_{min,max}`) updates the `ulong` texture bound to the slot, so the
-    /// slot is declared as an `R64ui` storage image: the binder views the bound `RG32Uint` texture
-    /// as `R64_UINT`, each texel's low word in R and high word in G one little-endian 64-bit
-    /// integer. A texture is that view of an image the consumer created with `MUTABLE_FORMAT`, and
-    /// a texture buffer an `R64_UINT` texel view of its bytes; an unbound slot takes the `R64_UINT`
-    /// neutral. A `ulong` slot without the fact is an `RG32` image.
-    UlongAtomicView { slot: SlotRef },
     /// The vertex function writes `[[viewport_array_index]]`, which selects a viewport only below
     /// the render encoder's viewport count (`setViewports:count:`): Metal draws a primitive whose
     /// index is at or past the count through viewport 0, so the function stores `ViewportIndex`
-    /// as 0 there, reading the count from `PushField::ViewportCount`, which the binder writes per
-    /// draw (`BindState::viewport_count`).
+    /// as 0 there, reading the count from `PushField::ViewportCount`, which the consumer writes per
+    /// draw.
     ViewportCount,
     /// The tile function aliases an explicit imageblock onto its implicit one
     /// (`air.alias_implicit_imageblock`), of `data_size` bytes (`air.imageblock_data_size`): a
@@ -336,6 +236,15 @@ pub enum RuntimeFact {
     /// otherwise); a `Function` kernel is compiled under its pipeline's. Nothing on the device
     /// reads it.
     OpenClMode,
+    /// The kernel of OpenCL mode has a 1D image (an `image1d_t` or `image1d_array_t`, which the AIR
+    /// declares `texture1d` or `texture1d_array`) at the slot, which it reads as the 2D texture of
+    /// height 1, or the 2D array texture, Apple's OpenCL binds for it. A 1D or 1D array texture
+    /// bound there instead, which Apple's OpenCL never binds, joins the plan's variant
+    /// (`VariantKey::open_cl_lines`, `LoweringInputs::open_cl_lines`), under which the kernel
+    /// declares the slot as that 1D texture and reads it: each read, sample and size query answers
+    /// the 1D texture's values, of the layer an array access names, as a Radeon Pro 5300M (macOS
+    /// 26.7.1) answers. Any other texture bound there leaves the variant.
+    OpenClLineTexture { slot: SlotRef },
     /// The kernel's only simdgroup semantics are the barriers its lockstep order took
     /// (`lower::simd::lockstep`), on a flattened tier, and they order only pairs whose threads meet
     /// where a simdgroup spans two rows of its threadgroup (`Lockstep::rows`). A dispatch region
@@ -345,16 +254,17 @@ pub enum RuntimeFact {
     /// (`VariantKey::one_row`), which has none of those barriers.
     RowLockstep,
     /// The kernel was compiled under `VariantKey::one_row` (`LoweringInputs::one_row`): it runs
-    /// threadgroups whose simdgroups each lie within one row, without the lockstep simdgroup
-    /// barriers its `RowLockstep` plan had (its threadgroup ones kept). Its plans state the
-    /// variant, and a dispatch with a region of more than one row asks for the variant without it.
+    /// threadgroups whose simdgroups each lie within one row, without the lockstep barriers that
+    /// order only pairs meeting where a simdgroup spans two rows (its threadgroup ones kept),
+    /// whatever its device. Its plans state the variant, and a dispatch with a region of more than
+    /// one row asks for the variant without it.
     OneRow,
     /// Unit axes (`lower::simd::uniform`, "Unit axes"; bit 0 `x`, bit 1 `y`, bit 2 `z`). Where
     /// `axes` is 0, the kernel's walk is predicated and `relief` holds, at bit `m − 1`, each mask
     /// `m` of axes under which fewer of its synchronizations' blocks are divergent once its
     /// threads' positions along them are taken as uniform: a dispatch whose threadgroups have one
     /// thread along exactly the axes `m` may run the kernel's unit-axes variant
-    /// (`VariantKey::unit_axes`, `BindingPlan::unit_axes_variant`). Where `axes` is not 0, the
+    /// (`VariantKey::unit_axes`). Where `axes` is not 0, the
     /// kernel was compiled under that variant (`LoweringInputs::unit_axes`), `relief` is 0, its
     /// plans state the variant, and a dispatch with more than one thread along one of `axes` asks
     /// for the variant without it.
@@ -383,10 +293,10 @@ pub enum RuntimeFact {
     /// The tile function reads its threadgroup argument `index` (`[[threadgroup(index)]]`):
     /// memory of its tile that the render pass keeps across its tile dispatches, at the offset
     /// and in the tile memory the encoder sets (`setThreadgroupMemoryLength:offset:atIndex:` and
-    /// the pass's `threadgroupMemoryLength`, `BindState::tile_threadgroup`). The binder
+    /// the pass's `threadgroupMemoryLength`). The consumer
     /// specializes `SpecKey::TgOffset(index)`, `SpecKey::TileThreadgroupLength` and
     /// `SpecKey::TileGridWidth`, binds the pass's `SyntheticBinding::TileMemory`, and refuses an
-    /// index the encoder did not set (`BindError::MissingThreadgroupMemory`). A fragment
+    /// index the encoder did not set. A fragment
     /// function's threadgroup arguments are the same memory: its draws read and write it in the
     /// buffer, at its tile, which `SpecKey::ImageblockWidth` and `SpecKey::ImageblockHeight` (the
     /// pass's tile size) place.
@@ -406,10 +316,9 @@ pub enum RuntimeFact {
     /// The tile function declares an explicit imageblock that stands alone (no implicit one
     /// beside it, and not aliased onto one), of `data_size` bytes (`air.imageblock_data_size`)
     /// whose layout aligns to `alignment` (`air.arg_type_align_size`). Its cells are the render
-    /// pass's imageblock storage (`SyntheticBinding::Imageblock`), which the pass's fragment
-    /// functions' imageblocks are in and the consumer keeps for the pass: a dispatch whose plan
-    /// writes `WriteSource::Imageblock` binds it, and the pass's draws and dispatches share it
-    /// by its bytes. With the color attachments it gives the tile pipeline state's
+    /// pass's imageblock storage (`SyntheticBinding::Imageblock`), which the consumer keeps for
+    /// the pass: a dispatch whose plan writes `WriteSource::Imageblock` binds it, and the pass's
+    /// dispatches share it by its bytes. With the color attachments it gives the tile pipeline state's
     /// `imageblockSampleLength` as a fragment function's explicit imageblock does (measured on an
     /// M4).
     TileImageblock { data_size: u32, alignment: u32 },
@@ -423,22 +332,6 @@ pub enum RuntimeFact {
     /// writes no viewport index of its own (a mapping offsets the viewport). Its plans state the
     /// variant the shape's amplification asks for.
     AmplificationDraws { layered: bool, viewports: bool },
-    /// The vertex function was compiled under `VariantKey::viewport_compensation`
-    /// (`LoweringInputs::viewport_compensation` of `depth`): it negates its position's `x` and,
-    /// under `depth`, rewrites its depth and clips at Metal's planes by the draw's
-    /// `PushField::ViewportCompensation`, which the binder writes from
-    /// `BindState::viewport_compensation`. Its plans state the variant the shape asks for.
-    /// Under `point_guard` it also scales its position by the draw's `PushField::PointGuard`
-    /// and culls a point past Metal's guard band by four clip distances. Under `mirrors` it negates
-    /// `x` by the selected viewport's bit of the draw's `PushField::ViewportMirrors`. Under
-    /// `vertex_clamp` it clamps its compensated depth by the draw's `PushField::VertexDepthClamp`
-    /// before the interpolation, as Metal clamps each vertex's depth.
-    ViewportCompensation {
-        depth: bool,
-        point_guard: bool,
-        mirrors: bool,
-        vertex_clamp: bool,
-    },
     /// The kernel was compiled under `VariantKey::folded_groups`
     /// (`LoweringInputs::folded_groups`): it runs a threadgroup dispatch of its own threadgroup
     /// size whose group counts it reads from the 32-byte region record at its
@@ -448,50 +341,35 @@ pub enum RuntimeFact {
     /// The vertex or fragment function was compiled under `VariantKey::replay_bindings`
     /// (`LoweringInputs::replay_bindings`): every buffer it reads is in the slot table at its
     /// stage's `PushField::RootTableAddress`, which a draw replay's preprocess writes per
-    /// replayed command (`bind::draw_replay_preprocess`). Its plans state the variant.
+    /// replayed command. Its plans state the variant.
     ReplayBindings,
     /// The vertex function was compiled under `VariantKey::merged_draws`
     /// (`LoweringInputs::merged_draws`): it runs a merged draw replay's corners, reading its
     /// command, vertex, instance and slot table from the header at its
     /// `PushField::MergedDrawAddress` (`bind::replay`'s `merged.rs`). Its plans state the variant.
     MergedDraws,
-    /// The `stage` function may read an argument its pipeline's function constants removed (a
-    /// texture's read, sample, gather, query, or atomic, or a sample through a removed sampler),
-    /// a read Metal gives no value. Where one runs, the function takes zero for it and sets
-    /// `StatusBits::ABSENT_ARGUMENT_READ` in the command buffer's `ExecutionStatus` buffer (through
-    /// the address the stage's `ExecutionStatus` fact asks for); a consumer that reads the bit
-    /// after the command buffer reports its execution as failed, since none of its results is then
-    /// Metal's. A run that never reaches such a read is Metal's exactly. Nothing binds it.
-    AbsentArgumentRead { stage: Stage },
     /// The fragment function was compiled under `VariantKey::zeroed_colors`
     /// (`LoweringInputs::zeroed_colors`): it writes zero to color attachment `color`, of pixel
     /// format `format`, which its Metal pipeline lacks and the pass has, as plain Metal stores
-    /// zero bytes there at every sample a draw covers. Its plans state the variant the shape asks
-    /// for (`BindShape::zeroed_colors`).
+    /// zero bytes there at every sample a draw covers.
     ZeroedColor {
         color: u32,
         format: crate::metal::PixelFormat,
     },
     /// The fragment function was compiled under `LoweringInputs::dropped_colors` holding
     /// `color`: it keeps no output at that color attachment, which the render pass lacks and
-    /// whose writes plain Metal drops. A plan of a draw whose pass has the attachment asks for the
-    /// variant without it.
+    /// whose writes plain Metal drops. A draw whose pass has the attachment takes the variant
+    /// without it.
     DroppedColor { color: u32 },
     /// The fragment function was compiled under `VariantKey::depth_clamp_range`
     /// (`LoweringInputs::depth_clamp_range`) and writes its depth: it clamps that depth to the
-    /// draw's depth clamp range itself, read from `PushField::DepthClampRange`, which the binder
-    /// writes from `BindState::depth_clamp_range`, a negative NaN storing 0 as Metal's does. Its
-    /// plans state the variant the shape asks for (`BindShape::depth_clamp_range`).
+    /// draw's depth clamp range itself, read from `PushField::DepthClampRange`, which the consumer
+    /// writes, a negative NaN storing 0 as Metal's does.
     DepthClampRange,
     /// The fragment function was compiled under `VariantKey::rotated_weights`
     /// (`LoweringInputs::rotated_weights`) and reads `[[barycentric_coord]]`: it takes Metal's
-    /// weights back from a triangle drawn with Metal's last vertex first. Its plans state the
-    /// variant the shape asks for (`BindShape::rotated_weights`).
+    /// weights back from a triangle drawn with Metal's last vertex first.
     RotatedWeights,
-    /// The emulated mesh function's pipeline was compiled under `VariantKey::mesh_last_first`:
-    /// its synthesized vertex stage draws each line or triangle from its last index first. Its
-    /// plans state the variant the shape asks for (`BindShape::mesh_last_first`).
-    MeshLastFirst,
     /// The function reads, samples, gathers, or fetches through a sampler the color texture
     /// bound to the slot, on a profile whose sparse textures are sparse images (it enables
     /// `shaderResourceResidency`): where that texture is sparse, a block of it that holds no
@@ -500,63 +378,20 @@ pub enum RuntimeFact {
     /// after the access, from `SpecKey::ConstantLanes`, which the binder sets from the bound
     /// texture's `MTLTexture.pixelFormat` and `swizzle` (0 where `isSparse` is false).
     ConstantLanes { slot: SlotRef },
-    /// The function reads visible-function tables by their resource ids: a listed table whose words
-    /// pass `maxStorageBufferRange` cannot be the function-table array's element, nor the snapshot
-    /// hold every listed table's words, so the plan of a shape whose tables may pass it
+    /// The function reads visible-function tables by their resource ids: the snapshot cannot hold
+    /// a listed table whose words pass `maxStorageBufferRange`, so the plan of a shape whose tables
+    /// may pass it
     /// (`FunctionTablesShape::bytes_class`) asks for the variant that reads every table's words
     /// through its device address (`VariantKey::addressed_function_tables`). `addressed` states
     /// that this compile is that variant.
     FunctionTableRange { addressed: bool },
-    /// The fragment function stores some channels of a color attachment through the interlocked
-    /// storage form (`InterlockedFramebufferFetch`) in a pipeline with a depth or stencil
-    /// attachment, and discards, but declares no `[[early_fragment_tests]]`, exports no depth,
-    /// stencil, or coverage, and writes no other memory: Metal tests its fragments after it runs,
-    /// so whether its write stores is the draw's depth and stencil tests' to decide. Without
-    /// `early_tests` its module stores before Vulkan's tests, Metal's store wherever the draw's
-    /// tests drop no fragment; with it (`LoweringInputs::read_only_tests`) the module declares
-    /// early fragment tests, Metal's store wherever they write neither attachment and count no
-    /// visibility result. The plan of a draw whose tests drop fragments asks for the variant with
-    /// `early_tests` where they write and count nothing (`VariantKey::read_only_tests`), and
-    /// refuses any other (`BindShape::fragment_tests`).
-    ///
-    /// `early_variant`: whether that variant serves a draw whose tests drop fragments but write and
-    /// count nothing, which it does for a function that only its discard keeps from early tests. A
-    /// function that writes other memory, or returns depth, stencil, or a sample mask, beside a
-    /// depth or stencil attachment states the fact without it: Metal runs its memory writes for the
-    /// fragments its tests then drop, and tests what it returns, which early tests would not. Its
-    /// stores before the tests are Metal's only where the draw's tests drop no fragment, and the
-    /// plan refuses every other draw.
-    TestedStorageWrites {
-        early_tests: bool,
-        early_variant: bool,
-    },
-    /// On a device that orders framebuffer fetch only through the ordered pixel interlock, the
-    /// fragment function writes
-    /// a color through its first output and does not declare early fragment tests, and it
-    /// discards, writes other memory, or returns depth, stencil, or a sample mask. A draw may move
-    /// such a color into the interlocked storage form (`BindShape::interlocked_colors`, or an
-    /// extended-range color's `BindShape::extended_shadows`), whose variant then stores before the
-    /// depth and stencil tests and states [`TestedStorageWrites`](Self::TestedStorageWrites) with
-    /// this `early_variant`, where the write stores something. So the plan of a pipeline that
-    /// writes no color so selects the tests of such a draw from this as from that fact, and the
-    /// variant it names plans itself.
-    ///
-    /// The plan reads it only for a draw that moves a color the function writes as an ordinary
-    /// output under a write mask that names some of the attachment's components (and only where
-    /// the pipeline has a depth or stencil attachment, whose tests the variant then depends on). A
-    /// write whose mask names none of them stores nothing: no test bears on it, its variant states
-    /// no store before the tests, and the plan selects none for it, as for a draw that moves
-    /// nothing. A draw whose tests neither the early-tests variant nor the function's own tests
-    /// serve (tests the draw does not state) is refused, as any draw whose variant is refused: the
-    /// runtime keeps the color out of the storage form there (the pass splits, or the shadow ends).
-    MovableStorageWrites { early_variant: bool },
     /// The tile function reads a builtin whose answer depends on its pipeline's
     /// `threadgroupSizeMatchesTileSize` (its threads per threadgroup, simdgroups or quadgroups
     /// per threadgroup or their `dispatch_` forms, its position in the grid, the threads per
     /// grid, or its thread or quadgroup index in the threadgroup), and was compiled under
     /// `tile_sized`, that flag (`LoweringInputs::threadgroup_size_matches_tile_size`). With
-    /// `tile_sized` the binder runs each dispatch with the pass's tile, its imageblock size
-    /// (`BindShape::imageblock_size`), as Metal's threadgroup in every region (`MultiRegion` 1),
+    /// `tile_sized` the consumer runs each dispatch with the pass's tile, its imageblock size,
+    /// as Metal's threadgroup in every region (`MultiRegion` 1),
     /// the threads per tile its workgroups; a tile pipeline whose descriptor gives the flag the
     /// other value is `InvalidDescriptor(TileThreadgroupSize)`.
     TileThreadgroup { tile_sized: bool },
@@ -588,30 +423,15 @@ pub enum RuntimeFact {
     /// not emulate there, it sets `StatusBits::CUBIC_ARGUMENT_SAMPLER` in the command buffer's
     /// `ExecutionStatus` buffer (through the address the stage's `ExecutionStatus` fact asks
     /// for), and a consumer that reads the bit reports the command buffer's execution as failed. A
-    /// run that never reaches such a sampler is Metal's exactly. The planner admits a cubic listed
-    /// state (`BindState::argument_samplers`) beside a stage's sampler table only where the stage
-    /// states this fact (a device that cannot write the buffer from the stage tests nothing, and
-    /// its stage is refused `NotImplemented(SamplerBicubicFilter)` there). A fragment stage never
+    /// run that never reaches such a sampler is Metal's exactly. A cubic argument sampler beside a
+    /// stage's sampler table is Metal's only where the stage states this fact (a device that
+    /// cannot write the buffer from the stage tests nothing). A fragment stage never
     /// states it: the mark is a store, which costs a fragment function the device's hidden-surface
     /// removal and early depth test although it never runs.
     CubicArgumentSampler { stage: Stage },
-    /// The function runs the draw's depth test itself (`LoweringInputs::shader_tests`): compiled
-    /// for a draw whose tests may drop fragments, a function with `TestedStorageWrites` tests its
-    /// fragment's depth against a stand-in of the depth attachment inside the ordered pixel
-    /// interlock (`SyntheticBinding::DepthStandIn`, `PushField::ShaderTestsState`), stores its
-    /// colors and writes the stand-in only where it passes, and kills a fragment that fails
-    /// (`GraphicsState::shader_tests`). `formatless`: the module declares the stand-in without a
-    /// format (`Unknown`), else as `R32f`. `multisampled`: compiled for a pipeline of more than
-    /// one sample, the stand-in holds each sample, `planes` as a single-sample 2D array of one
-    /// layer per sample, else as a multisampled image.
-    ShaderTests {
-        formatless: bool,
-        multisampled: bool,
-        planes: bool,
-    },
     /// The `stage` function samples, gathers, or queries a level of a heap texture of a sampled
     /// float class of one sample, where for a texture a heap holds by its raw texels alone
-    /// (`bind::heap_raw_form`) it reads the class's neutral (zero, or the neutral's level) where
+    /// (`lower::texture::heap_raw_form`) it reads the class's neutral (zero, or the neutral's level) where
     /// Metal samples the texture. The function emulates Metal's sample or gather of such a
     /// texture from its raw texels where the access is a 2D texture's sample or gather of a
     /// `float` or `half` result (a `half` gather of a bfloat form alone) without comparison,
@@ -626,59 +446,6 @@ pub enum RuntimeFact {
     /// with `None`, or naming a slot whose bound sampler states what the emulation does not
     /// answer (`Unsupported(ArgumentBufferTextures)`).
     HeapRawSamples { stage: Stage, sampler: Option<u32> },
-    /// Beside its depth test (`ShaderTests`), the function runs the draw's stencil test itself,
-    /// before the depth test, against a stand-in of the stencil attachment inside the ordered
-    /// pixel interlock (`SyntheticBinding::StencilStandIn`, `PushField::ShaderStencilState`): the
-    /// face's comparison of the reference with the stand-in's value under the read mask, then
-    /// its stencil-failure, depth-failure or pass operation under the write mask, as the two
-    /// tests decide. A fragment that fails either test is killed (`ShaderTestsUse::stencil`).
-    /// `formatless`: the module declares the stand-in without a format (`Unknown`), else as
-    /// `R8ui`. The stand-in holds the pipeline's samples as a multisampled image at more than one.
-    ShaderStencilTest { formatless: bool },
-    /// On a device that orders framebuffer fetch through rasterization-order input attachments,
-    /// the function computes Metal's blend `blend` into extended-range color attachment `color`
-    /// in the shader: it reads the attachment's raw texel through its input attachment
-    /// (`RuntimeFact::FramebufferFetch`), blends its output over the texel's tile value, and
-    /// writes the encode of the result through its first output, the channels `kept` (the
-    /// format's channels the descriptor's write mask leaves out) taken from the texel. Link
-    /// gives the attachment no Vulkan blend and writes every raw component, and a pipeline of
-    /// another blend or write mask there is `NeedsInput(FramebufferFetch)`.
-    ExtendedRangeInputBlend {
-        color: u32,
-        blend: crate::pipeline::lower_inputs::BlendEquation,
-        kept: crate::vk::ColorComponentFlags,
-    },
-    /// On a device that orders framebuffer fetch through rasterization-order input attachments,
-    /// the function computes Metal's blend `blend` into color attachment `color`, held with its
-    /// channels rotated (`ARGB8Unorm` in `R8G8B8A8_UNORM`), where no Vulkan state on that image
-    /// gives it (`color_writes::shader_rotated_blend`): it reads the texel through the
-    /// attachment's input attachment (`RuntimeFact::FramebufferFetch`), blends its output over it
-    /// in Metal's channel order by Metal's 8-bit unorm blend, and writes the result through its
-    /// first output, rotated as every output there is. `kept` is the format's channels the
-    /// descriptor's write mask leaves out, which the attachment's write mask keeps. Link gives the
-    /// attachment no Vulkan blend, and a pipeline of another blend or write mask there is
-    /// `NeedsInput(FramebufferFetch)`.
-    RotatedInputBlend {
-        color: u32,
-        blend: crate::pipeline::lower_inputs::BlendEquation,
-        kept: crate::vk::ColorComponentFlags,
-    },
-    /// On a device that orders framebuffer fetch through rasterization-order input attachments,
-    /// the function writes color attachment `color`, which renders through a view of its word
-    /// (`metal::format::WordAttachment`, an 8-bit sRGB one), under a write mask of some of the
-    /// word's channels: it reads the texel's word through the attachment's input attachment
-    /// (`RuntimeFact::FramebufferFetch`) and writes Metal's word of its output with the fields of
-    /// the channels `kept` (those of the word the descriptor's write mask leaves out) taken from
-    /// the word read. Likewise an extended-range attachment whose one raw component holds three
-    /// codes (`BGR10_XR`, the two-plane forms' color word, their `_sRGB` twins) written unblended
-    /// under a mask of some of them: the function writes the kernel write's encode of its output
-    /// with the codes of the channels `kept` taken from the texel read. Link writes the whole word
-    /// (every raw component), and a pipeline of another write mask there is
-    /// `NeedsInput(FramebufferFetch)`.
-    WordInputMerge {
-        color: u32,
-        kept: crate::vk::ColorComponentFlags,
-    },
     /// The function reads, samples or gathers the sampled color texture (not a texture buffer,
     /// a multisampled or a depth texture) bound to the slot only with `float`, `half` or 32-bit
     /// integer results: bound to a texture of a color format whose numeric class is not the
@@ -731,9 +498,7 @@ pub enum RuntimeFact {
     HeapResidency { stage: Stage },
     /// The `stage` function reads members of the heap's storage array of `class` (a `read_write`
     /// argument-buffer texture's read). Such an array holds a texture whose writes Metal drops
-    /// (`metal::format::writes_dropped`) as its neutral, and a 4:4:4 two-plane YCbCr texture whose
-    /// writes Metal stores into its planes (`metal::format::ycbcr_writes_stored`) as its write
-    /// shadow, which its writes mark and nothing reads; Metal's read of either through such a
+    /// (`metal::format::writes_dropped`) as its neutral; Metal's read of one through such a
     /// texture is not measured, as for a slot that reads one. The planner refuses such a texture
     /// the stage reaches in that class (a member the plan names, or one resident for the
     /// command), `Unsupported { feature: Format, needs: NotImplemented }`.
@@ -757,18 +522,6 @@ pub enum RuntimeFact {
     /// where a Vulkan write of a value the channel cannot represent is undefined. The binder
     /// writes `metal::format::integer_channels_word` of the bound format, and 0 for a neutral.
     StorageTextureIntegerChannels { slot: SlotRef },
-    /// The render pipeline draws through synthesized geometry stages, one per topology class, of
-    /// which a draw runs its class's (`RenderPipeline::runs_stage`): its fragment function reads
-    /// `[[barycentric_coord]]` on a device without `fragmentShaderBarycentric` (`weights`), or its
-    /// vertex function selects its primitive's render target slice (`layer`) or viewport
-    /// (`viewport`) on a device that cannot store `Layer` or `ViewportIndex` from a vertex
-    /// function (`pipeline::link::geometry`). Each draw runs a stage Metal's draw does not, at the
-    /// stage's cost, with Metal's answer; the consumer announces it. Nothing binds it.
-    SynthesizedGeometry {
-        weights: bool,
-        layer: bool,
-        viewport: bool,
-    },
     /// An object function's `[[threadgroup(n)]]` arguments, whose lengths the render encoder sets
     /// (`setObjectThreadgroupMemoryLength:atIndex:`, the object stage's
     /// `StageTable::threadgroup_lengths`), each a `ThreadgroupMemoryLength`: the static part of
@@ -783,49 +536,13 @@ pub enum RuntimeFact {
     /// The render pipeline was compiled under `VariantKey::quad_primitive_ids`, and its fragment
     /// function reads `[[primitive_id]]` from Vulkan's `PrimitiveId` shifted right by one
     /// (`LoweringInputs::quad_primitive_ids`): for a draw of Metal's private quads or quad strip,
-    /// listed as two triangles a quad. Its plans state the variant the shape asks for
-    /// (`BindShape::quad_primitive_ids`).
+    /// listed as two triangles a quad.
     QuadPrimitiveIds,
     /// The render pipeline was compiled under `VariantKey::private_list`, and its vertex function
     /// runs the consumer's list of one of Metal's private primitive types in the pulled list form
     /// (`LoweringInputs::private_list`): its index and Metal's base vertex read at
-    /// `PushHole::CaptureIndexAddress`, each list position run once. Its plans state the variant
-    /// the shape asks for (`BindShape::private_list`).
+    /// `PushHole::CaptureIndexAddress`, each list position run once.
     PrivateList,
-    /// The function reads the texture bound to the slot only as the in-place form of a two-plane
-    /// YCbCr texture reads it (`bind::YCbCrInPlace`): sampled or gathered through a constexpr sampler
-    /// or through the runtime sampler slots whose bits `samplers` holds (bit `n` for
-    /// `[[sampler(n)]]` of the slot's stage), read, or its size queried, as a 2D `float` texture.
-    /// Recorded on a profile that reads planes in place (`ProfileFields::ycbcr_in_place`). Where
-    /// the binder binds a texture whose planes are read so (`TextureShape::Texture::ycbcr_in_place`)
-    /// and each of those samplers states a filter the form reads (one filter for minification and
-    /// magnification, no anisotropy, no cubic filter, comparison or reduction), the slot joins the
-    /// plan's variant (`VariantKey::ycbcr_in_place`, `LoweringInputs::ycbcr_in_place`), under
-    /// which the slot's one binding is the planes' texel buffer (`WriteSource::YCbCrInPlace`) and
-    /// every access of it reads the codes and converts them as Metal does, its words in the slot's
-    /// push field (`PushField::YCbCrInPlace`). Elsewhere the slot binds the texture's image as
-    /// before. `device`: every sample of the slot is one the device's own sampler Y′CbCr
-    /// conversion takes (none addresses a border through a constexpr sampler or places a texel
-    /// offset by a parent's size, and none is a gather): where the bound texture's planes are also held as an image it
-    /// samples (`TextureShape::Texture::ycbcr_planes_sampler`) and each runtime sampler addresses
-    /// no border on either axis, the slot samples that image instead
-    /// (`VariantKey::ycbcr_planes_sampled`, `bind::YCbCrPlanesSampler`).
-    YCbCrInPlace {
-        slot: SlotRef,
-        samplers: u32,
-        device: bool,
-    },
-    /// The function only reads, writes or asks the size of the 2D texture bound to the slot
-    /// (`bind::TexelRows`): `read` at level 0 or a computed level, `write`, its width, height or
-    /// level count, `is_null` and a texture fence; no sample, gather, LOD query, atomic, read
-    /// through a sampler, imageblock slice or access of a level past the first through a storage
-    /// slot, and no arm of a handle that switches between slots. Where the binder binds a texture
-    /// whose rows are read and written in place (`TextureShape::Texture::texel_rows`), the slot
-    /// joins the plan's variant (`VariantKey::texel_rows`, `LoweringInputs::texel_rows`), under
-    /// which its one binding is a texel buffer over the rows' bytes (`WriteSource::TexelRows`),
-    /// texel `(x, y)` the view's `first + y · row + x`, those words in the slot's push field
-    /// (`PushField::TexelRows`). Elsewhere the slot binds the texture's image as before.
-    TexelRows { slot: SlotRef },
     /// The object function runs a partial threadgroup of a `drawMeshThreads` as Metal does
     /// (`lower::dispatch`'s partial object threadgroups): where its `DispatchRegion` (or a folded
     /// variant's region record) carries `lower::dispatch::NONUNIFORM`, it answers its
@@ -844,8 +561,7 @@ pub enum RuntimeFact {
     /// The render pipeline was compiled under `VariantKey::region_viewports`, and its vertex
     /// function stores `ViewportIndex` as `DrawIndex` (`LoweringInputs::region_viewports`): each
     /// draw of a multi-draw renders through the viewport and scissor at its index, the runtime's
-    /// draw of a rasterization-rate-mapped pass's regions several at a time. Its plans state the
-    /// variant the shape asks for (`BindShape::region_viewports`).
+    /// draw of a rasterization-rate-mapped pass's regions several at a time.
     RegionViewports,
     /// The kernel was compiled under `VariantKey::partial_threadgroups`
     /// (`LoweringInputs::partial_threadgroups`): where its `DispatchRegion` carries
@@ -854,19 +570,141 @@ pub enum RuntimeFact {
     /// threadgroups runs at the call's threadgroup size alone. Its plans state the variant, and
     /// plan such a dispatch so.
     PartialThreadgroups,
+    /// The function only reads, writes, updates by a texture atomic or asks the width of the
+    /// texture buffer bound to the slot (`bind::texel_parts`): `read` (not through a sampler),
+    /// `write`, an atomic, `get_width`, `is_null` and a texture fence, on a device that indexes an
+    /// array of the slot's kind of texel buffer by a `NonUniform` value. Where the consumer binds a
+    /// texture buffer of more texels than one view holds there, the slot takes the variant
+    /// (`VariantKey::texel_buffer_parts`, `LoweringInputs::texel_buffer_parts`), under which its
+    /// binding is an array of the texture buffer's parts, one texel buffer view each. Elsewhere the slot binds one view, which
+    /// `maxTexelBufferElements` bounds (`TexelBufferRange`).
+    TexelBufferParts { slot: SlotRef },
+    /// Under the identity domains, the buffer slot's address, its buffer's `gpuAddress` plus the
+    /// bind offset, is a multiple of `align` (2, 4, 8 or 16): its argument's alignment
+    /// (`air.arg_type_align_size`, at most 16). Metal's API validation refuses a bind offset that
+    /// is not a multiple of it ("must be a multiple of 4 but was set to 2" for a `uint *` argument,
+    /// `probes/vector_access_placement.m` in the conformance crate), and the runtime refuses a
+    /// dispatch at such an address. Where `align` is at least 4 the function reaches the slot from
+    /// that address as it is: no access rounds it to a word, and an 8- or 16-byte access at an
+    /// offset proven a multiple of its size is one `uvec2` or `uvec4`.
+    AddressAlignment { slot: SlotRef, align: u32 },
+    /// The kernel's partial-threadgroups variant (`RuntimeFact::PartialThreadgroups`) runs its
+    /// grid in tiles: a kernel that does not observe its threadgroup partition, on a profile that
+    /// tiles such a kernel's grid (`Device::from_queries`') under the identity domains. Where its
+    /// region's `MultiRegion` is 1, its workgroup of `pipeline::GRID_TILE_THREADS` threads is one
+    /// tile of the grid, whose power-of-two sides the region's nominal size gives
+    /// (`pipeline::grid_tile`); where it is 0, the kernel runs at its pipeline's size. Under
+    /// either, where the region is flagged `lower::dispatch::NONUNIFORM`, which a runtime sets for
+    /// a grid its workgroups do not divide, an invocation past the region's grid returns before the
+    /// body; an unflagged region runs no test of the grid's edge. Its plans run a `dispatchThreads`
+    /// grid in such tiles, flagged where the tile does not divide it.
+    GridTiles,
+    /// The kernel's private memory past the floor every device holds
+    /// (`device::function_storage::FLOOR`) lives in memory the runtime owns: a slot of
+    /// `slot_bytes` (a multiple of 16) for each invocation of a dispatch, at the address it pushes
+    /// (`PushField::PrivateArenaAddress`, which says which slot an invocation takes). A dispatch
+    /// whose invocations' slots pass what the runtime keeps runs as several dispatches, each of
+    /// them in its own slots' memory or ordered after the last one that used it. The kernel's own
+    /// bytes decide it, never a device fact.
+    PrivateArena { slot_bytes: u32 },
 }
 
-/// What one compile made of a slot of a `RuntimeFact::UniformViewRange`.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum UniformViewChoice {
-    /// A uniform view.
-    Viewed,
-    /// A storage view the fallback did not need to move.
-    Spare,
-    /// A storage view the compile's `LoweringInputs::storage_view_slots` keeps one.
-    Kept,
+impl RuntimeFact {
+    /// The fact's variant name, such as `"ImageblockSize"`: what a refusal names when the
+    /// runtime does not supply the fact, without its fields.
+    pub fn name(self) -> &'static str {
+        match self {
+            RuntimeFact::ThreadsPerThreadgroup => "ThreadsPerThreadgroup",
+            RuntimeFact::ThreadgroupMemoryLength { .. } => "ThreadgroupMemoryLength",
+            RuntimeFact::LocalSizeConstraint { .. } => "LocalSizeConstraint",
+            RuntimeFact::LocalSizeLimits => "LocalSizeLimits",
+            RuntimeFact::DispatchGrid => "DispatchGrid",
+            RuntimeFact::IndirectGroupCount => "IndirectGroupCount",
+            RuntimeFact::ResourcePresence { .. } => "ResourcePresence",
+            RuntimeFact::SampleCount => "SampleCount",
+            RuntimeFact::StorageTextureFormat { .. } => "StorageTextureFormat",
+            RuntimeFact::SamplerCoordinates { .. } => "SamplerCoordinates",
+            RuntimeFact::SamplerReduction { .. } => "SamplerReduction",
+            RuntimeFact::ImageViewShape { .. } => "ImageViewShape",
+            RuntimeFact::VertexFetch { .. } => "VertexFetch",
+            RuntimeFact::VertexBufferStride { .. } => "VertexBufferStride",
+            RuntimeFact::BaseVertexInstance => "BaseVertexInstance",
+            RuntimeFact::DeviceAddresses { .. } => "DeviceAddresses",
+            RuntimeFact::BufferRangeLimit { .. } => "BufferRangeLimit",
+            RuntimeFact::TexelBufferRange { .. } => "TexelBufferRange",
+            RuntimeFact::FramebufferFetch { .. } => "FramebufferFetch",
+            RuntimeFact::ExecutionStatus => "ExecutionStatus",
+            RuntimeFact::HeapNumericType { .. } => "HeapNumericType",
+            RuntimeFact::SimdgroupEmulation { .. } => "SimdgroupEmulation",
+            RuntimeFact::AmplificationCount => "AmplificationCount",
+            RuntimeFact::EmulatedSimdgroups => "EmulatedSimdgroups",
+            RuntimeFact::ImageblockSize { .. } => "ImageblockSize",
+            RuntimeFact::RenderTargetArrayLength { .. } => "RenderTargetArrayLength",
+            RuntimeFact::StageInRegion => "StageInRegion",
+            RuntimeFact::StageInStride { .. } => "StageInStride",
+            RuntimeFact::TileFunction => "TileFunction",
+            RuntimeFact::TileAttachmentFormat { .. } => "TileAttachmentFormat",
+            RuntimeFact::StorageTextureNumericType { .. } => "StorageTextureNumericType",
+            RuntimeFact::OutOfBoundsAlpha { .. } => "OutOfBoundsAlpha",
+            RuntimeFact::BicubicTexels { .. } => "BicubicTexels",
+            RuntimeFact::StorageTextureLevels { .. } => "StorageTextureLevels",
+            RuntimeFact::StorageTextureLevelViews { .. } => "StorageTextureLevelViews",
+            RuntimeFact::SparseTexture { .. } => "SparseTexture",
+            RuntimeFact::AccelerationStructureInstanceCount { .. } => {
+                "AccelerationStructureInstanceCount"
+            }
+            RuntimeFact::PredicationVote => "PredicationVote",
+            RuntimeFact::SrgbTexture { .. } => "SrgbTexture",
+            RuntimeFact::ViewportCount => "ViewportCount",
+            RuntimeFact::AliasedImageblock { .. } => "AliasedImageblock",
+            RuntimeFact::CallStackDepth { .. } => "CallStackDepth",
+            RuntimeFact::OpenClMode => "OpenClMode",
+            RuntimeFact::OpenClLineTexture { .. } => "OpenClLineTexture",
+            RuntimeFact::RowLockstep => "RowLockstep",
+            RuntimeFact::OneRow => "OneRow",
+            RuntimeFact::UnitAxes { .. } => "UnitAxes",
+            RuntimeFact::FlatGrid => "FlatGrid",
+            RuntimeFact::CallThreadgroups => "CallThreadgroups",
+            RuntimeFact::SparseTextureWrites { .. } => "SparseTextureWrites",
+            RuntimeFact::TileThreadgroupMemory { .. } => "TileThreadgroupMemory",
+            RuntimeFact::TextureSwizzle { .. } => "TextureSwizzle",
+            RuntimeFact::TileImageblock { .. } => "TileImageblock",
+            RuntimeFact::AmplificationDraws { .. } => "AmplificationDraws",
+            RuntimeFact::FoldedGroups => "FoldedGroups",
+            RuntimeFact::ReplayBindings => "ReplayBindings",
+            RuntimeFact::MergedDraws => "MergedDraws",
+            RuntimeFact::ZeroedColor { .. } => "ZeroedColor",
+            RuntimeFact::DroppedColor { .. } => "DroppedColor",
+            RuntimeFact::DepthClampRange => "DepthClampRange",
+            RuntimeFact::RotatedWeights => "RotatedWeights",
+            RuntimeFact::ConstantLanes { .. } => "ConstantLanes",
+            RuntimeFact::FunctionTableRange { .. } => "FunctionTableRange",
+            RuntimeFact::TileThreadgroup { .. } => "TileThreadgroup",
+            RuntimeFact::ConstexprSampled { .. } => "ConstexprSampled",
+            RuntimeFact::CubicSampler { .. } => "CubicSampler",
+            RuntimeFact::CubicArgumentSampler { .. } => "CubicArgumentSampler",
+            RuntimeFact::HeapRawSamples { .. } => "HeapRawSamples",
+            RuntimeFact::CrossClassReads { .. } => "CrossClassReads",
+            RuntimeFact::StorageTextureWriteRounding { .. } => "StorageTextureWriteRounding",
+            RuntimeFact::HeapWriteRounding { .. } => "HeapWriteRounding",
+            RuntimeFact::HeapCrossClassNeutral { .. } => "HeapCrossClassNeutral",
+            RuntimeFact::HeapResidency { .. } => "HeapResidency",
+            RuntimeFact::HeapStorageReads { .. } => "HeapStorageReads",
+            RuntimeFact::AnisotropicSampler { .. } => "AnisotropicSampler",
+            RuntimeFact::StorageTextureIntegerChannels { .. } => "StorageTextureIntegerChannels",
+            RuntimeFact::ObjectThreadgroupArena { .. } => "ObjectThreadgroupArena",
+            RuntimeFact::QuadPrimitiveIds => "QuadPrimitiveIds",
+            RuntimeFact::PrivateList => "PrivateList",
+            RuntimeFact::PartialObjectThreadgroups => "PartialObjectThreadgroups",
+            RuntimeFact::BorderTexels { .. } => "BorderTexels",
+            RuntimeFact::RegionViewports => "RegionViewports",
+            RuntimeFact::PartialThreadgroups => "PartialThreadgroups",
+            RuntimeFact::TexelBufferParts { .. } => "TexelBufferParts",
+            RuntimeFact::AddressAlignment { .. } => "AddressAlignment",
+            RuntimeFact::GridTiles => "GridTiles",
+            RuntimeFact::PrivateArena { .. } => "PrivateArena",
+        }
+    }
 }
 
 /// How a profile honors one runtime fact.
@@ -894,8 +732,6 @@ pub enum Mechanism {
     KeyProjection,
     /// `NumWorkgroups` for single-region dispatches, push fields for multi-region ones.
     RegionSelected,
-    /// The indirect-clamp prepass.
-    IndirectClamp,
     /// A synthetic binding: the `ExecutionStatus` fact on a device that does not address buffers.
     SyntheticBinding,
     /// Graphics state plus the render-pass contract.

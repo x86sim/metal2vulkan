@@ -5,14 +5,13 @@
 //! answers; some also record whether `newTextureWithDescriptor:` answers a texture at all, which is
 //! the fact that makes a 0-byte answer mean something.
 //!
-//! # Why this family came first
+//! # What the numbers are
 //!
-//! `runtime_lane`'s `heap_metal_sizes` carries the numbers these cases measure — 44 bytes for a
-//! 6 x 3 4:2:2 texture, 20480 for a 64 x 64 two-plane extended-range one, and some 240 more — and
-//! until now nothing tied them to a Metal run: they were taken on an Apple M4 by hand, written into
-//! assertions, and the probe was thrown away. The runtime answers them from a **model** of Metal's
-//! arithmetic (`texture/heap_tiled.rs`) that is the same on every device, so the numbers are a
-//! contract with Metal and with nothing else, and the only thing that can check them is Metal. Record mode now does, on the oracle, as often as anybody asks.
+//! The numbers these cases record — 44 bytes for a 6 x 3 4:2:2 texture, 20480 for a 64 x 64
+//! two-plane extended-range one, and some 240 more — are Metal's, taken on the oracle by record
+//! mode. The runtime answers its device image's own memory requirements
+//! (`Device::heap_texture_size_and_align`), which differ by device, so its answers are held by
+//! their property rather than by Metal's numbers (`texture_query::DEVICE_OWN_SIZES`).
 //!
 //! # Why every case here is safe
 //!
@@ -21,10 +20,8 @@
 //! so it allocates nothing either.
 //!
 //! The one real hazard is the descriptors Metal's own validation stops, which **end Metal's
-//! process** — the runtime spells that distinction out: `Error::Nil` is "plain Metal answers nil,
-//! the process going on", while `Error::Invalid` is "Metal's validation stops it, ending the
-//! process". Every such descriptor is left out of this family by construction, and the exclusions
-//! are named where they are made:
+//! process**, where plain Metal answering nil lets the process go on. Every such descriptor is left
+//! out of this family by construction, and the exclusions are named where they are made:
 //!
 //! - `ShaderAtomic` usage of any format but `R32Uint` (a failed assertion without the debug layer
 //!   too), so no case here sets that bit;
@@ -36,6 +33,7 @@
 //! the runtime first, where an `Invalid` answer is a recorded value and nothing else, and only a
 //! table that answers no `Invalid` anywhere is ever handed to Metal.
 
+use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{Abort, Case, Input, MetalSource, Side};
 use crate::texture_query::{HeapTextureQuery as Q, Storage};
 use crate::transcript::{Node, Observed, Sites, Value};
@@ -107,10 +105,9 @@ fn four_two_two() -> HeapSizeCase {
     }
 }
 
-/// `X32_Stencil8` beside `Stencil8` over one set of shapes: both answers are recorded, so the
-/// relation the runtime lane asserts — that the two descriptors answer alike — is a fact a reader
-/// of the recording can check, and a release where Apple parts them fails the case rather than
-/// passing under a rule nobody re-measured.
+/// `X32_Stencil8` beside `Stencil8` over one set of shapes: both answers are recorded, so that the
+/// two descriptors answer alike is a fact a reader of the recording can check, and a release where
+/// Apple parts them fails the case rather than passing under a rule nobody re-measured.
 fn x32_stencil8() -> HeapSizeCase {
     let mut queries = Vec::new();
     for format in [PixelFormat::X32Stencil8, PixelFormat::Stencil8] {
@@ -293,8 +290,8 @@ fn formats_without_textures() -> HeapSizeCase {
 }
 
 /// Apple's private `BlockWritesOnly` usage bit (0x10000) beside the same descriptor without it:
-/// both answers are recorded, so the relation the runtime lane asserts — that the bit changes no
-/// heap answer — is a fact a reader can check rather than a rule.
+/// both answers are recorded, so that the bit changes no heap answer is a fact a reader can check
+/// rather than a rule.
 fn block_writes_only() -> HeapSizeCase {
     let mut queries = Vec::new();
     for (format, texture_type, size, levels, slices) in [
@@ -344,20 +341,6 @@ fn block_writes_only() -> HeapSizeCase {
     }
 }
 
-/// The rows a driver that is not Metal answers a **larger** heap texture size or alignment for,
-/// which the runtime announces as `heap-texture-larger-than-metal`.
-///
-/// Measured on the RTX 5080 Laptop (615.71.09) and on llvmpipe (Mesa 26.2.4):
-/// `heap-sizes-x32-stencil8` announced it on both and `heap-sizes-block-writes-only` on the 5080,
-/// each with the case declaring it nowhere; the other five rows were exact on both
-/// (replay-nvidia.log, replay-llvmpipe.log).
-///
-/// The declaration is at the notices site alone, which matters here more than elsewhere: both rows
-/// also answer **sizes and alignments** that are not Metal's -- `X32_Stencil8` aligns at 1024
-/// where Metal aligns at 128 -- and those values stay compared exactly, so the rows stay divergent
-/// on them. That difference is the finding; the undeclared notice was only hiding it.
-const LARGER_THAN_METALS: [&str; 2] = [X32_STENCIL8, BLOCK_WRITES_ONLY];
-
 impl Case for HeapSizeCase {
     fn name(&self) -> &'static str {
         self.name
@@ -368,16 +351,18 @@ impl Case for HeapSizeCase {
     }
 
     fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // The family reads no buffer back -- it asks the device for a heap texture's size and
-        // alignment -- so the notice a card without unified memory announces for a `Shared` buffer
-        // cannot reach it, and no row declares one. Measured: five of the seven rows were exact on
-        // both the 5080 and llvmpipe.
-        match LARGER_THAN_METALS.contains(&self.name) {
-            true => vec![crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::HeapTextureLargerThanMetal.code(),
-            )],
-            false => Vec::new(),
-        }
+        // The runtime's answers are the device's own, held by their property and not by
+        // Metal's numbers (`texture_query::DEVICE_OWN_SIZES`).
+        self.queries
+            .iter()
+            .map(|query| {
+                Allowance::new(
+                    format!("case/{}/{}/Ok/*", query.site(), site::QUERY),
+                    Loosening::Unchecked,
+                    Justification::accepted(crate::texture_query::DEVICE_OWN_SIZES),
+                )
+            })
+            .collect()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -423,72 +408,5 @@ impl Case for HeapSizeCase {
             sites.push(node);
         }
         Ok(())
-    }
-}
-
-/// The safety guard this family rests on, run on a device.
-///
-/// Record mode hands every descriptor of these tables to Metal. A descriptor Metal's own validation
-/// stops **ends Metal's process**, and the runtime's model is what tells the two apart:
-/// `Error::Invalid` is "Metal's validation stops it, ending the process", while `Error::Nil` is
-/// "plain Metal answers nil, the process going on". So a table that makes the runtime answer
-/// `Invalid` anywhere is a table that must never be recorded, and this is the check that says so
-/// before anybody runs `conformance record`.
-///
-/// It is also the check that would catch a table growing a row somebody assumed was harmless. Its
-/// failure mode was exercised while writing it: a 2D descriptor of width 0 added to one table fails
-/// here, naming the descriptor and the problem.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod tests {
-    use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    #[test]
-    fn no_descriptor_of_the_family_is_one_metals_validation_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_descriptor_of_the_family_is_one_metals_validation_stops"),
-        );
-        let mut stopped = Vec::new();
-        for case in all() {
-            for query in &case.queries {
-                let answer = side.heap_texture_size_and_align(query);
-                if let Err(failure) = &answer {
-                    stopped.push(format!(
-                        "{} {}: {:?}",
-                        case.name,
-                        query.site(),
-                        failure.recorded()
-                    ));
-                }
-                if case.asks_texture {
-                    if let Err(failure) = side.makes_texture(query) {
-                        stopped.push(format!(
-                            "{} {} makes_texture: {:?}",
-                            case.name,
-                            query.site(),
-                            failure.recorded()
-                        ));
-                    }
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these descriptors do not answer on the runtime, so Metal's validation may stop them \
-             and record mode would end Metal's process; take them out of the table:\n{}",
-            stopped.join("\n")
-        );
     }
 }

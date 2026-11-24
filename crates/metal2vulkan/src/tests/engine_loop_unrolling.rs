@@ -21,7 +21,7 @@ use crate::pipeline::testing::{
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spv::Op;
 
-const PROFILES: [&str; 4] = ["amd-rdna3-radv", "lavapipe", "vk12-floor", "moltenvk-m3"];
+const PROFILES: [&str; 4] = ["amd-780m-radv", "lavapipe", "runtime-floor", "moltenvk-m3"];
 
 /// The kernels: name, and the latch's attachment.
 const KERNELS: [(&str, &str); 6] = [
@@ -158,7 +158,7 @@ fn asks(entry: &str, control: &[u32]) {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let what = format!("{entry} on {stem}");
         let a = compile(&bitcode, entry, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));

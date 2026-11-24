@@ -1959,8 +1959,14 @@ fn uf_len(i: usize) -> Result<u32, Error> {
     u32::try_from(i).map_err(|_| invariant("more pointer values than u32"))
 }
 
-/// Run the provenance analysis over `e`.
-pub fn analyze(e: &Entry, layouts: &TypeLayouts, m: &mut Meter) -> Result<Provenance, Error> {
+/// Run the provenance analysis over `e`; `words` says an argument buffer's command-buffer field
+/// holds its word, plain data (the identity domains, `objects`).
+pub fn analyze(
+    e: &Entry,
+    layouts: &TypeLayouts,
+    words: bool,
+    m: &mut Meter,
+) -> Result<Provenance, Error> {
     let func = e
         .module
         .func(e.func)
@@ -2244,7 +2250,7 @@ pub fn analyze(e: &Entry, layouts: &TypeLayouts, m: &mut Meter) -> Result<Proven
 
     // Uses and classes, the classes' tables returned to the ledger once resolved.
     let mut classes = Classes::new(n, m)?;
-    let result = classify(e, body, cx, &mut classes, m);
+    let result = classify(e, body, cx, &mut classes, words, m);
     m.release(classes.charged());
     result
 }
@@ -2256,6 +2262,7 @@ fn classify(
     body: &Body,
     mut cx: Cx<'_>,
     classes: &mut Classes,
+    words: bool,
     m: &mut Meter,
 ) -> Result<Provenance, Error> {
     let (values, n) = (cx.values, cx.ptr_values.len());
@@ -2288,7 +2295,7 @@ fn classify(
         .iter()
         .any(|b| matches!(&b.role, ParamRole::ArgumentBuffer(arg) if arg.layout.is_some()))
     {
-        ObjectLayouts::of(&e.structs, m)?
+        ObjectLayouts::of(&e.structs, words, m)?
     } else {
         ObjectLayouts::default()
     };
@@ -3223,6 +3230,15 @@ impl Walk<'_, '_> {
         };
         let Some(sig) = sig else {
             if call.args.iter().any(|a| self.is_ptr(*a)) || self.is_ptr(Value::Inst(id)) {
+                // An AGX operation has no signature only where its contract is not modeled: the
+                // refusal names that, not the access it cannot follow.
+                if let Callee::Llvm {
+                    op: crate::air::intrinsics::LlvmIntrinsic::Agx(_),
+                    ..
+                } = call.callee
+                {
+                    return Err(crate::lower::simd::agx::unmodeled());
+                }
                 return Err(not_lowered());
             }
             return Ok(());

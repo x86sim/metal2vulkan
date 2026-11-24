@@ -122,7 +122,6 @@ fn manifest(package_tail: &str) -> String {
 fn product(root: &Path) {
     write(root, "Cargo.toml", &manifest(""));
     write(root, "build.rs", "fn main() {}\n");
-    write(root, "build_support.rs", "// fingerprint inputs\n");
     for (path, text, _) in TREE {
         write(root, path, text);
     }
@@ -174,7 +173,7 @@ fn the_product_fingerprint_follows_exactly_the_product_files() {
         write(root, path, "fn unreachable() {}\n");
         assert_eq!(fingerprint(root), before, "{path} is reached by no module");
     }
-    for path in ["Cargo.toml", "build.rs", "build_support.rs"] {
+    for path in ["Cargo.toml", "build.rs"] {
         let text = std::fs::read_to_string(root.join(path)).unwrap();
         write(root, path, &format!("{text}\n# edited\n"));
         assert_ne!(fingerprint(root), before, "an edit to {path} is an input");
@@ -208,7 +207,7 @@ fn the_build_script_watches_exactly_what_can_change_the_product() {
     for (path, _, product) in TREE {
         assert_eq!(watched(root, path), *product, "{path}");
     }
-    for path in ["Cargo.toml", "build.rs", "build_support.rs"] {
+    for path in ["Cargo.toml", "build.rs"] {
         assert!(watched(root, path), "{path}");
     }
     write(root, "src/bin/undeclared.rs", "fn main() {}\n");
@@ -418,12 +417,12 @@ fn the_product_fingerprint_covers_the_front_end_crate_by_path() {
 }
 
 /// This build's product fingerprint is the walk over this workspace's translator, then the
-/// runtime's and the dev-tools crates (`product_fingerprint.rs`, which `build.rs` shares), each in
-/// its directory beside this crate, and the walk leaves out each crate's test-only modules: no file
+/// dev-tools crate (`product_fingerprint.rs`, which `build.rs` shares), each in its directory
+/// beside this crate, and the walk leaves out each crate's test-only modules: no file
 /// it lists is declared only under `#[cfg(test)]`.
 #[test]
 fn this_builds_product_fingerprint_is_the_walk_over_the_product() {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let crates = metal2vulkan_devtools::workspace_dir().join("crates");
     assert_eq!(
         product_fingerprint(&crates),
         env!("METAL2VULKAN_PRODUCT_FINGERPRINT")
@@ -437,10 +436,6 @@ fn this_builds_product_fingerprint_is_the_walk_over_the_product() {
     assert!(product.contains(Path::new("src/indirect_commands/host.rs")));
     assert!(!product.contains(Path::new("src/pipeline/testing.rs")));
     assert!(!product.contains(Path::new("src/pipeline/api_tests.rs")));
-    // The runtime's crate by its module tree, its tests left out.
-    let runtime = files(&crates.join("metal2vulkan-runtime"));
-    assert!(runtime.contains(Path::new("src/lib.rs")));
-    assert!(!runtime.iter().any(|file| file.starts_with("src/tests")));
     // The front end's crate by its module tree, its test-only modules left out, named through the
     // translator's manifest path (`../metal2vulkan-air`).
     let inputs = product_inputs(&root);
@@ -504,20 +499,5 @@ fn the_product_fingerprint_covers_the_workspace_manifest_it_inherits_from() {
         fingerprint(&root),
         before,
         "an edit to the workspace's manifest is an input"
-    );
-}
-
-/// The validation crate builds its own copy of the translator's `build_support.rs` (no crate
-/// includes a file outside its own directory), and the two are one file, so the product
-/// fingerprint this crate takes is the walk the translator's build script takes.
-#[test]
-fn the_build_support_copy_is_the_translators() {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let ours = std::fs::read(crate_dir.join("build_support.rs")).unwrap();
-    let translators = std::fs::read(crate_dir.join("../metal2vulkan/build_support.rs")).unwrap();
-    assert!(
-        ours == translators,
-        "crates/metal2vulkan-validation/build_support.rs differs from the translator's \
-         crates/metal2vulkan/build_support.rs: copy the translator's file over it"
     );
 }

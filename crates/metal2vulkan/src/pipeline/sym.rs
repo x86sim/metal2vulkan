@@ -87,111 +87,6 @@ pub enum SampledType {
     Uint64,
 }
 
-/// How a draw read through a snapshot keeps a texture's texel in the snapshot
-/// (`VariantKey::snapshot_textures`): the texel's codes, from which the read gives back the
-/// fetched value bit for bit, in as few bytes as hold them, or the fetched lanes' bits.
-///
-/// The copy takes the codes from the value the fetch returns, and the read decodes them as Metal
-/// reads the format: a normalized code `c` as `c / (2^b - 1)` correctly rounded (a signed one's
-/// magnitude so, `-1` at most), a half-float code widened exactly, an integer code extended. A
-/// device whose own decode is exactly that (its value one Metal reads) is given back its fetched
-/// value; one whose decode is not is given Metal's.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SnapshotForm {
-    /// The fetched `vec4`'s 32 bits a lane (`R32G32B32A32_UINT`): any texel.
-    Bits,
-    /// Four 8-bit unsigned normalized codes (`R8G8B8A8_UINT`).
-    Unorm8,
-    /// Four 8-bit signed normalized codes (`R8G8B8A8_UINT`, two's complement).
-    Snorm8,
-    /// Four 16-bit unsigned normalized codes (`R16G16B16A16_UINT`).
-    Unorm16,
-    /// Four 16-bit signed normalized codes (`R16G16B16A16_UINT`, two's complement).
-    Snorm16,
-    /// Four half-float codes (`R16G16B16A16_UINT`).
-    Half,
-    /// Four 8-bit unsigned integer codes (`R8G8B8A8_UINT`).
-    Uint8,
-    /// Four 8-bit signed integer codes (`R8G8B8A8_UINT`, two's complement).
-    Sint8,
-    /// Four 16-bit unsigned integer codes (`R16G16B16A16_UINT`).
-    Uint16,
-    /// Four 16-bit signed integer codes (`R16G16B16A16_UINT`, two's complement).
-    Sint16,
-}
-
-impl SnapshotForm {
-    /// The form a texture slot of sampled type `ty` keeps its texels in, read through a sampled
-    /// view of `format`: the codes of an 8- or 16-bit normalized, half-float or integer format
-    /// whose class is the slot's, one, two or four channels; [`Bits`](Self::Bits) for any other
-    /// format (an sRGB format's view decodes its codes, so its texels are no codes' values).
-    pub fn of(format: vk::Format, ty: SampledType) -> SnapshotForm {
-        use vk::Format as F;
-        let form = match format {
-            F::R8_UNORM
-            | F::R8G8_UNORM
-            | F::R8G8B8A8_UNORM
-            | F::B8G8R8A8_UNORM
-            | F::A8B8G8R8_UNORM_PACK32 => SnapshotForm::Unorm8,
-            F::R8_SNORM | F::R8G8_SNORM | F::R8G8B8A8_SNORM | F::A8B8G8R8_SNORM_PACK32 => {
-                SnapshotForm::Snorm8
-            }
-            F::R16_UNORM | F::R16G16_UNORM | F::R16G16B16A16_UNORM => SnapshotForm::Unorm16,
-            F::R16_SNORM | F::R16G16_SNORM | F::R16G16B16A16_SNORM => SnapshotForm::Snorm16,
-            F::R16_SFLOAT | F::R16G16_SFLOAT | F::R16G16B16A16_SFLOAT => SnapshotForm::Half,
-            F::R8_UINT | F::R8G8_UINT | F::R8G8B8A8_UINT | F::A8B8G8R8_UINT_PACK32 => {
-                SnapshotForm::Uint8
-            }
-            F::R8_SINT | F::R8G8_SINT | F::R8G8B8A8_SINT | F::A8B8G8R8_SINT_PACK32 => {
-                SnapshotForm::Sint8
-            }
-            F::R16_UINT | F::R16G16_UINT | F::R16G16B16A16_UINT => SnapshotForm::Uint16,
-            F::R16_SINT | F::R16G16_SINT | F::R16G16B16A16_SINT => SnapshotForm::Sint16,
-            _ => SnapshotForm::Bits,
-        };
-        let class = match form {
-            SnapshotForm::Bits => return form,
-            SnapshotForm::Uint8 | SnapshotForm::Uint16 => SampledType::Uint,
-            SnapshotForm::Sint8 | SnapshotForm::Sint16 => SampledType::Sint,
-            _ => SampledType::Float,
-        };
-        match class == ty {
-            true => form,
-            false => SnapshotForm::Bits,
-        }
-    }
-
-    /// The snapshot's format: an unsigned integer format of the codes' width, four channels.
-    pub fn format(self) -> vk::Format {
-        match self {
-            SnapshotForm::Bits => vk::Format::R32G32B32A32_UINT,
-            SnapshotForm::Unorm8
-            | SnapshotForm::Snorm8
-            | SnapshotForm::Uint8
-            | SnapshotForm::Sint8 => vk::Format::R8G8B8A8_UINT,
-            SnapshotForm::Unorm16
-            | SnapshotForm::Snorm16
-            | SnapshotForm::Half
-            | SnapshotForm::Uint16
-            | SnapshotForm::Sint16 => vk::Format::R16G16B16A16_UINT,
-        }
-    }
-
-    /// The width in bits of each code, and whether it is signed; `None` for
-    /// [`Bits`](Self::Bits).
-    pub(crate) fn code(self) -> Option<(u8, bool)> {
-        match self {
-            SnapshotForm::Bits => None,
-            SnapshotForm::Unorm8 | SnapshotForm::Uint8 => Some((8, false)),
-            SnapshotForm::Snorm8 | SnapshotForm::Sint8 => Some((8, true)),
-            SnapshotForm::Unorm16 | SnapshotForm::Half | SnapshotForm::Uint16 => Some((16, false)),
-            SnapshotForm::Snorm16 | SnapshotForm::Sint16 => Some((16, true)),
-        }
-    }
-}
-
 /// Whether an image is sampled or used as a storage image.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -285,24 +180,13 @@ pub enum SyntheticBinding {
     HandleTable,
     /// The pipeline constant blob, a read-only storage buffer.
     ConstantBlob,
-    /// A rate-mapped pass's region table (`bind::fan_out`), a read-only storage buffer of a
-    /// fan-out variant's geometry stage (`GraphicsState::region_fan_out`), declared with the
-    /// vertex stage's symbols.
-    RateMapRegions,
-    /// A fan-out probe's flags (`GraphicsState::region_fan_out`), a storage buffer of `u32`s its
-    /// geometry stage writes into at the pushed index (`PushField::RegionProbe`,
-    /// `bind::fan_out::PROBE_DRAW_WORDS` a draw): a flag, the copies its draw emits, the marks
-    /// of its triangles too wide for few copies, its first and last flagged triangle, the
-    /// count of its flagged triangles, and the bits of its blocks that hold one. Declared with
-    /// the vertex stage's symbols.
-    RateMapFlags,
     /// The render encoder's tessellation factor buffer (`setTessellationFactorBuffer:offset:
     /// instanceStride:`), a read-only storage buffer of a tessellation pipeline's synthesized
     /// control stage, declared with the vertex stage's symbols.
     TessellationFactors,
-    /// The render pass's fragment imageblock: a coherent `R32Uint` 2D-array storage image
-    /// whose layer `w` holds word `w` of every pixel's imageblock cell, read and written inside the
-    /// fragment's ordered pixel-interlock critical section.
+    /// The render pass's imageblock storage: a coherent `R32Uint` 2D-array storage image whose
+    /// layer `w` holds word `w` of every pixel's imageblock cell, which a tile dispatch whose
+    /// function's explicit imageblock stands alone stages its tile's cells from and back.
     Imageblock,
     /// The sampler table: the handle table's layout over the argument buffers' samplers, whose
     /// resource ids live apart from the textures' (the sampler half): 16-byte entries `{id low, id
@@ -312,11 +196,6 @@ pub enum SyntheticBinding {
     /// the index of the entry its id finds (0 for an id the table lacks), and every use of it reads
     /// that entry's element and word.
     SamplerTable,
-    /// The shadow of the render pass's stencil attachment a fragment function's shader-side
-    /// stencil tests and writes (`GraphicsState::shadow_stencil`): a coherent `R8Uint` 2D storage
-    /// image holding pixel `(x, y)`'s stencil value at texel `(x, y)`, read and written inside the
-    /// fragment's ordered pixel-interlock critical section.
-    ShadowStencil,
     /// The function-table directory: the handle table's layout over the visible-function tables
     /// the pipeline state made, whose resource ids live apart from textures' and samplers'.
     FunctionTableDirectory,
@@ -334,45 +213,11 @@ pub enum SyntheticBinding {
     /// `x + y · SpecKey::TileGridWidth`, which the pass keeps across its draws and tile
     /// dispatches and starts at zero (`RuntimeFact::TileThreadgroupMemory`).
     TileMemory,
-    /// The function-table snapshot of a device without the set-1 function-table array's
-    /// features: a read-only storage buffer of words the binder writes per command, holding a
-    /// null table's record at word 0 and then each listed table's record, its word count and
-    /// its words ([`FunctionTableSnapshot`](crate::bind::FunctionTableSnapshot)). The stage's
-    /// function-table directory gives each id the word offset of its table's record.
+    /// The function-table snapshot: a read-only storage buffer of words the consumer writes per
+    /// command, holding a null table's record at word 0 and then each listed table's record, its
+    /// word count and its words. The stage's function-table directory gives each id the word
+    /// offset of its table's record.
     FunctionTableSnapshot,
-    /// An emulated mesh function's records (`StageInterface::mesh_records`): a storage buffer of
-    /// words from the draw's first word (`lower::mesh::work::RECORDS_BASE`), each mesh
-    /// threadgroup's zeroed by its own threads before its body runs, which the mesh function's
-    /// compute entry writes and the pipeline's synthesized vertex stage reads. Declared with the
-    /// mesh stage's symbols.
-    MeshRecords,
-    /// An emulated mesh pipeline's work buffer for one draw: its object threadgroups' grids and
-    /// payloads, their offsets in the draw's mesh threadgroups, and where its records begin,
-    /// which its object function writes and its mesh function and synthesized vertex stage read
-    /// (`lower::mesh::work`). Declared with the mesh stage's symbols.
-    MeshWork,
-    /// An emulated tessellation draw's work buffer (`GraphicsState::emulated_tessellation`): its
-    /// arguments, where its records begin and its chunks' draws, which the tessellation scan
-    /// writes and the post-tessellation vertex function reads (`lower::tessellation::work`).
-    /// Declared with the vertex stage's symbols.
-    TessellationWork,
-    /// An emulated tessellation draw's records: one per instance and patch, each its processed
-    /// factors, its first triangle and its stream state, which the tessellation scan writes and
-    /// the post-tessellation vertex function reads (`lower::tessellation::work`). Declared with
-    /// the vertex stage's symbols.
-    TessellationRecords,
-    /// The stand-in of the render pass's depth attachment a fragment function that runs the
-    /// draw's depth test itself tests and writes (`GraphicsState::shader_tests`): a coherent
-    /// `R32f` storage image holding pixel `(x, y)`'s depth at texel `(x, y)` (its samples as the
-    /// stand-in's view says), read and written inside the fragment's ordered pixel-interlock
-    /// critical section.
-    DepthStandIn,
-    /// The stand-in of the render pass's stencil attachment a fragment function that runs the
-    /// draw's stencil test itself, beside its depth test, tests and writes
-    /// (`ShaderTestsUse::stencil`): a coherent `R8ui` storage image holding pixel `(x, y)`'s
-    /// stencil at texel `(x, y)` (each sample, multisampled at more than one), read and written
-    /// inside the fragment's ordered pixel-interlock critical section.
-    StencilStandIn,
 }
 
 /// What kind of resource a [`ResourceSlot`] names.
@@ -421,24 +266,11 @@ pub enum ResourceKind {
     /// constexpr sampler is the binding's immutable sampler. `ResourceSlot::index` is the use
     /// ([`ResourceSlot::separate_sampler`]), as a heap sampler's is.
     SeparateSampler(SamplerRef),
-    /// The `half` shadow of extended-range color attachment `n` (`ResourceSlot::index` too) for
-    /// the draw's render pass instance (`VariantKey::extended_shadows`): an `RGBA16_SFLOAT` 2D
-    /// storage image of the attachment's extent holding Metal's tile value of each texel, which
-    /// the function's interlocked storage form reads and writes beside the attachment's codes. In
-    /// a multisampled pipeline it holds the samples as the attachment's storage image does: a
-    /// multisampled image of the pipeline's samples, or a 2D array of one layer per sample
-    /// (`StorageAttachmentView::SamplePlanes`'s shape).
-    ExtendedShadow(u32),
-    /// The snapshot of the texture bound at fragment texture slot `n` (`ResourceSlot::index` too)
-    /// for a draw that reads it through one (`LoweringInputs::snapshot_textures`): an
-    /// `R32G32B32A32_UINT` 2D storage image covering the draw's render area, each texel the bits
-    /// of the four values a fetch of the texture's level 0 there returned.
-    SnapshotTexels(u32),
     /// The planes of the two-plane YCbCr texture bound at the stage's texture slot
     /// `ResourceSlot::index`, held as an image of the multi-planar format that the device's own
-    /// sampler Y′CbCr conversion samples (`LoweringInputs::ycbcr_planes_sampled`): a combined
-    /// image sampler whose immutable sampler is the device's conversion of this
-    /// (`vk::SamplerDesc::ycbcr`), whose image the consumer views with the same conversion.
+    /// sampler Y′CbCr conversion samples: a combined image sampler whose immutable sampler is the
+    /// device's conversion of this (`vk::SamplerDesc::ycbcr`), whose image the consumer views
+    /// with the same conversion.
     YCbCrPlanes(crate::bind::YCbCrPlanesSampler),
     /// The constexpr samplers one heap sampling chooses among by its sampler handle: an array of
     /// one immutable sampler per candidate, each made for this use (with comparison or without,
@@ -503,7 +335,7 @@ pub struct CombinedSampler {
     pub sampler: SamplerRef,
     /// The shader hands the binding a pixel sampler's coordinate in texels: its `VkSampler` is
     /// the device's unnormalized one (`SamplerUse::unnormalized`), and its image a view of the
-    /// texture's first level alone (`bind::ImageViewDesc::level`).
+    /// texture's first level alone.
     #[cfg_attr(feature = "serde", serde(default))]
     pub unnormalized: bool,
     /// The shader samples with depth comparison through this binding.
@@ -566,6 +398,24 @@ impl CombinedSampler {
     pub fn sampler_use(&self) -> crate::metal::sampler::SamplerUse {
         crate::metal::sampler::SamplerUse::new(self.compare, self.integer)
             .with_unnormalized(self.unnormalized)
+    }
+
+    /// The device's sampler of a constexpr sampler in this use: the immutable sampler link bakes
+    /// into the binding's layout, and under the identity domains the sampler the consumer makes
+    /// for `PushField::ConstexprSampler`. Metal compiles a constexpr sampler into the function;
+    /// this is the `MTLSamplerDescriptor` of the same state through `metal::sampler::vk_sampler`,
+    /// with the sampler's own LOD bias as its `mipLodBias`. `None` for a runtime sampler's slot.
+    /// It refuses only what translation for the same profile refused first.
+    pub fn constexpr_sampler(
+        &self,
+        profile: &crate::device::DeviceProfile,
+    ) -> Result<Option<vk::SamplerDesc>, crate::error::Error> {
+        match self.sampler {
+            SamplerRef::Constexpr(words) => {
+                crate::lower::sampler::constexpr_desc(words, self.sampler_use(), profile).map(Some)
+            }
+            SamplerRef::Slot(_) => Ok(None),
+        }
     }
 }
 
@@ -722,11 +572,9 @@ pub enum SpecKey {
     /// fragment function that reaches its tile's threadgroup memory, the render pass's tile
     /// height.
     ImageblockHeight,
-    /// The width of the render area a tile dispatch covers (`renderTargetWidth`,
-    /// `BindState::render_area`, default 0).
+    /// The width of the render area a tile dispatch covers (`renderTargetWidth`, default 0).
     RenderAreaWidth,
-    /// The height of the render area a tile dispatch covers (`renderTargetHeight`,
-    /// `BindState::render_area`, default 0).
+    /// The height of the render area a tile dispatch covers (`renderTargetHeight`, default 0).
     RenderAreaHeight,
     /// Boolean: an out-of-bounds read of the texture bound to the slot reads alpha 1, because its
     /// pixel format has no alpha component (or is a depth or stencil format, whose missing
@@ -740,9 +588,6 @@ pub enum SpecKey {
     /// Boolean: the texture bound to the slot is sparse (`MTLTexture.isSparse`, default false),
     /// so its accesses that observe residency take the sparse form (`RuntimeFact::SparseTexture`).
     SparseTexture(SlotRef),
-    /// How Metal converts the texels of the format bound at the texture slot to `half` (`u32`,
-    /// the class of `metal::texel_format::TexelFormat`).
-    TexelFormat(SlotRef),
     /// The state of the runtime sampler bound to the slot (`u32`, default 0): its
     /// [`SamplerWord`](crate::metal::sampler::SamplerWord) masked by `fields`, the word's bits
     /// the function reads, so samplers that differ only in other fields share a pipeline. A slot
@@ -786,31 +631,13 @@ pub enum SpecKey {
     /// that constant is 1. A slot bound to a texture that is not sparse (`MTLTexture.isSparse`),
     /// or to none, takes 0.
     ConstantLanes(SlotRef),
-    /// Boolean: the texture bound to the slot is in a format whose conversion to `half` is not
-    /// measured on a device that samples through Metal's own texture unit (default false; its
-    /// class, as `TexelFormat` states it, has no measured family, no 8-bit sRGB bit and no packed
-    /// field: `metal::texel_format::TexelFormat::unmeasured_on_metal_sampler`). A slot bound to
-    /// nothing takes false: its zero texel converts alike under every class. On such a device a
-    /// function notes its `half` conversion of the slot where it holds
-    /// (`PrecisionNote::HalfTexelConversion`), so the `TexelFormat` bits that only that note read
-    /// leave the pipeline's key.
-    UnmeasuredTexels(SlotRef),
-    /// Boolean: on a device that samples through Metal's own texture unit, the texture bound to
-    /// the slot converts every texel an image instruction hands back to a `half` result as that
-    /// `float` texel rounded to nearest even (default true): its class has no YCbCr field on the
-    /// grid `8192` (`metal::texel_format::TexelFormat::plain_on_metal_sampler`). A slot bound
-    /// to nothing takes true: its zero texel converts alike under every class. Where it holds, such
-    /// an access converts the instruction's own texel by the device's conversion, which Metal's
-    /// compiler may fold into the image instruction (`lower::texture::half`), and specialization
-    /// drops the class's routine; the class itself stays push data (`SpecKey::TexelFormat`).
-    PlainHalfTexels(SlotRef),
     /// The class of the format of the texture bound to the slot (`u32`, as `TexelFormat` states
     /// it: `metal::texel_format::texel_format`), read by a specialized note's test alone
     /// ([`SpecTest`](crate::pipeline::SpecTest)): no stage declares it as a constant and no
     /// pipeline's key carries it, so the bound format decides the note without a `VkPipeline` of
     /// its own. The runtime reads it from the texture a draw or dispatch binds
-    /// (`StageModule::bound_format_clauses`); where the format is not known (a reading of the
-    /// module alone, `StageModule::precision_notes_under`), such a test holds.
+    /// (`StageModule::precision_notes_bound`'s `bound`); where the format is not known, such a
+    /// test holds.
     BoundTexelFormat(SlotRef),
     /// The plane axes of the texture bound to the slot on which the base-level size Metal's
     /// texel-offset rule reads is not a power of two where the texture's own base level's is
@@ -834,66 +661,43 @@ pub enum SpecKey {
     /// device's sampler reads exactly the texel Metal's reads. A slot bound to a normalized sampler,
     /// or to none, takes false, so a normalized sampler's filter makes no pipeline of its own.
     NearestPixelSampler(SlotRef),
-    /// Boolean: the descriptor range bound at the buffer slot, which the function reads through a
-    /// uniform view, starts at the bind offset, so its `SlotBindOffset` residual is 0 (default
-    /// false): the slot holds inline bytes, which the consumer places at an aligned offset, or a
-    /// buffer at an offset that is a multiple of the view's descriptor base alignment
-    /// (`max(minUniformBufferOffsetAlignment, 16)`), under a window that starts in the range's
-    /// first aligned block. A slot bound to nothing takes true: its residual is 0. Where it holds,
-    /// the function reads the slot at the Metal offset alone, a constant for a constant member,
-    /// which a driver can load into registers ahead of the shader (Mesa's ANV does so only for a
-    /// uniform load at a constant offset); elsewhere at the residual plus the offset.
-    RangeAtBindOffset(SlotRef),
     /// The word of the runtime sampler bound to the slot (`u32`: its whole
     /// [`SamplerWord`](crate::metal::sampler::SamplerWord), its address modes as the bound
     /// texture's map sends them), read by a specialized note's test alone
     /// ([`SpecTest`](crate::pipeline::SpecTest)): no stage declares it as a constant and no
     /// pipeline's key carries it, so the bound sampler decides the note without a `VkPipeline` of
-    /// its own. A plan gives it (`BindingPlan::specialized_value`), and the runtime reads such a
-    /// test at each draw or dispatch (`StageModule::note_clauses_bound`); where the sampler is not
-    /// known (a reading of the module alone, `StageModule::precision_notes_under`), such a test
+    /// its own. The consumer gives it, and the runtime reads such a
+    /// test at each draw or dispatch (`StageModule::precision_notes_bound`); where the sampler is
+    /// not known, such a test
     /// holds. A slot bound to no sampler takes 0.
     BoundSamplerWord(SlotRef),
-    /// Boolean: a texture the stage's handles can name is of a two-plane YCbCr class (its
-    /// `metal::texel_format::TexelFormat::PACKED` field `YCbCr2048`, `YCbCr8192` or
-    /// `YCbCrExtended8192`): a heap member of the command reaching the stage, one it makes
-    /// resident (`BindShape::used`) or binds at a texture slot of the stage
-    /// (`bind::heap`'s members). Read by a specialized note's test alone
-    /// ([`SpecTest`](crate::pipeline::SpecTest)), as [`BoundSamplerWord`](Self::BoundSamplerWord)
-    /// is: a plan gives it (`BindingPlan::specialized_value`), and where it is not known such a
-    /// test holds. A texture the command neither names nor makes resident, which a handle loaded
-    /// from memory may still reach and whose read Metal leaves undefined, is not counted.
-    HeapYCbCrTextures(Stage),
     /// Two bits: 1 where a texture the stage's handles can name is one a heap holds by its raw
-    /// texels alone (`bind::heap::heap_raw_form`: an unswizzled, not sparse texture of one sample
-    /// of a form of `ExtendedRange::HEAP_READ`, whose texels the function's `float` read, sample
-    /// or gather decodes by the device's arithmetic, `PrecisionNote::DevicePackConversion`), and 2
+    /// texels alone (`lower::texture::heap_raw_form`: an unswizzled, not sparse texture of one sample
+    /// of a form of `ExtendedRange::HEAP_READ`, whose texels the function's `float` read, sample or
+    /// gather decodes by the device's arithmetic, `PrecisionNote::DevicePackConversion`), and 2
     /// where one such is of a form whose linear sample the function filters by the device's
     /// arithmetic (not a bfloat form, whose sample reads the nearest texel under either filter,
     /// `PrecisionNote::BicubicFilterArithmetic`): of the heap members of the command reaching the
-    /// stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), and given by a plan, as that
-    /// is. A stage whose `float` read, sample, gather or query of a heap may meet such a texture
-    /// declares it as a constant (default 3), whose bit 1 gates the raw arms
-    /// (`lower::texture::heap_raw_form`): where it is 0 they are dead code at pipeline creation,
-    /// exactly, since no handle the command names then carries a raw form's class. A pipeline's
-    /// key carries it there, and a specialized note's test reads it from the key; elsewhere such a
-    /// test reads the plan's value, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures).
+    /// stage, a member it makes resident (`useResource:`) or binds at a texture slot of the
+    /// stage, given by the consumer. A
+    /// texture the command neither names nor makes resident, which a handle loaded from memory may
+    /// still reach and whose read Metal leaves undefined, is not counted. A stage whose `float`
+    /// read, sample, gather or query of a heap may meet such a texture declares it as a constant
+    /// (default 3), whose bit 1 gates the raw arms (`lower::texture::heap_raw_form`): where it is 0
+    /// they are dead code at pipeline creation, exactly, since no handle the command names then
+    /// carries a raw form's class. A pipeline's key carries it there, and a specialized note's test
+    /// reads it from the key; elsewhere such a test reads the plan's value, and where it is not
+    /// known such a test holds.
     HeapRawTextures(Stage),
     /// Four bits: the families of the float textures the stage's handles can name whose texel may
     /// hold a NaN a `half` write stores (`lower::texture::half_write_nans`), each a bit of
     /// `bind::heap::nan_family`: 1 a 16-bit float format, 2 a 32-bit float one, 4 a packed
     /// small float one (`RG11B10Float`, `RGB9E5Float`), 8 a float format of none of those and
     /// none whose texels hold no NaN (normalized, sRGB, extended-range); of the heap members of
-    /// the command reaching the stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), and
-    /// read by a specialized note's test alone, given by a plan, as that is.
+    /// the command reaching the stage, as for [`HeapRawTextures`](Self::HeapRawTextures), and
+    /// read by a specialized note's test alone ([`SpecTest`](crate::pipeline::SpecTest)), given
+    /// by a plan, as [`BoundSamplerWord`](Self::BoundSamplerWord) is.
     HeapNanFamilies(Stage),
-    /// Boolean: a sampler state an argument buffer's sampler handle can name filters: one of the
-    /// bind state's argument samplers (`BindState::argument_samplers`, every live state, its
-    /// shape in `BindShape`) has a linear minification, magnification or mip filter, anisotropy,
-    /// or a cubic filter. Which state an argument buffer holds is in its memory, which no plan
-    /// reads. Read by a specialized note's test alone, given by a plan, as
-    /// [`HeapYCbCrTextures`](Self::HeapYCbCrTextures) is.
-    FilteringArgumentSampler,
     /// Boolean: an element that a kernel's `[[stage_in]]` fetch of a thread-position step reads
     /// in this dispatch region may lie past the first `2^32` bytes from its bind offset (default
     /// true). Each such element is the region's origin plus the thread's position over the step
@@ -912,17 +716,25 @@ pub enum SpecKey {
     /// the texture's swizzle deciding it (`metal::sampler::border_texels`,
     /// `RuntimeFact::BorderTexels`).
     BorderTexels(SlotRef),
-    /// Boolean (`u32`, default 1): a texture the stage's handles can name is a 4:4:4 two-plane
-    /// YCbCr one whose writes Metal stores into its planes (`metal::format::ycbcr_writes_stored`)
-    /// that a storage class can hold (its usage writes): a heap member of the command reaching the
-    /// stage, as for [`HeapYCbCrTextures`](Self::HeapYCbCrTextures), given by a plan
-    /// (`bind::plan::slots::heap_ycbcr_writes`). A stage with a `float` or `half` write through a
-    /// heap handle declares it as a constant, under which its handle-table search carries the
-    /// entry's `memory::handles::FLAG_YCBCR_WRITES` and the write marks the texel it stores in
-    /// such a member's write shadow (`lower::texture::emit`): where it is 0 the search carries
-    /// nothing for it and the write's test is dead code at pipeline creation, exactly, since no
-    /// handle the command names then names such a texture. A pipeline's key carries it.
-    HeapYCbCrWrites(Stage),
+    /// Boolean: the kernel's threadgroup runs as one row (default false). Its workgroup is then
+    /// `(sx·sy·sz, 1, 1)` (its [`WorkgroupSize`](SpecKey::WorkgroupSize) constants), and its
+    /// position in the threadgroup is its `LocalInvocationIndex`
+    /// unflattened over `(sx, sy, sz)`, `x` fastest, which is Metal's order, so its linear index
+    /// and every other builtin keep their values. Declared on `Device::from_queries`' profile by
+    /// a kernel whose workgroup is its threadgroup (`LocalSizeForm::Spec`), so a threadgroup
+    /// deeper than [`DEEP_THREADGROUP`](crate::pipeline::DEEP_THREADGROUP) runs within every
+    /// device's `maxComputeWorkGroupSize`; where it is false the workgroup is `(sx, sy, sz)` and
+    /// the pipeline is the one the kernel makes without it.
+    DeepThreadgroup,
+    /// A kernel's Vulkan workgroup size on one axis, where it declares
+    /// [`DeepThreadgroup`](SpecKey::DeepThreadgroup) (default the axis's `LocalSize` default):
+    /// the threadgroup's own size, or `(sx·sy·sz, 1, 1)` where `DeepThreadgroup` is true, as
+    /// [`threadgroup_constants`](crate::pipeline::threadgroup_constants) answers for the
+    /// threadgroup with its other keys. Each
+    /// part of the module's `WorkgroupSize` is such a plain constant, never an
+    /// `OpSpecConstantOp`: the size a driver reads from the composite's parts as declared is the
+    /// one the body computes with.
+    WorkgroupSize(Axis),
 }
 
 impl SpecKey {
@@ -943,15 +755,6 @@ impl SpecKey {
             },
         }
     }
-
-    /// Whether a function reads this key's value from its push field (`PushField::Specialized`)
-    /// rather than from a specialization constant: the format class of the texture bound at a
-    /// slot (`TexelFormat`), which a guest's draws vary most and whose data form costs a making
-    /// least. Every other key stays a specialization; read as data, the bound sampler's word, say,
-    /// made one NVIDIA making cost about four times a specialized one.
-    pub fn read_as_data(self) -> bool {
-        matches!(self, SpecKey::TexelFormat(_))
-    }
 }
 
 /// The specialization keys of one stage's threadgroup size and grid form
@@ -966,13 +769,6 @@ pub(crate) struct DispatchKeys {
     pub multi_region: SpecKey,
 }
 
-impl DispatchKeys {
-    /// The axis `key` is the local size of, or `None` for any other key.
-    pub(crate) fn axis(&self, key: SpecKey) -> Option<usize> {
-        self.local.iter().position(|k| *k == key)
-    }
-}
-
 /// A push-constant field kind, in the fixed placement order (the derived `Ord`).
 ///
 /// `select` places a function's fields in this order into the stage's push window and spills the
@@ -981,6 +777,11 @@ impl DispatchKeys {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PushField {
+    /// Device address (`u64`) of the stage's parameter block under the identity domains: the
+    /// fields placed past the push window (`PushLoc::ArgumentTable`), at their placed offsets, in
+    /// memory the consumer writes for the call (16-byte aligned, `argument_table_size` bytes).
+    /// It sorts first, so the window always holds it.
+    ArgumentTableAddress,
     /// Device address of the resident root table.
     RootTableAddress,
     /// Device address of the `ExecutionStatus` buffer: a function that counts resident-set misses
@@ -1000,12 +801,27 @@ pub enum PushField {
     /// `RootTableAddress`: a hole the consumer fills (`PushHole::MergedDrawAddress`), placed with
     /// the other addresses. The merge passes read the header there too.
     MergedDrawAddress,
-    /// Which draw of a fragment function compiled under `LoweringInputs::snapshot_textures` runs
-    /// (`u32`): a hole the consumer fills (`PushHole::SnapshotPhase`), placed beside the addresses
-    /// so the fragment window always holds it. 1 in the draw that takes the snapshot, whose
-    /// fragments copy their pixels' texels into it and run nothing else; 0 in the draw that reads
-    /// it, whose fragments copy nothing and run the function.
-    SnapshotPhase,
+    /// Device address (`u64`) of the execution range (Metal's
+    /// `MTLIndirectCommandBufferExecutionRange`, a `u32` location then a `u32` length) a vertex
+    /// function compiled under `LoweringInputs::indirect_range` reads in its first block: an
+    /// invocation of a command outside it ([`PushField::IndirectSequence`]) returns before the
+    /// body, its `[[position]]` outside every clip volume, so the command draws nothing. The
+    /// binder points it at the range an execution reads from a buffer, and at a range of every
+    /// command (location 0, length `u32::MAX`) for a direct draw or an execution over a range
+    /// the CPU gives. Placed with the other addresses.
+    IndirectRange,
+    /// The command (`u32`) of an indirect command buffer's execution that the draw is, less its
+    /// part's first ([`PushField::IndirectBase`]), which a vertex function compiled under
+    /// `LoweringInputs::indirect_range` adds to it and tests against its
+    /// [`PushField::IndirectRange`]: the sequence index an execution's `SEQUENCE_INDEX` token
+    /// pushes there, 0 for a direct draw. Placed beside the addresses, so the vertex window always
+    /// holds it.
+    IndirectSequence,
+    /// The first command (`u32`) of the part of an indirect command buffer's execution that the
+    /// draw is: a consumer may run an execution's commands as several parts, each counting its
+    /// sequences ([`PushField::IndirectSequence`]) from 0, and pushes each part's first here. 0
+    /// for a direct draw. Placed beside the addresses, so the vertex window always holds it.
+    IndirectBase,
     // The three amplification words come right after the addresses in the order, so every stage
     // window holds them (at most 32 bytes before them, 12 of them): a draw of one amplification
     // writes them alone, between its draws, never through an `ArgumentTable`.
@@ -1020,20 +836,11 @@ pub enum PushField {
     /// That amplification's `viewportArrayIndexOffset` (`u32`), added to the viewport index and
     /// read as `AmplificationLayerOffset` is.
     AmplificationViewportOffset,
-    /// The chunk an emulated tessellation draw's `vkCmdDrawIndirect` draws (`u32`): an emulated
-    /// post-tessellation vertex function draws the triangles of the draw's chunk this field names
-    /// (`lower::tessellation::work`). Placed with the amplification fields, so the vertex stage's
-    /// window holds it (at most 44 bytes before it there: `SnapshotPhase` is a fragment
-    /// function's): the draw of each chunk writes it alone, between its draws.
-    TessellationChunk,
-    /// The box of regions a recording of a rate-mapped pass's regions draws (`uvec2`;
-    /// `RegionFanOut::RegionCopies`, `LoweringInputs::region_copies`): its first region, in the
-    /// region table's order, and its columns `c`, at least 1. Its vertex function draws region
-    /// `first + (DrawIndex / c)·nx + DrawIndex mod c`, `nx` the table's segments of x: the box's
-    /// rows of `c` regions each, in order. Placed with the amplification fields, so the vertex
-    /// window holds it, as a recording writes it before its draws.
-    RegionBox,
-    /// Region base and grid of a multi-region dispatch.
+    /// Region base and grid of a multi-region dispatch (`lower::dispatch`'s module docs). Under
+    /// the identity domains every dispatch the host knows is a region: its first threadgroup in
+    /// Metal's grid (0 unless the consumer splits the dispatch), Metal's threadgroup size, and
+    /// Metal's `threads_per_grid`; an indirect dispatch states a zero grid, and its kernel takes
+    /// `NumWorkgroups` times its workgroup size.
     DispatchRegion,
     /// Device address (`u64`) of the region record a device-replay variant's dispatch reads its
     /// `DispatchRegion` value from: the replay's preprocess writes one record per replayed command
@@ -1054,7 +861,22 @@ pub enum PushField {
     /// Residual bind offset of a descriptor-form slot: the bind offset minus the descriptor base,
     /// modulo 2^32.
     SlotBindOffset(SlotRef),
-    /// Guest base address of a static-root slot.
+    /// Under the identity domains, the element of the set-1 sampled-texture array
+    /// through which a fragment function reads color attachment `color` (`[[color(n)]]`): one
+    /// `u32`, the index of an element holding a 2D view of the attachment's level and slice
+    /// (multisampled in a multisampled pipeline), which the function fetches as `texels` at the
+    /// integer part of its `FragCoord` (and its `SampleId`). No descriptor holds the attachment.
+    /// The function states `RuntimeFact::FramebufferFetch` for the color, and its fetches are
+    /// ordered after earlier draws only by the consumer's barriers, not after an overlapping
+    /// earlier fragment of the same draw (`PrecisionNote::UnorderedFetchWithinDraw`). Ordered
+    /// before the slot addresses, so on the floor a fragment function that
+    /// pushes no parameter block's address places it in the four bytes a vertex function's push
+    /// end may leave below the fragment function's first eight-byte field.
+    FetchedColor { color: u32, texels: SampledType },
+    /// Guest base address of a static-root slot. Under the identity domains, a `u64`: a buffer
+    /// slot's device address (its `gpuAddress` plus the bind offset) less 2^31, modulo 2^64
+    /// (`docs/API.md`, section 5), and a texture or sampler slot's `gpuResourceID`
+    /// (`docs/RESOURCE-ID.md`), 0 for nil.
     SlotGuestBase(SlotRef),
     /// Stride of a pulled vertex buffer layout.
     VertexBufferStride(u32),
@@ -1069,8 +891,17 @@ pub enum PushField {
     /// The encoder's tessellation factor scale rounded to `half` (`float`), a control-stage field.
     TessellationFactorScale,
     /// The mipmap level count (`u32`) of the storage texture bound to the slot, 0 where the binder
-    /// binds a neutral (`RuntimeFact::StorageTextureLevels`).
+    /// binds a neutral (`RuntimeFact::StorageTextureLevels`). Under the identity domains no fact
+    /// is stated: 0 where the slot's resource ID is nil.
     TextureLevels(SlotRef),
+    /// Under the identity domains, the first element (`u32`) of the run of set 1's storage-image
+    /// array that holds the levels of the storage texture bound to a slot read or written at a
+    /// level other than the constant 0, each its own single-level storage view, in order from the
+    /// texture's first level (`docs/RESOURCE-ID.md`): an access at level `l` reads or writes element
+    /// `first + min(l, max(n, 1) − 1)`, `n` the slot's [`PushField::TextureLevels`], and only
+    /// where `l < n`. A texture of one level pushes its resource ID's index, whose storage element
+    /// is that level, and nil pushes 0.
+    TextureLevelBase(SlotRef),
     /// The instance count (`u32`) of the instance acceleration structure bound at the buffer slot,
     /// 0 where none is bound (`RuntimeFact::AccelerationStructureInstanceCount`).
     InstanceCount(SlotRef),
@@ -1078,27 +909,18 @@ pub enum PushField {
     /// the device replay's preprocess module reads (`bind::replay`). No translated function
     /// reads it.
     CommandRecordsAddress,
-    /// The render encoder's stencil state for a fragment function's shader-side stencil
-    /// (`RuntimeFact::ShadowStencil`), a `uvec2`: the front face's word, then the back face's.
-    /// Each word holds the face's `MTLCompareFunction` in bits 0 to 2, its stencil-failure and
-    /// depth-stencil-pass `MTLStencilOperation`s in bits 3 to 5 and 6 to 8, its read mask in bits
-    /// 9 to 16, its write mask in bits 17 to 24, and in bit 31 whether the draw's pass has a
-    /// stencil attachment for the function to test against (`bind::shadow_stencil_words`).
-    ShadowStencilState,
     /// The whole indices (`u64`) from an indexed indirect draw's bound index offset to its index
     /// buffer's end, which the index-clamp prepass reads. No translated function reads it.
     IndexCapacity,
     /// The render encoder's viewport count (`u32`, `setViewports:count:`) for a vertex function
     /// that writes `[[viewport_array_index]]` (`RuntimeFact::ViewportCount`): it stores
     /// `ViewportIndex` as 0 for an index at or past it. 0 where the encoder never set its
-    /// viewports, which keeps every index 0, as Metal's one default viewport does
-    /// (`BindState::viewport_count`).
+    /// viewports, which keeps every index 0, as Metal's one default viewport does.
     ViewportCount,
     /// The render pass's `renderTargetArrayLength` (`u32`) for a vertex function that writes
-    /// `[[render_target_array_index]]`, in the variant that writes `Layer`
-    /// (`RuntimeFact::RenderTargetArrayLength` without `layer_dropped`): it stores `Layer` as 0
-    /// for an index at or past it, as Metal renders the pass's first layer there
-    /// (`BindState::render_target_array_length`).
+    /// `[[render_target_array_index]]` and writes `Layer` (`RuntimeFact::RenderTargetArrayLength`
+    /// without `layer_dropped`): it stores `Layer` as 0
+    /// for an index at or past it, as Metal renders the pass's first layer there.
     RenderTargetArrayLength,
     /// The patch index buffer's residual bind offset (`u32`), as `SlotBindOffset`'s: a field of
     /// a tessellation pipeline's synthesized control stage.
@@ -1106,78 +928,30 @@ pub enum PushField {
     /// Whether the patch draw binds a patch index buffer (`u32`, 1 or 0), a control-stage field.
     PatchIndexBound,
     /// The control-point index buffer's residual bind offset (`u32`), a control-stage field of a
-    /// pipeline with a control-point index type. An emulated post-tessellation vertex function
-    /// reads this field and the two before it in its own push window
-    /// (`GraphicsState::emulated_tessellation`).
+    /// pipeline with a control-point index type.
     ControlPointIndexOffset,
     /// The draw's band of a pipeline variant that draws its lines as bands
     /// (`VariantKey::line_band`, `link::band`): one `vec4` of the synthesized evaluation stage's
     /// own push range, `[sx, sy, h, 0]`, the half extent of the draw's Vulkan viewport 0 (its
-    /// height negative, as the runtime's viewports are) and half the band's width in pixels
-    /// (`BindState::line_band`).
+    /// height negative, as the runtime's viewports are) and half the band's width in pixels.
     LineBand,
-    /// The index a fan-out probe writes its flag at (`u32`; `GraphicsState::region_fan_out`,
-    /// `link::fan_out`): one field of the synthesized geometry stage's own push range.
-    RegionProbe,
     /// The stride (`u32`) the compute encoder binds the kernel buffer at this Metal index with
     /// (`setBuffer:offset:attributeStride:atIndex:` and its forms, its low 32 bits,
     /// `MTLAttributeStrideStatic`'s `2^32 - 1` included), 0 where it binds none, which a
     /// `[[stage_in]]` layout of `MTLBufferLayoutStrideDynamic` fetches at
     /// (`RuntimeFact::StageInStride`).
     StageInStride(u32),
-    /// The draw's viewport compensation for a vertex function compiled under
-    /// `LoweringInputs::viewport_compensation` (`RuntimeFact::ViewportCompensation`): one
-    /// `uvec4` holding the bits of four `f32`s, `[sx, a, b, clip]`, which the function applies to
-    /// its position as `(sx x, y, a w + b z, w)`, clipping at `z` and `w - z` where `clip` is 1
-    /// (`BindState::viewport_compensation`).
-    ViewportCompensation,
-    /// The draw's point guard band for a vertex function compiled under
-    /// `ViewportCompensation::point_guard`: one `uvec2` holding the bits of two `f32`s,
-    /// `[gx, gy]`, the inverse powers of two its Vulkan viewports are widened by, which the
-    /// function scales its position's `x` and `y` by (`CompensatedViewport::guard`).
-    PointGuard,
     /// The draw's depth clamp range for a fragment function compiled under
     /// `LoweringInputs::depth_clamp_range` (`RuntimeFact::DepthClampRange`): one `uvec2` holding
     /// the bits of two `f32`s, `[low, high]`, which the function clamps the depth it writes to
-    /// after Metal's `[0, 1]` (`BindState::depth_clamp_range`).
+    /// after Metal's `[0, 1]`.
     DepthClampRange,
-    /// The draw's mirrored viewports for a vertex function compiled under
-    /// `ViewportCompensation::mirrors`: one `u32` whose bit `i` is set where viewport `i` has a
-    /// negative width, which the function negates its position's `x` by for the viewport it
-    /// selects (`CompensatedViewport::mirrors`).
-    ViewportMirrors,
-    /// The draw's clamp of each vertex's depth for a vertex function compiled under
-    /// `ViewportCompensation::vertex_clamp`: one `uvec2` holding the bits of two `f32`s,
-    /// `[lo, hi]`, which the function clamps its compensated depth's `z / w`, the Vulkan
-    /// viewport's normalized depth, to before the interpolation (`CompensatedViewport::vertex_clamp`).
-    VertexDepthClamp,
-    /// The draw's depth state for a fragment function that runs the draw's depth test itself
-    /// (`RuntimeFact::ShaderTests`), a `uvec4`: word 0 holds the depth `MTLCompareFunction` in
-    /// bits 0 to 2, whether depth writes are enabled in bit 3, and whether the encoder's depth
-    /// clip mode is `MTLDepthClipModeClamp` in bit 4; words 1 and 2 the bits of viewport 0's near
-    /// and far depth (`f32`); word 3 is 0 (`bind::shader_tests_words`).
-    ShaderTestsState,
     /// The draw's layout for a vertex function compiled in the primitive ID's de-indexed form
     /// (`LoweringInputs::primitive_id_indices`), a `uvec4`, of a draw run from vertex 0: 0, the
     /// index count, the first instance, and the base vertex. Stream position `p = VertexIndex`
     /// reads its raw index at `PushField::CaptureIndexAddress`, and its vertex is that index plus
     /// the base vertex.
     CaptureLayout,
-    /// The channels each storage-form color attachment's write keeps from its texel, where the
-    /// fragment function takes them from the draw: one `u32` whose bits `4c` to `4c + 3` are color
-    /// `c`'s `R`, `G`, `B` and `A`, set where the pipeline's write mask leaves the channel out
-    /// (`StorageAttachmentUse::kept`), so every write mask that keeps some of a format's channels
-    /// shares one module.
-    StorageKeptChannels,
-    /// The draw's stencil state for a fragment function that runs the draw's stencil test itself
-    /// beside its depth test (`RuntimeFact::ShaderStencilTest`), a `uvec4`: words 0 and 1 the
-    /// front face's and the back face's words, each holding the face's `MTLCompareFunction` in
-    /// bits 0 to 2, its stencil-failure and depth-stencil-pass `MTLStencilOperation`s in bits 3 to
-    /// 5 and 6 to 8, its read mask in bits 9 to 16, its write mask in bits 17 to 24, and its
-    /// depth-failure operation in bits 25 to 27; word 2 the front reference in bits 0 to 7 and
-    /// the back reference in bits 8 to 15 (`BindState::stencil_references`); word 3 is 0
-    /// (`bind::shader_stencil_words`).
-    ShaderStencilState,
     /// The channel widths of the storage texture bound to the slot (`u32`;
     /// `metal::format::integer_channels_word`, 0 where the binder binds a neutral): byte `c`
     /// holds `32 - bits` of channel `c` (red to alpha) of an integer format narrower than 32 bits,
@@ -1185,36 +959,72 @@ pub enum PushField {
     /// signedness, as Metal stores it (`RuntimeFact::StorageTextureIntegerChannels`, a slot whose
     /// storage choice declares no format).
     TextureIntegerChannels(SlotRef),
+    /// Under the identity domains, how Metal's bicubic filter treats the texels of the texture
+    /// bound to the slot (`u32`; `metal::format::bicubic_texels_word`, the bits the binder
+    /// specializes `SpecKey::BicubicTexels` to elsewhere, `metal::format::BICUBIC_TEXELS_UNBOUND`
+    /// where the slot is bound to nothing): a bicubic sample of the slot selects its filter, clamp
+    /// and border texels on it at run time, so one module serves every bound format.
+    BicubicTexels(SlotRef),
     /// The render encoder's blend color (`setBlendColorRed:green:blue:alpha:`) for a fragment
     /// function that computes a blend in the shader under a blend that reads it (an
-    /// extended-range attachment's, or a fetched attachment's in the storage form): one `uvec4`
-    /// holding the four `f32`s' bits as the encoder set them (`BindState::blend_color`).
+    /// extended-range attachment's, or a rotated one's): one `uvec4`
+    /// holding the four `f32`s' bits as the encoder set them.
     HalfBlendColor,
     /// The render encoder's alpha test reference (`setAlphaTestReferenceValue:`) for a fragment
     /// function compiled under `LoweringInputs::alpha_test`: one `u32`, the reference's 8-bit
-    /// unorm code as Metal's alpha test compares it (`bind::alpha_test_code` of
-    /// `BindState::alpha_test_reference`), which the function compares its color 0's alpha's code
-    /// with.
+    /// unorm code as Metal's alpha test compares it (`bind::alpha_test_code` of the reference),
+    /// which the function compares its color 0's alpha's code with.
     AlphaTestReference,
-    /// The planes of the two-plane YCbCr texture bound to the slot, read in place
-    /// (`RuntimeFact::YCbCrInPlace`, `LoweringInputs::ycbcr_in_place`): two `uvec4`s, the
-    /// texture's size, its planes' first elements and rows in the slot's texel buffer, and its
-    /// conversion (`bind::YCbCrInPlace::words`), from the bound texture's facts
-    /// (`TextureFacts::ycbcr_in_place`).
-    YCbCrInPlace(SlotRef),
-    /// The rows of the 2D texture bound to the slot in its texel buffer view, read and written in
-    /// place (`RuntimeFact::TexelRows`, `LoweringInputs::texel_rows`): one `uvec4`, the texture's
-    /// width and height, its rows in texels and its first texel in the view
-    /// (`bind::TexelRows::words`), from the bound texture's facts (`TextureFacts::texel_rows`).
-    TexelRows(SlotRef),
-    /// The value a draw or dispatch binds for specialization key `key`, carried as data rather
-    /// than specialized: one `u32` holding exactly the value the binder computes for the key's
-    /// specialization constant from the bound textures and samplers (a boolean key as 1 or 0; a
-    /// `SamplerState` word masked by its `fields`). A function that reads a key this way declares
-    /// no specialization constant for it, so its pipelines' keys do not carry the value and one
-    /// `VkPipeline` serves every value. Last in the order, so these fields follow every other kind
-    /// into the window and from there into the `ArgumentTable`.
-    Specialized(SpecKey),
+    /// Under the identity domains, the sampler a sample takes through a constexpr sampler
+    /// (`SamplerRef::Constexpr`), used as the field's [`CombinedSampler`] states: one `u32`, the
+    /// index (1 to 3,999, `docs/RESOURCE-ID.md`) of the element of the set-1 sampler array of the
+    /// use (plain, compare, or integer texture) that holds the device's sampler
+    /// [`CombinedSampler::constexpr_sampler`] describes, as a runtime sampler's resource ID names
+    /// its element. Metal compiles a constexpr sampler into the function; the consumer makes it
+    /// a device sampler of its own. The use's coordinates are normalized: the function scales a
+    /// pixel sampler's coordinates itself.
+    ConstexprSampler(CombinedSampler),
+    /// Under the identity domains, the device address of the factors a tessellation pipeline's
+    /// synthesized control stage reads (`u64`): the factor buffer's address plus the encoder's
+    /// offset (`setTessellationFactorBuffer:offset:instanceStride:`). No function places it: the
+    /// pipeline's interface states it in a vertex-stage placement of its own, at the
+    /// `TessellationState::push_offset`.
+    TessellationFactorAddress,
+    /// The device address (`u64`, a multiple of 16) of the runtime's memory that holds a kernel's
+    /// private arena past the floor (`RuntimeFact::PrivateArena`): one slot of the fact's
+    /// `slot_bytes` for each invocation of the dispatch, the invocation's slot its index in its
+    /// dispatch, `((wz · ny + wy) · nx + wx) · n + LocalInvocationIndex` with `(wx, wy, wz)` its
+    /// `WorkgroupId`, `(nx, ny, nz)` the dispatch's `NumWorkgroups` and `n` its workgroup's
+    /// invocations. The memory holds a slot for every invocation of the dispatch, and no other
+    /// dispatch that may run beside it reaches those slots. Nothing is zeroed: the arena's bytes
+    /// are undefined until the thread writes them, as Metal's private memory is.
+    PrivateArenaAddress,
+    // The check's fields come last in the order: what every access reads is placed ahead of what
+    // only a checked access reads, so where a function's fields spill into its parameter block
+    // they are the first to go.
+    /// Under the identity domains, the device address (`u64`) of 16 bytes of zeros, at a multiple
+    /// of 16, that nothing writes: a load of a buffer slot checked against its `SlotBounds`
+    /// reads each of its units there where the check fails, so it reads zero (`docs/API.md`,
+    /// section 5). Being a multiple of 16 it is never `u64::MAX`, the value a floor stage whose
+    /// tail it is tests for (`lower::push::tail_never_pushed`).
+    ZeroAddress,
+    /// Under the identity domains, a buffer slot's buffer (`uvec2`): the bytes of the buffer before
+    /// the slot's bind offset (the bind offset), then the buffer's length; for a `set*Bytes` copy 0
+    /// and its length, for nil 0 and 0. A load, store or atomic of the slot at a byte offset `m`
+    /// from the bind offset, read as signed, that is not a translation-time constant is checked
+    /// against the buffer, `(len >= n) && (m + before <= len - n)` in `u32`, as `m + before <
+    /// len - min(len, n - 1)` with the limit made once per slot and size: outside, a load reads
+    /// zero at `ZeroAddress` and a store or atomic runs nothing (`docs/API.md`, section 5). A
+    /// buffer is at most 2 GiB, so the length is never `u32::MAX`: a floor stage whose tail it is
+    /// tests whether both words are all ones (`lower::push::tail_never_pushed`), which the consumer
+    /// never pushes.
+    SlotBounds(SlotRef),
+    /// On `Device::from_queries`' profile, the zero word (`u32`) a stage
+    /// whose pushed fields include no tail kind (`lower::push::tail_kind`) pushes as its tail,
+    /// `lower::push::HOLE_BYTES` above them, and tests whether it is non-zero: the consumer pushes
+    /// it zero with the stage's other fields, so the test never holds. No placement lists it
+    /// among its fields: it is the push-block member at `PushPlacement::tail_word`.
+    TailWord,
 }
 
 /// A relocatable literal: which decoration operand the serializer reserved, and for what.
@@ -1323,10 +1133,10 @@ mod tests {
     #[test]
     fn push_fields_order_by_d13_kind_order() {
         let ordered = [
+            PushField::ArgumentTableAddress,
             PushField::RootTableAddress,
             PushField::ExecutionStatusAddress,
             PushField::CaptureIndexAddress,
-            PushField::SnapshotPhase,
             PushField::DispatchRegion,
             PushField::ReplayRegionAddress,
             PushField::BaseVertexInstance,

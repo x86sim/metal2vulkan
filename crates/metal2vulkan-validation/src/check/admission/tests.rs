@@ -1,5 +1,4 @@
 use super::*;
-use crate::observation::Backend;
 use crate::source::SourceRow;
 use crate::ScratchDir;
 
@@ -33,12 +32,6 @@ done:
   ret void
 }
 "#;
-
-const HOST_BACKEND: Backend = if cfg!(target_os = "macos") {
-    Backend::Moltenvk
-} else {
-    Backend::Vulkan
-};
 
 /// A scratch corpus holding one installed case over `body`.
 fn corpus(body: &str, fuel: Option<u32>) -> (ScratchDir, AuthoredCase) {
@@ -209,7 +202,6 @@ fn a_metal_row_from_an_earlier_oracle_needs_metal_qualification() {
             root.path(),
             case.clone(),
             device,
-            HOST_BACKEND,
             environment_id,
             "admission-candidate",
             // The run stops before any compile, so no worker is started.
@@ -289,7 +281,6 @@ fn the_engine_candidate_is_admitted_whatever_its_loops() {
             root.path(),
             case.clone(),
             device,
-            HOST_BACKEND,
             "admission-oracle",
             "admission-candidate",
             // The run stops before any compile, so no worker is started.
@@ -330,7 +321,7 @@ fn no_environment_variable_selects_the_loop_budget() {
             }
         }
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = metal2vulkan_devtools::validation_dir();
     let mut files = Vec::new();
     sources(&root.join("src"), &mut files);
     sources(&root.join("tests"), &mut files);

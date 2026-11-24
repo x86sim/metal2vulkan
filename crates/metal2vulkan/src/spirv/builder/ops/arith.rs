@@ -1,14 +1,21 @@
 //! Arithmetic, bitwise, logical, comparison, linear-algebra, select, and bit-field constructors.
 
 use crate::spirv::builder::function::FunctionBuilder;
-use crate::spirv::builder::module::ProductForm;
 use crate::spirv::builder::ops::{err, Num};
 use crate::spirv::error::{BResult, OperandRule};
 use crate::spirv::ids::{TypeId, Value};
 use crate::spirv::ir::{
-    BinOp, ConstBits, ConstKind, Constant, Contraction, GlslOp, Inst, Shape, Type, UnOp,
+    BinOp, ConstBits, ConstKind, Constant, Contraction, ConvOp, Inst, Shape, Type, UnOp,
     ValueOrigin,
 };
+
+/// Whose sign a signed remainder takes ([`FunctionBuilder::signed_remainder`]): the dividend's, as
+/// LLVM's `srem` and Metal's `%` (SPIR-V's `OpSRem`), or the divisor's (`OpSMod`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemainderSign {
+    Dividend,
+    Divisor,
+}
 
 impl FunctionBuilder<'_> {
     /// A unary operation. Result types: `IsNan`/`IsInf` give `bool` of the operand's component
@@ -70,19 +77,7 @@ impl FunctionBuilder<'_> {
     /// the operation on its own and never fuses it with another. `op` must allow the decoration
     /// ([`BinOp::allows_no_contraction`]).
     ///
-    /// A multiply (`FMul`) takes the module's [`ProductForm`]: an `OpFMul` decorated
-    /// `NoContraction` where the device's driver compiles the SPIR-V itself, or `GLSL.std.450
-    /// Fma(a, b, -0.0)` decorated `NoContraction` where it reaches Metal through SPIRV-Cross. `a *
-    /// b + (-0.0)` is `a * b` exactly whether the device fuses it or rounds the product and then
-    /// the sum (`x + (-0.0)` is `x` for every `x`, either zero included). SPIRV-Cross, which
-    /// MoltenVK uses, renders a `NoContraction` `OpFMul` as `fma(l, r, 0)`, which answers `+0` for
-    /// a `-0` product; it renders the `Fma` as `fma(a, b, -0.0)`. Elsewhere the `-0.0` addend is a
-    /// value the device may answer: Mesa folds `Fma(0, b, -0.0)` to it under `nsz`, where Metal's
-    /// multiply answers `+0`, and no per-instruction decoration keeps it from doing so on Mesa
-    /// 26.2. The `Fma`'s decoration is still needed: Mesa splits a contractable `Fma` into a
-    /// multiply and an add and folds the `-0.0` away, leaving a multiply that may be fused with a
-    /// following add allowing contraction (NIR's `fuse` option on older Mesa, or a backend such as
-    /// ACO). Mesa's SPIR-V reader marks a `NoContraction` result exact, so it is not split.
+    /// A multiply (`FMul`) is an `OpFMul` decorated `NoContraction`, which the device rounds once.
     pub fn binary_no_contraction(&mut self, op: BinOp, a: Value, b: Value) -> BResult<Value> {
         self.binary_with(op, a, b, Contraction::Forbidden)
     }
@@ -107,8 +102,6 @@ impl FunctionBuilder<'_> {
             | BinOp::UDiv
             | BinOp::SDiv
             | BinOp::UMod
-            | BinOp::SRem
-            | BinOp::SMod
             | BinOp::BitwiseOr
             | BinOp::BitwiseXor
             | BinOp::BitwiseAnd => {
@@ -210,35 +203,132 @@ impl FunctionBuilder<'_> {
         if let Some(r) = self.fold_binary(op, a, b, ty)? {
             return Ok(r);
         }
-        if matches!(op, BinOp::FMul | BinOp::VectorTimesScalar)
-            && self.mb().product_form == ProductForm::PositiveZeroFactors
+        if matches!(op, BinOp::UMulExtended | BinOp::SMulExtended)
+            && self.num(a)?.is_some_and(|n| n.width == 64)
         {
-            if let Some(r) = self.product_by_positive_zeros(op, a, b, contract, ty)? {
+            return self.mul_extended_from_halves(op, a, b, ty);
+        }
+        if matches!(op, BinOp::FMul | BinOp::VectorTimesScalar) {
+            if let Some(r) = self.product_by_positive_zeros(op, a, b, contract)? {
                 return Ok(r);
             }
-        }
-        if op == BinOp::FMul
-            && contract == Contraction::Forbidden
-            && self.mb().product_form == ProductForm::NegativeZeroFma
-        {
-            let z = self.negative_zero(a)?;
-            return self.glsl_with(GlslOp::Fma, &[a, b, z], Contraction::Forbidden);
         }
         self.emit(Inst::Binary { op, a, b, contract }, ty)
     }
 
-    /// Under [`ProductForm::PositiveZeroFactors`], the product `op` of `a` and `b` where one of them
-    /// is an `f32` constant with a `-0.0` component: the product by that constant with each such
-    /// component `+0.0`, negated in those components of the result (`OpFNegate`, and an
-    /// `OpVectorShuffle` of the product and its negation where only some components are). `-(x ·
-    /// +0)` is `x · (−0)` for every `x`. `None` where neither factor is such a constant.
+    /// `OpUMulExtended` or `OpSMulExtended` (`op`) of the 64-bit lanes `a` and `b`, of the struct
+    /// type `ty`: the exact 128-bit product of each lane from four 32-bit `OpUMulExtended` of the
+    /// operands' halves, summed in 64-bit adds and shifts, its low and high words put together as
+    /// the instruction's struct. Signed, the high word is then corrected by subtracting each
+    /// operand where the other is negative (the product of the two's complement patterns read
+    /// unsigned exceeds the signed product's by `2^64` times each such operand).
+    ///
+    /// No 64-bit `MulExtended` is emitted: Intel's Windows driver
+    /// (`VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS` 101.2145 on the UHD Graphics 630) answers garbage
+    /// high words for both, different from run to run, while its 32-bit forms and its 64-bit
+    /// divisions are exact there (the runtime's device test
+    /// `a_kernel_s_64_bit_multiply_high_and_division_are_exact`, measured in job m3-max-32600).
+    fn mul_extended_from_halves(
+        &mut self,
+        op: BinOp,
+        a: Value,
+        b: Value,
+        ty: TypeId,
+    ) -> BResult<Value> {
+        let x = self.want(op.to_spirv(), 0, a, Num::is_int)?;
+        let u64_ = self.uint_ty(64)?;
+        let u32_ = self.uint_ty(32)?;
+        let (wide, narrow) = (self.vec_of(u64_, x.n)?, self.vec_of(u32_, x.n)?);
+        let splat = |fb: &mut Self, bits: u64| -> BResult<Value> {
+            let s = fb.module().constant(Constant::Scalar {
+                ty: u64_,
+                bits: ConstBits(bits),
+            })?;
+            let c = match x.n {
+                1 => s,
+                n => fb.module().constant(Constant::Composite {
+                    ty: wide,
+                    parts: vec![s; usize::from(n)].into(),
+                })?,
+            };
+            fb.module().const_value(c)
+        };
+        let as_wide = |fb: &mut Self, v: Value| -> BResult<Value> {
+            match fb.value_ty(v)? == wide {
+                true => Ok(v),
+                false => fb.convert(ConvOp::Bitcast, v, wide),
+            }
+        };
+        let (a, b) = (as_wide(self, a)?, as_wide(self, b)?);
+        let k32 = splat(self, 32)?;
+        let halves = |fb: &mut Self, v: Value| -> BResult<(Value, Value)> {
+            let low = fb.convert(ConvOp::UConvert, v, narrow)?;
+            let top = fb.binary(BinOp::ShiftRightLogical, v, k32)?;
+            let high = fb.convert(ConvOp::UConvert, top, narrow)?;
+            Ok((low, high))
+        };
+        let (a0, a1) = halves(self, a)?;
+        let (b0, b1) = halves(self, b)?;
+        // Each 32-bit product's words, widened to 64 bits.
+        let product = |fb: &mut Self, l: Value, r: Value| -> BResult<(Value, Value)> {
+            let p = fb.binary(BinOp::UMulExtended, l, r)?;
+            let low = fb.composite_extract(p, &[0])?;
+            let high = fb.composite_extract(p, &[1])?;
+            Ok((
+                fb.convert(ConvOp::UConvert, low, wide)?,
+                fb.convert(ConvOp::UConvert, high, wide)?,
+            ))
+        };
+        let (lo00, hi00) = product(self, a0, b0)?;
+        let (lo01, hi01) = product(self, a0, b1)?;
+        let (lo10, hi10) = product(self, a1, b0)?;
+        let (lo11, hi11) = product(self, a1, b1)?;
+        // Bits 32 to 63 of the product and their carry (below `3 * 2^32`, so no wrap).
+        let mid = self.binary(BinOp::IAdd, hi00, lo01)?;
+        let mid = self.binary(BinOp::IAdd, mid, lo10)?;
+        let mid_up = self.binary(BinOp::ShiftLeftLogical, mid, k32)?;
+        let low = self.binary(BinOp::BitwiseOr, lo00, mid_up)?;
+        let carry = self.binary(BinOp::ShiftRightLogical, mid, k32)?;
+        let top = self.binary(BinOp::ShiftLeftLogical, hi11, k32)?;
+        let high = self.binary(BinOp::IAdd, hi01, hi10)?;
+        let high = self.binary(BinOp::IAdd, high, lo11)?;
+        let high = self.binary(BinOp::IAdd, high, carry)?;
+        let mut high = self.binary(BinOp::IAdd, high, top)?;
+        if op == BinOp::SMulExtended {
+            let k63 = splat(self, 63)?;
+            let zero = splat(self, 0)?;
+            for (sign_of, other) in [(a, b), (b, a)] {
+                let sign = self.binary(BinOp::ShiftRightLogical, sign_of, k63)?;
+                let negative = self.binary(BinOp::INotEqual, sign, zero)?;
+                let less = self.select(negative, other, zero)?;
+                high = self.binary(BinOp::ISub, high, less)?;
+            }
+        }
+        let back = |fb: &mut Self, v: Value| -> BResult<Value> {
+            match x.ty == wide {
+                true => Ok(v),
+                false => fb.convert(ConvOp::Bitcast, v, x.ty),
+            }
+        };
+        let (low, high) = (back(self, low)?, back(self, high)?);
+        self.composite_construct(ty, &[low, high])
+    }
+
+    /// The product `op` of `a` and `b` where one of them is an `f32` constant with a `-0.0`
+    /// component, on every device: the product by that constant with each such component `+0.0`
+    /// (an `OpFMul`), negated in those components of the result
+    /// (`OpFNegate`, and an `OpVectorShuffle` of the product and its negation where only some
+    /// components are). `-(x · +0)` is `x · (−0)` for every `x`; a NaN's sign is the device's
+    /// either way. So no product the module emits has a `-0.0` factor beside a `+0.0` one, which a
+    /// driver may compile as one multiply (ANV's `brw` backend, Mesa 26.2.6, kept the first of two
+    /// products of one value by `+0.0` and `-0.0` and stored its result for both). `None` where
+    /// neither factor is such a constant.
     fn product_by_positive_zeros(
         &mut self,
         op: BinOp,
         a: Value,
         b: Value,
         contract: Contraction,
-        ty: TypeId,
     ) -> BResult<Option<Value>> {
         for (index, factor) in [(1, b), (0, a)] {
             let Some(negative) = self.negative_zero_components(factor)? else {
@@ -250,15 +340,8 @@ impl FunctionBuilder<'_> {
             } else {
                 (positive, b)
             };
-            let product = self.emit(
-                Inst::Binary {
-                    op,
-                    a: x,
-                    b: y,
-                    contract,
-                },
-                ty,
-            )?;
+            // The positive factor has no `-0.0` component, so this takes the module's form.
+            let product = self.binary_with(op, x, y, contract)?;
             let negated = self.unary(UnOp::FNegate, product)?;
             // A scalar factor of `OpVectorTimesScalar` scales every component.
             if negative.iter().all(|n| *n) {
@@ -329,24 +412,6 @@ impl FunctionBuilder<'_> {
         };
         let id = self.module().constant(positive)?;
         self.module().const_value(id)
-    }
-
-    /// The `-0.0` of `v`'s float scalar or vector type: the sign bit alone in each component.
-    fn negative_zero(&mut self, v: Value) -> BResult<Value> {
-        let x = self.want(crate::spv::Op::FMul, 0, v, Num::is_float)?;
-        let s = self.module().constant(Constant::Scalar {
-            ty: x.elem,
-            bits: ConstBits(1u64 << (x.width - 1)),
-        })?;
-        let c = if x.n == 1 {
-            s
-        } else {
-            self.module().constant(Constant::Composite {
-                ty: x.ty,
-                parts: vec![s; usize::from(x.n)].into(),
-            })?
-        };
-        self.module().const_value(c)
     }
 
     /// The value of `v` when it is a plain `bool` constant.
@@ -428,6 +493,87 @@ impl FunctionBuilder<'_> {
         self.module().const_value(c).map(Some)
     }
 
+    /// The signed remainder of integer `a` by `b` (scalars or vectors of one shape; the result has
+    /// `a`'s type) with the sign of `sign`'s operand, defined for operands of every sign on every
+    /// device: the unsigned remainder (`OpUMod`) of the operands' magnitudes, negated where the
+    /// dividend is negative, and for [`RemainderSign::Divisor`] then moved by the divisor where it
+    /// is not zero and the operands' signs differ. Vulkan makes `OpSRem` and `OpSMod` poison for a
+    /// negative operand unless the device enables `maintenance8`, so the builder emits neither. A
+    /// magnitude is the operand negated where it is negative, read unsigned, so the most negative
+    /// value's is `2^(w-1)` and its remainder by -1 is 0; a scalar constant's is computed here. A
+    /// zero divisor gives the device's `OpUMod` by zero; Metal leaves that undefined too.
+    pub fn signed_remainder(&mut self, a: Value, b: Value, sign: RemainderSign) -> BResult<Value> {
+        const OP: crate::spv::Op = crate::spv::Op::UMod;
+        let x = self.want(OP, 0, a, Num::is_int)?;
+        let y = self.want(OP, 1, b, Num::is_int)?;
+        if !x.same_shape(&y) {
+            return Err(err(OP, OperandRule::Mismatch(1)));
+        }
+        let u = self.uint_ty(x.width)?;
+        let u = self.vec_of(u, x.n)?;
+        let unsigned = |fb: &mut Self, v: Value| -> BResult<Value> {
+            match fb.value_ty(v)? == u {
+                true => Ok(v),
+                false => fb.convert(ConvOp::Bitcast, v, u),
+            }
+        };
+        let (a, b) = (unsigned(self, a)?, unsigned(self, b)?);
+        let zero = self.module().constant(Constant::Null { ty: u })?;
+        let zero = self.module().const_value(zero)?;
+        let (ma, na) = self.magnitude(a, zero)?;
+        let (mb, nb) = self.magnitude(b, zero)?;
+        let r = self.binary(BinOp::UMod, ma, mb)?;
+        let negated = self.unary(UnOp::SNegate, r)?;
+        let mut out = self.select(na, negated, r)?;
+        if sign == RemainderSign::Divisor {
+            let nonzero = self.binary(BinOp::INotEqual, r, zero)?;
+            let differ = match self.const_bool(nb)? {
+                Some(false) => na,
+                Some(true) => self.unary(UnOp::LogicalNot, na)?,
+                None => self.binary(BinOp::LogicalNotEqual, na, nb)?,
+            };
+            let moved = self.binary(BinOp::LogicalAnd, nonzero, differ)?;
+            let sum = self.binary(BinOp::IAdd, out, b)?;
+            out = self.select(moved, sum, out)?;
+        }
+        match x.ty == u {
+            true => Ok(out),
+            false => self.convert(ConvOp::Bitcast, out, x.ty),
+        }
+    }
+
+    /// The magnitude of integer `v` (of an unsigned type), read unsigned, and whether `v` is
+    /// negative read signed (`zero` is `v`'s type's zero); computed here where `v` is a scalar
+    /// constant.
+    fn magnitude(&mut self, v: Value, zero: Value) -> BResult<(Value, Value)> {
+        if let Some((bits, width, _)) = self.scalar_const(v)? {
+            let mask = if width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            let negative = (bits >> (width - 1)) & 1 == 1;
+            let m = match negative {
+                true => bits.wrapping_neg() & mask,
+                false => bits,
+            };
+            let ty = self.value_ty(v)?;
+            let m = self.module().constant(Constant::Scalar {
+                ty,
+                bits: ConstBits(m),
+            })?;
+            let bool_ = self.bool_ty(1)?;
+            let n = self.module().constant(Constant::Scalar {
+                ty: bool_,
+                bits: ConstBits(u64::from(negative)),
+            })?;
+            return Ok((self.module().const_value(m)?, self.module().const_value(n)?));
+        }
+        let negative = self.binary(BinOp::SLessThan, v, zero)?;
+        let negated = self.unary(UnOp::SNegate, v)?;
+        Ok((self.select(negative, negated, v)?, negative))
+    }
+
     /// `OpSelect`: `cond` is a `bool` or a `bool` vector with the objects' component count; the
     /// objects share one data type (no opaque value or logical pointer). Result: that type.
     pub fn select(&mut self, cond: Value, t: Value, f: Value) -> BResult<Value> {
@@ -456,25 +602,6 @@ impl FunctionBuilder<'_> {
             return Ok(if b != 0 { t } else { f });
         }
         self.emit(Inst::Select { cond, t, f }, ty)
-    }
-
-    /// `OpFmaKHR` (`SPV_KHR_fma`): `a * b + c` with one rounding, which Vulkan's precision table
-    /// makes correctly rounded. The three operands share one 16- or 32-bit float scalar or vector
-    /// type, the widths the core emits it at (its feature is `shaderFmaFloat16` or
-    /// `shaderFmaFloat32`). Result: that type.
-    pub fn fma(&mut self, a: Value, b: Value, c: Value) -> BResult<Value> {
-        const OP: crate::spv::Op = crate::spv::Op::FmaKHR;
-        let x = self.want(OP, 0, a, Num::is_float)?;
-        if x.width != 32 && x.width != 16 {
-            return Err(err(OP, OperandRule::Width(0)));
-        }
-        if self.value_ty(b)? != x.ty {
-            return Err(err(OP, OperandRule::Mismatch(1)));
-        }
-        if self.value_ty(c)? != x.ty {
-            return Err(err(OP, OperandRule::Mismatch(2)));
-        }
-        self.emit(Inst::Fma { a, b, c }, x.ty)
     }
 
     /// `OpBitFieldInsert`: `base` and `insert` share one 32-bit integer type (Vulkan), `offset`

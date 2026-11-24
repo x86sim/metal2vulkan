@@ -17,7 +17,7 @@
 //!
 //! Four of the six cases are built on the two committed domain fixtures,
 //! `k7_tess_quad_domain` and `k7_tess_triangle_domain`, which were written for the validation
-//! lane and are widened here rather than copied. Each is a `vertex void` post-tessellation vertex
+//! crate and are widened here rather than copied. Each is a `vertex void` post-tessellation vertex
 //! function with rasterization disabled, and for every domain point the tessellator calls it with
 //! it stores a mark at that point's cell of a 65-by-65 grid, `marks[j · 65 + i]` for
 //! `i = rint(u · grid.x)` and `j = rint(v · grid.y)`, the two scales coming from the patch's own
@@ -56,11 +56,10 @@
 //! three readings now have a measurement behind them — the answers these cases recorded are
 //! Metal's own, on the venue they were recorded on.
 //!
-//! `tessellation-triangle-order` and `emulated-tessellation-draws` are named too, for the venues
-//! that announce them: a device whose tessellator is not Apple's orders a patch's triangles its own
-//! way, and a device without `tessellationShader` draws the emulation's. Neither can move a mark,
-//! because a mark is a set member and not a position in a triangle stream; they are named because
-//! a notice our run announces that no case names is a divergence. Neither fired on MoltenVK over an
+//! `tessellation-triangle-order` is named too, for the venues that announce it: a device whose
+//! tessellator is not Apple's orders a patch's triangles its own way. It cannot move a mark,
+//! because a mark is a set member and not a position in a triangle stream; it is named because a
+//! notice our run announces that no case names is a divergence. It did not fire on MoltenVK over an
 //! Apple M3 Max, which is what says that venue draws a patch through Metal's own tessellator.
 //!
 //! # What the recorded answers settle
@@ -142,7 +141,11 @@
 //! validation refuses, so this family adds no refusal-surface row.
 
 use crate::allowance::Allowance;
-use crate::case::{call, made, probe, Abort, Case, Failure, Handle, Input, MetalSource, Side};
+use crate::case::{
+    call, drawn_or_refused, made, pipeline_or_refused, refused_leg, Abort, Case, Failure, Handle,
+    Input, MetalSource, Side,
+};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -154,7 +157,6 @@ use metal2vulkan::metal::{
     TessellationControlPointIndexType as IndexType, TessellationFactorStepFunction as Step,
     TessellationPartitionMode as Partition, VertexFormat, VertexStepFunction,
 };
-use metal2vulkan_runtime::Degradation;
 
 // ---- The domain fixtures ----------------------------------------------------------------------
 
@@ -326,12 +328,11 @@ fn marks_layout(offset: u64) -> ByteLayout {
 
 /// The notices every tessellation pipeline of ours can announce, which every case here names.
 ///
-/// The first two are unconditional on a tessellation pipeline. The last two are a venue's: a device
-/// whose tessellator is not Apple's announces `tessellation-triangle-order`, and one without
-/// `tessellationShader` announces `emulated-tessellation-draws`. Neither fires on MoltenVK over an
-/// Apple GPU (verified: the replay of `tessellation-patch-indices` on an Apple M3 Max fired two of
-/// the declarations and no other), and both are named so a run on a venue that does announce one
-/// reads it as declared rather than as an undeclared divergence.
+/// The first two are unconditional on a tessellation pipeline. The third is a venue's: a device
+/// whose tessellator is not Apple's announces `tessellation-triangle-order`. It does not fire on
+/// MoltenVK over an Apple GPU (verified: the replay of `tessellation-patch-indices` on an Apple M3
+/// Max fired two of the declarations and no other), and it is named so a run on a venue that does
+/// announce it reads it as declared rather than as an undeclared divergence.
 ///
 /// `tessellation-factor-instance` is **not** here: only a per-instance factor step provokes it, and
 /// only [`FactorSteps`] sets one, so naming it everywhere else would be a declaration no case could
@@ -341,16 +342,23 @@ pub(super) fn tessellation_notices() -> Vec<Allowance> {
         Degradation::TessellationWinding,
         Degradation::TessellationFactorEdgeCases,
         Degradation::TessellationTriangleOrder,
-        Degradation::EmulatedTessellationDraws,
     ]
     .into_iter()
     .map(|notice| crate::replay::notice_allowance(notice.code()))
-    .chain([
-        // The factor, control-point and read-back buffers a tessellated draw carries are all
-        // `Shared` ([`crate::replay::shared_memory_notice`]).
-        crate::replay::shared_memory_notice(),
-    ])
+    .chain([])
     .collect()
+}
+
+/// The notice declarations of a case that crosses the four partition modes: [`tessellation_notices`]
+/// and `tessellation-fractional-spacing`, which each pipeline of a fractional partition drawn
+/// through the device's tessellator announces, as `tessellation-rendered-patches` declares it.
+/// Declarations of the notices site alone: every mark compares exactly.
+pub(super) fn partition_notices() -> Vec<Allowance> {
+    let mut all = tessellation_notices();
+    all.push(crate::replay::notice_allowance(
+        Degradation::TessellationFractionalSpacing.code(),
+    ));
+    all
 }
 
 // ---- The partition-mode and factor sweeps over a domain ---------------------------------------
@@ -468,8 +476,9 @@ impl Case for PartitionModes {
 
     fn allowances(&self) -> Vec<Allowance> {
         // Nothing observed is loosened: a mark is a word that is 0 or 1 and a cell is a cell.
-        // These are the notice declarations the module docs explain.
-        tessellation_notices()
+        // These are the notice declarations the module docs explain, with the fractional
+        // spacing's, since the sweep draws the two fractional modes.
+        partition_notices()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -516,18 +525,17 @@ impl Case for PartitionModes {
 
         let mut pipelines = Vec::with_capacity(modes.len());
         for &mode in &modes {
-            pipelines.push(probe(
+            pipelines.push(pipeline_or_refused(
                 sites,
                 &format!("{}/pipeline", partition_site(mode)),
                 side.render_pipeline(library, &domain_pipeline(fixture.entry, self.state(mode))),
-                |_| Value::Absent,
             ));
         }
 
         let mut work = Vec::new();
         let mut drawn = Vec::new();
         for (at, pipeline) in pipelines.iter().enumerate() {
-            let Some(pipeline) = pipeline else { continue };
+            let Ok(pipeline) = pipeline else { continue };
             drawn.push(at);
             work.push(RenderWork::Pass(RenderPass::sized([1, 1]).drawing(
                 one_patch_steps(*pipeline, grid, factors, marks, at as u32 * REGION_BYTES, 1),
@@ -544,16 +552,15 @@ impl Case for PartitionModes {
         for (at, &mode) in modes.iter().enumerate() {
             let base = at as u64 * u64::from(REGION_BYTES);
             let region = read_marks(side, sites, partition_site(mode), marks, base)?;
-            let mut node = Node::branch(partition_site(mode), Vec::new()).with(Node::leaf(
+            let node = Node::branch(partition_site(mode), Vec::new()).with(Node::leaf(
                 "marks",
                 Observed::bytes(region, marks_layout(base)),
             ));
-            if let Some(pass) = drawn.iter().position(|held| *held == at) {
-                if let Some(Some(failure)) = outcome.refused.get(pass) {
-                    node = node.with(Node::leaf("pass", Observed::value(failure.recorded())));
-                }
-            }
-            nodes.push(node);
+            let pass = drawn.iter().position(|held| *held == at);
+            nodes.push(drawn_or_refused(
+                node,
+                refused_leg(&pipelines[at], &outcome, pass),
+            ));
         }
         sites.push(Node::branch(self.domain.patch_type(), nodes));
         Ok(())
@@ -665,15 +672,14 @@ impl Case for EdgeFactors {
             "buffer/marks",
             side.buffer(&vec![0u8; FACTOR_SITES.len() * REGION_BYTES as usize]),
         )?;
-        let pipeline = probe(
+        let pipeline = pipeline_or_refused(
             sites,
             "pipeline",
             side.render_pipeline(library, &domain_pipeline(fixture.entry, self.state())),
-            |_| Value::Absent,
         );
 
         let mut work = Vec::new();
-        if let Some(pipeline) = pipeline {
+        if let Ok(&pipeline) = pipeline.as_ref() {
             for (at, _) in FACTOR_SITES.iter().enumerate() {
                 let mut steps =
                     one_patch_steps(pipeline, grid, factors, marks, at as u32 * REGION_BYTES, 1);
@@ -693,14 +699,14 @@ impl Case for EdgeFactors {
         for (at, (site, _)) in FACTOR_SITES.iter().enumerate() {
             let base = at as u64 * u64::from(REGION_BYTES);
             let region = read_marks(side, sites, site, marks, base)?;
-            let mut node = Node::branch(*site, Vec::new()).with(Node::leaf(
+            let node = Node::branch(*site, Vec::new()).with(Node::leaf(
                 "marks",
                 Observed::bytes(region, marks_layout(base)),
             ));
-            if let Some(Some(failure)) = outcome.refused.get(at) {
-                node = node.with(Node::leaf("pass", Observed::value(failure.recorded())));
-            }
-            sites.push(node);
+            sites.push(drawn_or_refused(
+                node,
+                refused_leg(&pipeline, &outcome, Some(at)),
+            ));
         }
         Ok(())
     }
@@ -904,15 +910,14 @@ impl Case for NonFiniteFactors {
             "buffer/marks",
             side.buffer(&vec![0u8; cells.len() * REGION_BYTES as usize]),
         )?;
-        let pipeline = probe(
+        let pipeline = pipeline_or_refused(
             sites,
             "pipeline",
             side.render_pipeline(library, &domain_pipeline(QUAD.entry, self.state())),
-            |_| Value::Absent,
         );
 
         let mut work = Vec::new();
-        if let Some(pipeline) = pipeline {
+        if let Ok(&pipeline) = pipeline.as_ref() {
             for at in 0..cells.len() {
                 let mut steps =
                     one_patch_steps(pipeline, grid, factors, marks, at as u32 * REGION_BYTES, 1);
@@ -932,7 +937,7 @@ impl Case for NonFiniteFactors {
         // Each value is one branch holding the placements asked of it, and the control — which has
         // no placement — holds its marks directly, so the transcript says which of Metal's two
         // rules each answer is of.
-        let mut groups: Vec<(&'static str, Vec<Node>)> = Vec::new();
+        let mut groups: Vec<Node> = Vec::new();
         for (at, cell) in cells.iter().enumerate() {
             let base = at as u64 * u64::from(REGION_BYTES);
             let site = match cell.placement {
@@ -940,24 +945,24 @@ impl Case for NonFiniteFactors {
                 Some(placement) => format!("{}/{}", cell.value, placement.site()),
             };
             let region = read_medium_marks(side, sites, &site, marks, base)?;
-            let mut leaves = vec![Node::leaf(
+            let leaves = vec![Node::leaf(
                 "marks",
                 Observed::bytes(region, medium_layout(base)),
             )];
-            if let Some(Some(failure)) = outcome.refused.get(at) {
-                leaves.push(Node::leaf("pass", Observed::value(failure.recorded())));
-            }
-            let held = match cell.placement {
-                None => leaves,
-                Some(placement) => vec![Node::branch(placement.site(), leaves)],
-            };
-            match groups.last_mut() {
-                Some((value, nodes)) if *value == cell.value => nodes.extend(held),
-                _ => groups.push((cell.value, held)),
+            let refused = refused_leg(&pipeline, &outcome, Some(at));
+            match cell.placement {
+                None => groups.push(drawn_or_refused(Node::branch(cell.value, leaves), refused)),
+                Some(placement) => {
+                    let held = drawn_or_refused(Node::branch(placement.site(), leaves), refused);
+                    match groups.last_mut() {
+                        Some(group) if group.name == cell.value => group.children.push(held),
+                        _ => groups.push(Node::branch(cell.value, vec![held])),
+                    }
+                }
             }
         }
-        for (value, nodes) in groups {
-            sites.push(Node::branch(value, nodes));
+        for group in groups {
+            sites.push(group);
         }
         Ok(())
     }
@@ -1161,17 +1166,16 @@ impl Case for FactorSteps {
         let all = steps();
         let mut pipelines = Vec::with_capacity(all.len());
         for &step in &all {
-            pipelines.push(probe(
+            pipelines.push(pipeline_or_refused(
                 sites,
                 &format!("{}/pipeline", step.name()),
                 side.render_pipeline(library, &domain_pipeline(QUAD.entry, self.state(step))),
-                |_| Value::Absent,
             ));
         }
 
         let mut work = Vec::new();
         for (at, pipeline) in pipelines.iter().enumerate() {
-            let Some(pipeline) = pipeline else { continue };
+            let Ok(pipeline) = pipeline else { continue };
             for (leg, held) in STEP_LEGS.iter().enumerate() {
                 let region = Self::region(at, leg) * REGION_BYTES;
                 work.push(RenderWork::Pass(RenderPass::sized([1, 1]).drawing(vec![
@@ -1214,17 +1218,16 @@ impl Case for FactorSteps {
                 let base = u64::from(Self::region(at, leg) * REGION_BYTES);
                 let site = format!("{}/{}", step.name(), named.site);
                 let region = read_coarse_marks(side, sites, &site, marks, base)?;
-                let mut held = Node::branch(named.site, Vec::new()).with(Node::leaf(
+                let held = Node::branch(named.site, Vec::new()).with(Node::leaf(
                     "marks",
                     Observed::bytes(region, coarse_layout(base)),
                 ));
-                if pipelines[at].is_some() {
-                    if let Some(Some(failure)) = outcome.refused.get(pass) {
-                        held = held.with(Node::leaf("pass", Observed::value(failure.recorded())));
-                    }
-                    pass += 1;
-                }
-                node = node.with(held);
+                let drawn = pipelines[at].is_ok().then_some(pass);
+                pass += usize::from(drawn.is_some());
+                node = node.with(drawn_or_refused(
+                    held,
+                    refused_leg(&pipelines[at], &outcome, drawn),
+                ));
             }
             sites.push(node);
         }
@@ -1558,18 +1561,17 @@ impl Case for FactorScales {
         )?;
         let mut pipelines = Vec::with_capacity(2);
         for enabled in [true, false] {
-            pipelines.push(probe(
+            pipelines.push(pipeline_or_refused(
                 sites,
                 &format!("{}/pipeline", Self::pipeline_site(enabled)),
                 side.render_pipeline(library, &domain_pipeline(QUAD.entry, Self::state(enabled))),
-                |_| Value::Absent,
             ));
         }
 
         let mut work = Vec::new();
         let mut drawn = Vec::new();
         for (at, cell) in SCALE_CELLS.iter().enumerate() {
-            let Some(pipeline) = pipelines[usize::from(!cell.enabled)] else {
+            let Ok(&pipeline) = pipelines[usize::from(!cell.enabled)].as_ref() else {
                 continue;
             };
             drawn.push(at);
@@ -1597,16 +1599,16 @@ impl Case for FactorScales {
                 }
                 let base = at as u64 * u64::from(REGION_BYTES);
                 let region = read_medium_marks(side, sites, cell.site, marks, base)?;
-                let mut node = Node::branch(cell.site, Vec::new()).with(Node::leaf(
+                let node = Node::branch(cell.site, Vec::new()).with(Node::leaf(
                     "marks",
                     Observed::bytes(region, medium_layout(base)),
                 ));
-                if let Some(pass) = drawn.iter().position(|held| *held == at) {
-                    if let Some(Some(failure)) = outcome.refused.get(pass) {
-                        node = node.with(Node::leaf("pass", Observed::value(failure.recorded())));
-                    }
-                }
-                nodes.push(node);
+                let pass = drawn.iter().position(|held| *held == at);
+                let pipeline = &pipelines[usize::from(!cell.enabled)];
+                nodes.push(drawn_or_refused(
+                    node,
+                    refused_leg(pipeline, &outcome, pass),
+                ));
             }
             sites.push(Node::branch(Self::pipeline_site(enabled), nodes));
         }
@@ -1846,18 +1848,17 @@ impl Case for PatchIndices {
         }
         let mut pipelines = Vec::with_capacity(types.len());
         for &index_type in &types {
-            pipelines.push(probe(
+            pipelines.push(pipeline_or_refused(
                 sites,
                 &format!("{}/pipeline", index_type.name()),
                 side.render_pipeline(library, &self.pipeline(index_type)),
-                |_| Value::Absent,
             ));
         }
 
         let mut work = Vec::new();
         let mut drawn = Vec::new();
         for (at, pipeline) in pipelines.iter().enumerate() {
-            let Some(pipeline) = pipeline else { continue };
+            let Ok(pipeline) = pipeline else { continue };
             drawn.push(at);
             let region = at as u32 * PATCH_REGION_BYTES;
             let mut steps = vec![
@@ -1966,12 +1967,11 @@ impl Case for PatchIndices {
                     Observed::bytes(bytes.clone(), patch_words_layout(base)),
                 )),
             };
-            if let Some(pass) = drawn.iter().position(|held| *held == at) {
-                if let Some(Some(failure)) = outcome.refused.get(pass) {
-                    node = node.with(Node::leaf("pass", Observed::value(failure.recorded())));
-                }
-            }
-            sites.push(node);
+            let pass = drawn.iter().position(|held| *held == at);
+            sites.push(drawn_or_refused(
+                node,
+                refused_leg(&pipelines[at], &outcome, pass),
+            ));
         }
         Ok(())
     }
@@ -2131,12 +2131,75 @@ pub(super) fn load(fixture: Fixture) -> Result<crate::fixture::Loaded, Abort> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::case::PassOutcome;
 
     /// The four step functions the sweep names are every `MTLTessellationFactorStepFunction`
     /// there is, so a value the SDK grows is a failure here rather than a leg quietly missing.
     #[test]
     fn the_four_steps_are_every_factor_step_function() {
         assert_eq!(STEP_FUNCTIONS.to_vec(), Step::ALL.to_vec());
+    }
+
+    /// A leg our side did not draw answers with the refusal at the leg's own site and no marks:
+    /// the comparison holds that one refusal and nothing under it. The marks read back after a
+    /// refused pass are the buffer's starting bytes, and recorded they made a row for every cell
+    /// Metal marked. A leg drawn keeps its marks.
+    #[test]
+    fn a_refused_pass_is_the_legs_answer_and_no_marks() {
+        use crate::allowance::Offered;
+        use crate::transcript::Transcript;
+        let bytes = MEDIUM_WORDS as usize * 4;
+        let leg = |marks: Vec<u8>| {
+            Node::branch("factor-1", Vec::new()).with(Node::leaf(
+                "marks",
+                Observed::bytes(marks, medium_layout(0)),
+            ))
+        };
+        let metal = Transcript::new(vec![leg(vec![1; bytes])]);
+        let failure = Failure::named(
+            "Error::Unsupported",
+            "a render pass with NoAttachment is not built",
+        );
+        let ours = Transcript::new(vec![drawn_or_refused(leg(vec![0; bytes]), Some(&failure))]);
+        let found = crate::compare::compare(&metal, &ours, &[], Offered::notices(&[]));
+        assert!(found.divergences.is_empty(), "{found:?}");
+        let refused: Vec<&str> = found.refusals.iter().map(|at| at.path.as_str()).collect();
+        assert_eq!(refused, ["case/factor-1"], "{found:?}");
+        assert!(found.refusals[0].ours.contains("NoAttachment"), "{found:?}");
+
+        let drawn = drawn_or_refused(leg(vec![1; bytes]), None);
+        assert!(drawn.child("marks").is_some());
+        let found = crate::compare::compare(
+            &metal,
+            &Transcript::new(vec![drawn]),
+            &[],
+            Offered::notices(&[]),
+        );
+        assert!(found.is_exact(), "{found:?}");
+    }
+
+    /// A leg's refusal is its pipeline's where our side refused that, whatever the passes
+    /// answered, else its own pass's, and none for a leg drawn and answered.
+    #[test]
+    fn a_legs_refusal_is_its_pipelines_else_its_passs() {
+        let failure = |detail: &str| Failure::named("Error::Unsupported", detail);
+        let outcome = PassOutcome {
+            refused: vec![None, Some(failure("the pass"))],
+            status: Value::Absent,
+            error: None,
+        };
+        let refused = Err(failure("the pipeline"));
+        assert_eq!(
+            refused_leg(&refused, &outcome, None),
+            Some(&failure("the pipeline"))
+        );
+        let made = Ok(Handle(1));
+        assert_eq!(
+            refused_leg(&made, &outcome, Some(1)),
+            Some(&failure("the pass"))
+        );
+        assert_eq!(refused_leg(&made, &outcome, Some(0)), None);
+        assert_eq!(refused_leg(&made, &outcome, None), None);
     }
 
     /// The bytes the recording of `case` holds at the leaf `path` (node names from the root,

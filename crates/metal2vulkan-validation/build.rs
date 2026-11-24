@@ -7,9 +7,8 @@ use build_support::hash_files;
 use product_fingerprint::{collect_files, product_fingerprint};
 
 fn main() {
-    // The product fingerprint (`product_fingerprint.rs`): the translator's, the runtime's, and the
-    // dev-tools crate's sources beside this crate in the workspace's crates/, and nothing of this
-    // crate.
+    // The product fingerprint (`product_fingerprint.rs`): the translator's and the dev-tools
+    // crate's sources beside this crate in the workspace's crates/, and nothing of this crate.
     println!(
         "cargo:rustc-env=METAL2VULKAN_PRODUCT_FINGERPRINT={}",
         product_fingerprint(Path::new(".."))
@@ -26,6 +25,29 @@ fn main() {
     println!(
         "cargo:rustc-env=METAL2VULKAN_VALIDATION_FINGERPRINT={}",
         hex(&validation_hash.finalize())
+    );
+
+    // The runtime crate's sources (`metal2vulkan-runtime`: its manifest and the files its module
+    // tree compiles, `build_support::product_files`), through which the engine candidate runs a
+    // case: a row it ran is current only for this build of them
+    // (`candidate::engine::runtime_fingerprint`).
+    let runtime_crate = Path::new("../metal2vulkan-runtime");
+    println!(
+        "cargo:rerun-if-changed={}",
+        runtime_crate.join("src").display()
+    );
+    let mut runtime_crate_files = vec![runtime_crate.join("Cargo.toml")];
+    runtime_crate_files.extend(build_support::product_files(runtime_crate));
+    runtime_crate_files.sort();
+    let mut runtime_crate_hash = Sha256::new();
+    hash_files(
+        &mut runtime_crate_hash,
+        Path::new(".."),
+        &runtime_crate_files,
+    );
+    println!(
+        "cargo:rustc-env=METAL2VULKAN_RUNTIME_CRATE_FINGERPRINT={}",
+        hex(&runtime_crate_hash.finalize())
     );
 
     // Authoring-capability classification (`triage::ANALYZER_ABI`) reads exactly these files of
@@ -66,6 +88,7 @@ fn main() {
         "src/executor_contract/rate_map/layout.rs",
         "src/executor_contract/rate_map/value.rs",
         "src/executor_contract/sample_rate.rs",
+        "src/executor_contract/seq_cst_fence.rs",
         "src/requirement.rs",
         "src/check/cfg_fact.rs",
         "src/observation_contract.rs",
@@ -90,33 +113,27 @@ fn main() {
 
     // The product's runtime: the modules that act on a compiled pipeline after the compile, whose
     // behaviour C3's currency holds to `metal2vulkan::cache::RUNTIME_VERSION` beside an artifact's
-    // content digest. That is the binder (`src/bind`: planning, instantiation, the device replay,
-    // resident sets, status decoding), the device a run opens and what it enables (`src/device`,
+    // content digest. That is `src/bind` (argument-buffer layouts, the texel decoders, rate maps,
+    // indirect-command records, the device replay's helpers, the heap classes and status words),
+    // the device a run opens and what it enables (`src/device`,
     // `src/ash_interop`), the Vulkan and Metal vocabularies the runtime maps (`src/vk`,
     // `src/metal`, and the AIR front end's `metal2vulkan-air/src/metal`, whose `MTLDataType`
     // `metal` re-exports), the record and table formats it writes (indirect commands, the rate and
     // tile maps, function tables; the rate map's and function table's words are the AIR front end's
     // `metal2vulkan-air/src/canon` formats), root tables, handles and the threadgroup regions'
     // alignment (`src/memory`), the dispatch-region encoding (`src/lower/dispatch.rs`, and the
-    // used-parameter walk it reads, `src/lower/users.rs`), the shader-side stencil's shadow format
-    // and state word (`src/lower/fragment/stencil.rs`), an
-    // emulated mesh draw's work buffer layout (`src/lower/mesh/work.rs`), an emulated tessellation
-    // draw's work buffer layout, factor reads and tessellator, which its scan runs
-    // (`src/lower/tessellation/{work,factors,tessellator}.rs`),
+    // used-parameter walk it reads, `src/lower/users.rs`), a patch's factor bytes
+    // (`src/lower/tessellation/factors.rs`),
     // the sRGB steps the ASTC and PVRTC decoders read (`src/lower/arith/srgb.rs`), the sRGB
-    // transfer and half conversions the mipmap filter takes from `air.pack`'s lowering
-    // (`src/lower/arith/pack.rs`), the blend color an
-    // extended-range blend reads (`src/lower/arith/extended_range/blend_color.rs`), half-float
-    // conversion, and the Metal-like runtime (`metal2vulkan-runtime/src`, with the measured answers
-    // it reads), through which the executor runs the families that have moved onto it. The
-    // translator's paths above are below its crate (`metal2vulkan/src/...`). Each path is a product
-    // file below the workspace's crates/ directory, this crate's parent: those listed here, the
-    // binder's Rust sources under `metal2vulkan/src/bind/`, and every file under
-    // `metal2vulkan-runtime/src/`, test modules aside (`runtime_files`, so a file added under
-    // either joins), all sorted as strings. The guard test in `candidate::engine::artifact`
-    // requires this hash to be the one validation pins (`runtime-sources.sha256`), and the inputs
-    // to be closed over the module files their non-test code reaches (each is an input, or listed
-    // there with why a run does not depend on it beyond the artifact digest).
+    // encode the YCbCr write takes from `air.pack`'s lowering (`src/lower/arith/pack.rs`), and
+    // half-float conversion. The translator's paths above are below its crate (`metal2vulkan/src/...`). Each
+    // path is a product file below the workspace's crates/ directory, this crate's parent: those
+    // listed here and the Rust sources under `metal2vulkan/src/bind/`, test modules aside
+    // (`runtime_files`, so a file added there joins), all sorted as strings. The guard test in
+    // `candidate::engine::artifact` requires this hash to be the one validation pins
+    // (`runtime-sources.sha256`), and the inputs to be closed over the module files their non-test
+    // code reaches (each is an input, or listed there with why a run does not depend on it beyond
+    // the artifact digest).
     let listed = [
         "metal2vulkan-air/src/canon/function_table.rs",
         "metal2vulkan-air/src/canon/rate_map_data.rs",
@@ -128,10 +145,8 @@ fn main() {
         "metal2vulkan/src/device/check.rs",
         "metal2vulkan/src/device/derive.rs",
         "metal2vulkan/src/device/description.rs",
-        "metal2vulkan/src/device/driver_facts.rs",
         "metal2vulkan/src/device/enables.rs",
         "metal2vulkan/src/device/function_storage.rs",
-        "metal2vulkan/src/device/gpus.rs",
         "metal2vulkan/src/device/khronos.rs",
         "metal2vulkan/src/device/mechanism.rs",
         "metal2vulkan/src/device/metal.rs",
@@ -146,15 +161,10 @@ fn main() {
         "metal2vulkan/src/indirect_commands/host.rs",
         "metal2vulkan/src/lower/dispatch.rs",
         "metal2vulkan/src/lower/users.rs",
-        "metal2vulkan/src/lower/fragment/stencil.rs",
         "metal2vulkan/src/lower/arith/exact_division.rs",
-        "metal2vulkan/src/lower/arith/extended_range/blend_color.rs",
         "metal2vulkan/src/lower/arith/pack.rs",
         "metal2vulkan/src/lower/arith/srgb.rs",
-        "metal2vulkan/src/lower/mesh/work.rs",
         "metal2vulkan/src/lower/tessellation/factors.rs",
-        "metal2vulkan/src/lower/tessellation/tessellator.rs",
-        "metal2vulkan/src/lower/tessellation/work.rs",
         "metal2vulkan/src/memory/arena.rs",
         "metal2vulkan/src/memory/handles.rs",
         "metal2vulkan/src/memory/roots.rs",
@@ -173,7 +183,6 @@ fn main() {
         "metal2vulkan/src/metal/vertex.rs",
         "metal2vulkan/src/pipeline/table.rs",
         "metal2vulkan/src/pipeline/tile_map.rs",
-        "metal2vulkan/src/vk/draw.rs",
         "metal2vulkan/src/vk/generated.rs",
         "metal2vulkan/src/vk/mod.rs",
         "metal2vulkan/src/vk/structs.rs",
@@ -183,13 +192,6 @@ fn main() {
     runtime_files(
         &product,
         Path::new("metal2vulkan/src/bind"),
-        Walk::Sources,
-        &mut runtime_inputs,
-    );
-    runtime_files(
-        &product,
-        Path::new("metal2vulkan-runtime/src"),
-        Walk::Files,
         &mut runtime_inputs,
     );
     runtime_inputs.sort();
@@ -223,21 +225,12 @@ fn crate_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// What a walked directory gives the runtime's inputs.
-#[derive(Clone, Copy, PartialEq)]
-enum Walk {
-    /// Every file: the runtime crate's sources and the measured answers they read.
-    Files,
-    /// The Rust sources alone: the binder (`metal2vulkan/src/bind/`), whose non-test code reads no data file
-    /// (its `.txt` files are its tests' measured answers).
-    Sources,
-}
-
-/// Every file below `relative` under `product` that `walk` takes, but test modules (a `tests`
-/// directory, a `tests.rs` or `*_tests.rs` file) and hidden files, pushed as paths relative to
-/// `product` with `/` separators. Cargo reruns this script when anything under the directory
-/// changes, so a file added there joins the runtime's inputs.
-fn runtime_files(product: &Path, relative: &Path, walk: Walk, output: &mut Vec<String>) {
+/// Every Rust source below `relative` under `product` but test modules (a `tests` directory, a
+/// `tests.rs` or `*_tests.rs` file) and hidden files, pushed as paths relative to `product` with
+/// `/` separators: those of `metal2vulkan/src/bind/`, whose non-test code reads no data file
+/// (its `.txt` files are its tests' measured answers). Cargo reruns this script when anything
+/// under the directory changes, so a file added there joins the runtime's inputs.
+fn runtime_files(product: &Path, relative: &Path, output: &mut Vec<String>) {
     let directory = product.join(relative);
     println!("cargo:rerun-if-changed={}", directory.display());
     let entries = fs::read_dir(&directory)
@@ -251,12 +244,9 @@ fn runtime_files(product: &Path, relative: &Path, walk: Walk, output: &mut Vec<S
         let path = relative.join(&name);
         if entry.path().is_dir() {
             if name != "tests" {
-                runtime_files(product, &path, walk, output);
+                runtime_files(product, &path, output);
             }
-        } else if name != "tests.rs"
-            && !name.ends_with("_tests.rs")
-            && (walk == Walk::Files || name.ends_with(".rs"))
-        {
+        } else if name != "tests.rs" && !name.ends_with("_tests.rs") && name.ends_with(".rs") {
             output.push(path.to_string_lossy().replace('\\', "/"));
         }
     }

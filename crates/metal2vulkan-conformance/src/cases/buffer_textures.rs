@@ -1,11 +1,9 @@
 //! Textures laid over a buffer's bytes: which shapes Metal makes one of, what the made texture
 //! answers of itself, and where its texels are in the buffer.
 //!
-//! Ported from `runtime_lane::buffer_textures`. Metal's whole path here is **public** —
-//! `newTextureWithDescriptor:offset:bytesPerRow:` on an `MTLBuffer`, then `getBytes:`,
-//! `replaceRegion:` and the buffer's own `contents` — so record mode runs every case of this
-//! family on the oracle rather than carrying a table, and the lane's numbers become Metal's own
-//! answers, re-takeable whenever anybody asks.
+//! Metal's whole path here is **public** — `newTextureWithDescriptor:offset:bytesPerRow:` on an
+//! `MTLBuffer`, then `getBytes:`, `replaceRegion:` and the buffer's own `contents` — so record mode
+//! runs every case of this family on the oracle rather than carrying a table.
 //!
 //! Three cases, because the family asks three different kinds of question:
 //!
@@ -28,26 +26,18 @@
 //! [`MetalSource::did_not_return`]: its recording is written by hand, record mode refuses it, and
 //! [`crate::buffer_texture::ends_metals_process`] refuses the call on the Metal side as the second
 //! line of defence. What the case pins is the one fact there is — Metal did not come back — against
-//! our typed refusal (`BufferTextureProblem::RowPitch`) at the same site, so a release where we
-//! stop refusing it reads as a divergence rather than as a pass.
+//! the runtime's typed error at the same site, so a release where it answers reads as a divergence
+//! rather than as a pass. The row is a texture buffer whose `bytesPerRow` is less than its width's
+//! bytes, which the runtime refuses as it refuses a 2D texture whose rows are closer than a row
+//! (`Refusal::BufferTextureLayout`).
 //!
-//! # What is deliberately not ported, and why
+//! # What is deliberately not a case, and why
 //!
-//! The lane also checks four other refusals, each of which the runtime answers
-//! `Error::Invalid`: a block-compressed format, a 3D descriptor, a 2D descriptor at an offset off
-//! the format's alignment, and a 2D array through this call. (A 2D texture whose texels run past
-//! the buffer's length Metal makes, and so does the runtime: [`super::buffer_tails`].) `Error::Invalid` is, by the runtime's own documented model, "Metal
-//! stops this call" — as against `Error::Nil`, "plain Metal answers nil and the process goes on" —
-//! so handing any of them to Metal risks exactly what the stride row does. Unlike the stride row,
-//! no probe of this tree has recorded *how* Metal stops them, so there is nothing to state and the
-//! suite would be guessing. They stay `runtime_lane` assertions until somebody measures them
-//! safely, and the honest place for that is the refusal surface rather than a case here.
-//!
-//! The lane's remaining three tests are elsewhere by subject: the shareable texture buffer and its
-//! handle, the unbound texture-buffer slots reading the device's neutrals (what Metal reads there
-//! is undefined, so there is nothing to compare), and the texture buffer at an offset off 16 bytes
-//! whose *functions* read from the offset rounded down, which is a dispatch case rather than a
-//! texture-making one.
+//! Four other shapes the runtime refuses typed are not cases: a block-compressed format, a 3D
+//! descriptor and a 2D array through this call (`Gap::TextureOverBuffer`), and a 2D descriptor at
+//! an offset that is not a whole number of texels (`Refusal::BufferTextureLayout`). No probe of
+//! this tree has recorded what Metal does with them, and handing one to Metal risks exactly what
+//! the stride row does, so there is nothing to state and the suite would be guessing.
 //!
 //! Nothing here faults a GPU, hangs one or trips a watchdog: the making call allocates no texels of
 //! its own, and the bytes case runs one blit-free program of host calls over shared memory.
@@ -68,40 +58,11 @@ pub const MADE: &str = "buffer-textures-made";
 pub const CPU_ACCESS: &str = "buffer-textures-cpu-access";
 pub const STRIDE_BELOW_THE_ROW: &str = "buffer-textures-stride-below-the-row";
 
-/// The usage a texture buffer of this family carries, as the lane's descriptor does: read and
-/// written by shaders.
+/// The usage a texture buffer of this family carries: read and written by shaders.
 const READ_WRITE: TextureUsage = TextureUsage::SHADER_READ.union(TextureUsage::SHADER_WRITE);
 
-/// The buffer every making row is laid over: 4096 bytes, as the lane's is.
+/// The buffer every making row is laid over: 4096 bytes.
 const BUFFER: u64 = 4096;
-
-/// What the two recorded cases loosen, and what justifies it.
-///
-/// A 2D texture over a buffer whose rows the device's own linear image does not lay out as Metal
-/// does is an image the encoders copy the texels into and back — a **shadow** — and the runtime
-/// announces that once per device (`shadowed-texture`). Metal announces nothing, ever, so the
-/// notices site differs for every case of this family that holds a 2D row, and the notice is what
-/// justifies the difference. Measured on this M3 Max: the texture buffers alias their bytes and
-/// announce nothing, and it is the 2D rows that take the shadow.
-///
-/// Nothing else is loosened. Every fact and every byte of both cases compares exactly.
-fn shadow_allowances() -> Vec<crate::allowance::Allowance> {
-    // Every row reads its answer back through a `Shared` buffer, so on a device without
-    // unified memory the runtime announces `shared-in-system-memory`
-    // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-    // notices site alone, so every value of this family still compares against Metal's
-    // exactly.
-    //
-    // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-    // all 3 rows of the family, and each was divergent on that field and
-    // nothing else (replay-nvidia.log). On MoltenVK, where
-    // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-    // recording of this suite declares it.
-    vec![
-        crate::replay::shared_memory_notice(),
-        crate::replay::notice_allowance(metal2vulkan_runtime::Degradation::ShadowedTexture.code()),
-    ]
-}
 
 /// Every case of the family.
 pub fn all() -> Vec<Box<dyn Case>> {
@@ -114,9 +75,9 @@ pub fn all() -> Vec<Box<dyn Case>> {
 
 /// The shapes the making case asks about, in the order it asks them.
 ///
-/// Every row is one the runtime answers — a texture or Metal's own nil — and a device test of this
-/// module holds the table to that, because a row the runtime answers `Invalid` for is a row
-/// record mode would hand to Metal's assertion.
+/// No row is a shape the guard refuses ([`crate::buffer_texture::ends_metals_process`]), and a
+/// test of this module holds the table to that (`no_recorded_shape_would_end_metals_process`),
+/// because such a row is one record mode would hand to Metal's assertion.
 fn requests() -> Vec<Request> {
     let mut rows = Vec::new();
     // A texture buffer of 64 `R32Uint` texels: its row is 256 bytes.
@@ -175,11 +136,10 @@ fn requests() -> Vec<Request> {
     rows.push(
         Request::texture_2d(BUFFER, PixelFormat::R32Uint, [3, 2], 4, 256, 32).used(READ_WRITE),
     );
-    // A one-byte format at a pitch far wider than its row. Measured while writing this table: a
-    // pitch of 8 — the row exactly — is refused `Invalid` by the runtime, which by its own model
-    // means Metal stops the call, so the row that reached Metal is the padded one. Which pitches a
-    // 2D linear texture takes is Metal's own rule and belongs in the refusal surface rather than
-    // here, where it cannot be asked safely.
+    // A one-byte format at a pitch far wider than its row. The runtime takes any pitch of whole
+    // texels at least a row long (`Refusal::BufferTextureLayout` refuses the rest); which pitches
+    // Metal takes for a 2D linear texture is Metal's own rule and belongs in the refusal surface
+    // rather than here, where it cannot be asked safely, so the row asks a padded one.
     rows.push(
         Request::texture_2d(BUFFER, PixelFormat::R8Unorm, [8, 8], 1, 0, 256).used(READ_WRITE),
     );
@@ -211,10 +171,6 @@ impl Case for MadeOverBuffer {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        shadow_allowances()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -267,7 +223,7 @@ const ASSERTED_IN: &str = "AGX's own assertion text, which this suite's own whol
 const ASSERTED_SAYS: &str =
     "a texture over a buffer whose bytesPerRow is below the texture's own row fails AGX's \
      assertion `bytes_per_row >= used_bytes_per_row`, which ends Metal's process in the call; the \
-     runtime refuses it typed (BufferTextureProblem::RowPitch) and that refusal is what the row \
+     runtime refuses it typed (Refusal::BufferTextureLayout) and that refusal is what the row \
      pins";
 
 /// The runs behind the answer: the finding met the assertion once and the process ended with it.
@@ -318,16 +274,6 @@ impl Case for StrideBelowTheRow {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::did_not_return(ASSERTED_IN, BELOW_SITE, ASSERTED_SAYS)
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // The row makes its `Shared` buffer before the texture over it is refused, so on a device
-        // without unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: the refusal at the one value site is still what the row pins. Measured on
-        // the RTX 5080 Laptop (615.71.09): the whole-set replay announced it here and the row
-        // was divergent at the notices site and nowhere else.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -393,8 +339,8 @@ struct Read {
 /// The bytes rows: a texture buffer whose texels are the buffer's bytes, and a 2D texture whose
 /// rows lie `bytesPerRow` apart with the bytes between them untouched.
 const BYTES_ROWS: [Bytes; 2] = [
-    // 16 `RGBA8Uint` texels from byte 512, as the lane reads them: the whole row, then four texels
-    // from the fifth, then four texels written from the third.
+    // 16 `RGBA8Uint` texels from byte 512: the whole row, then four texels from the fifth, then
+    // four texels written from the third.
     Bytes {
         key: "texture-buffer-rgba8uint-16",
         kind: TextureKind::TextureBuffer,
@@ -617,10 +563,6 @@ impl Case for CpuAccess {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        shadow_allowances()
-    }
-
     fn inputs(&self) -> Result<Vec<Input>, String> {
         // The buffer's bytes, and the geometry of every call the program makes, keyed by the call
         // and its numbers: either moving makes the recording's answer another program's.
@@ -825,8 +767,8 @@ mod tests {
         assert_eq!(sites.len(), total, "two shapes of the table share a site");
     }
 
-    /// Every shape the bytes case lays over a buffer is also a row of the making table, whose
-    /// device guard has shown the runtime answers it.
+    /// Every shape the bytes case lays over a buffer is also a row of the making table, which the
+    /// guard holds away from Metal's assertion (`no_recorded_shape_would_end_metals_process`).
     ///
     /// Without this, the bytes case's safety would be a coincidence: its program makes its
     /// textures as resources, and a resource Metal stops would end the recorder's process before
@@ -846,8 +788,8 @@ mod tests {
             });
             assert!(
                 found,
-                "{}: its shape is not a row of the making table, so nothing has shown the runtime \
-                 answers it and record mode would hand it to Metal unguarded",
+                "{}: its shape is not a row of the making table, so no test holds it away from \
+                 Metal's assertion and record mode would hand it to Metal unguarded",
                 row.key
             );
         }
@@ -871,72 +813,10 @@ mod tests {
         // Metal's answer alone: the cost and timing halves of the file are our own measurements on
         // a venue, taken by another leg, and a case states nothing about either.
         assert_eq!(
-            committed.without_costs().without_times(),
+            committed.without_times(),
             stated,
             "{}: its committed recording is not the answer the case states",
             case.name()
-        );
-    }
-}
-
-/// The safety guard this family rests on, run on a device.
-///
-/// Record mode hands every shape of the making table to Metal. A shape Metal **stops** ends its
-/// process, and the runtime's model is what tells a stop from a nil: `Error::Invalid` is "Metal
-/// stops this call", while `Error::Nil` is "plain Metal answers nil and the process goes on". So a
-/// table that makes the runtime answer `Invalid` anywhere is a table that must never be recorded,
-/// and this is the check that says so before anybody runs `conformance record`.
-///
-/// Its failure mode was exercised while writing it: adding a 2D row at an offset of 8 — which the
-/// runtime refuses `Invalid(OffsetAlignment)` — fails here, naming the shape and the variant.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-    use crate::transcript::Value;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    /// The variant a failure names, where it names one: `Error::Invalid` and the rest.
-    fn variant(value: &Value) -> String {
-        match value {
-            Value::Variant { name, payload } if name == "Err" => match payload.as_ref() {
-                Value::Variant { name, .. } => name.clone(),
-                other => format!("{other:?}"),
-            },
-            other => format!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn no_shape_of_the_making_table_is_one_metal_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_shape_of_the_making_table_is_one_metal_stops"),
-        );
-        let mut stopped = Vec::new();
-        for request in requests() {
-            if let Err(failure) = side.buffer_texture(&request) {
-                let named = variant(&failure.recorded());
-                if named.contains("Invalid") {
-                    stopped.push(format!("{}: {named}", request.site()));
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these shapes are ones the runtime says Metal stops, so record mode would end Metal's \
-             process; take them out of the table:\n{}",
-            stopped.join("\n")
         );
     }
 }

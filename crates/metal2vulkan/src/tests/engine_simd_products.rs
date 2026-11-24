@@ -21,7 +21,7 @@ use crate::device::subgroup::Tier;
 use crate::device::{DevicePolicy, DeviceProfile};
 use crate::lower::arith::legal::f64_to_f16;
 use crate::lower::select::Plan;
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{engine_dir, llvm_assemble, profile, typed_module, AssembleError};
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
@@ -138,10 +138,7 @@ fn run_entry(
     lanes: SubgroupSize,
 ) -> Vec<u8> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([local, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(local));
+    spec.extend(crate::pipeline::threadgroup_constants([local, 1, 1]));
     let mut bytes = vec![
         input(entry, local),
         vec![0xAB; expected(entry, local).len()],
@@ -220,7 +217,7 @@ fn run_kernels(p: &DeviceProfile, tier: Tier, widths: &[SubgroupSize]) {
 
 #[test]
 fn simd_products_and_rotate_up_run_direct_at_32_lanes() {
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     run_kernels(&p, Tier::Direct, &[SubgroupSize::W32]);
 }
 
@@ -239,7 +236,7 @@ fn simd_products_and_rotate_up_run_cluster32_at_64_lanes() {
 /// fold and scan with 1 as the identity.
 #[test]
 fn simd_products_and_rotate_up_run_emulated_at_every_width() {
-    let p = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
     run_kernels(
         &p,
         Tier::Emulated,

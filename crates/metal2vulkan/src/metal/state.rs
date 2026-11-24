@@ -454,9 +454,7 @@ pub struct DepthBias {
 /// constant `c` (finite) or the slope factor is nonzero, by `c + 1` units of 1/65535 for `c` of 0
 /// or more and `c - 1` below, as `float` (so a slope alone brings one unit), added to the depth
 /// rounded toward zero, and the sum stored rounded to nearest. The runtime announces the device's
-/// bias there (`unorm-depth-bias`) where the profile does not take
-/// [`DriverDeviation::MetalDepth16BiasedStores`](crate::error::DriverDeviation::MetalDepth16BiasedStores)
-/// (MoltenVK, which hands Metal its constant).
+/// bias there (`unorm-depth-bias`).
 pub fn depth_bias(
     topology: vk::PrimitiveTopology,
     depth_bias: f32,
@@ -502,14 +500,14 @@ mod tests {
     fn device(dual: bool) -> Device {
         let (_, mut desc) = committed_descriptions()
             .into_iter()
-            .find(|(s, _)| s == "vk12-floor")
+            .find(|(s, _)| s == "runtime-floor")
             .unwrap();
         if dual {
             desc.features.insert(VkFeature::DualSrcBlend);
         } else {
             desc.features.remove(&VkFeature::DualSrcBlend);
         }
-        Device::new(desc, DevicePolicy::default()).unwrap()
+        Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).unwrap()
     }
 
     /// Every concrete factor maps, the names agree, and only `Source1*` needs `dualSrcBlend`.
@@ -625,18 +623,28 @@ mod tests {
     }
 
     fn committed(name: &str) -> Device {
-        let (_, desc) = committed_descriptions()
+        committed_without(name, &[])
+    }
+
+    /// Committed profile `name`'s device with `withheld` removed from its description.
+    fn committed_without(name: &str, withheld: &[VkFeature]) -> Device {
+        let (_, mut desc) = committed_descriptions()
             .into_iter()
             .find(|(s, _)| s == name)
             .unwrap();
-        Device::new(desc, DevicePolicy::default()).unwrap()
+        for f in withheld {
+            assert!(desc.features.remove(f), "{name} has {f:?}");
+        }
+        Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).unwrap()
     }
 
     /// The encoder's fill mode, depth clip mode, and depth bias clamp map where the device has
-    /// their features and are refused, naming the feature, where it does not.
+    /// their features and are refused, naming the feature, where it does not. The floor states
+    /// `depthBiasClamp` and `depthClamp`, so their refusals are on `runtime-floor` without them
+    /// (below the floor).
     #[test]
     fn encoder_raster_state_needs_its_features() {
-        let (floor, lavapipe) = (committed("vk12-floor"), committed("lavapipe"));
+        let (floor, lavapipe) = (committed("runtime-floor"), committed("lavapipe"));
         let needs =
             |what, feature| Error::from(Unsupported::needs(what, Capability::Feature(feature)));
         assert_eq!(
@@ -682,6 +690,11 @@ mod tests {
         );
         assert_eq!(
             depth_clamp_enable(DepthClipMode::Clamp, floor.profile()),
+            Ok(true)
+        );
+        let unclamped = committed_without("runtime-floor", &[VkFeature::DepthClamp]);
+        assert_eq!(
+            depth_clamp_enable(DepthClipMode::Clamp, unclamped.profile()),
             Err(needs(Feature::DepthClipClamp, VkFeature::DepthClamp))
         );
         assert_eq!(
@@ -704,6 +717,11 @@ mod tests {
         );
         assert_eq!(
             depth_bias(triangles, 1.0, 2.0, 0.5, floor.profile()),
+            bias(true, 1.0, 0.5, 2.0)
+        );
+        let below = committed_without("runtime-floor", &[VkFeature::DepthBiasClamp]);
+        assert_eq!(
+            depth_bias(triangles, 1.0, 2.0, 0.5, below.profile()),
             Err(needs(Feature::DepthBiasClamp, VkFeature::DepthBiasClamp))
         );
         assert_eq!(

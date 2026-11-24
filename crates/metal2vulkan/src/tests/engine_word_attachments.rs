@@ -5,26 +5,16 @@
 //!   but renders neither, a fragment function compiled for a pipeline with an `A1BGR5Unorm` or
 //!   `ABGR4Unorm` attachment (`rt6_fill_rgba32float`, `rt6_fill_rgba16float`) records the
 //!   attachment (`StageIo::word_colors`), keeps its interface variable's Metal type, declares the
-//!   output variable as one `uint`, bounds its emission by the plan's estimate, and links: the
+//!   output variable as one `uint`, and links: the
 //!   attachment takes `R16_UINT`, a write of its one component under a full mask and of none under
 //!   an empty one, no blend, and both modules pass L3.
 //! - Where the device renders the format (lavapipe), the attachment takes the format itself.
-//! - A mask of some of the format's channels, or a blend, on the 5080, which orders fetch through
-//!   the pixel interlock: the whole render pipeline, made on the profile's device, writes the
-//!   attachment in the interlocked storage form (`color_writes::stored_word`), a written storage
-//!   attachment of `R16_UINT` without a view alias, keeping the channels the mask leaves out, and
-//!   no color attachment of the subpass; a blended one's fragment notes `DeviceColorConversion`;
-//!   its stages pass L3. Compiled without the pipeline's fetch state, such a mask or blend is the
-//!   device's lack of the format.
-//! - The 8-bit sRGB formats the 5080 renders through their words (`R8Unorm_sRGB`,
-//!   `RG8Unorm_sRGB`) write the word too, and merge a partial mask in the interlock; a blend of one
+//! - A mask of some of the format's channels, or a blend, on the 5080: the whole render pipeline
 //!   is the device's lack of the format.
-//! - On lavapipe, which renders neither `R8_SRGB` nor `R8G8_SRGB` and orders fetch through
-//!   rasterization-order input attachments, an `RG8Unorm_sRGB` attachment written under a mask of
-//!   some of its channels keeps its `R16_UINT` color attachment, written whole, and its fragment
-//!   merges the word into its input attachment's (`lower::fragment`'s `word_input`), stating the
-//!   channels it keeps (`RuntimeFact::WordInputMerge`); a fragment compiled under another mask, or
-//!   under a full one, does not link there (`NeedsInput(FramebufferFetch)`).
+//! - The 8-bit sRGB formats the 5080 renders through their words (`R8Unorm_sRGB`,
+//!   `RG8Unorm_sRGB`) write the word too; a partial mask or a blend of one is the device's lack of
+//!   the format there, and on lavapipe, which renders neither `R8_SRGB` nor `R8G8_SRGB`: the
+//!   merge of the word into the texel over an ordered read of the attachment is not built.
 //! - `RGB9E5Float`, which the 5080 samples and does not render, takes a `float` output's word
 //!   through `R32_UINT`; a `half` output is `NotImplemented(Format)`, and a partial mask or a
 //!   blend the device's lack of the format.
@@ -41,12 +31,11 @@ use std::path::Path;
 use crate::budget::Budget;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{Error, Feature, Needs, RuntimeInput};
-use crate::library::{FunctionConstantValues, Library};
+use crate::library::Library;
 use crate::lower::select::LowerInputs;
 use crate::metal::format::WordAttachment;
 use crate::metal::{self, ColorWriteMask, PixelFormat};
 use crate::pipeline::artifact::PrecisionNote;
-use crate::pipeline::compile::{plan_bitcode, EntryRef};
 use crate::pipeline::descriptor::{
     ColorAttachmentDescriptor, FunctionDescriptor, RenderPipelineDescriptor, StageSource,
 };
@@ -54,8 +43,7 @@ use crate::pipeline::link::{link, LinkInputs, RenderLinkInputs};
 use crate::pipeline::relocate::relocate;
 use crate::pipeline::stage_io::{IoNumeric, IoRole};
 use crate::pipeline::testing::{
-    compile, compile_with, engine_dir, fragment_inputs, llvm_assemble, meter, profile,
-    AssembleError,
+    compile, compile_with, engine_dir, fragment_inputs, llvm_assemble, profile, AssembleError,
 };
 use crate::spirv::testing::{check_words_valid, spirv_dis};
 use crate::vk;
@@ -79,7 +67,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn venue(stem: &str) -> crate::device::profile::DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 /// A render pipeline of one color attachment, `pf`, written under `mask` and blended where
@@ -113,7 +101,6 @@ fn fragment_outputs_to_word_attachments_write_the_word() {
     let Some(bc) = fixture() else {
         return;
     };
-    let consts = FunctionConstantValues::defaults();
     let p = venue("nvidia-rtx5080-laptop");
     let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
     for pf in FORMATS.into_iter().chain(SRGB) {
@@ -176,21 +163,6 @@ fn fragment_outputs_to_word_attachments_write_the_word() {
                     (IoNumeric::Float, 4),
                     "{what}"
                 );
-                let plan = plan_bitcode(
-                    &bc,
-                    EntryRef::Name(entry),
-                    &consts,
-                    &p,
-                    &inputs,
-                    &mut meter(),
-                )
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-                assert!(
-                    plan.estimate.words >= f.module.words.len() as u64,
-                    "{what}: estimate {} < emitted {}",
-                    plan.estimate.words,
-                    f.module.words.len()
-                );
                 let g = l.graphics.as_ref().expect("graphics");
                 let a = g.color_attachments[0].expect("attachment");
                 assert_eq!(a.format, word.word_format(), "{what}");
@@ -229,14 +201,14 @@ fn device(stem: &str) -> Device {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
-/// A word attachment written under a mask of some of its channels, or blended, takes the
-/// interlocked storage form in the whole pipeline on the 5080's device, a blended one noting
-/// `DeviceColorConversion` (the module docs).
+/// A word attachment written under a mask of some of its channels, or blended, is the device's
+/// lack of the format in the whole pipeline on the 5080's device, which does not order fetch (the
+/// module docs).
 #[test]
-fn masked_and_blended_word_attachments_take_the_interlock() {
+fn masked_and_blended_word_attachments_are_the_devices_lack_of_the_format() {
     let Some(bc) = fixture() else {
         return;
     };
@@ -247,7 +219,6 @@ fn masked_and_blended_word_attachments_take_the_interlock() {
             library.function(name).expect("function"),
         ))
     };
-    let note = PrecisionNote::DeviceColorConversion;
     let mut checked = 0;
     for pf in FORMATS {
         for entry in ENTRIES {
@@ -265,30 +236,11 @@ fn masked_and_blended_word_attachments_take_the_interlock() {
                     let mut d = RenderPipelineDescriptor::new(function("rt6_fill_vertex"));
                     d.fragment = Some(function(entry));
                     d.color_attachments[0] = pipeline_of(pf, mask, blended).color_attachments[0];
-                    let pipe = dev
+                    let e = dev
                         .compile_render_pipeline(&d, &Budget::standard())
-                        .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    let storage: Vec<_> = (pipe.graphics.storage_attachments.iter())
-                        .map(|u| (u.color_index, u.format, u.writes, u.view_alias))
-                        .collect();
-                    assert_eq!(storage, [(0, vk::Format::R16_UINT, true, None)], "{what}");
-                    let kept = vk::ColorComponentFlags::known_bits()
-                        .difference(crate::metal::state::color_write_mask(mask).expect("mask"));
-                    assert_eq!(pipe.graphics.storage_attachments[0].kept, kept, "{what}");
-                    assert!(pipe.graphics.color_attachments[0].is_none(), "{what}");
-                    let fragment = (pipe.stages.iter())
-                        .find(|s| s.stage == vk::ShaderStage::FRAGMENT)
-                        .expect("a fragment stage");
-                    assert_eq!(
-                        fragment.precision_notes.contains(&note),
-                        blended,
-                        "{what}: {:?}",
-                        fragment.precision_notes
-                    );
-                    for s in &pipe.stages {
-                        check_words_valid(&s.spirv, &pipe.requirements, dev.profile())
-                            .unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-                    }
+                        .map(|_| ())
+                        .expect_err(&what);
+                    assert!(lacks_attachment(&e), "{what}: {e}");
                     checked += 1;
                 }
             }
@@ -297,160 +249,52 @@ fn masked_and_blended_word_attachments_take_the_interlock() {
     assert_eq!(checked, 28);
 }
 
-/// An 8-bit sRGB word attachment written under a mask of some of its channels takes the
-/// interlocked storage form in the whole pipeline on the 5080's device, without a note; blended,
-/// it is the device's lack of the format (Metal's sRGB blend over the word is not built).
+/// An 8-bit sRGB word attachment written under a mask of some of its channels, or blended, is the
+/// device's lack of the format on the 5080's device and on lavapipe's, which render neither
+/// format (the merge over the word and Metal's sRGB blend over it are not built).
 #[test]
-fn srgb_word_attachments_merge_but_do_not_blend() {
+fn srgb_word_attachments_neither_merge_nor_blend() {
     let Some(bc) = fixture() else {
         return;
     };
-    let dev = device("nvidia-rtx5080-laptop");
     let library = Library::from_air(&bc).expect("library");
     let function = |name: &str| {
         StageSource::Function(FunctionDescriptor::new(
             library.function(name).expect("function"),
         ))
     };
-    for entry in ENTRIES {
+    for (stem, entry) in ["nvidia-rtx5080-laptop", "lavapipe"]
+        .into_iter()
+        .flat_map(|s| ENTRIES.map(|e| (s, e)))
+    {
+        let dev = device(stem);
+        assert!(WordAttachment::of(PixelFormat::RG8UnormSRGB, dev.profile()).is_some());
         for (pf, mask, blended) in [
             (PixelFormat::RG8UnormSRGB, ColorWriteMask::RED, false),
             (PixelFormat::RG8UnormSRGB, ColorWriteMask::GREEN, false),
+            (
+                PixelFormat::RG8UnormSRGB,
+                ColorWriteMask::GREEN | ColorWriteMask::ALPHA,
+                false,
+            ),
             (PixelFormat::RG8UnormSRGB, ColorWriteMask::ALL, true),
             (PixelFormat::R8UnormSRGB, ColorWriteMask::ALL, true),
         ] {
-            let what = format!("{entry} {pf:?} {mask:?} blended {blended}");
+            let what = format!("{stem} {entry} {pf:?} {mask:?} blended {blended}");
             let mut d = RenderPipelineDescriptor::new(function("rt6_fill_vertex"));
             d.fragment = Some(function(entry));
             d.color_attachments[0] = pipeline_of(pf, mask, blended).color_attachments[0];
-            let made = dev.compile_render_pipeline(&d, &Budget::standard());
-            if blended {
-                let e = made.expect_err(&what);
-                assert!(lacks_attachment(&e), "{what}: {e}");
-                continue;
-            }
-            let pipe = made.unwrap_or_else(|e| panic!("{what}: {e}"));
-            let storage: Vec<_> = (pipe.graphics.storage_attachments.iter())
-                .map(|u| (u.color_index, u.format, u.writes, u.view_alias))
-                .collect();
-            assert_eq!(storage, [(0, vk::Format::R16_UINT, true, None)], "{what}");
-            assert!(pipe.graphics.color_attachments[0].is_none(), "{what}");
-            for s in &pipe.stages {
-                assert!(
-                    !s.precision_notes
-                        .contains(&PrecisionNote::DeviceColorConversion),
-                    "{what}: {:?}",
-                    s.precision_notes
-                );
-                check_words_valid(&s.spirv, &pipe.requirements, dev.profile())
-                    .unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            }
-        }
-    }
-}
-
-/// On lavapipe's device an `RG8Unorm_sRGB` attachment written under a mask of some of its channels
-/// keeps its color attachment of `R16_UINT`, written whole and unblended, and reads its input
-/// attachment as `uint`s; its fragment, compiled under the pipeline's fetch state, states the merge
-/// of the channels the mask leaves out and passes L3. Under a full mask the pipeline reads no input
-/// attachment. A fragment compiled under another partial mask, or under the full one, does not
-/// link into a pipeline of a partial mask (the module docs).
-#[test]
-fn srgb_word_attachments_merge_over_input_attachments() {
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::lower_inputs::FramebufferFetchInputs;
-    use crate::pipeline::sym::SampledType;
-    let Some(bc) = fixture() else {
-        return;
-    };
-    let dev = device("lavapipe");
-    let pf = PixelFormat::RG8UnormSRGB;
-    assert!(WordAttachment::of(pf, dev.profile()).is_some());
-    let library = Library::from_air(&bc).expect("library");
-    let function = |name: &str| {
-        StageSource::Function(FunctionDescriptor::new(
-            library.function(name).expect("function"),
-        ))
-    };
-    let p = dev.profile();
-    let v = compile(&bc, "rt6_fill_vertex", p).expect("vertex");
-    // The fragment compiled for pipeline `r`, as the pipeline compile hands it the fetch state.
-    let fragment = |entry: &str, r: &RenderLinkInputs| {
-        let mut inputs = fragment_inputs(r, p);
-        inputs.framebuffer_fetch = Some(FramebufferFetchInputs::of(
-            [0],
-            &r.color_attachments,
-            false,
-            false,
-            1,
-        ));
-        compile_with(&bc, entry, p, &inputs).expect("fragment")
-    };
-    for entry in ENTRIES {
-        for (mask, kept) in [
-            (ColorWriteMask::RED, vk::ColorComponentFlags::G),
-            (ColorWriteMask::GREEN, vk::ColorComponentFlags::R),
-            (
-                ColorWriteMask::GREEN | ColorWriteMask::ALPHA,
-                vk::ColorComponentFlags::R,
-            ),
-            (ColorWriteMask::ALL, vk::ColorComponentFlags::empty()),
-        ] {
-            let what = format!("{entry} {mask:?}");
-            let mut d = RenderPipelineDescriptor::new(function("rt6_fill_vertex"));
-            d.fragment = Some(function(entry));
-            d.color_attachments[0] = pipeline_of(pf, mask, false).color_attachments[0];
-            let pipe = dev
+            let e = dev
                 .compile_render_pipeline(&d, &Budget::standard())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let a = pipe.graphics.color_attachments[0].expect("a color attachment");
-            assert_eq!(
-                (a.format, a.write_mask, a.blend),
-                (vk::Format::R16_UINT, vk::ColorComponentFlags::R, None),
-                "{what}"
-            );
-            assert!(pipe.graphics.storage_attachments.is_empty(), "{what}");
-            let inputs: Vec<_> = (pipe.graphics.input_attachments.iter())
-                .map(|u| (u.color_index, u.input_attachment_index, u.format_class))
-                .collect();
-            let merged = !kept.is_empty();
-            let want = match merged {
-                true => vec![(0, 0, SampledType::Uint)],
-                false => Vec::new(),
-            };
-            assert_eq!(inputs, want, "{what}");
-            for s in &pipe.stages {
-                check_words_valid(&s.spirv, &pipe.requirements, p)
-                    .unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            }
-            let r = pipeline_of(pf, mask, false);
-            let f = fragment(entry, &r);
-            let stated: Vec<_> = (f.facts.iter())
-                .filter(|f| matches!(f, RuntimeFact::WordInputMerge { .. }))
-                .copied()
-                .collect();
-            let want = match merged {
-                true => vec![RuntimeFact::WordInputMerge { color: 0, kept }],
-                false => Vec::new(),
-            };
-            assert_eq!(stated, want, "{what}");
-            link(&[&v, &f], &render(&r), p).unwrap_or_else(|e| panic!("{what}: link: {e}"));
-        }
-        // Compiled under another mask, or the full one, for a pipeline of a partial mask.
-        let red = pipeline_of(pf, ColorWriteMask::RED, false);
-        for other in [ColorWriteMask::GREEN, ColorWriteMask::ALL] {
-            let f = fragment(entry, &pipeline_of(pf, other, false));
-            let e = link(&[&v, &f], &render(&red), p).expect_err(entry);
-            assert!(
-                matches!(e, Error::NeedsInput(RuntimeInput::FramebufferFetch)),
-                "{entry} compiled under {other:?}: {e}"
-            );
+                .map(|_| ())
+                .expect_err(&what);
+            assert!(lacks_attachment(&e), "{what}: {e}");
         }
     }
 }
 
 /// An `RGB9E5Float` attachment on the 5080's device renders a `float` output through an
-/// `R32_UINT` view, no storage form and no conversion note; a `half` output is `NotImplemented(Format)`, and
+/// `R32_UINT` view and no conversion note; a `half` output is `NotImplemented(Format)`, and
 /// a mask of some of its channels, or a blend, the device's lack of the format (the module docs).
 #[test]
 fn an_rgb9e5_attachment_takes_a_float_outputs_word() {
@@ -497,7 +341,6 @@ fn an_rgb9e5_attachment_takes_a_float_outputs_word() {
                 continue;
             }
             let pipe = made.unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert!(pipe.graphics.storage_attachments.is_empty(), "{what}");
             let a = pipe.graphics.color_attachments[0].expect("attachment");
             assert_eq!(a.format, vk::Format::R32_UINT, "{what}");
             assert_eq!(a.write_mask, vk::ColorComponentFlags::R, "{what}");

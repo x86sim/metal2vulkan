@@ -1,7 +1,7 @@
 //! One specialization audit attempt: a row's compile under one value set, answering each
 //! pipeline input the compile asks for that the audit can derive from the row's AIR.
 //!
-//! The compile runs exactly as the plain census's ([`crate::engine::translate_with`]: the same
+//! The compile runs exactly as the plain census's ([`crate::engine::translate_unvalidated`]: the same
 //! meter, deadline, allocator measure, standalone link, relocation, and L3), with the set's
 //! function-constant values. When it stops at `NeedsInput`, the audit derives that input from the
 //! row and compiles again on a fresh meter under the same deadline, as the plain census does for
@@ -884,6 +884,21 @@ mod tests {
         replay_specialized(bitcode, entry, constants, &profile, None, None).attempt
     }
 
+    /// `description`'s profile under the resident-table domains, the executor's own context's: the
+    /// inputs the binder supplies (a storage texture's format, a tile function's member formats)
+    /// are theirs, and the identity domains refuse what needs them.
+    fn resident_tables(
+        description: metal2vulkan::device::DeviceDescription,
+    ) -> metal2vulkan::device::DeviceProfile {
+        metal2vulkan::device::Device::from_queries(
+            description,
+            metal2vulkan::device::DevicePolicy::RESIDENT_TABLES,
+        )
+        .unwrap()
+        .profile()
+        .clone()
+    }
+
     fn row_plan(bitcode: &[u8], entry: &str) -> RowPlan {
         let mut meter = Meter::new(&Budget::standard());
         let decoded = metal2vulkan_air::decode(bitcode, &mut meter).unwrap();
@@ -902,7 +917,7 @@ mod tests {
             &bitcode,
             "fcfold",
             &FunctionConstantValues::defaults(),
-            "vk12-floor",
+            "runtime-floor",
         );
         assert_eq!(
             undefined.attempt.outcome,
@@ -917,7 +932,7 @@ mod tests {
         // One required constant: 0 and 1, each also its defined and covering set.
         assert_eq!(row.specializations.len(), 2, "{row:#?}");
         for set in &row.specializations {
-            let result = attempt(&bitcode, "fcfold", &set.values(), "vk12-floor");
+            let result = attempt(&bitcode, "fcfold", &set.values(), "runtime-floor");
             if set.kinds.contains(&SpecKind::One) {
                 assert_eq!(result.attempt.outcome, Outcome::Translated, "{result:?}");
             }
@@ -961,18 +976,23 @@ mod tests {
         assert_eq!(result.supplied, vec![Supplied::StageInputDescriptor]);
     }
 
-    /// A tile function is supplied each implicit imageblock member's format.
+    /// A tile function is supplied each implicit imageblock member's format, under the
+    /// resident-table domains ([`resident_tables`]).
     #[test]
     fn a_tile_function_is_supplied_its_members_formats() {
         let Some(bitcode) = bitcode(engine_dir().join("k10ts_tile_order.ll")) else {
             return;
         };
-        let result = attempt(
+        let profile = resident_tables(crate::engine::load_description("moltenvk-m3").unwrap());
+        let result = replay_specialized(
             &bitcode,
             "k10ts_tile_order",
             &FunctionConstantValues::defaults(),
-            "moltenvk-m3",
-        );
+            &profile,
+            None,
+            None,
+        )
+        .attempt;
         assert_eq!(
             result.supplied,
             vec![Supplied::TileAttachments {
@@ -1050,8 +1070,9 @@ mod tests {
         assert_eq!(result.attempt.outcome, Outcome::Translated, "{result:?}");
     }
 
-    /// A storage texture on a profile without formatless storage access is supplied the widest
-    /// format of its texel class.
+    /// A storage texture on a profile without formatless storage access (`runtime-floor` without
+    /// `shaderStorageImageWriteWithoutFormat`, below the runtime's floor) is supplied the widest
+    /// format of its texel class, under the resident-table domains ([`resident_tables`]).
     #[test]
     fn a_storage_texture_is_supplied_the_widest_format_of_its_class() {
         let Some(bitcode) =
@@ -1059,12 +1080,20 @@ mod tests {
         else {
             return;
         };
-        let result = attempt(
+        let mut description = crate::engine::load_description("runtime-floor").unwrap();
+        assert!(description
+            .features
+            .remove(&metal2vulkan::device::VkFeature::ShaderStorageImageWriteWithoutFormat));
+        let profile = resident_tables(description);
+        let result = replay_specialized(
             &bitcode,
             "kernel_write_one_dimensional_textures",
             &FunctionConstantValues::defaults(),
-            "roadmap-2022",
-        );
+            &profile,
+            None,
+            None,
+        )
+        .attempt;
         assert!(
             result
                 .supplied

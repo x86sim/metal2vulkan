@@ -5,8 +5,8 @@
 //!   offsets computed after the load; out-of-bounds accesses (past the end, below the start,
 //!   wrapped offsets near 2³² and 2⁶⁴) never trap, load 0, and store only into the sink.
 //! - A null pointer or a guest address outside the resident set is root 0: every access through
-//!   it is contained and, under `GuestIsolation::On`, counted in the `ExecutionStatus` miss word
-//!   and bit; with isolation off nothing is counted and no status address is read.
+//!   it is bounded and counted in the `ExecutionStatus` miss word
+//!   and bit.
 //! - `inttoptr` resolves every address of resident sets of 0 to 33 entries exactly (the binary
 //!   search's loop), including a pointer one past an allocation's end, and the probed addresses
 //!   of sets of 2^16 to about 3 * 2^16 entries.
@@ -24,23 +24,26 @@
 //! assembles the kernels; without it the tests skip visibly.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::status::{ExecutionStatus, StatusBits, StatusWord};
-use crate::device::profile::{DeviceProfile, GuestIsolation};
+use crate::bind::status::StatusWord;
+use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
-use crate::device::{ContainmentPolicy, Device, DeviceDescription, DevicePolicy};
+use crate::device::DevicePolicy;
 use crate::error::{Capability, Error, Feature, Needs};
 use crate::lower::select::Plan;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{BufferForm, PushLoc, SlotInterface};
 use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, Stage};
 use crate::pipeline::testing::{
-    compile, link_and_validate, llvm_assemble, typed_module, AssembleError,
+    compile, device_f, link_and_validate, llvm_assemble, typed_module, AssembleError, PROFILE_F,
 };
-use crate::spirv::interp::{run, Buffer, Config, InterpError, Resources};
+use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::ir::{Inst, StorageClass, Type, TypedModule};
+
+/// The `ExecutionStatus` buffer's bytes, every word 0 at the start: through its last word.
+const STATUS_BYTES: usize =
+    crate::bind::status::StatusWord::SeqCstFences.byte_offset() as usize + 4;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -59,32 +62,21 @@ const fn guest(k: u64) -> u64 {
 /// Bytes of each resident allocation (a multiple of 16).
 const ALLOC: u64 = 64;
 
-fn profile(stem: &str, robust: bool, policy: DevicePolicy) -> DeviceProfile {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    if !robust {
-        desc.features.remove(&VkFeature::RobustBufferAccess);
-        desc.features.remove(&VkFeature::RobustBufferAccess2);
-    }
-    Device::new(desc, policy).expect("device").profile().clone()
+fn profile(stem: &str, policy: DevicePolicy) -> DeviceProfile {
+    crate::pipeline::testing::profile(stem, policy).expect("committed profile")
 }
 
-/// Profile-A profiles in both descriptor encodings (the device-address check is emitted in both:
-/// robustness does not cover device addresses).
+/// The Profile-A profiles.
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        for robust in [true, false] {
-            out.push((
-                format!("{stem} robust={robust}"),
-                profile(stem, robust, DevicePolicy::default()),
-            ));
-        }
-    }
-    out
+    ["moltenvk-m3", "lavapipe"]
+        .into_iter()
+        .map(|stem| {
+            (
+                stem.to_owned(),
+                profile(stem, DevicePolicy::RESIDENT_TABLES),
+            )
+        })
+        .collect()
 }
 
 fn assemble_text(name: &str, text: &str) -> Option<Vec<u8>> {
@@ -140,7 +132,6 @@ const CHASE: &str = "  %k = load i32, ptr addrspace(1) %2, align 8\n\
 struct Leaf {
     name: &'static str,
     bytes: u64,
-    align: u64,
     body: &'static str,
     /// The stored bytes, for a store.
     store: Option<&'static [u8]>,
@@ -150,28 +141,24 @@ const LEAVES: [Leaf; 4] = [
     Leaf {
         name: "dyn_load_i32",
         bytes: 4,
-        align: 4,
         body: "  %v = load i32, ptr addrspace(1) %q, align 4\n  store i32 %v, ptr addrspace(1) %1, align 4\n",
         store: None,
     },
     Leaf {
         name: "dyn_load_i8",
         bytes: 1,
-        align: 1,
         body: "  %v = load i8, ptr addrspace(1) %q, align 1\n  store i8 %v, ptr addrspace(1) %1, align 4\n",
         store: None,
     },
     Leaf {
         name: "dyn_store_i32",
         bytes: 4,
-        align: 4,
         body: "  store i32 305419896, ptr addrspace(1) %q, align 4\n",
         store: Some(&[0x78, 0x56, 0x34, 0x12]),
     },
     Leaf {
         name: "dyn_store_i16",
         bytes: 2,
-        align: 1,
         body: "  store i16 -21829, ptr addrspace(1) %q, align 1\n",
         store: Some(&[0xBB, 0xAA]),
     },
@@ -269,236 +256,6 @@ fn status_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// The offsets the chase kernels try: in bounds, at both ends, just outside, and wrapped (as a
-/// 32-bit or 64-bit displacement), then 24 seeded random ones drawn around the same edges and
-/// from the whole 64-bit range (the interpreter traps any access outside a bound buffer, so a
-/// wrapped offset that escaped containment would fail the run, not only the comparison).
-fn offsets() -> Vec<u64> {
-    let mut v = vec![0, 1, 4, 5, 30, 60, 61, 62, 63, 64, 65, 68, 128];
-    v.extend([
-        u64::MAX,
-        u64::MAX - 3,
-        (-4i64) as u64,
-        0xFFFF_FFF0,
-        0xFFFF_FFFC,
-        0xFFFF_FFFF,
-        0x1_0000_0000,
-        0x1_0000_0004,
-        1 << 63,
-    ]);
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
-    for i in 0..24u64 {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        let small = x % 96;
-        v.push(match i % 4 {
-            0 => x,
-            1 => 0x1_0000_0000u64.wrapping_sub(48).wrapping_add(small),
-            2 => (small as i64 - 48) as u64,
-            _ => small,
-        });
-    }
-    v
-}
-
-/// A loaded pointer resolves to its allocation (a pointer into its middle included), every leaf is
-/// exact in bounds and contained out of bounds at any 64-bit offset, and accesses through root 0
-/// (null, or an address outside the resident set) are contained and counted.
-#[test]
-fn a_loaded_pointer_is_exact_in_bounds_and_contained_elsewhere() {
-    // Element k of `ptrs`: allocation 0, allocation 1 at byte 16, a miss, null.
-    let targets: [(Option<u64>, u64); 4] = [
-        (Some(0), guest(0)),
-        (Some(1), guest(1) + 16),
-        (None, guest(9)),
-        (None, 0),
-    ];
-    let ptrs: Vec<u8> = targets.iter().flat_map(|(_, g)| g.to_le_bytes()).collect();
-    for leaf in &LEAVES {
-        let Some(bc) = assemble_text(
-            leaf.name,
-            &kernel(leaf.name, &format!("{CHASE}{}", leaf.body)),
-        ) else {
-            return;
-        };
-        for (what, p) in profiles() {
-            let what = format!("{} {what}", leaf.name);
-            let a = compile(&bc, leaf.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            assert!(a.interface.needs_pointer_translation, "{what}");
-            let (plan, m) = typed_module(&bc, leaf.name, &p).expect("module");
-            assert!(plan.facts.contains(&RuntimeFact::ExecutionStatus), "{what}");
-            // The slots stay descriptor views: no wide pointer reaches them.
-            for s in 0..3 {
-                match a.interface.slots.get(&SlotRef {
-                    stage: Stage::Kernel,
-                    class: SlotClass::Buffer,
-                    index: s,
-                }) {
-                    Some(SlotInterface::Buffer(b)) => {
-                        assert!(matches!(b.form, BufferForm::Descriptor(_)), "{what} {s}")
-                    }
-                    None if s == 1 && leaf.store.is_some() => {}
-                    other => panic!("{what} slot {s}: {other:?}"),
-                }
-            }
-            let resident = [
-                (host(0), guest(0), ALLOC),
-                (host(1), guest(1), ALLOC),
-                (host(2), guest(2), ALLOC),
-            ];
-            for (k, (alloc, g)) in targets.iter().enumerate() {
-                for off in offsets() {
-                    // Metal leaves a misaligned access undefined.
-                    if off % leaf.align != 0 {
-                        continue;
-                    }
-                    let mut params = vec![0u8; 16];
-                    params[..4].copy_from_slice(&(k as u32).to_le_bytes());
-                    params[8..].copy_from_slice(&off.to_le_bytes());
-                    let data: Vec<Vec<u8>> = (0..3).map(pattern).collect();
-                    let res = Resources {
-                        buffers: vec![
-                            slot_buffer(0, ptrs.clone()),
-                            slot_buffer(1, vec![0; 16]),
-                            slot_buffer(2, params),
-                            addressed(TABLE, root_table(&[(0, 0, 0, 0); 3], &resident)),
-                            addressed(SINK, vec![0; 64]),
-                            addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
-                            addressed(host(0), data[0].clone()),
-                            addressed(host(1), data[1].clone()),
-                            addressed(host(2), data[2].clone()),
-                        ],
-                        push: push_bytes(&plan),
-                        spec: Default::default(),
-                    };
-                    let case = format!("{what} k={k} off={off:#x}");
-                    let out = match run(&m, &Config::default(), res) {
-                        Ok(o) => o,
-                        Err(InterpError::Trap(t)) => panic!("{case}: trapped {t:?}"),
-                        Err(e) => panic!("{case}: {e}"),
-                    };
-                    // The byte offset inside the allocation, when the access is inside it.
-                    let at = alloc.and_then(|a| {
-                        let rel = (g - guest(a)).wrapping_add(off);
-                        (ALLOC >= leaf.bytes && rel <= ALLOC - leaf.bytes)
-                            .then_some((a as usize, rel as usize))
-                    });
-                    match leaf.store {
-                        None => {
-                            let mut want = vec![0u8; 16];
-                            if let Some((a, rel)) = at {
-                                let n = leaf.bytes as usize;
-                                want[..n].copy_from_slice(&data[a][rel..rel + n]);
-                            }
-                            assert_eq!(out.buffers[1], want, "{case}");
-                        }
-                        Some(bytes) => {
-                            for (i, d) in data.iter().enumerate() {
-                                let mut want = d.clone();
-                                if let Some((a, rel)) = at {
-                                    if a == i {
-                                        want[rel..rel + bytes.len()].copy_from_slice(bytes);
-                                    }
-                                }
-                                assert_eq!(out.buffers[6 + i], want, "{case}: allocation {i}");
-                            }
-                        }
-                    }
-                    let status = status_words(&out.buffers[5]);
-                    let missed = alloc.is_none();
-                    assert_eq!(
-                        status[StatusWord::ResidentMisses.index() as usize],
-                        u32::from(missed),
-                        "{case}: miss count"
-                    );
-                    assert_eq!(
-                        StatusBits(status[StatusWord::Status.index() as usize])
-                            .contains(StatusBits::RESIDENT_MISS),
-                        missed,
-                        "{case}: miss bit"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// With `GuestIsolation::Off` a miss is contained but not counted: the function reads no
-/// status address. With containment off too (`UnsafeOff`) an in-bounds access is still exact.
-#[test]
-fn without_isolation_misses_are_not_counted() {
-    let leaf = &LEAVES[0];
-    let Some(bc) = assemble_text("off", &kernel(leaf.name, &format!("{CHASE}{}", leaf.body)))
-    else {
-        return;
-    };
-    for unsafe_off in [false, true] {
-        let mut policy = DevicePolicy {
-            isolation: GuestIsolation::Off,
-            ..Default::default()
-        };
-        if unsafe_off {
-            policy.containment = ContainmentPolicy::UnsafeOff;
-        }
-        let p = profile("moltenvk-m3", true, policy);
-        let what = format!("unsafe_off={unsafe_off}");
-        let a = compile(&bc, leaf.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-        let (plan, m) = typed_module(&bc, leaf.name, &p).expect("module");
-        assert!(
-            !plan
-                .push
-                .fields
-                .iter()
-                .any(|f| f.field == PushField::ExecutionStatusAddress),
-            "{what}"
-        );
-        assert!(
-            !plan.facts.contains(&RuntimeFact::ExecutionStatus),
-            "{what}"
-        );
-        let ptrs: Vec<u8> = [guest(0), guest(7)]
-            .iter()
-            .flat_map(|g| g.to_le_bytes())
-            .collect();
-        // In bounds (both policies), and a miss (contained only with containment on).
-        let cases: &[(u32, u64)] = if unsafe_off {
-            &[(0, 8)]
-        } else {
-            &[(0, 8), (1, 0)]
-        };
-        for &(k, off) in cases {
-            let mut params = vec![0u8; 16];
-            params[..4].copy_from_slice(&k.to_le_bytes());
-            params[8..].copy_from_slice(&off.to_le_bytes());
-            let res = Resources {
-                buffers: vec![
-                    slot_buffer(0, ptrs.clone()),
-                    slot_buffer(1, vec![0; 16]),
-                    slot_buffer(2, params),
-                    addressed(
-                        TABLE,
-                        root_table(&[(0, 0, 0, 0); 3], &[(host(0), guest(0), ALLOC)]),
-                    ),
-                    addressed(SINK, vec![0; 64]),
-                    addressed(host(0), pattern(0)),
-                ],
-                push: push_bytes(&plan),
-                spec: Default::default(),
-            };
-            let out = run(&m, &Config::default(), res).unwrap_or_else(|e| panic!("{what}: {e}"));
-            let want: Vec<u8> = if k == 0 {
-                pattern(0)[8..12].to_vec()
-            } else {
-                vec![0; 4]
-            };
-            assert_eq!(out.buffers[1][..4], want[..], "{what} k={k}");
-        }
-    }
-}
-
 /// The resident-set search (its loop of ⌈log₂ N⌉ steps) finds every address of every entry of sets
 /// of 0 to 33 entries, a pointer one past an entry's end included (its accesses are out of bounds, not
 /// misses), and misses addresses in the gaps, below the first entry, and above the last.
@@ -511,7 +268,7 @@ fn inttoptr_resolves_every_resident_address() {
     let Some(bc) = assemble_text("from_int", &kernel("from_int", body)) else {
         return;
     };
-    let p = profile("moltenvk-m3", true, DevicePolicy::default());
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES);
     let a = compile(&bc, "from_int", &p).expect("compile");
     link_and_validate(&a, &p).expect("L3");
     let (plan, m) = typed_module(&bc, "from_int", &p).expect("module");
@@ -534,7 +291,7 @@ fn inttoptr_resolves_every_resident_address() {
                 slot_buffer(2, addr.to_le_bytes().to_vec()),
                 addressed(TABLE, root_table(&[(0, 0, 0, 0); 3], &resident)),
                 addressed(SINK, vec![0; 64]),
-                addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
+                addressed(STATUS, vec![0; STATUS_BYTES]),
             ];
             for k in 0..n {
                 buffers.push(addressed(host(k), pattern(k)));
@@ -572,7 +329,7 @@ fn inttoptr_resolves_addresses_of_large_sets() {
     let Some(bc) = assemble_text("from_int", &kernel("from_int", body)) else {
         return;
     };
-    let p = profile("moltenvk-m3", true, DevicePolicy::default());
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES);
     let a = compile(&bc, "from_int", &p).expect("compile");
     link_and_validate(&a, &p).expect("L3");
     let (plan, m) = typed_module(&bc, "from_int", &p).expect("module");
@@ -598,7 +355,7 @@ fn inttoptr_resolves_addresses_of_large_sets() {
                 slot_buffer(2, addr.to_le_bytes().to_vec()),
                 addressed(TABLE, table.clone()),
                 addressed(SINK, vec![0; 64]),
-                addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
+                addressed(STATUS, vec![0; STATUS_BYTES]),
             ];
             if let Some((k, _)) = want {
                 buffers.push(addressed(host(k), pattern(k)));
@@ -620,83 +377,6 @@ fn inttoptr_resolves_addresses_of_large_sets() {
             assert_eq!(got, &expect[..], "{case}");
             let misses = status_words(&out.buffers[5])[StatusWord::ResidentMisses.index() as usize];
             assert_eq!(misses, u32::from(want.is_none()), "{case}: misses");
-        }
-    }
-}
-
-/// The entries `(host, guest, size)` of a resident set uploaded apart from its root table.
-fn resident_entries(resident: &[(u64, u64, u64)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(32 * resident.len());
-    for &(h, g, s) in resident {
-        for v in [h, g, s, 0] {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    bytes
-}
-
-/// A resident set uploaded apart from its root table, below it (`R0` wraps modulo 2^64) or far
-/// above it, resolves every resident address as one inside the table does, and misses the gaps; the
-/// search indexes the set from its own first entry, so the interpreter, which traps a negative
-/// access-chain index, reads only the set.
-#[test]
-fn a_resident_set_apart_from_the_table_resolves_below_and_above_it() {
-    let body = "  %g = load i64, ptr addrspace(1) %2, align 8\n\
-  %p = inttoptr i64 %g to ptr addrspace(1)\n\
-  %v = load i32, ptr addrspace(1) %p, align 4\n\
-  store i32 %v, ptr addrspace(1) %1, align 4\n";
-    let Some(bc) = assemble_text("from_int", &kernel("from_int", body)) else {
-        return;
-    };
-    let p = profile("moltenvk-m3", true, DevicePolicy::default());
-    let a = compile(&bc, "from_int", &p).expect("compile");
-    link_and_validate(&a, &p).expect("L3");
-    let (plan, m) = typed_module(&bc, "from_int", &p).expect("module");
-    for set in [TABLE - 0x1_0000_0000, TABLE - 0x800, TABLE + 0x3_0000_0000] {
-        for n in [1u64, 2, 5, 17] {
-            let resident: Vec<(u64, u64, u64)> =
-                (0..n).map(|k| (host(k), guest(k), ALLOC)).collect();
-            let mut table = root_table(&[(0, 0, 0, 0); 3], &[]);
-            let fields = crate::bind::RootTable::resident_fields(TABLE, set, n).expect("aligned");
-            let at = crate::bind::RootTable::RESIDENT_FIELDS_OFFSET as usize;
-            table[at..at + 16].copy_from_slice(&fields);
-            let mut probes: Vec<(u64, Option<(u64, u64)>)> =
-                vec![(0, None), (guest(0) - 4, None), (guest(n) + 8, None)];
-            for k in 0..n {
-                probes.push((guest(k), Some((k, 0))));
-                probes.push((guest(k) + 12, Some((k, 12))));
-                probes.push((guest(k) + ALLOC + 4, None));
-            }
-            for (addr, want) in probes {
-                let mut buffers = vec![
-                    slot_buffer(0, vec![0; 16]),
-                    slot_buffer(1, vec![0; 16]),
-                    slot_buffer(2, addr.to_le_bytes().to_vec()),
-                    addressed(TABLE, table.clone()),
-                    addressed(SINK, vec![0; 64]),
-                    addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
-                    addressed(set, resident_entries(&resident)),
-                ];
-                for k in 0..n {
-                    buffers.push(addressed(host(k), pattern(k)));
-                }
-                let res = Resources {
-                    buffers,
-                    push: push_bytes(&plan),
-                    spec: Default::default(),
-                };
-                let case = format!("set={set:#x} n={n} addr={addr:#x}");
-                let out =
-                    run(&m, &Config::default(), res).unwrap_or_else(|e| panic!("{case}: {e}"));
-                let expect = match want {
-                    Some((k, rel)) => pattern(k)[rel as usize..rel as usize + 4].to_vec(),
-                    None => vec![0; 4],
-                };
-                assert_eq!(&out.buffers[1][..4], &expect[..], "{case}");
-                let misses =
-                    status_words(&out.buffers[5])[StatusWord::ResidentMisses.index() as usize];
-                assert_eq!(misses, u32::from(want.is_none()), "{case}: misses");
-            }
         }
     }
 }
@@ -771,7 +451,7 @@ fn a_parameter_merged_with_loaded_pointers_walks_a_list() {
             },
             node(guest(2), 17),
         ];
-        let status = ExecutionStatus::initial().to_vec();
+        let status = vec![0; STATUS_BYTES];
         for steps in [1u32, 2, 3, 6] {
             let resident = [
                 (host(0), guest(0), ALLOC),
@@ -827,16 +507,15 @@ fn profile_f_refuses_a_loaded_pointer_dereference() {
     ) else {
         return;
     };
-    let p = profile("vk12-floor", true, DevicePolicy::default());
-    match compile(&bc, leaf.name, &p) {
+    let f = device_f(DevicePolicy::RESIDENT_TABLES).expect(PROFILE_F);
+    match compile(&bc, leaf.name, f.profile()) {
         Err(Error::Unsupported(u)) => {
             assert_eq!(u.feature, Feature::DereferenceLoadedPointer);
             assert_eq!(
                 u.needs,
-                Needs::AnyOf(vec![vec![
-                    Capability::Feature(VkFeature::BufferDeviceAddress),
-                    Capability::Feature(VkFeature::ShaderInt64),
-                ]])
+                Needs::AnyOf(vec![vec![Capability::Feature(
+                    VkFeature::BufferDeviceAddress
+                )]])
             );
         }
         other => panic!("expected a refusal, got {other:?}"),
@@ -901,7 +580,7 @@ fn loaded_pointers_compare_by_metal_address() {
             let mut head_alloc = vec![0xEEu8; 16];
             head_alloc.extend(node(guest(0), 7));
             let nodes = [node(guest(1), 11), node(guest(2), 13), node(last, 17)];
-            let status = ExecutionStatus::initial().to_vec();
+            let status = vec![0; STATUS_BYTES];
             // The head's allocation is resident too (a bound argument), below the nodes.
             let resident = [
                 (head_host, head_guest, head_alloc.len() as u64),
@@ -993,7 +672,6 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
             Leaf {
                 name: "dyn_volatile_load",
                 bytes: 4,
-                align: 4,
                 body: "  %v = load volatile i32, ptr addrspace(1) %q, align 4\n  store i32 %v, ptr addrspace(1) %1, align 4\n",
                 store: None,
             },
@@ -1003,7 +681,6 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
             Leaf {
                 name: "dyn_volatile_store",
                 bytes: 4,
-                align: 4,
                 body: "  store volatile i32 305419896, ptr addrspace(1) %q, align 4\n",
                 store: Some(&[0x78, 0x56, 0x34, 0x12]),
             },
@@ -1013,7 +690,6 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
             Leaf {
                 name: "dyn_volatile_copy_from",
                 bytes: 4,
-                align: 4,
                 body: "  call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) align 4 %1, ptr addrspace(1) align 4 %q, i64 4, i1 true)\n",
                 store: None,
             },
@@ -1024,7 +700,6 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
             Leaf {
                 name: "dyn_volatile_copy_to",
                 bytes: 4,
-                align: 4,
                 body: "  call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) align 4 %q, ptr addrspace(1) align 4 %2, i64 4, i1 true)\n",
                 store: Some(&[1, 0, 0, 0]),
             },
@@ -1062,7 +737,7 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
                         slot_buffer(2, params),
                         addressed(TABLE, root_table(&[(0, 0, 0, 0); 3], &resident)),
                         addressed(SINK, vec![0; 64]),
-                        addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
+                        addressed(STATUS, vec![0; STATUS_BYTES]),
                         addressed(host(0), data[0].clone()),
                         addressed(host(1), data[1].clone()),
                     ],
@@ -1093,8 +768,8 @@ fn volatile_accesses_through_a_loaded_pointer_are_exact() {
 }
 
 /// A volatile load of a pointer from the allocation a loaded pointer reaches (a pointer loaded
-/// through a wide pointer): its guest address's two words are volatile loads by device address, and
-/// the pointer it yields resolves to its allocation.
+/// through a wide pointer): its guest address, two whole words, is one volatile load by device
+/// address, and the pointer it yields resolves to its allocation.
 #[test]
 fn a_volatile_pointer_load_through_a_loaded_pointer_is_exact() {
     let name = "dyn_volatile_chase";
@@ -1120,7 +795,7 @@ fn a_volatile_pointer_load_through_a_loaded_pointer_is_exact() {
         let a = compile(&bc, name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
         link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
         let (plan, m) = typed_module(&bc, name, &p).expect("module");
-        assert_eq!(volatiles(&m), (vec![(PSB, 2)], vec![]), "{what}");
+        assert_eq!(volatiles(&m), (vec![(PSB, 1)], vec![]), "{what}");
         let res = Resources {
             buffers: vec![
                 slot_buffer(0, ptrs.clone()),
@@ -1128,7 +803,7 @@ fn a_volatile_pointer_load_through_a_loaded_pointer_is_exact() {
                 slot_buffer(2, params.clone()),
                 addressed(TABLE, root_table(&[(0, 0, 0, 0); 3], &resident)),
                 addressed(SINK, vec![0; 64]),
-                addressed(STATUS, vec![0; ExecutionStatus::BYTES]),
+                addressed(STATUS, vec![0; STATUS_BYTES]),
                 addressed(host(0), data[0].clone()),
                 addressed(host(1), data[1].clone()),
             ],

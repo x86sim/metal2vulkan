@@ -15,12 +15,13 @@
 //!   field; `Always` keeps the pipeline.
 //! - The logic operation leaves the normalized, sRGB and integer attachments unblended (unwritten
 //!   under a no-op), so copy and no-op draw on every device; the others take Vulkan's `logicOp`
-//!   where the device has it (lavapipe), are computed by the fragment function where it does not
-//!   and the device orders fetch (MoltenVK, and lavapipe with the feature off), and are refused
-//!   where neither holds and where Metal's operation is not built.
+//!   where the device has it (lavapipe), and are refused where it does not (MoltenVK, lavapipe
+//!   with the feature off) and where Metal's operation is not built.
 //! - The sample coverage is Metal's masks by the window pixel's place in its quad, ANDed with the
 //!   sample mask: alike at every place the Vulkan mask, else applied by the fragment function from
 //!   its pixel.
+//! - A single-sampled attachment of a signed normalized format notes the minimum code Metal's
+//!   pass rewrites (`PrecisionNote::SnormMinimumKept`) on the fragment stage.
 //! - Each property not built refuses a value other than Metal's default `NotImplemented`, naming
 //!   it (the coverage at 8 samples, where Metal was not measured). A compute pipeline's `needs_custom_border_color_samplers`, which changes nothing, keeps
 //!   its key.
@@ -56,7 +57,7 @@ fn fixture(stem: &str) -> Option<Library> {
 }
 
 fn device(stem: &str) -> Device {
-    device_with(stem, DevicePolicy::default())
+    device_with(stem, DevicePolicy::RESIDENT_TABLES)
 }
 
 fn device_with(stem: &str, policy: DevicePolicy) -> Device {
@@ -65,7 +66,7 @@ fn device_with(stem: &str, policy: DevicePolicy) -> Device {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let description = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(description, policy).expect("device")
+    Device::from_queries(description, policy).expect("device")
 }
 
 /// The fullscreen triangle drawn white into one `RGBA8Unorm` attachment at `samples`.
@@ -517,20 +518,120 @@ fn each_property_not_built_refuses_a_value_other_than_metals_default() {
     }
 }
 
+/// A pipeline that draws single-sampled into an attachment of each signed normalized format
+/// records `PrecisionNote::SnormMinimumKept` on its fragment stage alone; at four samples, and into
+/// an unsigned or float attachment, no stage records it.
+#[test]
+fn a_snorm_attachment_notes_the_minimum_code_metal_s_pass_rewrites() {
+    use crate::pipeline::artifact::PrecisionNote;
+    use crate::vk::ShaderStage;
+    let Some(lib) = fixture("rt6_render_state") else {
+        return;
+    };
+    let with = |pf: PixelFormat, samples: u32| {
+        let mut d = render(&lib, samples);
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
+        d
+    };
+    let noted = |p: &RenderPipeline, stage: ShaderStage| {
+        p.stages.iter().any(|s| {
+            s.stage == stage && s.precision_notes.contains(&PrecisionNote::SnormMinimumKept)
+        })
+    };
+    for stem in STEMS {
+        let queries = device(stem);
+        for pf in [
+            PixelFormat::R8Snorm,
+            PixelFormat::RG8Snorm,
+            PixelFormat::RGBA8Snorm,
+            PixelFormat::R16Snorm,
+            PixelFormat::RG16Snorm,
+            PixelFormat::RGBA16Snorm,
+        ] {
+            let what = format!("{stem} {pf:?}");
+            let p = compile(&queries, &with(pf, 1), &what);
+            assert!(noted(&p, ShaderStage::FRAGMENT), "{what}");
+            assert!(!noted(&p, ShaderStage::VERTEX), "{what}");
+        }
+        let p = compile(&queries, &with(PixelFormat::RGBA8Snorm, 4), stem);
+        assert!(!noted(&p, ShaderStage::FRAGMENT), "{stem} at four samples");
+        for pf in [PixelFormat::RGBA8Unorm, PixelFormat::RGBA16Float] {
+            let p = compile(&queries, &with(pf, 1), stem);
+            assert!(!noted(&p, ShaderStage::FRAGMENT), "{stem} {pf:?}");
+        }
+    }
+}
+
+/// A pipeline that draws single-sampled into an `RGB9E5Float` attachment records
+/// `PrecisionNote::SharedExponentKept` on its fragment stage alone; into another float or a signed
+/// normalized attachment no stage records it, nor at four samples where the
+/// profile builds that pipeline: lavapipe renders the format through an `R32_UINT` word view and
+/// refuses four samples for want of a 4-sample integer color count, so MoltenVK's profile is the
+/// one that holds the sample-count gate here.
+#[test]
+fn a_shared_exponent_attachment_notes_the_words_metal_s_pass_normalizes() {
+    use crate::pipeline::artifact::PrecisionNote;
+    use crate::vk::ShaderStage;
+    let Some(lib) = fixture("rt6_render_state") else {
+        return;
+    };
+    let with = |pf: PixelFormat, samples: u32| {
+        let mut d = render(&lib, samples);
+        d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(pf));
+        d
+    };
+    let noted = |p: &RenderPipeline, stage: ShaderStage| {
+        p.stages.iter().any(|s| {
+            s.stage == stage
+                && s.precision_notes
+                    .contains(&PrecisionNote::SharedExponentKept)
+        })
+    };
+    let mut multisampled = 0;
+    for stem in STEMS {
+        let queries = device(stem);
+        let what = format!("{stem} RGB9E5Float");
+        let p = compile(&queries, &with(PixelFormat::RGB9E5Float, 1), &what);
+        assert!(noted(&p, ShaderStage::FRAGMENT), "{what}");
+        assert!(!noted(&p, ShaderStage::VERTEX), "{what}");
+        match queries
+            .compile_render_pipeline(&with(PixelFormat::RGB9E5Float, 4), &Budget::standard())
+        {
+            Ok(p) => {
+                assert!(!noted(&p, ShaderStage::FRAGMENT), "{what} at four samples");
+                multisampled += 1;
+            }
+            Err(e) => assert!(
+                e.to_string().contains("RasterSampleCount"),
+                "{what} at four samples: {e}"
+            ),
+        }
+        for pf in [
+            PixelFormat::RG11B10Float,
+            PixelFormat::RGBA16Float,
+            PixelFormat::RGBA8Snorm,
+        ] {
+            let p = compile(&queries, &with(pf, 1), stem);
+            assert!(!noted(&p, ShaderStage::FRAGMENT), "{stem} {pf:?}");
+        }
+    }
+    assert!(
+        multisampled > 0,
+        "no profile built the four-sample pipeline"
+    );
+}
+
 /// The private logic operation: every normalized, sRGB and integer attachment is unblended, and
 /// under a no-op unwritten, which draws copy and no-op on both profiles with no Vulkan operation;
 /// another operation (xor, raw 10, and raw 26, whose low four bits are xor's) is Vulkan's
 /// `logicOp` on lavapipe, its requirements naming the feature, its fragment stage noting
 /// `PrecisionNote::NativeLogicOperation` exactly where the operation reaches a written channel of
-/// `RGB10A2Unorm` or `BGR10A2Unorm` (whose codes Metal widens). On MoltenVK, which lacks it, the
-/// fragment function computes it through the storage form, and on lavapipe without it over the
-/// attachment's input attachment, noting the device's conversion of the codes (`RGB10A2Unorm`'s
-/// on 16-bit codes, as Metal's); `B5G6R5Unorm`, whose operation is not a per-channel rule, is
-/// refused there, and on a device that orders fetch in neither form the operation is refused
-/// naming the three features. A float attachment
-/// keeps its blend under copy and no-op and takes Vulkan's operation unblended, or keeps its blend
-/// beside the function's; an sRGB attachment under xor, a blended float attachment under Vulkan's
-/// xor and a format whose operation Metal was not measured with are refused `NotImplemented`.
+/// `RGB10A2Unorm` or `BGR10A2Unorm` (whose codes Metal widens). A device without it (MoltenVK,
+/// lavapipe with the feature off) refuses the operation naming Vulkan's operation, and draws copy
+/// as every device does. A float attachment keeps its blend under copy and no-op and takes
+/// Vulkan's operation unblended; an sRGB attachment under xor, a blended float attachment under
+/// Vulkan's xor and a format whose operation Metal was not measured with are refused
+/// `NotImplemented`.
 #[test]
 fn the_logic_operation_draws_as_metal_s_or_is_refused() {
     use crate::device::requirements::VkFeature;
@@ -560,6 +661,12 @@ fn the_logic_operation_draws_as_metal_s_or_is_refused() {
             PrivateRenderField::LogicOperation,
         )))
         .at_attachment(Attachment::Color(index))
+    };
+    let lacking = || {
+        Error::Unsupported(Unsupported::needs(
+            Feature::PrivateRenderState(PrivateRenderField::LogicOperation),
+            Capability::Feature(VkFeature::LogicOp),
+        ))
     };
     for stem in STEMS {
         let dev = device(stem);
@@ -593,12 +700,8 @@ fn the_logic_operation_draws_as_metal_s_or_is_refused() {
             ] {
                 let blended = pf != PixelFormat::RGBA16Float;
                 let d = with(pf, blended, Some(raw));
-                match (
-                    has,
-                    pf,
-                    dev.compile_render_pipeline(&d, &Budget::standard()),
-                ) {
-                    (true, _, Ok(p)) => {
+                match (has, dev.compile_render_pipeline(&d, &Budget::standard())) {
+                    (true, Ok(p)) => {
                         assert_eq!(p.graphics.logic_op, Some(vk::LogicOp::XOR), "{pf:?}");
                         let a = p.graphics.color_attachments[0].expect("attachment 0");
                         assert!(a.blend.is_none(), "{stem} {pf:?} blends");
@@ -609,51 +712,34 @@ fn the_logic_operation_draws_as_metal_s_or_is_refused() {
                             matches!(pf, PixelFormat::RGB10A2Unorm | PixelFormat::RGBA8Snorm);
                         assert_eq!(native_logic(&p), differs, "{stem} {pf:?} xor");
                     }
-                    // MoltenVK lacks Vulkan's operation and orders fetch through the pixel
-                    // interlock: the fragment function computes it.
-                    (false, _, Ok(p)) => {
-                        let what = format!("{stem} {pf:?} xor");
-                        shader_operated(&p, pf != PixelFormat::RGBA16Float, &what);
-                        assert!(!native_logic(&p), "{what}");
-                        let stored = p
-                            .graphics
-                            .storage_attachments
-                            .iter()
-                            .any(|s| s.color_index == 0);
-                        assert_eq!(stored, pf != PixelFormat::RGBA16Float, "{what}");
-                    }
-                    (_, _, other) => panic!("{stem} {pf:?} xor: {other:?}"),
+                    // MoltenVK lacks Vulkan's operation.
+                    (false, Err(e)) => assert_eq!(e, lacking(), "{stem} {pf:?} xor"),
+                    (_, other) => panic!("{stem} {pf:?} xor: {other:?}"),
                 }
             }
         }
-        // Where Vulkan's operation is not Metal's, on either device; the function's own leaves a
-        // blended float attachment to the device's blend.
+        // Where Vulkan's operation is not Metal's, on the device that has it.
         for (pf, blended) in [
             (PixelFormat::RGBA8UnormSRGB, false),
             (PixelFormat::RGBA16Float, true),
             (PixelFormat::RG11B10Float, false),
         ] {
-            let refused = has || pf != PixelFormat::RGBA16Float;
-            match (
-                refused,
-                dev.compile_render_pipeline(&with(pf, blended, Some(10)), &Budget::standard()),
-            ) {
-                (true, Err(e)) => assert_eq!(e, not_built(0), "{stem} {pf:?}"),
-                (false, Ok(p)) => {
-                    let a = p.graphics.color_attachments[0].expect("attachment 0");
-                    assert!(a.blend.is_some(), "{stem} {pf:?} keeps its blend");
-                    shader_operated(&p, false, &format!("{stem} {pf:?}"));
-                }
-                (_, other) => panic!("{stem} {pf:?} xor: {other:?}"),
+            let want = if has { not_built(0) } else { lacking() };
+            match dev.compile_render_pipeline(&with(pf, blended, Some(10)), &Budget::standard()) {
+                Err(e) => assert_eq!(e, want, "{stem} {pf:?}"),
+                other => panic!("{stem} {pf:?} xor: {:?}", other.map(|_| ())),
             }
         }
         // Each operation keys a pipeline of its own, apart from copy's, whose attachments are the
         // same unblended ones.
-        let key =
-            |raw: u64| compile(&dev, &with(PixelFormat::RGBA8Unorm, true, Some(raw)), "key").key;
-        let keys = [key(0), key(10), key(15), key(2)];
-        for (i, a) in keys.iter().enumerate() {
-            assert!(keys[i + 1..].iter().all(|b| a != b), "{stem} keys {keys:?}");
+        if has {
+            let key = |raw: u64| {
+                compile(&dev, &with(PixelFormat::RGBA8Unorm, true, Some(raw)), "key").key
+            };
+            let keys = [key(0), key(10), key(15), key(2)];
+            for (i, a) in keys.iter().enumerate() {
+                assert!(keys[i + 1..].iter().all(|b| a != b), "{stem} keys {keys:?}");
+            }
         }
         // Off, the pipeline is the one without the property.
         let off = compile(&dev, &with(PixelFormat::RGBA8Unorm, true, None), "off");
@@ -693,65 +779,17 @@ fn the_logic_operation_draws_as_metal_s_or_is_refused() {
     unwritten.color_attachments[1] =
         Some(ColorAttachmentDescriptor::new(PixelFormat::RGB10A2Unorm));
     assert!(!noted(&unwritten, "RGB10A2Unorm unwritten beside xor"));
-    // lavapipe without `logicOp` orders fetch through rasterization-order input attachments: the
-    // function computes the operation over each served attachment's input attachment, which the
-    // device's write mask then keeps channels of; without either ordered form it is refused naming
-    // the three features.
-    let inputs = device_without("lavapipe", &["logicOp"]);
-    for pf in [
-        PixelFormat::RGBA8Unorm,
-        PixelFormat::RGBA8Snorm,
-        PixelFormat::RGB10A2Unorm,
-        PixelFormat::R16Unorm,
-        PixelFormat::RGBA16Float,
-    ] {
-        let what = format!("lavapipe without logicOp {pf:?}");
-        let p = compile(&inputs, &with(pf, false, Some(10)), &what);
-        let operated = pf != PixelFormat::RGBA16Float;
-        shader_operated(&p, operated, &what);
-        assert!(!native_logic(&p), "{what}");
-        assert!(p.graphics.storage_attachments.is_empty(), "{what}");
-        let read = p
-            .graphics
-            .input_attachments
-            .iter()
-            .any(|i| i.color_index == 0);
-        assert_eq!(read, operated, "{what}");
-    }
-    // A packed 16-bit format's operation is not a per-channel rule: refused at the attachment.
-    let packed = with(PixelFormat::B5G6R5Unorm, false, Some(10));
-    match inputs.compile_render_pipeline(&packed, &Budget::standard()) {
-        Err(e) => assert_eq!(e, not_built(0), "lavapipe without logicOp B5G6R5Unorm"),
-        Ok(_) => panic!("lavapipe without logicOp B5G6R5Unorm xor compiled"),
-    }
-    let unordered = device_without(
-        "lavapipe",
-        &[
-            "logicOp",
-            "fragmentShaderPixelInterlock",
-            "rasterizationOrderColorAttachmentAccess",
-        ],
-    );
-    let wanted = Error::Unsupported(Unsupported::needs_any_of(
-        Feature::PrivateRenderState(PrivateRenderField::LogicOperation),
-        vec![
-            vec![Capability::Feature(VkFeature::LogicOp)],
-            vec![Capability::Feature(VkFeature::FragmentShaderPixelInterlock)],
-            vec![Capability::Feature(
-                VkFeature::RasterizationOrderColorAttachmentAccess,
-            )],
-        ],
-    ));
+    // Without `logicOp` the operation is refused naming it; copy needs no operation there.
+    let without = device_without("lavapipe", &["logicOp"]);
     let d = with(PixelFormat::RGBA8Unorm, false, Some(10));
-    match unordered.compile_render_pipeline(&d, &Budget::standard()) {
-        Err(e) => assert_eq!(e, wanted),
-        Ok(_) => panic!("xor compiled without an ordered fetch"),
+    match without.compile_render_pipeline(&d, &Budget::standard()) {
+        Err(e) => assert_eq!(e, lacking(), "lavapipe without logicOp"),
+        Ok(_) => panic!("xor compiled without logicOp"),
     }
-    // Copy needs no operation there either.
     compile(
-        &unordered,
+        &without,
         &with(PixelFormat::RGBA8Unorm, false, Some(2)),
-        "unordered copy",
+        "copy without logicOp",
     );
 }
 
@@ -767,35 +805,7 @@ fn device_without(stem: &str, features: &[&str]) -> Device {
         text = text.replace(&on, &format!("\"{f}\": false"));
     }
     let description = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(description, DevicePolicy::default()).expect("device")
-}
-
-/// Assert that pipeline `p` draws its logic operation in its fragment function: no Vulkan
-/// operation or requirement of it; where `operated`, attachment 0 is unblended and the function
-/// notes the device's conversion of its codes.
-fn shader_operated(p: &RenderPipeline, operated: bool, what: &str) {
-    use crate::device::requirements::VkFeature;
-    use crate::pipeline::artifact::PrecisionNote;
-    assert_eq!(p.graphics.logic_op, None, "{what}");
-    assert!(
-        !p.requirements.features.contains(&VkFeature::LogicOp),
-        "{what}"
-    );
-    let fragment = p
-        .stages
-        .iter()
-        .find(|s| s.stage == crate::vk::ShaderStage::FRAGMENT)
-        .expect("a fragment stage");
-    if operated {
-        let noted = fragment
-            .precision_notes
-            .contains(&PrecisionNote::DeviceColorConversion);
-        assert!(noted, "{what}");
-        // Attachment 0 is a color attachment of the subpass over an input attachment, and none
-        // in the storage form, which writes it as a storage image.
-        let a = p.graphics.color_attachments[0];
-        assert!(a.is_none_or(|a| a.blend.is_none()), "{what} blends");
-    }
+    Device::from_queries(description, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// Whether pipeline `p`'s fragment stage records Vulkan's operation on a 10-bit or signed

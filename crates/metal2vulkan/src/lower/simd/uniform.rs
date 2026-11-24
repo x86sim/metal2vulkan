@@ -616,6 +616,8 @@ impl Uniformity {
         Uniformity::analyze(e, body, among, Some(loops), &[], 0, m)
     }
 
+    /// The analysis among `among`, with the barrier contract where `contract` gives the loop
+    /// forest.
     fn analyze(
         e: &Entry,
         body: &Body,
@@ -839,6 +841,7 @@ impl<'a> State<'a> {
         Ok(self)
     }
 
+    /// Run the worklist.
     fn run(mut self, pdom: &PostDomTree<BlockId>, m: &mut Meter) -> Result<Uniformity, Error> {
         let body = self.body;
         // A reachable block that reaches no exit has no post-dominator information.

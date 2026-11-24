@@ -3,11 +3,9 @@
 //!
 //! - On the CPU interpreter, 192 linear 2D samples Metal took, 16 per format and result type, are
 //!   Metal's bytes, through a constexpr sampler and through a runtime one: 128 of the one-plane
-//!   formats (an Apple M3 Max on macOS 26.7, byte-identical to the Apple M4's probe),
-//!   whose device lane `runtime_lane::extended_range_samples` compares the same samples on each
-//!   venue, and 64 of the two-plane formats (an Apple M4 on macOS 27.0.1: footprints inside the
-//!   texture of its linear clamp-to-edge samples), whose device lane
-//!   `runtime_lane::two_plane_samples` replays every sample of that probe.
+//!   formats (an Apple M3 Max on macOS 26.7, byte-identical to the Apple M4's probe), and 64 of
+//!   the two-plane formats (an Apple M4 on macOS 27.0.1: footprints inside the
+//!   texture of its linear clamp-to-edge samples).
 //! - Under every address mode, each border color, a constant offset, and pixel coordinates,
 //!   through constexpr and runtime samplers (a runtime sampler's `MirrorClampToEdge` too, each
 //!   tap mirrored once and clamped), nearest samples are the decoded texel at Metal's position and
@@ -22,11 +20,11 @@
 //!   slot's own image in the raw format and binds no sampler.
 
 use super::*;
-use crate::bind::{BoundSampler, SamplerDescriptor};
+use crate::bind::SamplerDescriptor;
 use crate::error::Unsupported;
 use crate::metal::format::extended_srgb::SRGB_DECODE_STEPS;
 use crate::metal::sampler::SamplerWord;
-use crate::metal::{SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter};
+use crate::metal::{SamplerAddressMode, SamplerBorderColor};
 
 /// Metal's linear samples, the files `xr_samples.tsv` and `xr_plane_samples.tsv` beside the owned
 /// fixture `xr_samples.metal`, one per line: the raw format (550 `RGB10A8_2P_XR10`, 551 its `_sRGB`
@@ -217,7 +215,7 @@ pub(super) struct Texels<'a> {
 
 /// The samples kernel `bc` takes on `p` of `tex` in `form` at `coords`, through a runtime
 /// sampler of word `word` where it has one: each result's lanes as bits (`half` lanes where
-/// `half`). The compile is validated, and the plan's estimate bounds it.
+/// `half`). The compile is validated.
 fn sample(
     bc: &[u8],
     p: &crate::device::profile::DeviceProfile,
@@ -263,10 +261,7 @@ pub(super) fn run_samples(
     what: &str,
 ) -> Vec<[u32; 4]> {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     if let Some(w) = swizzle {
         spec.insert(SpecKey::TextureSwizzle(SOURCE), u64::from(w));
     }
@@ -290,9 +285,6 @@ pub(super) fn run_samples(
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value the function reads as data, which the interpreter writes from the
-            // specialization it is given.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("{what}: unexpected push field {other:?}"),
         }
     }
@@ -1167,8 +1159,7 @@ fn swizzled_samples_and_gathers_are_the_unswizzled_swizzled() {
             width: N as u32,
             codes: &codes,
         };
-        // The lowering takes no profile's choice here: one profile serves (the device lane
-        // `runtime_lane::extended_swizzles` runs each venue).
+        // The lowering takes no profile's choice here: one profile serves.
         for (stem, p) in profiles().into_iter().take(1) {
             // Each kernel's unswizzled results.
             let mut base = BTreeMap::new();
@@ -1368,165 +1359,6 @@ fn replay_padded_samples(name: &str) {
     assert!(checked > 0);
 }
 
-/// A kernel's state: texture slot 0 bound in `pf`, buffers 0 and 1, and sampler slot 0 bound to
-/// `desc`.
-pub(super) fn sampled_state(pf: PixelFormat, desc: SamplerDescriptor) -> BindState {
-    sampled_state_of(TextureType::Type2D, pf, desc)
-}
-
-/// [`sampled_state`] with a texture of type `ty`.
-pub(super) fn sampled_state_of(
-    ty: TextureType,
-    pf: PixelFormat,
-    desc: SamplerDescriptor,
-) -> BindState {
-    let mut t = StageTable::default();
-    t.textures.insert(
-        0,
-        BoundTexture::Texture {
-            facts: TextureFacts::new(ty, pf),
-            resource_id: None,
-        },
-    );
-    for index in [0, 1] {
-        t.buffers.insert(
-            index,
-            BoundBuffer::Buffer {
-                length: 65536,
-                offset: 0,
-                gpu_address: 0x1_0000 * u64::from(index + 1),
-                device_address: None,
-                attribute_stride: None,
-            },
-        );
-    }
-    t.samplers.insert(0, BoundSampler::new(desc));
-    let mut s = BindState::default();
-    s.stages.insert(Stage::Kernel, t);
-    s
-}
-
-/// A sampled slot bound in an extended-range format joins the plan's variant through a
-/// constexpr and a runtime sampler: the variant's pipeline plans the same key, views the slot's
-/// image in the raw format, and binds no sampler. The binder refuses a runtime sampler whose
-/// word states mixed filters, `NotImplemented(Format)`, and plans one stating a nearest mip
-/// filter, whose level the function reads (`levels`), or `MirrorClampToEdge`, whose taps the
-/// fetches address. On every committed profile.
-#[test]
-fn a_sampled_slot_joins_the_variant() {
-    use SamplerMinMagFilter as F;
-    let formats = [
-        (PixelFormat::BGR10XR, ExtendedRange::Bgr10 { srgb: false }),
-        (
-            PixelFormat::BGRA10XRSRGB,
-            ExtendedRange::Bgra10 { srgb: true },
-        ),
-        (
-            PixelFormat::RGB10A82PXR10,
-            ExtendedRange::Planes { srgb: false },
-        ),
-        (PixelFormat::R10UnormX6, ExtendedRange::R10X6),
-        (PixelFormat::RG10UnormX12, ExtendedRange::Rg10X12),
-    ];
-    let mut linear = SamplerDescriptor::new();
-    linear.min_filter = F::Linear;
-    linear.mag_filter = F::Linear;
-    let mut planned = 0;
-    for through in [
-        Through::Constexpr(words(true, 1, false, 0)),
-        Through::Runtime,
-    ] {
-        let Some(bc) = assemble("bind sample", &sample_kernel(through, false, (0, 0), false))
-        else {
-            return;
-        };
-        for (stem, dev) in devices() {
-            let plain = pipeline(&dev, &bc, &LowerInputs::new()).expect("a sampling kernel");
-            for (pf, form) in formats {
-                let what = format!("{through:?} {pf:?} on {stem}");
-                let shape = sampled_state(pf, linear).shape();
-                let plan = plain
-                    .plan(&dev, &shape)
-                    .unwrap_or_else(|e| panic!("{what}: {e}"));
-                assert_eq!(
-                    plan.variant.extended_range,
-                    BTreeMap::from([(SOURCE, form)]),
-                    "{what}"
-                );
-                let key = plan.variant.lowering_inputs(Stage::Kernel);
-                let variant = pipeline(&dev, &bc, &key).expect("the variant's inputs");
-                let again = variant.plan(&dev, &shape).expect("variant plan");
-                assert_eq!(again.variant, plan.variant, "{what}");
-                let mut views = Vec::new();
-                for d in &again.descriptors {
-                    match &d.source {
-                        WriteSource::Texture { view, .. } => views.push(view.format),
-                        WriteSource::Sampler { .. } | WriteSource::CombinedImageSampler { .. } => {
-                            panic!("{what}: the variant binds {:?}", d.source)
-                        }
-                        _ => {}
-                    }
-                }
-                assert_eq!(views, [form.raw_format()], "{what}");
-                planned += 1;
-                // A swizzled texture joins `swizzled_storage` too, under a border sampler as
-                // under this one, and the variant's pipeline plans the same key.
-                let mut border = linear;
-                border.s_address_mode = SamplerAddressMode::ClampToBorderColor;
-                border.t_address_mode = SamplerAddressMode::ClampToBorderColor;
-                border.border_color = SamplerBorderColor::OpaqueWhite;
-                for desc in [linear, border] {
-                    let mut state = sampled_state(pf, desc);
-                    if let Some(BoundTexture::Texture { facts, .. }) = state
-                        .stages
-                        .get_mut(&Stage::Kernel)
-                        .and_then(|t| t.textures.get_mut(&0))
-                    {
-                        use crate::metal::{TextureSwizzle as S, TextureSwizzleChannels as C};
-                        facts.swizzle = C::new(S::Alpha, S::Red, S::One, S::Zero);
-                    }
-                    let shape = state.shape();
-                    let what = format!("{what} swizzled {:?}", desc.s_address_mode);
-                    let plan = plain
-                        .plan(&dev, &shape)
-                        .unwrap_or_else(|e| panic!("{what}: {e}"));
-                    assert!(plan.variant.swizzled_storage.contains(&SOURCE), "{what}");
-                    let key = plan.variant.lowering_inputs(Stage::Kernel);
-                    let variant = pipeline(&dev, &bc, &key).expect("the variant's inputs");
-                    let again = variant.plan(&dev, &shape).expect("variant plan");
-                    assert_eq!(again.variant, plan.variant, "{what}");
-                }
-                if let Through::Runtime = through {
-                    let mut mip = linear;
-                    mip.mip_filter = crate::metal::SamplerMipFilter::Nearest;
-                    let mut mixed = linear;
-                    mixed.mag_filter = F::Nearest;
-                    let mut clamp = linear;
-                    clamp.t_address_mode = SamplerAddressMode::MirrorClampToEdge;
-                    for (name, desc) in [("mirror clamp", clamp), ("mip", mip)] {
-                        let shape = sampled_state(pf, desc).shape();
-                        for p in [&plain, &variant] {
-                            let named = p
-                                .plan(&dev, &shape)
-                                .unwrap_or_else(|e| panic!("{what} {name}: {e}"));
-                            assert_eq!(named.variant, plan.variant, "{what} {name}");
-                        }
-                    }
-                    match plain.plan(&dev, &sampled_state(pf, mixed).shape()) {
-                        Err(crate::error::BindError::Unsupported(u)) => assert_eq!(
-                            u,
-                            Unsupported::not_implemented(Feature::Format),
-                            "{what} mixed"
-                        ),
-                        other => panic!("{what} mixed: {:?}", other.map(|_| ())),
-                    }
-                }
-            }
-        }
-    }
-    assert!(planned > 0);
-}
-
 /// [`sample_kernel`]'s `float` sample through `through` taken `n` times, the `i`-th at the
 /// coordinate plus `i / 8` on each axis, and where `offsets` at its own constant texel offset
 /// (`(i + 1, -i)`), the sum stored.
@@ -1572,13 +1404,11 @@ fn samples_kernel(through: Through, n: usize, offsets: bool) -> String {
 /// call with its arguments, the status word and the sum's addition.
 const SITE_WORDS: usize = 160;
 
-/// The samples of one extended-range slot call one routine (`routine::Extended`) on a profile
-/// whose driver keeps a `DontInline` call a call (`DriverWorkaround::DontInlineKeepsCalls`): a
-/// kernel of 1, 2 and 4 samples through the runtime sampler, or through a constexpr linear
+/// The samples of one extended-range slot call one routine (`routine::Extended`) on every profile:
+/// a kernel of 1, 2 and 4 samples through the runtime sampler, or through a constexpr linear
 /// clamp-to-edge sampler each at its own constant texel offset (the call's value), holds one
 /// routine, which its entry calls once per sample and which holds every fetch, and each sample
-/// past the first adds no more than a call's words. On any other profile the entry holds every
-/// fetch, its code written at each site (`extended::Sample::routine`).
+/// past the first adds no more than a call's words.
 #[test]
 fn the_samples_of_one_slot_call_one_routine() {
     const OP_FUNCTION: u32 = 54;
@@ -1591,10 +1421,6 @@ fn the_samples_of_one_slot_call_one_routine() {
         .into_iter()
         .flat_map(|sp| cases.map(|c| (sp.clone(), c)))
     {
-        let keeps = p
-            .fields()
-            .workarounds
-            .contains(&crate::device::profile::DriverWorkaround::DontInlineKeepsCalls);
         let mut words = Vec::new();
         for n in [1usize, 2, 4] {
             let what = format!("{stem}, {n} samples, offsets {offsets}");
@@ -1632,14 +1458,6 @@ fn the_samples_of_one_slot_call_one_routine() {
             }
             let called: std::collections::BTreeSet<u32> =
                 calls.values().flat_map(|c| c.keys().copied()).collect();
-            if !keeps {
-                let holders: Vec<u32> = fetches.keys().copied().collect();
-                assert!(
-                    matches!(holders[..], [f] if !called.contains(&f)),
-                    "{what}: the entry holds every fetch, {holders:?}"
-                );
-                continue;
-            }
             // The entry is the calling function no other calls.
             let entries: Vec<u32> = calls
                 .keys()
@@ -1667,9 +1485,6 @@ fn the_samples_of_one_slot_call_one_routine() {
                 "{what}: the routine the entry calls per sample"
             );
             words.push((n, w.len()));
-        }
-        if !keeps {
-            continue;
         }
         let (n0, words0) = words[0];
         for &(n, w) in &words[1..] {

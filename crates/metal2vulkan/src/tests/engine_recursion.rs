@@ -36,13 +36,13 @@
 //!
 //! `llvm-as` assembles the module; a missing tool skips visibly.
 
-use super::engine_argument_tables::{bytes_at, capable_profiles, device, one_group, table_layout};
-use crate::bind::{ArgumentFunctionTable, BindState, FunctionTableWords};
+use super::engine_argument_tables::device;
+use crate::bind::FunctionTableWords;
 use crate::budget::{Budget, SPIRV_WORDS};
 use crate::device::VkLimit;
 use crate::error::{Capability, DescriptorError, Error, Feature, Limit, Unsupported};
 use crate::library::{FunctionConstantValues, Library};
-use crate::lower::access::function_table::{directory_symbol, heap_symbol};
+use crate::lower::access::function_table::{directory_symbol, snapshot_symbol};
 use crate::lower::select::LowerInputs;
 use crate::metal::PixelFormat;
 use crate::pipeline::artifact::PrecisionNote;
@@ -589,27 +589,6 @@ fn pipeline(bitcode: &[u8], entry: &str, k: u32) -> (ComputePipeline, Vec<Functi
     (pipe, handles)
 }
 
-/// The directory bytes a dispatch of `pipe` gets with table [`T`] listed, and the bytes of
-/// table [`T`] holding `handles` in order.
-fn table_inputs(pipe: &ComputePipeline, handles: &[FunctionHandle]) -> (Vec<u8>, Vec<u8>) {
-    let dev = device("moltenvk-m3");
-    let (_, directory) = table_layout(pipe);
-    let state = BindState {
-        function_tables: vec![ArgumentFunctionTable::new(T, handles.len() as u32)],
-        ..Default::default()
-    };
-    let plan = pipe.plan(&dev, &state.shape()).expect("plan");
-    let cmds = plan
-        .instantiate_dispatch(&state, &one_group())
-        .expect("dispatch");
-    let directory = bytes_at(&cmds.descriptor_bytes, directory).to_vec();
-    let mut table = FunctionTableWords::new(handles.len() as u32);
-    for (i, h) in handles.iter().enumerate() {
-        assert!(table.set(i as u32, Some(*h)));
-    }
-    (directory, table.to_bytes())
-}
-
 /// Kernel buffer `index`.
 pub(super) fn slot(index: u32) -> ResourceSlot {
     ResourceSlot {
@@ -629,8 +608,8 @@ pub(super) fn buffer(slot: ResourceSlot, bytes: Vec<u8>) -> Buffer {
 }
 
 /// Run `m` with one thread per entry of `depths` (buffer 2), `out_words` output words a thread
-/// (buffer 0), and, for a table kernel, `tables`: the directory's bytes and table [`T`]'s, with
-/// [`T`]'s id at buffer 1. The words it writes.
+/// (buffer 0), and, for a table kernel, `tables`: the directory's bytes and the snapshot of table
+/// [`T`], with [`T`]'s id at buffer 1. The words it writes.
 fn dispatch(
     m: &TypedModule,
     depths: &[u32],
@@ -645,12 +624,11 @@ fn dispatch(
             depths.iter().flat_map(|d| d.to_le_bytes()).collect(),
         ),
     ];
-    if let Some((directory, table)) = tables {
+    if let Some((directory, snapshot)) = tables {
         buffers.extend([
             buffer(slot(1), T.to_le_bytes().to_vec()),
             buffer(directory_symbol(Stage::Kernel), directory.clone()),
-            buffer(heap_symbol(Stage::Kernel), vec![0; 16]),
-            buffer(heap_symbol(Stage::Kernel), table.clone()),
+            buffer(snapshot_symbol(Stage::Kernel), snapshot.clone()),
         ]);
     }
     let res = Resources {
@@ -733,7 +711,7 @@ fn direct_recursion_makes_one_call_fewer_than_its_depth() {
     let Some(bitcode) = module() else {
         return;
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
     for k in [1, 2, 8, 256] {
         let m = typed(&bitcode, DIRECT, k, &p);
         let ds = depths(k);
@@ -742,29 +720,29 @@ fn direct_recursion_makes_one_call_fewer_than_its_depth() {
     }
 }
 
-/// Recursion through a table holds the frames Metal reached: within them each sum and parity is
-/// Metal's, past them the sum stops and the parity is zero.
-#[test]
-fn table_recursion_reaches_the_frames_metal_reaches() {
-    let Some(bitcode) = module() else {
-        return;
+/// The directory bytes a dispatch gets with table [`T`] listed, and the snapshot of table [`T`]
+/// holding `handles` in order (`lower::access::function_table`): the directory is the handle
+/// table's layout (`memory::handles`), its null entry and then [`T`]'s, whose element is the word
+/// offset of its record in the snapshot (1, after the null table's word count, 0); the record is
+/// the table's word count and its words.
+fn table_inputs(handles: &[FunctionHandle]) -> (Vec<u8>, Vec<u8>) {
+    let entry = |id: u64, element: u32| {
+        [id as u32, (id >> 32) as u32, element, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
-    for (k, frames) in TABLE_FRAMES {
-        let (pipe, handles) = pipeline(&bitcode, TABLE, k);
-        let tables = table_inputs(&pipe, &handles);
-        let m = typed(&bitcode, TABLE, k, &p);
-        let ds = depths(frames);
-        let want: Vec<u32> = ds
-            .iter()
-            .flat_map(|&d| [sum(d, frames), even(d, frames)])
-            .collect();
-        assert_eq!(
-            dispatch(&m, &ds, 2, Some(&tables)),
-            want,
-            "depth {k}: {ds:?}"
-        );
+    let directory = entry(0, crate::memory::handles::NEUTRAL_ELEMENT)
+        .chain(entry(T, 1))
+        .collect();
+    let mut table = FunctionTableWords::new(handles.len() as u32);
+    for (i, h) in handles.iter().enumerate() {
+        assert!(table.set(i as u32, Some(*h)));
     }
+    let words = table.to_bytes();
+    let mut snapshot = 0u32.to_le_bytes().to_vec();
+    snapshot.extend((words.len() as u32 / 4).to_le_bytes());
+    snapshot.extend(words);
+    (directory, snapshot)
 }
 
 /// A frame keeps its function's private array across the recursive call: at depth 8 every one of
@@ -775,9 +753,9 @@ fn a_recursive_frame_keeps_its_private_array() {
     let Some(bitcode) = module() else {
         return;
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
-    let (pipe, handles) = pipeline(&bitcode, BIG, 8);
-    let tables = table_inputs(&pipe, &handles);
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
+    let (_, handles) = pipeline(&bitcode, BIG, 8);
+    let tables = table_inputs(&handles);
     let m = typed(&bitcode, BIG, 8, &p);
     let ds: Vec<u32> = vec![0, 1, 2, 5, 6, 7, 8];
     let want: Vec<u32> = ds.iter().map(|&d| big(d, 8)).collect();
@@ -797,17 +775,19 @@ fn needs_storage(required: u64, available: u64) -> Result<(), Error> {
     )))
 }
 
-/// The kernels at depth 8 pass L3 on every committed profile that reads tables from argument
-/// buffers (the direct one on every profile), and compute there what they compute on the first.
-/// Their stacks fit every device's Function storage, the floor of a device not measured among
-/// them, which holds them with no note (`PrecisionNote::FunctionStorageAssumed` is past it).
+/// The kernels at depth 8 pass L3 on every committed profile, and the table kernel computes what
+/// it computes on the first on each but the runtime's floor: there its module reads through a
+/// device address, which this CPU dispatch does not back (it binds buffers by slot alone, and the
+/// read traps). Their stacks fit every device's Function storage, the floor of a device not
+/// measured among them, which holds them with no note (`PrecisionNote::FunctionStorageAssumed` is
+/// past it).
 #[test]
 fn recursive_kernels_validate_and_agree_on_every_profile() {
     let Some(bitcode) = module() else {
         return;
     };
-    let (pipe, handles) = pipeline(&bitcode, TABLE, 8);
-    let tables = table_inputs(&pipe, &handles);
+    let (_, handles) = pipeline(&bitcode, TABLE, 8);
+    let tables = table_inputs(&handles);
     let check = |stem: &str, entry: &str, p: &crate::device::DeviceProfile| {
         let a = compile(&bitcode, entry, 8, p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         link_and_validate(&a, p).unwrap_or_else(|e| panic!("{stem} {entry}: L3: {e}"));
@@ -820,9 +800,12 @@ fn recursive_kernels_validate_and_agree_on_every_profile() {
     }
     let ds = depths(24);
     let want: Vec<u32> = ds.iter().flat_map(|&d| [sum(d, 24), even(d, 24)]).collect();
-    for (stem, p) in capable_profiles() {
+    for (stem, p) in committed_profiles().expect("profiles") {
         for entry in [TABLE, BIG] {
             check(&stem, entry, &p);
+        }
+        if stem == "runtime-floor" {
+            continue;
         }
         let m = typed(&bitcode, TABLE, 8, &p);
         assert_eq!(dispatch(&m, &ds, 2, Some(&tables)), want, "{stem}");
@@ -841,7 +824,7 @@ fn a_stack_past_metals_is_refused() {
     let Some(bitcode) = module() else {
         return;
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
     let refused = Err(Error::LimitExceeded(Limit::CallStackBytes));
     let cases: [(&str, &[&str], u32); 7] = [
         (DIRECT, &["drec"], 16359),
@@ -863,26 +846,25 @@ fn a_stack_past_metals_is_refused() {
 /// Stacks past the device's Function storage are `Unsupported{Recursion}` needing more, counted
 /// with the rest of the kernel's run-time-indexed private memory: a stack is indexed by its depth,
 /// and the 4-byte variable each machine keeps its depth in is reached at a constant offset, so it
-/// counts nothing. On the RTX 5080's measured 32 KiB a thread: `drec`'s `k` 8-byte frames fit to
-/// depth 4096; the table kernel's two stacks of `3k` 8-byte frames fit at depth 682 and not at 683;
-/// the large frame's `k` of 264 bytes fit at depth 124 and not at 125. On a device not measured,
-/// such as another RADV GPU than the Radeon 780M, the floor of 16 KiB holds: `drec`'s frames fit to
-/// depth 2048.
+/// counts nothing. Every device holds the floor's 16 KiB a thread: on the RTX 5080's profile
+/// `drec`'s `k` 8-byte frames fit to depth 2048; the table kernel's two stacks of `3k` 8-byte frames
+/// fit at depth 341 and not at 342; the large frame's `k` of 264 bytes fit at depth 62 and not at
+/// 63; on RDNA 3's `drec`'s frames fit to depth 2048 too.
 #[test]
 fn stacks_past_the_device_s_function_storage_are_refused() {
     let Some(bitcode) = module() else {
         return;
     };
-    let (nv, radv, kib) = ("nvidia-rtx5080-laptop", "amd-rdna3-radv", 1024);
+    let (nv, radv, kib) = ("nvidia-rtx5080-laptop", "amd-780m-radv", 1024);
     let cases = [
-        (nv, DIRECT, 4096, 4097 * 8, 32 * kib),
-        (nv, TABLE, 682, 2 * 3 * 683 * 8, 32 * kib),
-        (nv, BIG, 124, 125 * 264, 32 * kib),
+        (nv, DIRECT, 2048, 2049 * 8, 16 * kib),
+        (nv, TABLE, 341, 2 * 3 * 342 * 8, 16 * kib),
+        (nv, BIG, 62, 63 * 264, 16 * kib),
         (radv, DIRECT, 2048, 2049 * 8, 16 * kib),
     ];
     let mut wrong = Vec::new();
     for (stem, entry, fits, required, available) in cases {
-        let p = profile(stem, Default::default()).expect("profile");
+        let p = profile(stem, crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
         if let Err(e) = compile(&bitcode, entry, fits, &p) {
             wrong.push(format!("{stem} {entry} at {fits}: {e}"));
         }
@@ -901,7 +883,7 @@ fn depth_zero_is_depth_one() {
     let Some(bitcode) = module() else {
         return;
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
     let ds = depths(3);
     let one = typed(&bitcode, DIRECT, 1, &p);
     let zero = typed(&bitcode, DIRECT, 0, &p);
@@ -1045,10 +1027,15 @@ fn a_tile_function_recurses_under_its_pipeline_s_depth() {
         d.max_call_stack_depth = k;
         d
     };
-    let key = |k| dev.tile_pipeline_key(&descriptor(StageSource::Function(t.clone()), k));
+    let b = Budget::standard();
+    let key = |k| {
+        let d = descriptor(StageSource::Function(t.clone()), k);
+        dev.compile_tile_pipeline(&d, &b)
+            .unwrap_or_else(|e| panic!("the tile pipeline at {k}: {e}"))
+            .key
+    };
     assert_eq!(key(0), key(1));
     assert_ne!(key(1), key(8));
-    let b = Budget::standard();
     dev.compile_tile_pipeline(&descriptor(StageSource::Function(t.clone()), 8), &b)
         .unwrap_or_else(|e| panic!("the tile pipeline at 8: {e}"));
     let inputs = LowerInputs {
@@ -1083,7 +1070,7 @@ fn recursion_through_a_pointer_passed_as_a_value_makes_one_call_fewer_than_its_d
     let Some(bitcode) = module() else {
         return;
     };
-    let p = profile("moltenvk-m3", Default::default()).expect("profile");
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
     let none = FunctionConstantValues::defaults();
     for list in [LinkedList::Functions, LinkedList::PrivateFunctions] {
         let mut linked = LinkedSource::new("prec", &bitcode, &none);
@@ -1096,5 +1083,30 @@ fn recursion_through_a_pointer_passed_as_a_value_makes_one_call_fewer_than_its_d
             let want: Vec<u32> = ds.iter().map(|&d| sum(d, k)).collect();
             assert_eq!(dispatch(&m, &ds, 1, None), want, "{list:?} at depth {k}");
         }
+    }
+}
+
+/// Recursion through a table holds the frames Metal reached: within them each sum and parity is
+/// Metal's, past them the sum stops and the parity is zero.
+#[test]
+fn table_recursion_reaches_the_frames_metal_reaches() {
+    let Some(bitcode) = module() else {
+        return;
+    };
+    let p = profile("moltenvk-m3", crate::device::DevicePolicy::RESIDENT_TABLES).expect("profile");
+    for (k, frames) in TABLE_FRAMES {
+        let (_, handles) = pipeline(&bitcode, TABLE, k);
+        let tables = table_inputs(&handles);
+        let m = typed(&bitcode, TABLE, k, &p);
+        let ds = depths(frames);
+        let want: Vec<u32> = ds
+            .iter()
+            .flat_map(|&d| [sum(d, frames), even(d, frames)])
+            .collect();
+        assert_eq!(
+            dispatch(&m, &ds, 2, Some(&tables)),
+            want,
+            "depth {k}: {ds:?}"
+        );
     }
 }

@@ -10,7 +10,6 @@
 
 use super::*;
 use crate::lower::arith::fma::{self, Fma, Route};
-use std::collections::BTreeSet;
 
 fn floats(lanes: u8) -> Form {
     vec(float(32), lanes)
@@ -263,95 +262,22 @@ fn check_fma(
     );
 }
 
-/// `OpFmaKHR` and the device's `Fma` round the exact `a * b + c` once on the interpreter (whose
-/// `Fma` is IEEE's), on scalars and vectors, specials, signed zeros, denormals, overflow, and the
-/// double-rounding hazards included: the module adds nothing to the device's instruction.
+/// The device's `Fma` rounds the exact `a * b + c` once on the interpreter (whose `Fma` is IEEE's),
+/// on scalars and vectors, specials, signed zeros, denormals, overflow, and the double-rounding
+/// hazards included: the module adds nothing to the device's instruction.
 #[test]
 fn float_fused_multiply_add_is_the_device_s_instruction() {
     let triples = float_triples();
-    for route in [Route::Khr, Route::Native] {
-        for lanes in [1u8, 3] {
-            let fma = Fma {
-                form: floats(lanes),
-                route,
-            };
-            check_fma(
-                &format!("fma {route:?} x{lanes}"),
-                fma,
-                &lane_cases(&triples, lanes),
-                &fma32,
-                false,
-            );
-        }
-    }
-}
-
-/// The blends' exact `float` multiply-add (`fma::float_fma_exact`, of a `float` output's blend into
-/// an extended-range or 16-bit float attachment) rounds the exact `a * b + c` once on operands below
-/// 2 in magnitude whose parts do not underflow, on one lane and four, and its zero is IEEE's: `-0`
-/// for a negative zero product and a `-0` addend (`-0 · 1 + -0`, the zero alpha Metal stores for a
-/// `float4` output's blend over a `-0` texel), `+0` for opposite zeros and for a product the addend
-/// cancels. The emulation's own sum loses the first (`th + v` adds a `+0` to a `-0`). An infinite
-/// operand's infinite result is that infinity, where the emulation's own steps give a NaN (a
-/// `float4` output's infinity over a texel, which Metal stores as the `half` infinity).
-#[test]
-fn the_blends_float_multiply_add_rounds_once_and_signs_its_zeros() {
-    fn operand(rng: &mut Rng) -> u64 {
-        let r = rng.next();
-        mk32(r & 1, ((r >> 1) % 15) as i32 - 14, (r >> 8) & 0x7F_FFFF)
-    }
-    let edges: [u64; 8] = [
-        0,
-        0x8000_0000,
-        0x3F80_0000,
-        0xBF80_0000,
-        0x3F00_0000,
-        0xBF00_0000,
-        0x3FFF_FFFF,
-        0xBFFF_FFFF,
-    ];
-    let mut triples = Vec::new();
-    for a in edges {
-        for b in edges {
-            for c in edges {
-                triples.push([a, b, c]);
-            }
-        }
-    }
-    // Infinite operands whose results are infinite.
-    triples.extend([
-        [0x7F80_0000, 0x3F80_0000, 0x3F00_0000],
-        [0xFF80_0000, 0x3F00_0000, 0xBF80_0000],
-        [0x3F80_0000, 0x3F00_0000, 0x7F80_0000],
-        [0xBFFF_FFFF, 0x3F80_0000, 0xFF80_0000],
-        [0x7F80_0000, 0x3F80_0000, 0x7F80_0000],
-    ]);
-    let mut rng = Rng(0xB1E0_F32A);
-    for _ in 0..2000 {
-        triples.push([operand(&mut rng), operand(&mut rng), operand(&mut rng)]);
-    }
-    // Products the addend cancels: factors of 12 significand bits, whose product is a `float`.
-    for _ in 0..300 {
-        let (a, b) = (operand(&mut rng) & !0xFFF, operand(&mut rng) & !0xFFF);
-        let p = f32v(a) * f32v(b);
-        triples.push([a, b, u64::from((-p).to_bits())]);
-    }
-    assert!(triples.contains(&[0x8000_0000, 0x3F80_0000, 0x8000_0000]));
-    for lanes in [1u8, 4] {
-        let f = floats(lanes);
-        check(
-            &format!("the blends' float fma x{lanes}"),
-            &[f, f, f],
-            f,
-            &|fb, x| fma::float_fma_exact(fb, f, x[0], x[1], x[2]),
+    for lanes in [1u8, 3] {
+        let fma = Fma {
+            form: floats(lanes),
+            route: Route::Native,
+        };
+        check_fma(
+            &format!("fma x{lanes}"),
+            fma,
             &lane_cases(&triples, lanes),
-            &|c| {
-                Some(
-                    (0..c[0].len())
-                        .map(|l| fma32(c[0][l], c[1][l], c[2][l]))
-                        .collect(),
-                )
-            },
+            &fma32,
             false,
         );
     }
@@ -480,14 +406,14 @@ fn half_triples() -> Vec<[u64; 3]> {
     out
 }
 
-/// A `half` fused multiply-add on 16-bit floats, by the device's `Fma` ([`Route::F16`]) or by
-/// `OpFmaKHR` ([`Route::F16Khr`]), rounds once on the interpreter: the operands convert to 16 bits
-/// exactly and the result widens exactly. The device's `float` `Fma` rounded to `half`
+/// A `half` fused multiply-add on 16-bit floats, by the device's `Fma` ([`Route::F16Native`]),
+/// rounds once on the interpreter, whose `Fma` rounds once (a device's may not, noted): the operands
+/// convert to 16 bits exactly and the result widens exactly. The device's `float` `Fma` rounded to `half`
 /// ([`Route::Native`]) rounds the sum twice, so it is within one `half` unit in the last place.
 #[test]
 fn half_fused_multiply_add_rounds_on_its_route() {
     let triples = half_triples();
-    for route in [Route::F16, Route::F16Khr] {
+    for route in [Route::F16Native] {
         for lanes in [1u8, 2] {
             let fma = Fma {
                 form: vec(float(16), lanes),
@@ -549,31 +475,19 @@ fn the_half_reference_rounds_the_exact_sum() {
     assert_eq!(fma16(0x0003, 0x3800, 0), 0x0002);
 }
 
-/// The route follows the profile: `float` by `OpFmaKHR` where `shaderFmaFloat32` is enabled, else
-/// the device's `Fma`; `half` by the device's 16-bit `Fma` where the driver is measured to compute
-/// it as Metal's `half` `fma` and `shaderFloat16` is enabled (the MoltenVK captures alone), else
-/// `OpFmaKHR` on 16 bits where `shaderFmaFloat16` is enabled and the profile rounds under the
-/// 16-bit float controls, else the device's `float` `Fma` rounded to `half`; `bfloat` and `double`
-/// keep their own lowering.
+/// The route follows the profile: `float` by the device's `Fma` on every profile; `half` by the
+/// device's 16-bit `Fma` where the profile rounds under the 16-bit float controls, else the
+/// device's `float` `Fma` rounded to `half`; `bfloat` and `double` keep their own lowering.
 #[test]
 fn the_fused_multiply_add_route_follows_the_profile() {
-    use crate::error::DriverDeviation;
-    use crate::spirv::testing::is_moltenvk_capture;
-    let mut seen = BTreeSet::new();
-    let mut f16 = 0;
-    let mut khr16 = 0;
     for (stem, p) in committed_profiles().expect("profiles") {
-        let l = &p.fields().leaf;
-        let want = if l.fma32 { Route::Khr } else { Route::Native };
         assert_eq!(
             Fma::by(fma::routes(&p), float(32)).expect("float").route,
-            want,
+            Route::Native,
             "{stem}"
         );
-        let half = if p.takes_driver_deviation(DriverDeviation::MetalHalfFma) && l.float16 {
-            Route::F16
-        } else if l.fma16 && crate::lower::arith::narrow::half_controls(&p) {
-            Route::F16Khr
+        let half = if crate::lower::arith::narrow::half_controls(&p) {
+            Route::F16Native
         } else {
             Route::Native
         };
@@ -582,18 +496,7 @@ fn the_fused_multiply_add_route_follows_the_profile() {
             half,
             "{stem}"
         );
-        assert_eq!(half == Route::F16, is_moltenvk_capture(&stem), "{stem}");
-        f16 += usize::from(half == Route::F16);
-        khr16 += usize::from(half == Route::F16Khr);
         assert_eq!(Fma::by(fma::routes(&p), bfloat()), None, "{stem}");
         assert_eq!(Fma::by(fma::routes(&p), float(64)), None, "{stem}");
-        seen.insert(want);
     }
-    assert_eq!(
-        seen,
-        BTreeSet::from([Route::Khr, Route::Native]),
-        "every float route is some committed profile's"
-    );
-    assert!(f16 >= 1, "{f16} profiles take Metal's 16-bit Fma");
-    assert!(khr16 >= 2, "{khr16} profiles take OpFmaKHR on 16 bits");
 }

@@ -1,0 +1,175 @@
+{
+  "format": 1,
+  "case": "fence-empty-waiter",
+  "suite_version": 1,
+  "answers": [
+    {
+      "key": {
+        "chip": "apple-m3-max",
+        "os_version": "27.0.1",
+        "os_build": "26A434",
+        "metal_level": "27.0.1"
+      },
+      "provenance": "metal_run",
+      "device": "Apple M3 Max",
+      "runs": 5,
+      "outcomes": [
+        {
+          "runs": 5,
+          "transcript": {
+            "root": {
+              "name": "case",
+              "observed": {
+                "value": "absent"
+              },
+              "children": [
+                {
+                  "name": "inputs",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "shape",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "296c76300bf9c42a275b827aaab7f1f710b91f491387eb84e0d7d8f0afbc1042"
+                        }
+                      }
+                    },
+                    {
+                      "name": "buffer-bytes-and-written-byte",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "0b05a72b3f11e6c4b8210f3317e4e55dca521804b84be42f52b5dd9a14f94168"
+                        }
+                      }
+                    },
+                    {
+                      "name": "long-job-and-bound",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "20a3d0ebb6bd065160beb9d1b5c34d6eeae4d4bab6047e4ce0aadae2a9e3b503"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "order",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "x/words-written-when-the-waiter-completed",
+                      "observed": {
+                        "value": {
+                          "uint": 1024
+                        }
+                      }
+                    },
+                    {
+                      "name": "updater/status-once-both-completed",
+                      "observed": {
+                        "value": {
+                          "variant": {
+                            "name": "Completed",
+                            "payload": "absent"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "waiter/status-once-both-completed",
+                      "observed": {
+                        "value": {
+                          "variant": {
+                            "name": "Completed",
+                            "payload": "absent"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "notices",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "set",
+                      "observed": {
+                        "value": {
+                          "nothing": "announced_nothing"
+                        }
+                      }
+                    },
+                    {
+                      "name": "counts",
+                      "observed": {
+                        "value": {
+                          "fields": {}
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "validated": {
+        "stopped": {
+          "call": "fence_order",
+          "message": "M2V-TIMES EmptyWaiter y 0 updater 0.000..4.167 waiter -0.145..4.276 busy []"
+        }
+      }
+    }
+  ],
+  "times": [
+    {
+      "venue": "native Metal",
+      "chip": "apple-m3-max",
+      "os_build": "26A434",
+      "rounds": 8,
+      "measured": "8 round(s) of the whole selection, in the case set's own order, each round on a fresh device, our shader cache carried over between the cases of a round; a figure is the median of the rounds' own medians; Metal's leg ran at a one-minute load average of 5.66 and ours at 5.66; the legs run one after the other, so the per-call margin is judged only when both are 26.0 or under and within 2.0x of each other",
+      "instrument": 290,
+      "times": {
+        "case": "fence-empty-waiter",
+        "calls": 1,
+        "in_calls": 10559584,
+        "on_cpu": 2948750,
+        "blocked": 7686708,
+        "elsewhere": 4530583,
+        "spend": 15073167,
+        "spend_least": 14817250,
+        "spend_most": 16173125,
+        "per_call": [
+          {
+            "call": "fence_order",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 10559584,
+            "on_cpu": 2948750,
+            "blocked": 7686708,
+            "wall_least": 9777875,
+            "wall_most": 11496042,
+            "wall_total": 10559584,
+            "on_cpu_total": 2948750,
+            "blocked_total": 7686708
+          }
+        ]
+      }
+    }
+  ]
+}

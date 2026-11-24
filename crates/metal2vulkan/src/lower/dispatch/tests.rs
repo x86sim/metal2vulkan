@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::device::DevicePolicy;
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, Stage};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::{natural_layout, ExecModel, LayoutRule, StorageClass, TypedModule};
 use crate::spirv::testing::assert_valid;
@@ -35,9 +35,13 @@ fn plan(form: LocalSizeForm, multi_region: bool) -> DispatchPlan {
         keys: SpecKey::dispatch_keys(Stage::Kernel),
         folded_groups: false,
         draw_pieces: false,
-        wrapper_groups: false,
         object_grid: false,
         partial_groups: false,
+        grid_edge: false,
+        identity: false,
+        pinned_subgroup_size: None,
+        deep: false,
+        private_arena: false,
     }
 }
 
@@ -204,22 +208,14 @@ struct Region {
 }
 
 /// Run `m` for region `r`; returns each invocation's `(Vulkan workgroup, local index, record)`.
-fn run_region(
-    m: &TypedModule,
-    form: LocalSizeForm,
-    r: &Region,
-    sg: SubgroupSize,
-) -> Vec<([u32; 3], u32, Vec<u32>)> {
+fn run_region(m: &TypedModule, r: &Region, sg: SubgroupSize) -> Vec<([u32; 3], u32, Vec<u32>)> {
     let n = r.local.iter().product::<u32>();
     let groups = r.groups.iter().product::<u32>();
     let words = record_words();
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(r.local) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    if form == LocalSizeForm::Flat {
-        spec.insert(SpecKey::FlatLocalSize, u64::from(n));
-    }
+    // A module that declares it runs a region deeper than `DEEP_THREADGROUP` as one row; any other
+    // reads no such key.
+    spec.extend(crate::pipeline::threadgroup_constants(r.local));
     let mut push = Vec::new();
     if let Some((base, threads, nominal)) = r.multi {
         spec.insert(SpecKey::MultiRegion, 1);
@@ -319,7 +315,6 @@ fn position(rec: &[u32]) -> [u32; 3] {
 /// the records cover each Metal thread exactly once with Metal's builtins.
 fn check_dispatch(
     m: &TypedModule,
-    form: LocalSizeForm,
     regions: &[Region],
     threads: [u32; 3],
     l: [u32; 3],
@@ -327,7 +322,7 @@ fn check_dispatch(
 ) {
     let mut seen: BTreeMap<[u32; 3], Vec<u32>> = BTreeMap::new();
     for r in regions {
-        for (wg, li, rec) in run_region(m, form, r, sg) {
+        for (wg, li, rec) in run_region(m, r, sg) {
             let p = position(&rec);
             assert!(
                 seen.insert(p, rec.clone()).is_none(),
@@ -390,8 +385,91 @@ fn single_region_builtins_match_metal() {
                         multi: None,
                     };
                     let threads = std::array::from_fn(|i| l[i] * groups[i]);
-                    check_dispatch(&m, form, &[r], threads, l, sg);
+                    check_dispatch(&m, &[r], threads, l, sg);
                 }
+            }
+        }
+    }
+}
+
+/// A kernel that declares `SpecKey::DeepThreadgroup` ([`DispatchPlan::deep`]) runs a region
+/// deeper than `DEEP_THREADGROUP` as one row of its threads, and every builtin keeps Metal's value:
+/// single regions 320 and 100 deep, with and without `MultiRegion`, at both modelled subgroup
+/// widths, and the regions of a `dispatchThreads` grid of threadgroups 128 deep whose edge along
+/// `z` is 60 deep, which runs at its own size. So does a region no deeper.
+#[test]
+fn a_deep_threadgroup_keeps_every_builtin() {
+    for mr in [false, true] {
+        let mut dp = plan(LocalSizeForm::Spec, mr);
+        dp.deep = true;
+        let m = module(&dp);
+        for sg in [SubgroupSize::W32, SubgroupSize::W64] {
+            for (l, groups) in [
+                ([1, 1, 320], [2, 1, 1]),
+                ([2, 3, 100], [1, 2, 1]),
+                ([8, 4, 2], [3, 2, 1]),
+            ] {
+                let r = Region {
+                    local: l,
+                    groups,
+                    multi: None,
+                };
+                let threads = std::array::from_fn(|i| l[i] * groups[i]);
+                check_dispatch(&m, &[r], threads, l, sg);
+            }
+        }
+    }
+    let mut dp = plan(LocalSizeForm::Spec, true);
+    dp.deep = true;
+    let m = module(&dp);
+    let (threads, l) = ([3, 5, 316], [2, 2, 128]);
+    let regions = thread_regions(threads, l);
+    check_dispatch(&m, &regions, threads, l, SubgroupSize::W32);
+}
+
+/// A flattened kernel whose pipeline pins its subgroup size reads no `SubgroupSize` builtin: its
+/// module declares none, and its `lin` takes the pinned size as a constant, so every builtin keeps
+/// Metal's value at either modelled width with and without regions. Unpinned, it declares and
+/// reads the builtin.
+#[test]
+fn a_pinned_subgroup_size_reads_no_subgroup_size_builtin() {
+    let declares_subgroup_size = |m: TypedModule| {
+        let words = crate::spirv::serialize::serialize(m)
+            .expect("serialize")
+            .words;
+        let mut at = 5;
+        let mut found = false;
+        while let Some(&first) = words.get(at) {
+            let (count, op) = ((first >> 16) as usize, first & 0xffff);
+            found |= op == crate::spv::Op::Decorate as u32
+                && words.get(at + 2) == Some(&(crate::spv::Decoration::BuiltIn as u32))
+                && words.get(at + 3) == Some(&(crate::spv::BuiltIn::SubgroupSize as u32));
+            at += count.max(1);
+        }
+        found
+    };
+    for mr in [false, true] {
+        let dp = plan(LocalSizeForm::Flat, mr);
+        assert!(
+            declares_subgroup_size(module(&dp)),
+            "unpinned, MultiRegion {mr}"
+        );
+        for (size, sg) in [(32, SubgroupSize::W32), (64, SubgroupSize::W64)] {
+            let mut dp = plan(LocalSizeForm::Flat, mr);
+            dp.pinned_subgroup_size = Some(size);
+            assert!(
+                !declares_subgroup_size(module(&dp)),
+                "pinned {size}, MultiRegion {mr}"
+            );
+            let m = module(&dp);
+            for (l, groups) in [([8, 4, 2], [3, 2, 1]), ([64, 1, 1], [2, 1, 2])] {
+                let threads = std::array::from_fn(|i| l[i] * groups[i]);
+                let r = Region {
+                    local: l,
+                    groups,
+                    multi: None,
+                };
+                check_dispatch(&m, &[r], threads, l, sg);
             }
         }
     }
@@ -408,14 +486,7 @@ fn dispatch_threads_regions_match_metal() {
         ([5, 7, 3], [2, 3, 2]),
     ] {
         let regions = thread_regions(threads, l);
-        check_dispatch(
-            &m,
-            LocalSizeForm::Spec,
-            &regions,
-            threads,
-            l,
-            SubgroupSize::W32,
-        );
+        check_dispatch(&m, &regions, threads, l, SubgroupSize::W32);
     }
 }
 
@@ -442,17 +513,16 @@ fn group_count_splits_match_the_single_dispatch() {
                 });
             }
         }
-        check_dispatch(&m, form, &regions, threads, l, SubgroupSize::W64);
+        check_dispatch(&m, &regions, threads, l, SubgroupSize::W64);
     }
 }
 
 /// A partial object threadgroups module's run of a draw of `threads` threads in threadgroups of
 /// `l` (one dispatch of the threadgroups the threads fill, rounded up, each of `l` invocations,
-/// `MultiRegion` 1), its region flagged where `flagged` ([`partial_region_bytes`]): each
+/// `MultiRegion` 1), its region flagged where `flagged` ([`nonuniform_region_bytes`]): each
 /// invocation's live word and builtins.
 fn run_partial(
     m: &TypedModule,
-    form: LocalSizeForm,
     threads: [u32; 3],
     l: [u32; 3],
     flagged: bool,
@@ -463,15 +533,10 @@ fn run_partial(
     let count = groups.iter().product::<u32>() * n;
     let words = record_words() + 1;
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip(l) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    if form == LocalSizeForm::Flat {
-        spec.insert(SpecKey::FlatLocalSize, u64::from(n));
-    }
+    spec.extend(crate::pipeline::threadgroup_constants(l));
     spec.insert(SpecKey::MultiRegion, 1);
     let push = match flagged {
-        true => partial_region_bytes(threads, l),
+        true => nonuniform_region_bytes([0; 3], threads, l),
         false => region_bytes([0; 3], threads, l),
     };
     let res = Resources {
@@ -535,7 +600,7 @@ fn partial_object_threadgroups_match_metal() {
             for &(threads, l) in cases {
                 let mut seen: BTreeMap<[u32; 3], Vec<u32>> = BTreeMap::new();
                 let mut dead = 0;
-                for (live, rec) in run_partial(&m, form, threads, l, true, sg) {
+                for (live, rec) in run_partial(&m, threads, l, true, sg) {
                     if live == 0 {
                         dead += 1;
                         continue;
@@ -561,7 +626,7 @@ fn partial_object_threadgroups_match_metal() {
             }
             // Unflagged, of whole threadgroups: the uniform answers, every invocation live.
             let (threads, l) = ([64, 4, 2], [32, 2, 1]);
-            for (live, rec) in run_partial(&m, form, threads, l, false, sg) {
+            for (live, rec) in run_partial(&m, threads, l, false, sg) {
                 assert_eq!(live, 1);
                 assert_eq!(rec, metal(position(&rec), threads, l), "{form:?}");
             }
@@ -677,8 +742,8 @@ fn builtin_facts_and_projections() {
 /// whose kernel stage has subgroups (the flattened form reads subgroup builtins).
 #[test]
 fn derivation_modules_are_valid() {
-    for stem in ["moltenvk-m3", "lunarg-desktop-baseline-2023"] {
-        let p = crate::pipeline::testing::profile(stem, DevicePolicy::default()).expect(stem);
+    for stem in ["moltenvk-m3", "runtime-floor"] {
+        let p = crate::pipeline::testing::profile(stem, DevicePolicy::RESIDENT_TABLES).expect(stem);
         for form in [LocalSizeForm::Spec, LocalSizeForm::Flat] {
             for mr in [false, true] {
                 assert_valid(module(&plan(form, mr)), &p);
@@ -799,7 +864,7 @@ fn the_flat_variant_s_64_bit_division_is_exact() {
     )
     .expect("entry");
     let m = mb.finalize().expect("finalize");
-    let p = crate::pipeline::testing::profile("intel-arl-anv", DevicePolicy::default())
+    let p = crate::pipeline::testing::profile("intel-arl-anv", DevicePolicy::RESIDENT_TABLES)
         .expect("profile");
     assert_valid(m.clone(), &p);
     let bytes: Vec<u8> = cases
@@ -834,5 +899,110 @@ fn the_flat_variant_s_64_bit_division_is_exact() {
             (n / u64::from(d), (n % u64::from(d)) as u32),
             "{n} / {d}"
         );
+    }
+}
+
+/// [`grid_tile`]'s rule taken over every tile it may give: the sides `2^a, 2^b, 2^c` with
+/// `a + b + c = 8`, the least of each tile's key in its total order: the tiles launched, then the
+/// tiles partly past the grid, then the depth `c`, then where the grid has two rows or more the
+/// height's distance `|b - 1|` from 2, then the narrower last (`-a`).
+fn every_tile_rule(threads: [u32; 3]) -> [u32; 3] {
+    let rows = threads[1] >= 2;
+    let mut best: Option<([u32; 3], (u128, u128, u32, u32, i64))> = None;
+    for a in 0..=8u32 {
+        for b in 0..=8 - a {
+            let k = [a, b, 8 - a - b];
+            let tiles: u128 = (0..3)
+                .map(|i| u128::from(threads[i].div_ceil(1 << k[i])))
+                .product();
+            let whole: u128 = (0..3).map(|i| u128::from(threads[i] >> k[i])).product();
+            let height = if rows { b.abs_diff(1) } else { 0 };
+            let key = (tiles, tiles - whole, k[2], height, -i64::from(a));
+            if best.is_none_or(|(_, kept)| key < kept) {
+                best = Some((k, key));
+            }
+        }
+    }
+    best.expect("a tile").0.map(|k| 1 << k)
+}
+
+/// The tiles of grids the rule must place, in its total order over the 45 tiles: the fewest
+/// threads launched, then the fewest tiles partly past the grid, then the shallowest, then where
+/// the grid has two rows or more the height nearest 2, then the widest. Ragged rows of 8 x 8
+/// threadgroups (24x24x252 and 8x8x360 whole in 8x8x4, 8x8x22 in 8x8x4 at 24 planes for 22,
+/// 304x304 whole in 16x16); whole grids, which take the first tile that divides them (128x2 for
+/// square, wide and tall ones a 2-row tile divides, 64x4 for a cube of 64); ragged square, wide,
+/// tall and deep grids, where 1000x30 launches as many threads in 256x1 as in 128x2 and takes
+/// 128x2 for its fewer tiles partly past the grid; one-row grids, which take 256x1, and a column
+/// and a pillar of 300 and 1000 threads along their axis; and grids one tile holds, which take
+/// the first tile that holds them (8x8 in 32x8).
+#[test]
+fn grid_tiles_launch_the_fewest_threads_past_the_grid() {
+    let table: [([u32; 3], [u32; 3]); 25] = [
+        ([24, 24, 252], [8, 8, 4]),
+        ([8, 8, 360], [8, 8, 4]),
+        ([8, 8, 22], [8, 8, 4]),
+        ([304, 304, 1], [16, 16, 1]),
+        ([1024, 1024, 1], [128, 2, 1]),
+        ([5600, 4200, 1], [32, 8, 1]),
+        ([64, 64, 64], [64, 4, 1]),
+        ([4096, 256, 1], [128, 2, 1]),
+        ([256, 4096, 1], [128, 2, 1]),
+        ([16, 16, 1], [16, 16, 1]),
+        ([100, 100, 1], [16, 16, 1]),
+        ([1000, 30, 1], [128, 2, 1]),
+        ([30, 1000, 1], [2, 128, 1]),
+        ([255, 4095, 1], [1, 256, 1]),
+        ([33, 33, 33], [8, 8, 4]),
+        ([300, 1, 1], [256, 1, 1]),
+        ([1000, 1, 1], [256, 1, 1]),
+        ([1, 1000, 1], [1, 256, 1]),
+        ([1, 1, 300], [1, 1, 256]),
+        ([7, 5, 3], [8, 8, 4]),
+        ([1, 1, 1], [256, 1, 1]),
+        ([33, 1, 1], [256, 1, 1]),
+        ([3, 3, 1], [64, 4, 1]),
+        ([8, 8, 1], [32, 8, 1]),
+        ([2, 2, 1], [128, 2, 1]),
+    ];
+    for (threads, tile) in table {
+        assert_eq!(grid_tile(threads), tile, "{threads:?}");
+        assert_eq!(
+            tile.iter().product::<u32>(),
+            GRID_TILE_THREADS,
+            "{threads:?}"
+        );
+    }
+}
+
+/// [`grid_tile`] gives the tile its rule takes over every tile, on every grid of extents 1 to 40
+/// per axis and on wide, tall and deep ones: its shortcuts, for grids its tile divides and grids
+/// one tile holds, take the tile the rule takes.
+#[test]
+fn grid_tiles_match_the_rule_over_every_tile() {
+    let mut grids: Vec<[u32; 3]> = Vec::new();
+    for x in 1..=40 {
+        for y in 1..=40 {
+            for z in [1, 2, 3, 5, 6, 8, 22, 40] {
+                grids.push([x, y, z]);
+            }
+        }
+    }
+    for n in [
+        255,
+        256,
+        257,
+        1023,
+        1366,
+        1920,
+        4097,
+        65_535,
+        1 << 20,
+        u32::MAX,
+    ] {
+        grids.extend([[n, 1, 1], [1, n, 1], [1, 1, n], [n, 768, 1], [n, 3, 5]]);
+    }
+    for threads in grids {
+        assert_eq!(grid_tile(threads), every_tile_rule(threads), "{threads:?}");
     }
 }

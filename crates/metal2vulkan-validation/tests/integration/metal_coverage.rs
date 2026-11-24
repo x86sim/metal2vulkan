@@ -2,10 +2,11 @@
 //! docs/METAL-COVERAGE.md) names only counterparts that exist.
 //!
 //! Each row is a public item of the macOS SDK's Metal headers, by name. An implemented row names
-//! its counterpart in the runtime (`runtime/src`) or the translator (`src`, `air/src`): a type
-//! (`Type`), a method or associated item (`Type::name`), or a field
-//! (`Type.name`), or several of these, comma-separated. This test reads those sources and holds every counterpart to a public item of
-//! that name: the type declared `pub`, a method `pub fn` inside an `impl` of the type, a field
+//! its counterpart in the runtime (`metal2vulkan-runtime/src`) or the translator (`src`, `air/src`):
+//! a type (`Type`), a method or associated item (`Type::name`), or a field (`Type.name`), or
+//! several of these, comma-separated. This test reads those sources and holds every counterpart
+//! to a public item of that name: the type declared `pub`, a method `pub fn` inside an `impl` of
+//! the type, a field
 //! `pub` inside the type's struct. A renamed or removed counterpart fails here until the table
 //! says so. It also holds the table's vocabulary (status, size) and the generated document's
 //! totals to the table. `coverage.py --sdk` checks the table's names against the SDK on a Mac.
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 /// The repository root.
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    metal2vulkan_devtools::workspace_dir()
 }
 
 /// The table's rows, by column name.

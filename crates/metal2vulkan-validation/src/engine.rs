@@ -10,18 +10,17 @@
 //! error taxonomy, never a second list of reasons.
 
 use crate::l3::L3Failure;
-use metal2vulkan::device::VkLimit;
-use metal2vulkan::device::{DevicePolicy, DeviceProfile, Requirements};
+use metal2vulkan::device::{
+    ApiVersion, DeviceDescription, DevicePolicy, DeviceProfile, EnableSet, Requirements,
+    VkExtension,
+};
 use metal2vulkan::error::{
-    CanonError, Capability, Error, ErrorClass, Feature, InputError, InputErrorKind, InternalError,
-    InternalKind, Limit, Location, Needs, RuntimeInput,
+    CanonError, Capability, Error, ErrorClass, Feature, InputError, InputErrorKind, InternalKind,
+    Limit, Location, Needs, RuntimeInput,
 };
 use metal2vulkan::library::{CompiledFunction, FunctionConstantValues};
-use metal2vulkan::pipeline::{
-    ColorGroup, CompileReport, EntryDescriptor, EntryRef, LoweringInputs, PipelineLayout,
-};
+use metal2vulkan::pipeline::{CompileReport, EntryDescriptor, EntryRef, LoweringInputs};
 use metal2vulkan::Budget;
-use metal2vulkan_air::abi::{AbiInt, OutputRole, Stage as AbiStage};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,8 +125,7 @@ pub enum Outcome {
     Failed { failure: FailureKind },
 }
 
-/// Why an `Unsupported` outcome is refused: on every device, or on a device whose driver has a
-/// measured defect.
+/// Why an `Unsupported` outcome is refused on every device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnsupportedReason {
@@ -135,10 +133,6 @@ pub enum UnsupportedReason {
     NotImplemented,
     /// No Vulkan 1.2+ mechanism exists.
     NotRepresentable,
-    /// The device's driver is measured to run the mechanism wrong (`Needs::DriverDefect`, the
-    /// profile's `DriverWorkaround`), or to run one the runtime itself records wrong
-    /// (`Needs::RuntimeDriverDefect`).
-    DriverDefect,
 }
 
 impl UnsupportedReason {
@@ -146,7 +140,6 @@ impl UnsupportedReason {
         match self {
             UnsupportedReason::NotImplemented => "not_implemented",
             UnsupportedReason::NotRepresentable => "not_representable",
-            UnsupportedReason::DriverDefect => "driver_defect",
         }
     }
 }
@@ -389,7 +382,6 @@ impl Outcome {
                 let reason = [
                     UnsupportedReason::NotImplemented,
                     UnsupportedReason::NotRepresentable,
-                    UnsupportedReason::DriverDefect,
                 ]
                 .into_iter()
                 .find(|known| known.as_str() == reason)?;
@@ -429,12 +421,6 @@ impl From<&Error> for Outcome {
                         reason: UnsupportedReason::NotRepresentable,
                         feature,
                     },
-                    Needs::DriverDefect(_) | Needs::RuntimeDriverDefect(_) => {
-                        Outcome::Unsupported {
-                            reason: UnsupportedReason::DriverDefect,
-                            feature,
-                        }
-                    }
                     _ => Outcome::Failed {
                         failure: FailureKind::Unclassified,
                     },
@@ -504,12 +490,12 @@ impl Attempt {
     }
 
     /// Settle this attempt, as it stands if `spirv-val` accepts its module
-    /// ([`translate_unvalidated`]), with L3's `checked` result (or panic): unchanged, and `true`,
-    /// when the module was accepted; else L3's outcome, keeping the compile's cost without the
-    /// module's hash, and `false`.
-    pub fn settle_l3(&mut self, checked: std::thread::Result<Result<(), L3Failure>>) -> bool {
+    /// ([`translate_unvalidated`]), with L3's `checked` result (or panic): unchanged when the
+    /// module was accepted; else L3's outcome, keeping the compile's cost without the module's
+    /// hash.
+    pub fn settle_l3(&mut self, checked: std::thread::Result<Result<(), L3Failure>>) {
         let failed = match checked {
-            Ok(Ok(())) => return true,
+            Ok(Ok(())) => return,
             Ok(Err(l3)) => l3_attempt(&l3),
             Err(payload) => panic_attempt(payload.as_ref()),
         };
@@ -519,7 +505,6 @@ impl Attempt {
         if let Some(cost) = &mut self.cost {
             cost.spirv_sha256 = None;
         }
-        false
     }
 }
 
@@ -564,10 +549,7 @@ pub fn bounded_detail(detail: &str) -> String {
 /// that reads `[[stage_in]]` attributes asks for its stage-input descriptor
 /// (`NeedsInput(StageInputDescriptor)`): it is translated again, on a fresh meter, under the one
 /// its AIR implies (`executor_contract::stage_inputs::implied_descriptor`), and keeps the
-/// `NeedsInput` when the tool cannot derive one. A fragment function refused for writing more
-/// colors than the profile draws at once is translated as the render pipeline of its own colors
-/// draws it there, in color groups (`color_groups`): one module a group, each linked and checked
-/// by L3.
+/// `NeedsInput` when the tool cannot derive one.
 ///
 /// `deadline` is the per-attempt wall deadline of the engine's meter. Every stage runs under
 /// `catch_unwind`, so a panic is an outcome, never an unwind into the caller.
@@ -577,18 +559,6 @@ pub fn translate_new(
     profile: &DeviceProfile,
     deadline: Option<Instant>,
 ) -> Attempt {
-    translate_new_linked(bitcode, entry, profile, deadline).0
-}
-
-/// [`translate_new`], and a translated module's final words (the words L3 accepted) with the
-/// pipeline layout link gave it alone (what `msl_portability::moltenvk` configures MoltenVK's
-/// conversion from).
-pub fn translate_new_linked(
-    bitcode: &[u8],
-    entry: &str,
-    profile: &DeviceProfile,
-    deadline: Option<Instant>,
-) -> (Attempt, Option<(Vec<u32>, PipelineLayout)>) {
     validated(translate_new_unvalidated(bitcode, entry, profile, deadline))
 }
 
@@ -600,137 +570,33 @@ pub fn translate_new_unvalidated(
     deadline: Option<Instant>,
 ) -> (Attempt, Option<PendingL3>) {
     let descriptor = EntryDescriptor::new(bitcode, EntryRef::Name(entry));
-    translate_modules_unvalidated(profile, deadline, |budget| {
-        let (compiled, report) =
-            match profile.compile_entry(&descriptor, &LoweringInputs::new(), budget) {
-                (Err(e @ Error::NeedsInput(RuntimeInput::StageInputDescriptor { .. })), report) => {
-                    match crate::executor_contract::stage_inputs::implied_descriptor(
-                        bitcode,
-                        entry,
-                        &FunctionConstantValues::defaults(),
-                    ) {
-                        Ok(Some(stage_input)) => {
-                            let mut inputs = LoweringInputs::new();
-                            inputs.stage_input = Some(stage_input);
-                            profile.compile_entry(&descriptor, &inputs, budget)
-                        }
-                        Ok(None) | Err(_) => (Err(e), report),
+    translate_unvalidated(profile, deadline, |budget| {
+        match profile.compile_entry(&descriptor, &LoweringInputs::new(), budget) {
+            (Err(e @ Error::NeedsInput(RuntimeInput::StageInputDescriptor { .. })), report) => {
+                match crate::executor_contract::stage_inputs::implied_descriptor(
+                    bitcode,
+                    entry,
+                    &FunctionConstantValues::defaults(),
+                ) {
+                    Ok(Some(stage_input)) => {
+                        let mut inputs = LoweringInputs::new();
+                        inputs.stage_input = Some(stage_input);
+                        profile.compile_entry(&descriptor, &inputs, budget)
                     }
+                    Ok(None) | Err(_) => (Err(e), report),
                 }
-                other => other,
-            };
-        match compiled {
-            Err(refusal) if color_limit(&refusal) => {
-                color_groups(profile, &descriptor, budget, (refusal, report))
             }
-            compiled => (compiled.map(|function| vec![function]), report),
+            other => other,
         }
     })
 }
 
-/// Whether `error` is the refusal of a function's color outputs past what the profile draws at
-/// once (`InterfaceComponents` at `MaxFragmentOutputAttachments` or `MaxColorAttachments`).
-fn color_limit(error: &Error) -> bool {
-    let Error::Unsupported(u) = error else {
-        return false;
-    };
-    let limit = |c: &Capability| {
-        matches!(
-            c,
-            Capability::Limit {
-                limit: VkLimit::MaxFragmentOutputAttachments | VkLimit::MaxColorAttachments,
-                ..
-            }
-        )
-    };
-    u.feature == Feature::InterfaceComponents
-        && matches!(&u.needs, Needs::AnyOf(sets) if sets.iter().flatten().any(limit))
-}
-
-/// The fragment function of `descriptor`, refused alone for writing more colors than `profile`
-/// draws at once (`refusal`, after `report`), compiled as each color group of the render pipeline
-/// whose attachments are the colors it writes ([`ColorGroup::of`], `LoweringInputs::color_group`),
-/// as the runtime draws that pipeline on the profile (`pipeline::compile::color_group`): every
-/// group's module, in group order, or the first group's refusal. A function that is not a fragment
-/// function, or whose colors take no group, keeps `refusal`, and so does one of more groups that
-/// writes memory, which the pipeline's link refuses so ([`CompiledFunction::writes_memory`]).
-/// Each compile runs on a fresh meter of `budget`; the report is their total work and their
-/// highest ledger peak.
-fn color_groups(
-    profile: &DeviceProfile,
-    descriptor: &EntryDescriptor<'_>,
-    budget: &Budget,
-    (refusal, report): (Error, CompileReport),
-) -> (Result<Vec<CompiledFunction>, Error>, CompileReport) {
-    let present: BTreeSet<u32> =
-        match profile.specialized_entry(descriptor, &LoweringInputs::new(), budget) {
-            Ok(entry) if matches!(entry.ep.stage, AbiStage::Fragment { .. }) => entry
-                .ep
-                .outputs
-                .iter()
-                .filter_map(|output| match output.role {
-                    OutputRole::RenderTarget {
-                        attachment: AbiInt::Const(color),
-                        ..
-                    } => Some(color),
-                    _ => None,
-                })
-                .collect(),
-            Ok(_) | Err(_) => return (Err(refusal), report),
-        };
-    let width = ColorGroup::width_on(profile);
-    let Some(grouping) = ColorGroup::of(present.into_iter().collect(), width, 0) else {
-        return (Err(refusal), report);
-    };
-    let mut total = report;
-    let mut modules = Vec::with_capacity(grouping.groups() as usize);
-    for group in 0..grouping.groups() {
-        let Some(of_group) = ColorGroup::of(grouping.present.clone(), width, group) else {
-            return (Err(refusal), total);
-        };
-        // The colors of the other groups, at their locations past the group's, have no
-        // attachment in the group's pipeline: stored nowhere, as `compile_render_variant` compiles
-        // the group's variant (`LoweringInputs::unattached_colors`).
-        let mut inputs = LoweringInputs::new();
-        inputs.unattached_colors = (grouping.present.iter())
-            .filter(|color| !of_group.colors().contains(color))
-            .map(|&color| of_group.location(color))
-            .collect();
-        inputs.color_group = Some(of_group);
-        let (compiled, report) = profile.compile_entry(descriptor, &inputs, budget);
-        total.work_units += report.work_units;
-        total.ledger_peak = total.ledger_peak.max(report.ledger_peak);
-        match compiled {
-            Ok(function) => modules.push(function),
-            Err(error) => return (Err(error), total),
-        }
-    }
-    if grouping.groups() > 1 && modules.iter().any(CompiledFunction::writes_memory) {
-        return (Err(refusal), total);
-    }
-    (Ok(modules), total)
-}
-
-/// One engine attempt whose compile `compile` makes under the per-attempt wall deadline
-/// `deadline`, linked alone and checked by L3 for `profile` in this process:
-/// [`translate_unvalidated`], then [`PendingL3::validate`]. [`translate_new_linked`] and the
-/// specialization audit's attempts (`specialization::attempt`) are its two compiles.
-pub fn translate_with(
-    profile: &DeviceProfile,
-    deadline: Option<Instant>,
-    compile: impl FnOnce(&Budget) -> (Result<CompiledFunction, Error>, CompileReport),
-) -> (Attempt, Option<(Vec<u32>, PipelineLayout)>) {
-    validated(translate_unvalidated(profile, deadline, compile))
-}
-
 /// An attempt [`translate_unvalidated`] left `pending`, settled by L3 in this process
 /// ([`PendingL3::validate`]); any other attempt as it is.
-pub fn validated(
-    (attempt, pending): (Attempt, Option<PendingL3>),
-) -> (Attempt, Option<(Vec<u32>, PipelineLayout)>) {
+pub fn validated((attempt, pending): (Attempt, Option<PendingL3>)) -> Attempt {
     match pending {
         Some(pending) => pending.validate(attempt),
-        None => (attempt, None),
+        None => attempt,
     }
 }
 
@@ -752,22 +618,6 @@ pub fn translate_unvalidated(
     deadline: Option<Instant>,
     compile: impl FnOnce(&Budget) -> (Result<CompiledFunction, Error>, CompileReport),
 ) -> (Attempt, Option<PendingL3>) {
-    translate_modules_unvalidated(profile, deadline, |budget| {
-        let (compiled, report) = compile(budget);
-        (compiled.map(|function| vec![function]), report)
-    })
-}
-
-/// [`translate_unvalidated`] of a compile that may make several modules of the one function, its
-/// color groups' ([`color_groups`]): each is linked alone, relocated and checked against
-/// `profile` as one module is, and the first refusal is the attempt's. The attempt's words are
-/// theirs together, its hash that of their bytes in order, and its strategies' words their sums;
-/// L3 checks every module ([`PendingL3`]).
-fn translate_modules_unvalidated(
-    profile: &DeviceProfile,
-    deadline: Option<Instant>,
-    compile: impl FnOnce(&Budget) -> (Result<Vec<CompiledFunction>, Error>, CompileReport),
-) -> (Attempt, Option<PendingL3>) {
     let budget = Budget::with_deadline(deadline);
     // The allocator window is exactly the compiles' scope: everything their ledgers are charged
     // for (decode through serialization) and nothing after it.
@@ -783,23 +633,8 @@ fn translate_modules_unvalidated(
             spirv_sha256: None,
         })
     };
-    let no_module = || {
-        Error::Internal(InternalError::new(
-            InternalKind::Invariant,
-            "a compile that made no module",
-        ))
-    };
-    let (functions, report) = match compiled {
-        Ok((Ok(functions), report)) if !functions.is_empty() => (functions, report),
-        Ok((Ok(_), report)) => {
-            return (
-                Attempt {
-                    cost: cost(report, BTreeMap::new()),
-                    ..error_attempt(&no_module())
-                },
-                None,
-            )
-        }
+    let (function, report) = match compiled {
+        Ok((Ok(function), report)) => (function, report),
         Ok((Err(error), report)) => {
             return (
                 Attempt {
@@ -820,42 +655,25 @@ fn translate_modules_unvalidated(
         }
     };
     let mut strategy_words = BTreeMap::new();
-    for function in &functions {
-        for (name, used) in &function.strategies().entries {
-            *strategy_words.entry(name.clone()).or_insert(0) += used.words;
-        }
+    for (name, used) in &function.strategies().entries {
+        *strategy_words.entry(name.clone()).or_insert(0) += used.words;
     }
     let cost = cost(report, strategy_words);
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut modules = Vec::with_capacity(functions.len());
-        for function in &functions {
-            let module = profile.link_standalone(function).map_err(Err)?;
-            crate::l3::check_requirements(function.requirements(), profile).map_err(Ok)?;
-            modules.push(PendingModule {
-                plan: L3Plan::of(profile, function.requirements()),
-                words: module.words,
-                layout: module.layout,
-            });
-        }
-        let mut modules = modules.into_iter();
-        let first = modules.next().ok_or_else(|| Err(no_module()))?;
+        let module = profile.link_standalone(&function).map_err(Err)?;
+        crate::l3::check_requirements(function.requirements(), profile).map_err(Ok)?;
         Ok::<_, Result<L3Failure, Error>>(PendingL3 {
-            plan: first.plan,
-            words: first.words,
-            layout: first.layout,
-            groups: modules.collect(),
+            plan: L3Plan::of(profile, function.requirements()),
+            words: module.words,
         })
     }));
     match run {
         Ok(Ok(pending)) => {
-            let bytes: Vec<u8> = pending
-                .modules()
-                .flat_map(|(words, _)| words.iter().flat_map(|w| w.to_le_bytes()))
-                .collect();
+            let bytes: Vec<u8> = pending.words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let attempt = Attempt {
                 outcome: Outcome::Translated,
                 detail: None,
-                words: Some(pending.modules().map(|(words, _)| words.len() as u64).sum()),
+                words: Some(pending.words.len() as u64),
                 cost: cost.map(|cost| AttemptCost {
                     spirv_sha256: Some(crate::hash::sha256_bytes(&bytes)),
                     ..cost
@@ -930,52 +748,26 @@ impl L3Plan {
 }
 
 /// A module [`translate_unvalidated`] linked, relocated, and found within the profile, which
-/// `spirv-val` has yet to check: its words, the pipeline layout link gave it alone, and L3's plan;
-/// for a function translated in color groups (`color_groups`), the first group's, and the later
-/// groups' modules, which L3 checks after it.
+/// `spirv-val` has yet to check: its words and L3's plan.
 #[derive(Debug)]
 pub struct PendingL3 {
     pub words: Vec<u32>,
-    pub layout: PipelineLayout,
-    pub plan: L3Plan,
-    pub groups: Vec<PendingModule>,
-}
-
-/// A later color group's module of a [`PendingL3`]: its words, its layout and L3's plan for it.
-#[derive(Debug)]
-pub struct PendingModule {
-    pub words: Vec<u32>,
-    pub layout: PipelineLayout,
     pub plan: L3Plan,
 }
 
 impl PendingL3 {
     /// L3's `spirv-val` in this process: `attempt` (as it stands if the module is accepted) as L3
-    /// leaves it ([`Attempt::settle_l3`]), with the words and layout when it accepts them (the
-    /// first group's, for a function translated in color groups).
-    pub fn validate(self, mut attempt: Attempt) -> (Attempt, Option<(Vec<u32>, PipelineLayout)>) {
-        let linked = attempt
-            .settle_l3(self.check())
-            .then_some((self.words, self.layout));
-        (attempt, linked)
+    /// leaves it ([`Attempt::settle_l3`]).
+    pub fn validate(self, mut attempt: Attempt) -> Attempt {
+        attempt.settle_l3(self.check());
+        attempt
     }
 
-    /// L3's `spirv-val` on each module in this process, in order, under `catch_unwind`: the
-    /// first failure, else success.
+    /// L3's `spirv-val` on the module in this process, under `catch_unwind`.
     pub fn check(&self) -> std::thread::Result<Result<(), L3Failure>> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.modules()
-                .try_for_each(|(words, plan)| plan.check(words))
+            self.plan.check(&self.words)
         }))
-    }
-
-    /// Each module's words and L3's plan for it, the first group's first.
-    pub fn modules(&self) -> impl Iterator<Item = (&[u32], &L3Plan)> {
-        std::iter::once((self.words.as_slice(), &self.plan)).chain(
-            self.groups
-                .iter()
-                .map(|module| (module.words.as_slice(), &module.plan)),
-        )
     }
 }
 
@@ -1112,17 +904,6 @@ pub fn translate_row(
     profile: &DeviceProfile,
     deadline: Option<Instant>,
 ) -> Attempt {
-    translate_row_linked(source, entry, profile, deadline).0
-}
-
-/// [`translate_row`], and a translated module's final words and pipeline layout
-/// ([`translate_new_linked`]).
-pub fn translate_row_linked(
-    source: &RowSource<'_>,
-    entry: &str,
-    profile: &DeviceProfile,
-    deadline: Option<Instant>,
-) -> (Attempt, Option<(Vec<u32>, PipelineLayout)>) {
     validated(translate_row_unvalidated(source, entry, profile, deadline))
 }
 
@@ -1186,7 +967,7 @@ fn l3_outcome(failure: &L3Failure) -> Outcome {
 
 /// The committed device-profile directory (`validation/profiles`).
 pub fn profiles_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles")
+    metal2vulkan_devtools::validation_dir().join("profiles")
 }
 
 /// The stems of every committed device profile, sorted.
@@ -1205,22 +986,68 @@ pub fn committed_profiles() -> Result<Vec<String>, String> {
     Ok(stems)
 }
 
-/// The committed profile `stem` derived under the default (untrusted) policy, the policy every
+/// The committed profile `stem` derived under the default policy (the runtime's), the policy every
 /// engine census row is recorded under.
 pub fn load_profile(stem: &str) -> Result<DeviceProfile, String> {
     Ok(load_device(stem)?.profile().clone())
 }
 
-/// The engine's `Device` for committed profile `stem` under the default untrusted policy:
-/// what the public compile API compiles against (its profile is [`load_profile`]'s).
+/// The engine's `Device` for committed profile `stem` under the default policy (the runtime's),
+/// made of [`runtime_description`]: what the public compile API compiles against (its profile is
+/// [`load_profile`]'s).
 pub fn load_device(stem: &str) -> Result<metal2vulkan::device::Device, String> {
-    metal2vulkan::device::Device::new(load_description(stem)?, DevicePolicy::default())
+    metal2vulkan::device::Device::from_queries(runtime_description(stem)?, DevicePolicy::default())
         .map_err(|error| format!("{stem}: {error}"))
 }
 
-/// The `DeviceDescription` of committed profile `stem`, as the Khronos JSON reader builds it:
+/// Committed profile `stem` as the runtime's device describes it: read at the runtime's Vulkan
+/// version (`metal2vulkan_runtime::floor::VERSION`, [`crate::acceptance::read_at`]) and restricted
+/// to what the runtime enables of it ([`runtime_enables`]). What every census compiles for, and
 /// what a compile worker rebuilds [`load_device`]'s `Device` from.
-pub fn load_description(stem: &str) -> Result<metal2vulkan::device::DeviceDescription, String> {
+pub fn runtime_description(stem: &str) -> Result<DeviceDescription, String> {
+    let read = crate::acceptance::read_at(&load_description(stem)?, runtime_version());
+    let enables = runtime_enables(&read);
+    read.with_enabled(&enables)
+        .map_err(|error| format!("{stem}: the runtime's enables: {error}"))
+}
+
+/// The Vulkan version the runtime requires of every device and makes its descriptions at.
+fn runtime_version() -> ApiVersion {
+    ApiVersion::from_packed(metal2vulkan_runtime::floor::VERSION)
+}
+
+/// What the runtime enables of a device `description` states, in the translator's vocabulary:
+/// `description`'s recommended enables (`DeviceDescription::recommended_enables`) of the features
+/// the runtime enables on some device (`metal2vulkan_runtime::floor::enable_set`) and of those
+/// its version has as core with nothing to enable (extended dynamic state), with the set's
+/// extensions and each extension that exposes one of those features below its core version (a
+/// context below the runtime's version reaches them so). The one definition of what a validation
+/// context enables and of what a census compiles for: no feature or extension outside the
+/// runtime's set.
+///
+/// It is the runtime's tables applied to what `description` states, not the runtime's answer for
+/// one device: where the runtime enables a group all or none (the border swizzle's two features),
+/// by the device's limits (the attachment feedback loop), or not at all (a device below its floor),
+/// this keeps each member of the set `description` states.
+pub fn runtime_enables(description: &DeviceDescription) -> EnableSet {
+    let runtime = metal2vulkan_runtime::floor::enable_set();
+    let api = description.api_version;
+    let mut kept = description.clone();
+    kept.features.retain(|&feature| {
+        runtime.features.contains(&feature) || !feature.exposure().has_member(runtime_version())
+    });
+    let exposing: BTreeSet<VkExtension> = (kept.features.iter())
+        .flat_map(|feature| feature.exposure().extensions_at(api))
+        .copied()
+        .collect();
+    kept.extensions
+        .retain(|extension| runtime.extensions.contains(extension) || exposing.contains(extension));
+    kept.recommended_enables()
+}
+
+/// The `DeviceDescription` of committed profile `stem`, as the Khronos JSON reader builds it: what
+/// the device states, before [`runtime_description`] restricts it.
+pub fn load_description(stem: &str) -> Result<DeviceDescription, String> {
     let committed = committed_profiles()?;
     if !committed.iter().any(|known| known == stem) {
         return Err(format!(
@@ -1231,8 +1058,7 @@ pub fn load_description(stem: &str) -> Result<metal2vulkan::device::DeviceDescri
     let path = profiles_dir().join(format!("{stem}.json"));
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    metal2vulkan::device::DeviceDescription::from_khronos_json(&text, None)
-        .map_err(|error| format!("{stem}: {error}"))
+    DeviceDescription::from_khronos_json(&text, None).map_err(|error| format!("{stem}: {error}"))
 }
 
 #[cfg(test)]
@@ -1257,25 +1083,6 @@ mod tests {
                 Error::Unsupported(Unsupported::not_representable(Feature::HandleAsPointer)),
                 "unsupported",
                 "not_representable HandleAsPointer",
-            ),
-            // A driver's measured defect keys by reason and feature; the defect stays in the
-            // detail.
-            (
-                Error::Unsupported(Unsupported::driver_defect(
-                    Feature::FramebufferFetch,
-                    metal2vulkan::device::DriverWorkaround::EarlyTestsDropMultisampledImageWrites,
-                )),
-                "unsupported",
-                "driver_defect FramebufferFetch",
-            ),
-            // A defect the runtime records for its own mechanism keys the same way.
-            (
-                Error::Unsupported(Unsupported::runtime_driver_defect(
-                    Feature::SeparateMultisampledDepthStencil,
-                    metal2vulkan::error::RuntimeDriverDefect::MultisampledDepthStencilColourCopies,
-                )),
-                "unsupported",
-                "driver_defect SeparateMultisampledDepthStencil",
             ),
             // A refusal that names its symbol keys by reason and feature alone; the symbol and the
             // location stay in the detail.
@@ -1535,8 +1342,8 @@ mod tests {
     #[test]
     fn committed_profiles_load_and_unknown_stems_are_refused() {
         let stems = committed_profiles().unwrap();
-        assert!(stems.iter().any(|s| s == "vk12-floor"), "{stems:?}");
-        assert!(load_profile("vk12-floor").is_ok());
+        assert!(stems.iter().any(|s| s == "runtime-floor"), "{stems:?}");
+        assert!(load_profile("runtime-floor").is_ok());
         let error = load_profile("../moltenvk-m3").unwrap_err();
         assert!(error.contains("unknown profile"), "{error}");
     }
@@ -1554,7 +1361,7 @@ mod tests {
             }
             Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected store_const.ll: {why}"),
         };
-        let profile = load_profile("vk12-floor").unwrap();
+        let profile = load_profile("runtime-floor").unwrap();
         let attempt = translate_new(&bitcode, "store_const", &profile, None);
         assert_eq!(attempt.outcome, Outcome::Translated, "{attempt:?}");
         assert!(attempt.words.is_some_and(|words| words > 5));
@@ -1567,13 +1374,12 @@ mod tests {
         assert_eq!(missing.outcome.label(), "invalid_descriptor", "{missing:?}");
     }
 
-    /// A fragment function of more colors than vk12-floor draws at once (four), refused alone, is
-    /// translated as each color group of the pipeline of its colors, every module checked by L3:
-    /// five and seven colors in two groups, colors 0 and 5 in one renumbered. One that writes
-    /// memory keeps its limit refusal, which a pipeline of more groups meets at link. On lavapipe
-    /// (eight) each is one module, as it was.
+    /// A fragment function of more colors than a device draws at once (four: `runtime-floor` with
+    /// four color attachments, below the runtime's floor of eight) keeps its limit refusal:
+    /// five and seven colors, colors 0 and 5, and one that writes memory. On lavapipe (eight)
+    /// each translates.
     #[test]
-    fn a_fragment_function_of_more_colors_than_the_floor_translates_in_color_groups() {
+    fn a_fragment_function_of_more_colors_than_the_device_draws_is_refused() {
         use metal2vulkan_devtools::{engine_dir, llvm_assemble, AssembleError};
         let bitcode = match llvm_assemble(&engine_dir().join("color_groups.ll")) {
             Ok(bytes) => bytes,
@@ -1583,29 +1389,31 @@ mod tests {
             }
             Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected color_groups.ll: {why}"),
         };
-        for (stem, groups) in [("vk12-floor", 2), ("lavapipe", 1)] {
-            let profile = load_profile(stem).unwrap();
-            for (entry, modules) in [("cg_five", groups), ("cg_seven", groups), ("cg_sparse", 1)] {
-                let (attempt, pending) = translate_new_unvalidated(&bitcode, entry, &profile, None);
-                assert_eq!(attempt.outcome, Outcome::Translated, "{entry} on {stem}");
-                let pending = pending.unwrap();
-                assert_eq!(pending.modules().count(), modules, "{entry} on {stem}");
-                let words: usize = pending.modules().map(|(words, _)| words.len()).sum();
-                assert_eq!(attempt.words, Some(words as u64), "{entry} on {stem}");
-                let (attempt, linked) = pending.validate(attempt);
-                assert_eq!(attempt.outcome, Outcome::Translated, "{entry} on {stem}");
-                assert!(linked.is_some(), "{entry} on {stem}");
+        let four = {
+            let mut description = load_description("runtime-floor").unwrap();
+            description.limits.max_color_attachments = 4;
+            description.limits.max_fragment_output_attachments = 4;
+            metal2vulkan::device::Device::from_queries(
+                description,
+                metal2vulkan::device::DevicePolicy::default(),
+            )
+            .unwrap()
+            .profile()
+            .clone()
+        };
+        let lavapipe = load_profile("lavapipe").unwrap();
+        for (stem, profile, expected) in [
+            ("four colors", four, "device_capability_missing"),
+            ("lavapipe", lavapipe, "translated"),
+        ] {
+            for entry in ["cg_five", "cg_seven", "cg_sparse", "cg_counts"] {
+                let attempt = translate_new(&bitcode, entry, &profile, None);
+                assert_eq!(
+                    attempt.outcome.label(),
+                    expected,
+                    "{entry} on {stem}: {attempt:?}"
+                );
             }
-            let counts = translate_new(&bitcode, "cg_counts", &profile, None);
-            let expected = match stem {
-                "vk12-floor" => "device_capability_missing",
-                _ => "translated",
-            };
-            assert_eq!(
-                counts.outcome.label(),
-                expected,
-                "cg_counts on {stem}: {counts:?}"
-            );
         }
     }
 
@@ -1634,7 +1442,7 @@ mod tests {
     #[test]
     fn rows_without_retained_bitcode_are_assembled_from_their_text() {
         use metal2vulkan_devtools::engine_dir;
-        let profile = load_profile("vk12-floor").unwrap();
+        let profile = load_profile("runtime-floor").unwrap();
         let text = std::fs::read_to_string(engine_dir().join("store_const.ll")).unwrap();
         let source = RowSource::of(None, text.clone());
         assert_eq!(source, RowSource::Text(Cow::Borrowed(text.as_str())));
@@ -1689,7 +1497,7 @@ mod tests {
     #[test]
     fn a_public_rows_attempt_does_not_follow_its_scratch_directory() {
         use metal2vulkan_devtools::engine_dir;
-        let profile = load_profile("vk12-floor").unwrap();
+        let profile = load_profile("runtime-floor").unwrap();
         let text: String = std::fs::read_to_string(engine_dir().join("store_const.ll"))
             .unwrap()
             .lines()
@@ -1725,7 +1533,7 @@ mod tests {
 
     #[test]
     fn garbage_bitcode_is_typed_invalid_input_not_a_panic() {
-        let profile = load_profile("vk12-floor").unwrap();
+        let profile = load_profile("runtime-floor").unwrap();
         let attempt = translate_new(b"not bitcode", "main", &profile, None);
         assert_eq!(attempt.outcome.label(), "invalid_input", "{attempt:?}");
         assert!(attempt.detail.is_some());

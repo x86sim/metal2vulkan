@@ -16,8 +16,8 @@ use crate::spirv::ir::{
 };
 use crate::spirv::spec_bits::mark_unread;
 
-/// The constant the tests read: a texture slot's format class.
-const KEY: SpecKey = SpecKey::TexelFormat(SlotRef {
+/// The constant the tests read: a texture slot's bicubic texel class.
+const KEY: SpecKey = SpecKey::BicubicTexels(SlotRef {
     stage: Stage::Kernel,
     class: SlotClass::Texture,
     index: 0,
@@ -99,7 +99,7 @@ fn unread(m: &TypedModule, notes: &[SpecializedNote]) -> u64 {
     spec[0].unread_bits
 }
 
-/// The half texel routine's reads (`lower::texture::half`): bits under a mask, and a field
+/// A routine's reads of its constant argument: bits under a mask, and a field
 /// shifted down and masked. The analysis follows the constant into the routine's parameter.
 fn bit_tests(fb: &mut FunctionBuilder<'_>, flags: Value) -> BResult<Value> {
     let m = k(fb, 0x30D)?;

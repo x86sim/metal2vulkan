@@ -21,6 +21,11 @@
 //!   stage returns a value before it compiles it, and both the question and the compile need the
 //!   module's decode: through one object they read it once
 //!   ([`a_plain_answer_and_the_stages_entry_decode_the_module_once`]).
+//! - **A partition check and the compile share one order.** A compute creation asks whether its
+//!   kernel observes the threadgroup partition before it compiles it, and both read the kernel's
+//!   specialized entry ordered for the device: through one object the entry is ordered once, and
+//!   the compile reads the check's
+//!   ([`a_partition_check_and_the_kernels_compile_order_its_entry_once`]).
 //! - **Not across libraries.** Two libraries of different bytes read a decode each, however the
 //!   object is shared: the module's own AIR hash keys the decode, so nothing of one library is
 //!   taken for another ([`two_libraries_decode_their_modules_apart`]).
@@ -36,6 +41,9 @@
 //!   `HASH` is verified against its bitcode when the container is parsed
 //!   ([`a_librarys_stated_air_hash_is_the_hash_of_the_bitcode_a_compile_reads`],
 //!   [`a_metallib_whose_stated_hash_is_not_its_bitcodes_is_refused`]).
+//! - **Bounded.** Filled past its bounds, it keeps the most recently used entries and no more,
+//!   and what it holds stays within its byte bounds
+//!   ([`an_object_filled_past_its_bounds_keeps_only_the_most_recent`]).
 //! - **What holding it costs.** The headline part reports what one decode charges the ledger and
 //!   holds four of the largest committed module's to the object's byte bound, so a bound that
 //!   could not hold a library's one decode would fail here.
@@ -44,11 +52,12 @@ use std::path::{Path, PathBuf};
 
 use crate::air::container;
 use crate::budget::{Budget, Meter};
-use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::library::{Library, LibraryType};
 use crate::lower::select::LowerInputs;
-use crate::pipeline::compile::{compile_stage, compile_stage_from, InputsFrom, StageEntries};
+use crate::pipeline::compile::{
+    compile_stage, compile_stage_from, kernel_observes_partition, InputsFrom, StageEntries,
+};
 use crate::pipeline::testing::{fixtures_dir, llvm_assemble, AssembleError};
 use crate::pipeline::FunctionDescriptor;
 
@@ -63,9 +72,8 @@ fn device() -> Device {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.features.insert(VkFeature::RobustBufferAccess);
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 fn fixture(name: &str) -> Option<Vec<u8>> {
@@ -343,6 +351,64 @@ fn a_plain_answer_and_the_stages_entry_decode_the_module_once() {
     );
 }
 
+/// Each kernel of one library, checked for whether it observes its threadgroup partition and then
+/// compiled, as a compute creation does, through one object: the check orders the kernel's
+/// specialized entry for the device and the compile finds that order rather than ordering again.
+/// Each compile is held to the kernel's own unshared compile word for word, byte for byte and
+/// unit for unit, so the kept order changes no output and spares no charge.
+#[test]
+fn a_partition_check_and_the_kernels_compile_order_its_entry_once() {
+    use crate::library::FunctionStage::Kernel;
+    let Some(bitcode) = fixture(MANY) else { return };
+    let device = device();
+    let library = Library::from_air(&bitcode).expect("library");
+    let kernels: Vec<FunctionDescriptor> = stages(&library)
+        .into_iter()
+        .filter(|fd| matches!(fd.function.info().stage, Kernel))
+        .collect();
+    assert!(
+        kernels.len() >= 2,
+        "{MANY} must hold the kernels this orders, not {}",
+        kernels.len()
+    );
+    for fd in &kernels {
+        let name = fd.function.info().name;
+        let expected = alone(fd, &device);
+        let entries = StageEntries::new();
+        let inputs = LowerInputs::new();
+        let mut meter = Meter::new(&Budget::standard());
+        kernel_observes_partition(
+            fd,
+            device.profile(),
+            InputsFrom::Given(&inputs),
+            &entries,
+            &mut meter,
+        )
+        .expect("the partition check");
+        assert_eq!(
+            entries.orders(),
+            (1, 0),
+            "the partition check orders the kernel's entry ({name})"
+        );
+        let work = from_entries(fd, &device, &entries, &expected);
+        assert_eq!(
+            entries.orders(),
+            (1, 1),
+            "the compile finds the entry the check ordered rather than ordering it again ({name})"
+        );
+        assert_eq!(
+            entries.counts(),
+            (1, 1),
+            "the check made the specialized entry and the compile found it ({name})"
+        );
+        assert_eq!(
+            work, expected.2,
+            "the compile is charged the work units of its own unshared compile, the order it found \
+             included ({name})"
+        );
+    }
+}
+
 /// The AIR hash a library states of a function is the SHA-256 of the bitcode a compile of it
 /// reads: for a module, the whole module every entry of it shares. A compile records that hash
 /// rather than hashing the module again, so this is what makes the two the same value.
@@ -414,4 +480,59 @@ fn a_metallib_whose_stated_hash_is_not_its_bitcodes_is_refused() {
         refused.is_err(),
         "a metallib whose HASH is not its bitcode's must be refused, not parsed"
     );
+}
+
+/// Filled past its bounds, the object keeps the most recently used and no more: one entry of
+/// [`MANY`] asked at forty call-stack depths, each depth its own specialized entry, leaves at most
+/// `KEPT_ENTRIES` entries and one decode within the byte bounds ([`StageEntries::held`]); of the
+/// depths, the latest is found again, while the first, gone past the bound, is made again.
+#[test]
+fn an_object_filled_past_its_bounds_keeps_only_the_most_recent() {
+    use crate::pipeline::compile::{KEPT_DECODE_BYTES, KEPT_ENTRIES, KEPT_ENTRY_BYTES};
+    let Some(bitcode) = fixture(MANY) else { return };
+    let device = device();
+    let library = Library::from_air(&bitcode).expect("library");
+    let fd = stages(&library).into_iter().next().expect("an entry");
+    let entries = StageEntries::new();
+    let ask = |depth: u32| {
+        let mut inputs = LowerInputs::new();
+        inputs.max_call_stack_depth = Some(depth);
+        let mut meter = Meter::new(&Budget::standard());
+        let compiled = compile_stage_from(
+            &fd,
+            device.profile(),
+            InputsFrom::Given(&inputs),
+            &entries,
+            &mut meter,
+        );
+        compiled.expect("the entry compiles at every depth");
+    };
+    for depth in 1..=40 {
+        ask(depth);
+    }
+    let (held, decodes, bytes) = entries.held();
+    let kept = u64::try_from(KEPT_ENTRIES).expect("the bound");
+    assert!(
+        (1..=kept).contains(&held),
+        "40 entries asked must leave between 1 and {kept} held, not {held}"
+    );
+    assert_eq!(decodes, 1, "one module, one decode held");
+    assert!(
+        bytes <= KEPT_ENTRY_BYTES + KEPT_DECODE_BYTES,
+        "the held bytes, {bytes}, must stay within the bounds"
+    );
+    assert_eq!(
+        entries.counts(),
+        (40, 0),
+        "forty depths, forty entries made"
+    );
+    ask(40);
+    assert_eq!(entries.counts(), (40, 1), "the latest depth is found again");
+    ask(1);
+    assert_eq!(
+        entries.counts(),
+        (41, 1),
+        "the first depth, gone past the bound, is made again"
+    );
+    assert!(entries.held().0 <= kept, "asking again keeps the bound");
 }

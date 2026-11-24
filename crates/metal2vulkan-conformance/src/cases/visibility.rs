@@ -1,24 +1,20 @@
 //! What Metal writes into a pass's visibility-result buffer: the words a `Boolean` mode stores,
 //! the samples a `Counting` mode counts, and what an offset nobody set keeps.
 //!
-//! Ported from the runtime lane `runtime_lane/visibility.rs`. Every pass here is one the lane
-//! drives, drawn with the owned fixture `rt6_render_state`: the fullscreen triangle covers every
-//! pixel of a 4 by 4 target, and the same draw **from vertex 3** covers none. Each visibility
-//! buffer starts as `0xaa` bytes, so a word Metal never wrote is visible as the bytes that were
-//! there rather than as a zero nobody can tell from a result; an `Accumulate` shape's starts as
-//! the words it adds to.
+//! Every pass here is drawn with the owned fixture `rt6_render_state`: the fullscreen triangle
+//! covers every pixel of a 4 by 4 target, and the same draw **from vertex 3** covers none. Each
+//! visibility buffer starts as `0xaa` bytes, so a word Metal never wrote is visible as the bytes
+//! that were there rather than as a zero nobody can tell from a result; an `Accumulate` shape's
+//! starts as the words it adds to.
 //!
-//! The lane's own table was measured on an M4, and its comment says so. Metal's answer here is
-//! **run**, not copied: record mode takes it on this M3 Max, and this module's tests cross-check
-//! the recordings against the lane's words, which is the evidence the port owes the lane. A fresh
-//! answer that disagrees with the lane is a finding about one of the two chips, not a nuisance.
+//! The table of words this module's tests hold was measured on an Apple M4. Metal's answer here is
+//! **run**, not copied: record mode takes it on an M3 Max, and the tests cross-check the
+//! recordings against the table. A fresh answer that disagrees with the table is a finding about
+//! one of the two chips, not a nuisance.
 //!
-//! Every word compares exactly but a `Boolean` result's: the M3 Max writes 1 where a sample
-//! passed, and the runtime the device's own nonzero value, which it announces
-//! (`device-boolean-visibility`), whose documentation states the bound the comparison holds: zero
-//! exactly where Metal's word is zero ([`Loosening::Nonzero`] at that word alone, `boolean_words`).
-//! Not a native note of the suite's set: the note's bound is exact, so a case names it at the
-//! words it loosens.
+//! Every word compares exactly but a `Boolean` result's, which compares as zero or nonzero alone:
+//! the M3 Max writes 1 where a sample passed, Metal documents a nonzero word, and the runtime
+//! writes the count (`docs/API.md`'s accepted difference `BOOLEAN_COUNT`).
 //!
 //! The shapes, each its own case so a device that lacks precise occlusion queries loses only the
 //! counted rows:
@@ -36,6 +32,9 @@
 //!   set with no draw kept, a sum past 32 and past 64 bits, a second pass in the next command
 //!   buffer and in the **same** one (`joined`, read once after both), and an offset taken again.
 //!   `Boolean`: words 0, 2 and 3 under a covering draw and under one covering nothing.
+//! - No mode: a pass whose encoder sets none, then one that sets `Disabled` at both words, each
+//!   drawing, under `Reset` and under `Accumulate`. Metal leaves every byte as it was, which is
+//!   what a pass of the replay streams' asks: a visibility result buffer and no mode.
 //!
 //! # How this family's inputs are keyed, and the one key the compiler cannot guard
 //!
@@ -71,20 +70,18 @@ use crate::render::{
     ColorState, PassColor, PassDepth, RenderPass, RenderPipelineSpec, RenderStep, RenderWork,
     TargetSpec,
 };
-use crate::replay::NOTICES_SITE;
 use crate::transcript::{ByteLayout, Digest, Element, Node, Observed, Sites, Value};
+use crate::values::{StoreAction, VisibilityResultMode, VisibilityResultType};
 use metal2vulkan::metal::state::DepthStencilDescriptor;
 use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType};
-use metal2vulkan_runtime::{Degradation, StoreAction, VisibilityResultMode, VisibilityResultType};
-use std::collections::BTreeSet;
 
-/// The owned fixture the lane draws with: `rt6_full` takes a depth and a slope as one `float2` at
+/// The owned fixture the case draws with: `rt6_full` takes a depth and a slope as one `float2` at
 /// vertex buffer 0, and `rt6_white` returns white.
 const FIXTURE: &str = "rt6_render_state";
 const VERTEX: &str = "rt6_full";
 const FRAGMENT: &str = "rt6_white";
 
-/// The lane's target: a 4 by 4 `RGBA8Unorm` render target, whose 16 pixels are the 16 samples a
+/// The target: a 4 by 4 `RGBA8Unorm` render target, whose 16 pixels are the 16 samples a
 /// covering draw passes at 1x.
 const SIDE: u32 = 4;
 const COLOR: PixelFormat = PixelFormat::RGBA8Unorm;
@@ -92,10 +89,10 @@ const COLOR: PixelFormat = PixelFormat::RGBA8Unorm;
 /// The byte every visibility buffer starts as, so a word Metal never wrote is readable as itself.
 const UNWRITTEN: u8 = 0xaa;
 
-/// The depth the lane's draws take unless the shape says otherwise.
+/// The depth the draws take unless the shape says otherwise.
 const DEPTH: f32 = 0.5;
 
-/// One command a case encodes into a pass, in the lane's own vocabulary.
+/// One command a case encodes into a pass.
 #[derive(Clone, Copy, Debug)]
 enum Act {
     /// `setVisibilityResultMode:offset:`.
@@ -108,12 +105,12 @@ enum Act {
         instances: u32,
     },
     /// `drawPrimitives:indirectBuffer:indirectBufferOffset:` of three vertices and **no**
-    /// instances, which the lane's arguments buffer holds.
+    /// instances, which the arguments buffer holds.
     DrawIndirect,
 }
 
 impl Act {
-    /// The fullscreen triangle at the lane's depth, covering every pixel.
+    /// The fullscreen triangle at [`DEPTH`], covering every pixel.
     const fn draw() -> Self {
         Act::Draw {
             z: DEPTH,
@@ -148,10 +145,10 @@ struct Shape {
     /// 64-bit words the case's visibility buffer holds.
     words: usize,
     /// The passes, in order, each over its own fresh color target and all over **one** visibility
-    /// buffer, as the lane runs them.
+    /// buffer.
     passes: &'static [&'static [Act]],
     depth: Option<Depth>,
-    /// `rasterSampleCount` and the attachment's samples: 1, or 4 for the lane's 4x pass.
+    /// `rasterSampleCount` and the attachment's samples: 1, or 4 for the 4x pass.
     samples: u32,
     /// Every pass's `visibilityResultType`.
     kind: VisibilityResultType,
@@ -162,7 +159,7 @@ struct Shape {
     joined: bool,
 }
 
-/// `Boolean`, `Counting` and `Disabled`, as short as the lane writes them.
+/// `Boolean`, `Counting` and `Disabled`, short.
 const BOOL: VisibilityResultMode = VisibilityResultMode::Boolean;
 const COUNT: VisibilityResultMode = VisibilityResultMode::Counting;
 const OFF: VisibilityResultMode = VisibilityResultMode::Disabled;
@@ -170,6 +167,10 @@ const OFF: VisibilityResultMode = VisibilityResultMode::Disabled;
 /// `Reset`, Metal's default, and `Accumulate`.
 const RESET: VisibilityResultType = VisibilityResultType::Reset;
 const ACCUMULATE: VisibilityResultType = VisibilityResultType::Accumulate;
+
+/// The slug of `docs/API.md`'s accepted difference that a `Boolean` result is the count of samples
+/// that passed.
+const BOOLEAN_COUNT: &str = "a-boolean-visibility-result-is-the-count-of-samples-that-passed";
 
 /// A word whose low half a count of 16 takes past 32 bits.
 const CARRY: u64 = 0xffff_fff8;
@@ -471,6 +472,44 @@ const SHAPES: &[Shape] = &[
         start: Some(&[0, 2, 3, 0, 2, 3, 9]),
         joined: false,
     },
+    // No mode: a pass that sets none, then one that sets `Disabled` at both words, each drawing.
+    Shape {
+        name: "visibility-disabled-reset",
+        words: 2,
+        passes: &[
+            &[Act::draw(), Act::draw_nothing()],
+            &[
+                Act::Mode(OFF, 8),
+                Act::draw(),
+                Act::Mode(OFF, 0),
+                Act::draw(),
+            ],
+        ],
+        depth: None,
+        samples: 1,
+        kind: RESET,
+        start: None,
+        joined: false,
+    },
+    // The same under `Accumulate`, over words a mode would add to.
+    Shape {
+        name: "visibility-disabled-accumulate",
+        words: 2,
+        passes: &[
+            &[Act::draw(), Act::draw_nothing()],
+            &[
+                Act::Mode(OFF, 8),
+                Act::draw(),
+                Act::Mode(OFF, 0),
+                Act::draw(),
+            ],
+        ],
+        depth: None,
+        samples: 1,
+        kind: ACCUMULATE,
+        start: Some(&[100, 7]),
+        joined: false,
+    },
 ];
 
 /// The arguments an indirect draw of three vertices and no instances reads:
@@ -485,48 +524,6 @@ pub struct Visibility {
 /// Every case of the family, in the order the report lists them.
 pub fn all() -> Vec<Visibility> {
     SHAPES.iter().map(|shape| Visibility { shape }).collect()
-}
-
-/// The degrade notices a visibility pass may announce. As with every family, it is a list rather
-/// than a device query, because a case never branches on the device: it asks by running and reads
-/// what came back. A venue that announces a kind not here fails the case until its kind is added.
-const PASS_NOTICES: &[Degradation] = &[
-    // A `Shared` buffer the device keeps in system memory, which the visibility buffer is.
-    Degradation::SharedInSystemMemory,
-    // The multisampled attachment of a `MultisampleResolve` store, and a `DontCare` store, are
-    // Vulkan's `DONT_CARE` on a driver measured to leave the earlier texels there. Nothing of
-    // these cases reads a colour attachment -- the visibility result is the answer, and it is
-    // compared exactly -- so naming the kind declares what our side announced and loosens no byte.
-    Degradation::DontCareStore,
-];
-
-/// Each read's `Boolean` results, as (the pass's index, the result's offset): the offsets whose
-/// last mode set, in that pass or one before it, is `Boolean`, which the pass's `words` site holds,
-/// at each pass the words are read after ([`groups`]).
-fn boolean_words(shape: &Shape) -> Vec<(usize, u64)> {
-    let read: Vec<usize> = groups(shape)
-        .iter()
-        .filter_map(|g| g.last().copied())
-        .collect();
-    let mut held: BTreeSet<u64> = BTreeSet::new();
-    let mut out = Vec::new();
-    for (index, acts) in shape.passes.iter().enumerate() {
-        for act in *acts {
-            match act {
-                Act::Mode(BOOL, offset) => {
-                    held.insert(*offset);
-                }
-                Act::Mode(COUNT, offset) => {
-                    held.remove(offset);
-                }
-                Act::Mode(..) | Act::Draw { .. } | Act::DrawIndirect => {}
-            }
-        }
-        if read.contains(&index) {
-            out.extend(held.iter().map(|&offset| (index, offset)));
-        }
-    }
-    out
 }
 
 /// The shape's passes by command buffer, as indices: all in one where it is `joined`, else one
@@ -787,38 +784,37 @@ impl Case for Visibility {
         self.shape.name
     }
 
-    fn metal_source(&self) -> MetalSource {
-        MetalSource::Run
+    /// Each word whose last mode, as a command buffer's words are read, is `Boolean` compares as
+    /// zero or nonzero alone (`BOOLEAN_COUNT`).
+    fn allowances(&self) -> Vec<Allowance> {
+        let mut boolean = std::collections::BTreeMap::new();
+        let mut allowances = Vec::new();
+        for group in groups(self.shape) {
+            for &index in &group {
+                for act in self.shape.passes[index] {
+                    if let Act::Mode(mode, offset) = act {
+                        match mode {
+                            VisibilityResultMode::Boolean => boolean.insert(*offset, true),
+                            VisibilityResultMode::Counting => boolean.insert(*offset, false),
+                            VisibilityResultMode::Disabled => None,
+                        };
+                    }
+                }
+            }
+            let last = group.last().copied().unwrap_or_default();
+            for (offset, _) in boolean.iter().filter(|(_, boolean)| **boolean) {
+                allowances.push(Allowance::new(
+                    format!("case/pass-{last}/words/{offset}"),
+                    Loosening::Nonzero,
+                    Justification::AcceptedDifference(BOOLEAN_COUNT.to_owned()),
+                ));
+            }
+        }
+        allowances
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // The notices site, and each `Boolean` result's word by its contract (the module docs): a
-        // visibility result is a number Metal wrote, and any other number that differs is a bug,
-        // not a near-equivalent. Nothing else here is loosened.
-        let mut all: Vec<Allowance> = PASS_NOTICES
-            .iter()
-            .map(|kind| {
-                Allowance::new(
-                    format!("case/{NOTICES_SITE}/*"),
-                    Loosening::Unchecked,
-                    Justification::notice(*kind),
-                )
-            })
-            .collect();
-        let booleans = boolean_words(self.shape);
-        if !booleans.is_empty() {
-            all.push(crate::replay::notice_allowance(
-                Degradation::DeviceBooleanVisibility.code(),
-            ));
-        }
-        for (index, offset) in booleans {
-            all.push(Allowance::new(
-                format!("case/pass-{index}/words/{offset}"),
-                Loosening::Nonzero,
-                Justification::notice(Degradation::DeviceBooleanVisibility),
-            ));
-        }
-        all
+    fn metal_source(&self) -> MetalSource {
+        MetalSource::Run
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1006,7 +1002,7 @@ struct Held<'a> {
 }
 
 impl Visibility {
-    /// Pass `index` of the shape: a fresh target, as the lane makes one a pass, so no pass reads
+    /// Pass `index` of the shape: a fresh target, so no pass reads
     /// what another left in the color attachment, its acts as steps, and its depth attachment
     /// where the shape has one.
     fn pass(
@@ -1105,13 +1101,9 @@ impl Visibility {
 
 #[cfg(test)]
 mod tests {
-    //! The cross-check the port owes the lane: the words Metal wrote, as the recordings hold them,
-    //! against the lane's table.
-    //!
-    //! The table is the lane's (`runtime_lane/visibility.rs`), restated here because a conformance
-    //! case may not depend on the validation crate. Its comment says it was measured on an **M4**;
-    //! this recording is of an M3 Max. A disagreement is therefore a fact about one of the two
-    //! chips, and the test names the case and the word.
+    //! The cross-check: the words Metal wrote, as the recordings hold them, against a table
+    //! measured on an **M4**; this recording is of an M3 Max. A disagreement is therefore a fact
+    //! about one of the two chips, and the test names the case and the word.
 
     use super::*;
     use crate::recording::Recording;
@@ -1120,7 +1112,8 @@ mod tests {
     /// A word Metal never wrote, as a 64-bit value.
     const U: u64 = u64::from_le_bytes([UNWRITTEN; 8]);
 
-    /// The lane's words, by case: what Metal wrote after each command buffer, in order.
+    /// The table, measured on an Apple M4, by case: what Metal wrote after each command buffer, in
+    /// order.
     const TABLE: &[(&str, &[&[u64]])] = &[
         (
             "visibility-boolean-offsets",
@@ -1138,7 +1131,7 @@ mod tests {
         ("visibility-counting-revisit", &[&[32, 16]]),
         ("visibility-counting-revisit-after-disabled", &[&[32, U]]),
         ("visibility-counting-four-samples", &[&[64]]),
-        // The `Accumulate` rows, the lane's too: a count is added to the word's low 32 bits,
+        // The `Accumulate` rows: a count is added to the word's low 32 bits,
         // which wrap, and its high 32 bits stay.
         (
             "visibility-counting-accumulate",
@@ -1156,6 +1149,9 @@ mod tests {
             "visibility-boolean-accumulate",
             &[&[1, 3, 3, 0, 2, 3, 9], &[1, 3, 3, 1, 2, 3, 9]],
         ),
+        // Taken on an M3 Max, macOS 27.0.1, not the M4: no mode writes nothing, under either type.
+        ("visibility-disabled-reset", &[&[U, U], &[U, U]]),
+        ("visibility-disabled-accumulate", &[&[100, 7], &[100, 7]]),
     ];
 
     /// The one outcome of `name`'s recorded Metal answer.
@@ -1189,13 +1185,13 @@ mod tests {
             .collect()
     }
 
-    /// Metal's own visibility results on this M3 Max are the lane's words, pass by pass.
+    /// Metal's own visibility results on the M3 Max are the table's words, pass by pass.
     ///
     /// Every case the table names must have a recording, so a case that was never recorded fails
     /// here rather than being skipped: the table is the claim, and a claim with no run behind it
     /// is the thing this suite exists to stop.
     #[test]
-    fn the_recorded_results_are_the_lanes_words() {
+    fn the_recorded_results_are_the_tables_words() {
         for (name, passes) in TABLE {
             let shape = SHAPES
                 .iter()
@@ -1220,18 +1216,45 @@ mod tests {
         }
     }
 
-    /// Every case of the family is in the table, states its inputs, and loosens **only** its
-    /// notices site and its `Boolean` results' words, each by its contract alone.
+    /// Every case of the family is in the table, states its inputs, and loosens nothing but a
+    /// `Boolean` word, to nonzero.
     ///
     /// A visibility result is a number Metal wrote; a number that differs is a bug, never a
-    /// near-equivalent, but that a `Boolean` result's nonzero value is the device's. A case that
-    /// ever loosened another word, or a `Boolean` one by more than its contract, would fail here.
+    /// near-equivalent, but for the one accepted difference `BOOLEAN_COUNT`: a `Boolean` word is
+    /// the count of samples that passed, right where it is nonzero exactly where Metal's is. A
+    /// case that loosened a `Counting` word, or a word another way, would fail here.
     #[test]
-    fn every_case_is_tabled_and_loosens_its_notices_and_boolean_words_alone() {
+    fn every_case_is_tabled_and_loosens_only_a_boolean_word() {
         for case in all() {
+            let boolean: Vec<String> = (case.shape.passes.iter())
+                .flat_map(|pass| pass.iter())
+                .filter_map(|act| match act {
+                    Act::Mode(VisibilityResultMode::Boolean, offset) => Some(format!("/{offset}")),
+                    _ => None,
+                })
+                .collect();
+            for allowance in case.allowances() {
+                assert_eq!(
+                    (allowance.loosening, allowance.justified_by),
+                    (
+                        Loosening::Nonzero,
+                        Justification::AcceptedDifference(BOOLEAN_COUNT.to_owned())
+                    ),
+                    "{}",
+                    case.name()
+                );
+                assert!(
+                    boolean
+                        .iter()
+                        .any(|offset| allowance.path.ends_with(offset)),
+                    "{}: {} is no Boolean word",
+                    case.name(),
+                    allowance.path
+                );
+            }
             assert!(
                 TABLE.iter().any(|(name, _)| *name == case.name()),
-                "{}: no row in the lane's table",
+                "{}: no row in the table",
                 case.name()
             );
             let inputs = case.inputs().unwrap();
@@ -1242,39 +1265,6 @@ mod tests {
             );
             assert_eq!(case.metal_source(), MetalSource::Run);
             case.shaders().unwrap();
-            let words: Vec<String> = boolean_words(case.shape)
-                .iter()
-                .map(|(index, offset)| format!("case/pass-{index}/words/{offset}"))
-                .collect();
-            for allowance in case.allowances() {
-                if words.contains(&allowance.path) {
-                    assert_eq!(allowance.loosening, Loosening::Nonzero, "{}", case.name());
-                    assert_eq!(
-                        allowance.justified_by,
-                        Justification::notice(Degradation::DeviceBooleanVisibility),
-                        "{}",
-                        case.name()
-                    );
-                    continue;
-                }
-                assert_eq!(
-                    allowance.path,
-                    format!("case/{NOTICES_SITE}/*"),
-                    "{}: an allowance outside the notices site and the Boolean words",
-                    case.name()
-                );
-                match &allowance.justified_by {
-                    Justification::Degradation(code) => assert!(
-                        PASS_NOTICES
-                            .iter()
-                            .chain([&Degradation::DeviceBooleanVisibility])
-                            .any(|kind| kind.code() == code),
-                        "{}: {code} is not a visibility-pass notice",
-                        case.name()
-                    ),
-                    other => panic!("{}: an unexpected tolerance: {other:?}", case.name()),
-                }
-            }
         }
     }
 

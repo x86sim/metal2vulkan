@@ -17,6 +17,7 @@ use crate::library::dynamic::DynamicLibrary;
 use crate::library::function::{Function, FunctionConstantValues};
 use crate::metal;
 use crate::pipeline::compile::StageEntries;
+use crate::pipeline::lower_inputs::LoweringInputs;
 
 /// A function plus its constant values and the functions its pipeline links
 /// (`MTLFunctionDescriptor` and the stage's `MTLLinkedFunctions`).
@@ -89,37 +90,6 @@ impl FunctionDescriptor {
     pub fn with_libraries(mut self, libraries: DynamicLibraries) -> FunctionDescriptor {
         self.libraries = libraries;
         self
-    }
-
-    /// This descriptor with a library in `libraries.loaded` for each install name the stage's
-    /// search reaches that it lacks, as Metal loads them at pipeline creation: `load` gives the
-    /// library at an install name, or `None` where none loads. The install names come in the order
-    /// [`DynamicLibraries`] searches them (a loaded library's own after those already reached), and
-    /// loading stops at the first that `load` gives none for: compiling then refuses any import
-    /// that survives specialization (`NeedsInput(DynamicLibrary)`), as Metal fails such a creation
-    /// and makes the others. A library `loaded` already holds is used as it is.
-    pub fn with_loaded_dependencies(
-        mut self,
-        mut load: impl FnMut(&str) -> Option<DynamicLibrary>,
-    ) -> FunctionDescriptor {
-        loop {
-            let unloaded = crate::pipeline::compile::dynamic_order(
-                &self.function,
-                &self.linked,
-                &self.libraries,
-            )
-            .unloaded
-            .map(str::to_owned);
-            let Some(name) = unloaded else {
-                return self;
-            };
-            match load(&name) {
-                Some(library) => {
-                    self.libraries.loaded.insert(name, library);
-                }
-                None => return self,
-            }
-        }
     }
 }
 
@@ -542,8 +512,8 @@ pub struct PrivateRenderState {
     /// `openGLModeEnabled` (default off): changes nothing Metal draws or reflects, and makes two
     /// states Metal otherwise refuses (`pipeline::private_state`'s docs): a fragment function
     /// writing depth without a depth attachment, its depth going nowhere, and a rasterizing state
-    /// whose vertex function returns `void`, which rasterizes nothing. The runtime answers both
-    /// (`metal2vulkan-runtime`'s `new_render_pipeline_state`), the second as the state of the
+    /// whose vertex function returns `void`, which rasterizes nothing. The runtime answers both,
+    /// the second as the state of the
     /// descriptor with rasterization disabled; the compile reads it not, and its link refuses a
     /// rasterizing `void` vertex function whatever the mode
     /// ([`DescriptorError::RasterizedVoidVertex`](crate::error::DescriptorError::RasterizedVoidVertex)).
@@ -712,6 +682,21 @@ pub struct ComputePipelineDescriptor {
 }
 
 impl ComputePipelineDescriptor {
+    /// The lowering inputs a `Function` kernel of this descriptor compiles under
+    /// ([`Device::compile_compute_pipeline`](crate::device::Device::compile_compute_pipeline)):
+    /// the stage-input descriptor, `maxCallStackDepth` where it is not Metal's 1, and OpenCL mode.
+    /// A consumer that compiles a variant of the kernel itself
+    /// (`LoweringInputs::partial_threadgroups`) starts from them.
+    pub fn lowering_inputs(&self) -> LoweringInputs {
+        LoweringInputs {
+            stage_input: self.stage_input.clone(),
+            max_call_stack_depth: (self.max_call_stack_depth > 1)
+                .then_some(self.max_call_stack_depth),
+            open_cl_mode: self.open_cl_mode_enabled,
+            ..LoweringInputs::new()
+        }
+    }
+
     /// A descriptor with Metal's defaults.
     pub fn new(kernel: StageSource) -> ComputePipelineDescriptor {
         ComputePipelineDescriptor {
@@ -755,29 +740,17 @@ pub struct MeshPipelineDescriptor {
     /// `float` outputs to half-float color attachments round by it.
     pub texture_write_rounding_mode: metal::TextureWriteRoundingMode,
     /// `maxTotalThreadsPerObjectThreadgroup`: `None` for Metal's 0, the object function's
-    /// `[[max_total_threads_per_threadgroup(n)]]` or else Metal's 1024. The compiled pipeline's
-    /// [`MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup`] answers it within the
-    /// device's limit. Refused as Metal refuses it
-    /// ([`MeshPipelineProblem`](crate::error::MeshPipelineProblem)): above 1024, or beside a
+    /// `[[max_total_threads_per_threadgroup(n)]]` or else Metal's 1024. Refused as Metal refuses
+    /// it ([`MeshPipelineProblem`](crate::error::MeshPipelineProblem)): above 1024, or beside a
     /// function's maximum of other threads. A draw is not held to it.
-    ///
-    /// [`MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threads_per_object_threadgroup
     pub max_total_threads_per_object_threadgroup: Option<u32>,
     /// `maxTotalThreadsPerMeshThreadgroup`: as
     /// [`max_total_threads_per_object_threadgroup`](Self::max_total_threads_per_object_threadgroup),
-    /// of the mesh stage, answered as
-    /// [`MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup`]; also refused beside a
-    /// required mesh threadgroup size of other threads.
-    ///
-    /// [`MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threads_per_mesh_threadgroup
+    /// of the mesh stage; also refused beside a required mesh threadgroup size of other threads.
     pub max_total_threads_per_mesh_threadgroup: Option<u32>,
-    /// `maxTotalThreadgroupsPerMeshGrid`: `None` for Metal's 0, which answers 2^20 whatever the
-    /// object function's `[[max_total_threadgroups_per_mesh_grid(n)]]`. The compiled pipeline's
-    /// [`MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid`] answers it, within the
-    /// device's limit where it runs mesh functions natively; Metal takes any count, above the
-    /// object function's attribute too. An object function's grid is not held to it.
-    ///
-    /// [`MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid`]: crate::pipeline::MeshPipelineMetalInfo::max_total_threadgroups_per_mesh_grid
+    /// `maxTotalThreadgroupsPerMeshGrid`: `None` for Metal's 0. Metal takes any count, above the
+    /// object function's `[[max_total_threadgroups_per_mesh_grid(n)]]` too. An object function's
+    /// grid is not held to it.
     pub max_total_threadgroups_per_mesh_grid: Option<u32>,
     /// `objectThreadgroupSizeIsMultipleOfThreadExecutionWidth`: a promise to Metal's optimizer
     /// that each draw's object threadgroup is a multiple of 32 threads. No compiled module

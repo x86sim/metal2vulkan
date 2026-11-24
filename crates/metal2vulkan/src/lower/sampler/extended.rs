@@ -4,7 +4,7 @@
 //!
 //! **Why fetches on every device.** No Vulkan format holds these codes: the image holds the
 //! texels' bytes in an unsigned integer format, which no device filters, so the shader reads
-//! the taps and filters them itself, on a device that samples through Metal's own sampler too.
+//! the taps and filters them itself.
 //!
 //! **Metal's answers** (an Apple M3 Max on macOS 26.7 and an Apple M4 on macOS 27.0.1,
 //! byte-identical): a nearest sample is the read of the texel at Metal's position, decoded (its
@@ -144,14 +144,14 @@
 //! computes (the coordinate, the layer, the level its mip filter reads at, a level from the
 //! fragment's derivatives or the sample's gradients taken at the site, and the offset, which the
 //! routine places as the footprint places a constant one), and the site keeps the status word, so
-//! each answer is the one the code written at the site gave. A sample takes the routine where the
-//! profile's driver keeps a `DontInline` call a call (`DriverWorkaround::DontInlineKeepsCalls`),
-//! which compiles it once: a guest fragment's 49 two-plane samples, at the defaults on the RTX 5080
-//! Laptop GPU, took its variant from 446,777 words made in 7.1 to 9.6 s to 259,809 words made in
-//! 2.8 to 4.8 s. Elsewhere its code is written at its site (`Sample::routine`): a driver that
-//! inlines every call compiles a copy per sample either way, and on ANV (the Iris Xe) the routine
-//! form made the same variant in 18.0 to 18.3 s against the site code's 17.6 to 17.7 s. A heap
-//! element's sample (`heap_raw`) is its site's own code.
+//! each answer is the one the code written at the site gave. Every device takes the routine, a kept
+//! routine declared `DontInline`: a driver that keeps such a call a call compiles it once (a guest
+//! fragment's 49 two-plane samples, at the defaults on the RTX 5080 Laptop GPU, took its variant
+//! from 446,777 words made in 7.1 to 9.6 s with the code at each site to 259,809 words made in 2.8
+//! to 4.8 s), and a driver that inlines every call compiles a copy per sample either way. The
+//! known loss: on ANV (the Iris Xe) the routine made the same variant in 18.0 to 18.3 s against the
+//! site code's 17.6 to 17.7 s, 2 to 3% slower to create. A heap element's sample (`heap_raw`) is
+//! its site's own code.
 
 use crate::air::abi::{BorderColor, MipFilter, SamplerState};
 use crate::air::ir::ValueId;
@@ -211,12 +211,6 @@ pub struct Sample {
     pub half: bool,
     /// The lowered type of the result (`{T, i8}`, its status word 0).
     pub result: DemoteTy,
-    /// The sample calls its shape's routine (`routine::Extended`): where the profile's driver
-    /// keeps a `DontInline` call a call (`DriverWorkaround::DontInlineKeepsCalls`), so it
-    /// compiles the routine once. Elsewhere the code is written at the site: a driver that
-    /// inlines every call (Mesa's) compiles a copy per sample either way, and the routine's
-    /// passed offset leaves it more to fold (the module docs).
-    pub routine: bool,
 }
 
 /// The state of the sampler an extended-range sample follows.
@@ -362,9 +356,8 @@ impl Sample {
     }
 
     /// The estimated words at the sample's site: the routine's call (`routine::Extended`, whose
-    /// own words the module counts once, [`body_words`](Self::body_words)) or, where the sample
-    /// takes no routine, its code, a level from derivatives or gradients, and the status
-    /// composite.
+    /// own words the module counts once, [`body_words`](Self::body_words)), a level from
+    /// derivatives or gradients, and the status composite.
     pub(crate) fn words(&self) -> u32 {
         let derived = match self.level {
             Level::Stated { at, .. } | Level::Word { at, .. } => {
@@ -372,11 +365,7 @@ impl Sample {
             }
             Level::Base => false,
         };
-        let code = match self.routine {
-            true => super::routine::CALL_WORDS,
-            false => self.body_words(),
-        };
-        code + if derived { DERIVED_WORDS } else { 0 } + 16
+        super::routine::CALL_WORDS + if derived { DERIVED_WORDS } else { 0 } + 16
     }
 
     /// The estimated words of the sample's code (its routine's body): per filter it takes, each
@@ -494,9 +483,6 @@ pub(super) struct Texture {
     /// The slot's `SpecKey::OffsetBaseAxes` tests, by which a texel offset is placed
     /// (`position::offset_dropped`), where the sample reads them ([`Sample::offset_base`]).
     pub parent: Option<crate::lower::texture::OffsetBase>,
-    /// The base level's size (a `uvec2`) where the image's own query does not state it: an
-    /// in-place texture's, whose image is its planes' texel buffer (`super::in_place`).
-    pub size: Option<SValue>,
 }
 
 /// How a sample's raw texels decode: by one form, a slot's variant's; or by the form a heap handle's class index names (`sampler::heap_raw`), through the
@@ -514,9 +500,6 @@ pub(super) enum Decode {
         /// The routine of a `float` result, and of a `half` one where the access rounds to it.
         routines: (FuncId, Option<FuncId>),
     },
-    /// The planes of a two-plane YCbCr texture read in place, each tap converted as Metal reads
-    /// it (`super::in_place::texel`).
-    InPlace(super::in_place::Planes),
 }
 
 /// Where a sample reads: its plane coordinate (two floats), a 2D array's layer (an integer), the
@@ -536,9 +519,7 @@ pub(super) struct At<'a> {
 /// The texel of extended-range sample `e` in the open block, with its status word 0 (module
 /// docs): its shape's routine's value (`routine::Extended`), called with the coordinate, the
 /// layer and the level its mip filter reads at, each taken in the sample's own position (a level
-/// from derivatives or gradients too, so no implicit derivative crosses a call), or where the
-/// sample takes no routine ([`Sample::routine`]) the same code written at the site, its constant
-/// offset placed as a constant.
+/// from derivatives or gradients too, so no implicit derivative crosses a call).
 pub(crate) fn emit(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -553,17 +534,6 @@ pub(crate) fn emit(
         Level::Base => None,
         Level::Stated { at, .. } | Level::Word { at, .. } => Some(level_at(cx, fb, e, coord, at)?),
     };
-    if !e.routine {
-        let r = Extended::of(e);
-        let x = sampled(
-            cx,
-            fb,
-            &r,
-            (coord, layer, level),
-            (e.offset.as_deref(), None),
-        )?;
-        return crate::lower::texture::with_word(cx, fb, &e.result, x, None);
-    }
     // A constant texel offset is the call's value, so the samples at every offset call one
     // routine.
     let offset = match &e.offset {
@@ -632,7 +602,7 @@ fn define(
 ) -> BResult<FuncId> {
     let f32_ = mb.ty(crate::spirv::ir::Type::Float { width: 32 })?;
     let ret = mb.ty(crate::spirv::ir::Type::Vector { elem: f32_, len: 4 })?;
-    let mut fb = mb.sampling_routine(ret)?;
+    let mut fb = mb.kept_routine(ret)?;
     let mut params = Vec::with_capacity(tys.len());
     for &ty in tys {
         params.push(fb.param(ty)?);
@@ -652,20 +622,20 @@ fn define(
         Some(lanes) => params.next().map(|v| (v, lanes)),
         None => None,
     };
-    let x = sampled(cx, &mut fb, r, (coord, layer, level), (None, passed))?;
+    let x = sampled(cx, &mut fb, r, (coord, layer, level), passed)?;
     fb.ret(Some(x))?;
     fb.finish()
 }
 
 /// The swizzled texel of extended-range sample shape `r` at coordinate `coord`, `layer` and the
-/// level `level` its mip filter reads at (module docs), in the open block: its texel offset a
-/// constant at the site (`offset`), or a routine's call's value (`passed`).
+/// level `level` its mip filter reads at (module docs), in the open block of its routine: its texel
+/// offset the routine's call's value (`passed`).
 fn sampled(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     r: &Extended,
     (coord, layer, level): (SValue, Option<SValue>, Option<SValue>),
-    (offset, passed): (Option<&[i32]>, Option<(SValue, u8)>),
+    passed: Option<(SValue, u8)>,
 ) -> BResult<SValue> {
     let (decl, img) = crate::lower::texture::slot_image(cx, fb, r.texture)?;
     let t = Tys::new(fb)?;
@@ -712,12 +682,11 @@ fn sampled(
         flags: value(fb, flags)?,
         swizzle,
         parent,
-        size: None,
     };
     let at = At {
         coord,
         layer,
-        offset,
+        offset: None,
         passed,
         level: None,
         half: r.half,
@@ -811,7 +780,7 @@ fn sampled(
 }
 
 /// The footprint over `taps` of the sample at `at` of `tex`, the border color seen through the
-/// channels `bits` state: its size the image's query of the taps' level, or `tex`'s stated size.
+/// channels `bits` state: its size the image's query of the taps' level.
 fn footprint_of(
     fb: &mut FunctionBuilder<'_>,
     t: &Tys,
@@ -820,24 +789,14 @@ fn footprint_of(
     bits: Bits,
     taps: &Taps<'_>,
 ) -> BResult<Footprint> {
-    match tex.size {
-        Some(size) => super::bicubic::footprint_sized(
-            fb,
-            t,
-            (at.coord, at.layer, at.passed),
-            (size, tex.image),
-            bits,
-            (taps, tex.parent),
-        ),
-        None => footprint_of_image(
-            fb,
-            t,
-            (at.coord, at.layer, at.passed),
-            (tex.img, tex.image),
-            bits,
-            (taps, tex.parent),
-        ),
-    }
+    footprint_of_image(
+        fb,
+        t,
+        (at.coord, at.layer, at.passed),
+        (tex.img, tex.image),
+        bits,
+        (taps, tex.parent),
+    )
 }
 
 /// The filtered texel at `at` of `tex` (unswizzled) by `state`: a constexpr sampler's linear or
@@ -1067,9 +1026,7 @@ fn swizzled(fb: &mut FunctionBuilder<'_>, tex: &Texture, x: SValue) -> BResult<S
 
 /// The linear sample at `at` of `tex` under `addressing`: the device's `FMix` of the four taps'
 /// decoded values by the fractions `k / 256`, a merged axis's fraction taken as 0, or a 3D
-/// texture's of the eight ([`block_taps`]); its `half` result the device's narrowing. An in-place
-/// two-plane YCbCr texture's is Metal's exact sum of its taps on its grid (`super::in_place`,
-/// `bicubic::routines::Quad`).
+/// texture's of the eight ([`block_taps`]); its `half` result the device's narrowing.
 pub(super) fn filtered(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
@@ -1078,19 +1035,6 @@ pub(super) fn filtered(
     tex: &Texture,
     addressing: Addressing<'_>,
 ) -> BResult<SValue> {
-    if let Decode::InPlace(_) = tex.decode {
-        let Some(quad) = cx.decl.families.sampler.linear_quad else {
-            return Err(cx.fail("an in-place linear sample without its routines"));
-        };
-        let mut args = quad_taps(cx, fb, t, at, tex, addressing)?.to_vec();
-        args.push(tex.flags);
-        let half = fb.module().constant(Constant::Scalar {
-            ty: t.bool_,
-            bits: ConstBits(u64::from(at.half)),
-        })?;
-        args.push(value(fb, half)?);
-        return fb.call(quad.exact, &args)?.ok_or_else(missing_routine);
-    }
     let x = match tex.image.plane {
         3 => {
             let (taps, [kx, ky, kz]) = block_taps(cx, fb, t, at, tex, addressing)?;
@@ -1314,7 +1258,7 @@ pub(super) fn nearest(
             let v = texel(cx, fb, &fp, tex, &site, false)?;
             crate::lower::arith::extended_range::bfloat_sample_half(fb, v)
         }
-        (true, Decode::Form { .. } | Decode::InPlace(_)) => texel(cx, fb, &fp, tex, &site, true),
+        (true, Decode::Form { .. }) => texel(cx, fb, &fp, tex, &site, true),
         // A heap handle's form: both roundings of the one raw texel, chosen by the form.
         (true, Decode::Heap { bfloat, .. }) => {
             let (raw, inside) = tap(fb, &fp, tex, &site)?;
@@ -1376,11 +1320,6 @@ pub(super) fn texel(
     site: &[Tap],
     half: bool,
 ) -> BResult<SValue> {
-    if let Decode::InPlace(planes) = tex.decode {
-        let (at, inside) = fp.site(fb, site)?;
-        let v = super::in_place::texel(fb, &planes, tex.img, at, half)?;
-        return fp.border(fb, v, inside);
-    }
     let (raw, inside) = tap(fb, fp, tex, site)?;
     let v = decoded(cx, fb, tex, raw, half)?;
     fp.border(fb, v, inside)
@@ -1424,7 +1363,6 @@ fn decoded(
             fb.call(routine, &[raw, form, inside])?
                 .ok_or_else(missing_routine)
         }
-        Decode::InPlace(_) => Err(cx.fail("an in-place tap decoded as a raw texel")),
     }
 }
 

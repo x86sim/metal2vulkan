@@ -5,8 +5,7 @@
 //! memory **the program owns**, handed to Metal by
 //! `newBufferWithBytesNoCopy:length:options:deallocator:`, because that is the only shape in which
 //! a Metal program can say "this memory is read-only" — Metal's private `MTLResourceOptions`
-//! bit 24, which `metal2vulkan-runtime` names
-//! [`ResourceOptions::PRIVATE_BIT`](metal2vulkan_runtime::ResourceOptions::PRIVATE_BIT). With the
+//! bit 24. With the
 //! bit, the GPU's writes to the memory go nowhere, and matching that exactly on every driver is
 //! the owner's standing rule.
 //!
@@ -133,27 +132,14 @@ impl HostPages {
     /// `length` bytes of private anonymous memory, every byte `pattern`: `None` where the system
     /// maps none.
     ///
-    /// `mmap` rather than an allocation, because a no-copy buffer's pointer and length have to be
-    /// the host's own pages — page-aligned and whole pages — which no allocator promises.
+    /// `mmap` (`VirtualAlloc` on Windows) rather than an allocation, because a no-copy buffer's
+    /// pointer and length have to be the host's own pages — page-aligned and whole pages — which
+    /// no allocator promises.
     pub fn of(length: usize, pattern: u8) -> Option<Self> {
         if length == 0 {
             return None;
         }
-        // SAFETY: a new private anonymous mapping, which reads no memory of ours.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
-            return None;
-        }
-        let pointer = NonNull::new(mapped.cast::<u8>())?;
+        let pointer = map(length)?;
         // SAFETY: the mapping is this value's own, just made writable, and `length` bytes long.
         unsafe { std::ptr::write_bytes(pointer.as_ptr(), pattern, length) };
         Some(Self { pointer, length })
@@ -183,12 +169,59 @@ impl HostPages {
 
 impl Drop for HostPages {
     fn drop(&mut self) {
+        #[cfg(unix)]
         // SAFETY: the mapping is this value's, and nothing reads it any more: the buffer over it
         // was dropped first, because the field holding these is declared last in its side.
         unsafe {
             libc::munmap(self.pointer.as_ptr().cast(), self.length);
         }
+        #[cfg(windows)]
+        // SAFETY: as above; a release frees the allocation whole, from its base, with a size of 0.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            VirtualFree(self.pointer.as_ptr().cast(), 0, MEM_RELEASE);
+        }
     }
+}
+
+/// `length` bytes of new private anonymous pages, read-write, at an address the kernel picks;
+/// `None` where the system maps none.
+#[cfg(unix)]
+fn map(length: usize) -> Option<NonNull<u8>> {
+    // SAFETY: a new private anonymous mapping, which reads no memory of ours.
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return None;
+    }
+    NonNull::new(mapped.cast::<u8>())
+}
+
+/// `length` bytes of new private pages, read-write, at an address the system picks: a committed
+/// allocation of their own (`VirtualAlloc`); `None` where the system makes none.
+#[cfg(windows)]
+fn map(length: usize) -> Option<NonNull<u8>> {
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+    };
+    // SAFETY: a new allocation, which reads no memory of ours.
+    let mapped = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            length,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    NonNull::new(mapped.cast::<u8>())
 }
 
 #[cfg(test)]

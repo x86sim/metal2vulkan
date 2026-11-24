@@ -1,8 +1,7 @@
 //! Where Metal puts a multisampled pass's samples: the device's own positions, custom ones, and
 //! what Metal does to a coordinate that is not already a sixteenth of a pixel.
 //!
-//! Ported from the runtime lane `runtime_lane/sample_positions.rs`, whose first test is the Metal
-//! probe's pass: a one-pixel multisampled `RGBA8Unorm` target cleared to zero, one triangle
+//! The Metal probe's pass: a one-pixel multisampled `RGBA8Unorm` target cleared to zero, one triangle
 //! covering everything left of a vertical edge, resolved into a single-sampled texture. The owned
 //! fixture `rt6_restart` draws it — its vertex function places each vertex where buffer 0 holds it,
 //! its fragment function writes alpha 1 — so the resolved alpha **is** the pixel's coverage, and
@@ -12,8 +11,8 @@
 //! comes to. The bytes are the stronger claim and they are compared exactly: a resolve of this
 //! family's target averages `k` white samples out of `n`, so a venue whose resolve rounds
 //! differently is a difference worth seeing rather than one worth tolerating. The count is the
-//! claim the lane makes, and `tests::the_recorded_coverage_is_the_lanes_table` holds the recordings
-//! to the lane's own numbers, which is the evidence this port owes the lane.
+//! probe's claim, and `tests::the_recorded_coverage_is_the_probes_table` holds the recordings to
+//! the numbers a probe on an Apple M4 measured.
 //!
 //! # Which rows Metal may be asked, and which it may not
 //!
@@ -22,7 +21,7 @@
 //!
 //! **Asked (`MetalSource::Run`)** — every row of the `COVERAGE` table. Each states as many
 //! positions as the pass has samples, every coordinate inside `[0, 1)`, at a count Metal takes
-//! custom positions at, or states none at all. These are the descriptors the lane's probe ran on
+//! custom positions at, or states none at all. These are the descriptors the probe ran on
 //! Metal **with and without** its API validation layer, and they are what Metal documents as
 //! valid. One 1x1 target and three vertices a pass: nothing loops and nothing is large.
 //!
@@ -36,23 +35,22 @@
 //! is a count Metal's API validation stops, and the probe measured what plain Metal does with it: the
 //! samples past the positions rasterize at the pixel's corner. The answer is written down, so the
 //! row compares; the row is not re-recorded because the neighbouring shape, **one position past**
-//! the pass's samples, is measured to end Metal's process
-//! (`metal2vulkan_runtime::RenderPassProblem::SamplePositionsSamples`), and a record run that may
+//! the pass's samples, is measured to end Metal's process, and a record run that may
 //! walk this family must not be one keystroke away from that.
 //!
-//! **Not ported at all** — the lane's refusal rows: a coordinate at 1.0 or below 0, one position in
+//! **Not a case at all** — four refusal shapes: a coordinate at 1.0 or below 0, one position in
 //! a pass of four samples, a 1x pass with a position, and eight positions in a pass of four. Every
 //! one of them is a row whose only Metal fact is that *Metal's API validation* stops it, and this
 //! suite's ruling is that a validated stop is not Metal refusing a call: plain Metal is the
 //! behavioural oracle. Nobody has measured what plain Metal does with those four shapes, and this
 //! suite does not find out by trying — the eight-position one is measured fatal, and a coordinate
 //! outside the pixel is a value Metal asserts on and that reaches the sample grid. So they have no
-//! oracle value here and they stay runtime-lane rows, where the expectation is tied to Metal's
-//! validation layer rather than to Metal. [`crate::render::forbidden_positions`] refuses the two
+//! oracle value here. [`crate::render::forbidden_positions`] refuses the two
 //! fatal shapes from the input's own shape, so a case cannot build one by accident.
 
 use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{answered, Abort, Case, Failure, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::{ShaderRef, APPLE_M4};
 use crate::render::{
@@ -61,8 +59,8 @@ use crate::render::{
 };
 use crate::replay::NOTICES_SITE;
 use crate::transcript::{ByteLayout, Digest, Element, Node, Observed, Sites, Transcript, Value};
+use crate::values::{SamplePosition, StoreAction, StoreActionOptions};
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::{Degradation, SamplePosition, StoreAction, StoreActionOptions};
 
 /// The owned fixture the probe drew with: each vertex where buffer 0 holds it, and alpha 1.
 const FIXTURE: &str = "rt6_restart";
@@ -81,7 +79,7 @@ const fn at(x: f32, y: f32) -> SamplePosition {
 }
 
 /// One row of the family: the pass's samples, its positions, the edge the triangle covers what
-/// lies left of, and the samples the lane's table says Metal covered.
+/// lies left of, and the samples the probe's table says Metal covered.
 struct Shape {
     name: &'static str,
     samples: u32,
@@ -89,9 +87,9 @@ struct Shape {
     positions: &'static [SamplePosition],
     /// The vertical edge in normalized device coordinates.
     edge: f32,
-    /// The samples Metal covered, as the lane's table holds it.
+    /// The samples Metal covered, as the probe's table holds it.
     covered: u64,
-    /// The attachment's `storeAction`. The lane's own is `MultisampleResolve`, which keeps the
+    /// The attachment's `storeAction`. The probe's is `MultisampleResolve`, which keeps the
     /// resolve and nothing of the multisampled texture; two rows ask the other resolving action.
     store: StoreAction,
     /// The attachment's `storeActionOptions`.
@@ -99,7 +97,7 @@ struct Shape {
 }
 
 impl Shape {
-    /// A row at the lane's own store action and Metal's default options.
+    /// A row at the probe's store action and Metal's default options.
     const fn new(
         name: &'static str,
         samples: u32,
@@ -131,15 +129,14 @@ impl Shape {
     }
 }
 
-/// Four positions at `(x, 0.5)`: the shape every row of the lane's table but the mixed one states.
+/// Four positions at `(x, 0.5)`: the shape every row of the probe's table but the mixed one states.
 macro_rules! four {
     ($x:expr) => {
         &[at($x, 0.5), at($x, 0.5), at($x, 0.5), at($x, 0.5)]
     };
 }
 
-/// The rows Metal is asked, in the order the report lists them: the lane's own table, name for
-/// name.
+/// The rows Metal is asked, in the order the report lists them: the probe's table, name for name.
 ///
 /// The last four are the rounding question. Metal samples at the nearest sixteenth of a pixel, a
 /// tie up, at most 15/16, which is why 0.53 and 0.51 cover against an edge at 0.52 while 0.55,
@@ -227,7 +224,7 @@ const FEWER: &[Shape] = &[
 ];
 
 /// Where the carried rows' Metal answer was measured, and why record mode must not replace it.
-const CARRIED_FROM: &str = "the Metal probe behind runtime_lane/sample_positions.rs";
+const CARRIED_FROM: &str = "a Metal probe of custom sample positions on an Apple M4";
 const NEVER_RE_RECORD: &str = "fewer custom sample positions than the pass's samples is a count \
                                Metal's API validation stops, and one position past the pass's \
                                samples is measured to end Metal's process: a record run must not \
@@ -241,20 +238,11 @@ const MEASURED_RUNS: u32 = 1;
 /// a case never branches on the device: it runs and reads what came back, and a venue that
 /// announces a kind not here fails the case until the kind is added.
 const PASS_NOTICES: &[Degradation] = &[
-    // A `Shared` buffer the device keeps in system memory, which the triangle's vertices are.
-    // (The fixture's vertex function writes `[[point_size]]`, which sizes no triangle: its
-    // `device-point-size` is announced at a draw of points alone, which this family makes none of.)
-    Degradation::SharedInSystemMemory,
-    // A device that resolves the multisampled attachment through a pass of its own rather than in
-    // the store. Announced on lavapipe, where the whole resolve is emulated; MoltenVK resolves in
-    // the store and announces nothing.
-    Degradation::ShaderResolve,
-    // The multisampled attachment of a `MultisampleResolve` store is Vulkan's `DONT_CARE`, which
-    // Apple's GPU is measured to leave at the earlier texels unless its tiler overflows. Announced
-    // on MoltenVK, where that driver fact holds. Nothing of this case reads the multisampled
-    // attachment -- the resolved texel is the whole answer, and it compares exactly -- so naming
-    // the kind declares what our side announced and loosens no byte.
-    Degradation::DontCareStore,
+    // The fixture's vertex function writes `[[point_size]]`, which sizes no triangle. Where the
+    // device's `pointSizeRange` ends below Metal's largest point, its translation records the
+    // static note `PrecisionNote::DevicePointSize`, which the runtime's side announces as the
+    // pipeline state is made (the Iris Xe and lavapipe). Naming it loosens no byte.
+    Degradation::DevicePointSize,
 ];
 
 /// The three vertices of the probe's triangle, which covers what lies left of `edge`.
@@ -269,7 +257,7 @@ fn triangle(edge: f32) -> Vec<u8> {
 /// samples, to the nearest whole sample.
 ///
 /// A resolve of this target averages the white samples, so an alpha of `k * 255 / n` is `k` samples
-/// of `n`. The rounding is the lane's own rule, so the number this records is the number the lane's
+/// of `n`. The rounding is the probe's rule, so the number this records is the number the probe's
 /// table holds.
 fn covered(texel: &[u8], samples: u32) -> u64 {
     let alpha = texel.get(3).copied().unwrap_or(0);
@@ -602,12 +590,11 @@ pub fn all() -> Vec<Box<dyn Case>> {
 
 #[cfg(test)]
 mod tests {
-    //! The cross-check the port owes the lane: the coverage Metal produced, as the recordings hold
-    //! it, against the lane's own table.
+    //! The cross-check of the coverage Metal produced, as the recordings hold it, against the
+    //! probe's own table.
     //!
-    //! The table is the lane's (`runtime_lane/sample_positions.rs`), restated here because a
-    //! conformance case may not depend on the validation crate. A disagreement is a finding about
-    //! one of the two chips or about the port, never something to edit away.
+    //! The table is the probe's, restated here. A disagreement is a finding about
+    //! one of the two chips or about the case, never something to edit away.
 
     use super::*;
     use crate::recording::Recording;
@@ -635,21 +622,21 @@ mod tests {
         node
     }
 
-    /// Metal's own coverage on this M3 Max is the lane's number, and the resolved texel it was read
+    /// Metal's own coverage on the M3 Max is the probe's number, and the resolved texel it was read
     /// from is `k * 255 / n` in alpha with nothing in the other channels.
     ///
     /// Every row Metal is asked must have a recording, so a row that was never recorded fails here
     /// rather than being skipped: the table is the claim, and a claim with no run behind it is what
     /// this suite exists to stop.
     #[test]
-    fn the_recorded_coverage_is_the_lanes_table() {
+    fn the_recorded_coverage_is_the_probes_table() {
         for shape in COVERAGE {
             let recorded = only_outcome(shape.name);
             let want = format!("{} of {} samples", shape.covered, shape.samples);
             assert_eq!(
                 site(shape.name, &recorded, "coverage").observed.value,
                 Value::Lines(vec![want.clone()]),
-                "{}: the lane's table says {want}",
+                "{}: the probe's table says {want}",
                 shape.name
             );
             let Value::Bytes(texel) = &site(shape.name, &recorded, "resolved").observed.value
@@ -660,7 +647,7 @@ mod tests {
             assert_eq!(
                 covered(texel, shape.samples),
                 shape.covered,
-                "{}: the texel {texel:?} and the lane's number",
+                "{}: the texel {texel:?} and the probe's number",
                 shape.name
             );
             // The fragment function writes red 1/255 and alpha 1, and nothing else; the resolve
@@ -674,10 +661,10 @@ mod tests {
         }
     }
 
-    /// Every carried row states the lane's number as its Metal answer, over the runs the probe
+    /// Every carried row states the probe's number as its Metal answer, over the runs the probe
     /// took, and forbids record mode from replacing it.
     #[test]
-    fn every_carried_row_states_the_lanes_number_and_forbids_re_recording() {
+    fn every_carried_row_states_the_probes_number_and_forbids_re_recording() {
         for shape in FEWER {
             let case = Fewer { shape };
             let source = case.metal_source();

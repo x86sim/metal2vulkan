@@ -75,15 +75,12 @@ fn leaves_nothing(m: &TypedModule, inst: &Inst) -> bool {
         | Inst::EndInterlock
         | Inst::DemoteToHelperInvocation
         | Inst::SetMeshOutputs { .. }
-        | Inst::EmitVertex
-        | Inst::EndPrimitive
         | Inst::RayQuery(_) => false,
         Inst::Load { .. }
         | Inst::Unary { .. }
         | Inst::Binary { .. }
         | Inst::Select { .. }
         | Inst::BitFieldInsert { .. }
-        | Inst::Fma { .. }
         | Inst::BitFieldExtract { .. }
         | Inst::Convert { .. }
         | Inst::CompositeConstruct { .. }

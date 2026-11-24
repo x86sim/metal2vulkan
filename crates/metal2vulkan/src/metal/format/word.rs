@@ -19,16 +19,15 @@
 //! it too, measured the same way on the same device, its red at bit 8, green 4, blue 0 and alpha
 //! 12, read back off Metal's own words.
 //!
-//! Metal's store into an 8-bit sRGB format (`R8Unorm_sRGB`, `RG8Unorm_sRGB`; the lane's rule,
-//! `runtime_lane::color_writes`, and its in-guest probe's clears and draws on the M3 Max): each
+//! Metal's store into an 8-bit sRGB format (`R8Unorm_sRGB`, `RG8Unorm_sRGB`; an in-guest probe's
+//! clears and draws on the M3 Max): each
 //! channel's value clamped to `[0, 1]` (a NaN 0), times 4095 exactly, rounded to nearest, encoded
 //! by Metal's twelve-bit table, as `pack_float_to_srgb_unorm4x8` encodes a color channel. The
 //! fragment function encodes the channel by the MSL transfer through the device's `Pow`, as its
 //! `pack_float_to_srgb_unorm4x8` does (`lower::arith::pack`, `PrecisionNote::DevicePackConversion`). A write
-//! of some of its channels merges the word into the texel's: in the pixel interlock
-//! (`color_writes::stored_word`), or over the attachment's input attachment on a device that orders
-//! fetch through rasterization-order input attachments (`color_writes::merged_word`). A blend of
-//! such an attachment, other than one and zero, is not built.
+//! of some of its channels takes the format's own attachment, refused as the device lacking the
+//! format: its merge into the texel over an ordered read of the attachment is not built. A blend
+//! of such an attachment, other than one and zero, is not built.
 //!
 //! Metal's store of a `float` output into `RGB9E5Float` (measured on the M3 Max: 65,536 draws and
 //! clears, and the format scout's draws): each of red, green and blue clamped to `[0, 65408]` (a
@@ -38,31 +37,13 @@
 //! folds the conversion into the store): that store is not built.
 //!
 //! A blend of factors one and zero, added, stores the same (Metal's draws through it matched too).
-//! A write mask of some of the format's channels keeps the other fields: where the device orders
-//! fetch through the pixel interlock, the fragment function stores the word in the interlocked
-//! storage form, merging the kept fields of the word it reads first (`lower::fragment::fetch`),
-//! which hold their codes as Metal's tile holds them. The device blends no such view otherwise,
-//! resolves none, and reads none as the format's input attachment: a pipeline that blends a word
-//! attachment, covers by its alpha, or writes some of its channels on a device without that
-//! interlock is refused as the device lacking the format's attachment, as without the view.
-//!
-//! A fragment function's color input of a packed 16-bit word attachment reads the word and
-//! decodes it, in the interlocked storage form (`lower::fragment::fetch`): each channel's code
-//! over its maximum code rounded to `half`, nearest even, which is the value Metal's programmable
-//! blending hands the function (measured on an Apple M3 Max under macOS 27.0.1: a `float4` and a
-//! `half4` color input of `BGRA4Unorm`, `ABGR4Unorm` and `B5G6R5Unorm`, every code of each 4-bit
-//! channel and a sweep of the 5- and 6-bit ones, stored raw into an `RGBA32Float` attachment; an
-//! `RGBA8Unorm` control reads the `f32` quotient through a `float4` input, so the two rules are
-//! told apart). Metal's tile holds a pass's clear and an earlier draw's write finer than the
-//! codes, as it holds them for a blend (`PrecisionNote::DeviceColorConversion`), so a read after
-//! one in the same pass reads the code the attachment holds. A color input of an 8-bit sRGB word
-//! and of an `RGB9E5Float` one is `NotImplemented(Format)`.
+//! The device blends no such view, resolves none, and reads none as the format's input attachment:
+//! a pipeline that blends a word attachment, covers by its alpha, or writes some of a word's
+//! channels is refused as the device lacking the format's attachment, as without the view. A fragment function's color input of a word attachment is
+//! `NotImplemented(Format)`.
 //!
 //! A multisampled texture of such a format is held in the word's format where the device renders
-//! that at the texture's count (the runtime's image plan), so every sample holds Metal's word. A
-//! pass's resolve of it reads the stored words (`bind::ColorResolveFormat::word`): Metal's rule
-//! for `RGB9E5Float` and an 8-bit sRGB word, a near-equivalent from the codes for a packed 16-bit
-//! one.
+//! that at the texture's count (the runtime's image plan), so every sample holds Metal's word.
 
 use crate::device::requirements::FormatUsage;
 use crate::device::DeviceProfile;
@@ -381,10 +362,10 @@ mod tests {
         use crate::pipeline::testing::profile;
         let nvidia = profile(
             "nvidia-rtx5080-laptop",
-            crate::device::DevicePolicy::default(),
+            crate::device::DevicePolicy::RESIDENT_TABLES,
         )
         .unwrap();
-        let lavapipe = profile("lavapipe", crate::device::DevicePolicy::default()).unwrap();
+        let lavapipe = profile("lavapipe", crate::device::DevicePolicy::RESIDENT_TABLES).unwrap();
         for pf in [
             PixelFormat::A1BGR5Unorm,
             PixelFormat::ABGR4Unorm,
@@ -410,7 +391,11 @@ mod tests {
             WordAttachment::of(PixelFormat::RGB9E5Float, &nvidia),
             Some(WordAttachment::Rgb9e5)
         );
-        let radv = profile("amd-rdna3-radv", crate::device::DevicePolicy::default()).unwrap();
+        let radv = profile(
+            "amd-780m-radv",
+            crate::device::DevicePolicy::RESIDENT_TABLES,
+        )
+        .unwrap();
         assert_eq!(WordAttachment::of(PixelFormat::RGB9E5Float, &radv), None);
         // Vulkan makes `R5G6B5` and `A1R5G5B5` attachments mandatory.
         for pf in [PixelFormat::B5G6R5Unorm, PixelFormat::BGR5A1Unorm] {

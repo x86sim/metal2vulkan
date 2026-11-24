@@ -12,7 +12,7 @@
 //! of one thread-local read. Its counters are the measuring thread's own: the translation runs on
 //! its caller's thread, so a measurement holds whether its test runs alone in its process (as
 //! nextest runs every test) or beside others on libtest's threads (`cargo test`), whose
-//! allocations it does not see. Other tests count allocations with it ([`allocations_during`]).
+//! allocations it does not see.
 //!
 //! `llvm-as` assembles the kernel; without it the test skips visibly.
 
@@ -131,13 +131,6 @@ pub(crate) fn held_during<T>(work: impl FnOnce() -> T) -> (T, u64) {
     (value, counts.peak.max(0) as u64)
 }
 
-/// `work`'s result, and the allocations and reallocations it made while it ran (the calling
-/// thread's).
-pub(super) fn allocations_during<T>(work: impl FnOnce() -> T) -> (T, u64) {
-    let (value, counts) = measured(work);
-    (value, counts.allocations)
-}
-
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
 /// Where a kernel's escaping constant is, if it has one ([`blob_kernel`]).
@@ -229,7 +222,7 @@ fn assemble(depth: u32, escaping: Escaping) -> Option<Vec<u8>> {
 /// Compile `bc` for `lavapipe` with the default caps: the result, the ledger peak, and the most
 /// bytes the compile held at once.
 fn compile(bc: &[u8]) -> (Result<(), Error>, Option<u64>, u64, u64) {
-    let p = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let mut m = Meter::with_caps(&Budget::default(), WORK_UNITS, LEDGER_BYTES);
     let (compiled, held) = held_during(|| {
         compile_bitcode(
@@ -271,7 +264,7 @@ fn written(bc: &[u8]) -> (u64, u64, u64) {
         .join("../metal2vulkan-validation/profiles/lavapipe.json");
     let text = std::fs::read_to_string(&path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    let device = Device::new(desc, DevicePolicy::default()).expect("device");
+    let device = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
     let f = Library::from_air(bc)
         .expect("library")
         .function("blob")

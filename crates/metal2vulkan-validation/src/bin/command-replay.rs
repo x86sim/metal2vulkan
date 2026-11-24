@@ -1,120 +1,148 @@
-//! The command replay harness's runtime leg: run one recorded stretch of Metal commands (a
-//! render pass's draws and tile dispatches, compute dispatches, across command buffers) on a
-//! Vulkan device through the runtime, from a manifest that names every object, every byte the
-//! commands start from and every call in order, and write what they leave behind, so the same
-//! manifest run on Metal (the Metal leg, a Swift program kept beside the probes) and on each
-//! Vulkan device can be compared byte for byte.
+//! Replay streams (`docs/REPLAY-STREAM.md`): play one on a Vulkan device through the runtime,
+//! or print its records.
 //!
-//! `command-replay run --manifest FILE --out DIR --device-type cpu|gpu --shader-cache DIR`
+//! `command-replay play --stream FILE --out DIR --device-type cpu|gpu --shader-cache DIR
+//! [--blobs DIR] [--managed one-copy|two-copy]
+//! [--until-frame F] [--past-range yes|no] [--states-only yes|no] [--state-log FILE]
+//! [--state-threads N] [--state-keys KEY,...] [--state-digests yes|no] [--gpu-wait-timeout SECONDS]
+//! [--video-handle dma-buf|opaque-fd|opaque-win32] [--check-presents F,...]` plays the stream
+//! whose first segment is `FILE` through the runtime (with `--states-only yes`, its device,
+//! library, function and pipeline state records and its presents alone, every other call passed
+//! over, and no judged metric), with
+//! `--video-handle dma-buf|opaque-fd|opaque-win32` telling the runtime the consumer's decoder
+//! route, the handle its video surfaces are made with (a dma-buf unless it says otherwise; an NT
+//! handle, `opaque-win32`, on a Windows host), and
+//! `--gpu-wait-timeout` bounding each device wait (10 s unless it says otherwise; a CPU device's
+//! work can take longer than a GPU's), `--managed`
+//! telling the runtime how the recording device kept Managed buffers where the stream has no
+//! `m2v.deviceIdentity` record (one copy: unified memory; two copies: a GPU copy; with neither, a
+//! Managed buffer stops the play), `--until-frame` stopping the play after frame `F`'s present
+//! (frames counted from 0; a command buffer committed by then and held on an event no call played
+//! signals is named on a `held` line, not an invalid stream), and `--check-presents` checking the texture each listed frame's
+//! present shows, at that present, as a recorded check of it would (a `check` line of the
+//! frame, compared by `compare-plays`, and the bytes read kept as `DIR/presents/frame-F.bytes`,
+//! which `compare-plays` sizes where two plays' digests differ; its readback's time is the
+//! frame's, so a timed play lists none). The play ends at the stream's recording range (its sidecar's, else
+//! its row of `RECORDED_RANGES`, else the whole stream) unless `--past-range yes` takes it past.
+//! It writes `DIR/report.txt`, each line to the standard error too: first `mode full: every call`
+//! or `mode states-only: ...`, then, where the stream's
+//! header lacks `FLAG_COMPLETION_BYTES_RECORDED`, the line `recorded before the recorder's
+//! completion fix: the stream may differ from what the program did` by itself, then `range ...`
+//! (the recording range, where it came from, and whether the play ends there), then `device NAME
+//! runtime rt`, each frame's `frame` and `end` lines as the frame ends
+//! (flushed, so a play that never ends leaves the frames it finished), `addresses ...` (the
+//! written words that look like addresses, which play as recorded but those a noted buffer's range
+//! holds, which move, the address arguments and those moved, and the objects whose ID differs from
+//! the recording's), the player's other report lines,
+//! the
+//! backend's own lines, `until-frame F` where the play stopped there (at `--until-frame` or at the
+//! recording range), `cut SEGMENT OFFSET` where
+//! the last
+//! segment ends in a record cut
+//! short, `skipped ...` where the backend skipped what its runtime does not build (such a play is
+//! no gate result), `gaps ...` where it met a typed gap, on the runtime where the play
+//! finished its range and skipped nothing the matrix's judged metrics (`M2V-MATRIX metric
+//! replay-rt/STEM/RANGE/NAME N`, `docs/REPLAY-STREAM.md`, section 10), then `ok`, `ids: ...` or
+//! `error WHAT`, the skipped line and this one ending `; not a verdict past frame F, call C` where
+//! the backend skipped anything (`F` and `C` the first skip's frame and stream position); a play
+//! that ends where an object's ID differs, the compute pipeline states' typed gap aside, ends
+//! `ids: played to the end; ...`. The exit status is 0 for `ok`, 1 for a play that stopped, 2 for
+//! a harness failure (a bad command line, no device, an unreadable stream or sidecar) and 3 for
+//! `ids`.
 //!
-//! **The manifest** (version 1), one JSON object; every Metal enum is its raw number, files are
-//! relative to the manifest's directory, and each table's ids are free strings:
+//! With `--state-log FILE`, each pipeline state's make is written as it happens, for a driver that
+//! ends the process inside one: `M2V-STATE begin SEQ THREAD WHAT` before its first driver call,
+//! `M2V-STATE modules SEQ THREAD` once its shader modules are made and before its `VkPipeline` is,
+//! and `M2V-STATE end SEQ THREAD made in MS ms|refused ERROR|failed ERROR` after, each line
+//! flushed to the standard output and to `FILE` as it is written, so the last `begin` with no
+//! `end` names the make a crash ended and its `modules` line, or none, which of the two calls. A
+//! render state's `WHAT` is `render #OBJECT call POSITION key KEY colors [F, ...] depth F stencil F
+//! samples N fragment true|false`: `KEY` is the hex of the translator's key of its descriptor, the
+//! name of its content's record under `renders/` in the cache directory, and `F` are raw
+//! `MTLPixelFormat` values, 0 for none; a compute state's is `compute #OBJECT call POSITION`. In a
+//! states-only play, `--state-threads N` (0 unless it says otherwise) has `N` threads of the
+//! player's own make the states, at once, through the device's one pipeline cache, as a
+//! consumer's compile threads do (their lines go to the standard output where no `--state-log`
+//! names a file), and `--state-keys KEY,...` makes only the render states of those contents and
+//! passes over every other state, each named on a `M2V-STATE pass WHAT` line. With
+//! `--state-digests yes` (no unless it says so), a render state's `modules` line ends in `digest
+//! HEX`, the hex of its content digest (`RenderPipelineState::content_digest`: both stages'
+//! modules, the layout and the fixed-function state, and no version), which two builds share where
+//! they translate the state alike; the lines go to the standard output where no `--state-log`
+//! names a file. The report's
+//! `states` line counts the makes begun and how they ended, and the states passed over; pooled or
+//! passed over, a state plays as a skipped object, which a states-only play binds nowhere, so its
+//! `render states made` count leaves them out.
 //!
-//! - `library`: the metallib a function comes from unless it names another; `libraries`?: `{LID:
-//!   file}`, other metallibs. `functions`: `{FID: {"name", "library"?: LID, "constants": [{"index",
-//!   "type" (MTLDataType), "hex"}]}}`.
-//! - `heaps`: `{HID: {"size", "type" (MTLHeapType), "options" (MTLResourceOptions)}}`.
-//! - `buffers`: `{BID: {"length", "options", "file"?, "heap"?, "offset"?}}` (`offset` places it in
-//!   a placement heap).
-//! - `textures`: `{TID: {"type", "format", "width", "height", "depth", "levels", "array",
-//!   "samples", "usage", "options", "heap"?, "offset"?, "file"?}}`; the file holds level 0 of each
-//!   slice in turn, rows packed (`width` texels each), copied in through a blit (a two-plane
-//!   format's plane 0 only). A two-plane YCbCr texture over a surface takes `"surface": {"ostype"
-//!   (four characters), "file", "lumaRow", "chromaOffset", "chromaRow", "matrix"?: "601" | "709" |
-//!   "2020" (none: the surface has no `kIOSurfaceYCbCrMatrix`)}` instead: the file holds the
-//!   surface's luma plane at byte 0, rows `lumaRow` bytes apart, and its chroma plane at
-//!   `chromaOffset`, rows `chromaRow` apart; the texture is made over its plane 0
-//!   (`newTextureWithDescriptor:iosurface:plane:`).
-//! - `views`: `{TID: {"of" (a texture), "format", "type"?, "levels"?: [first, count], "slices"?:
-//!   [first, count], "swizzle"?: [r, g, b, a] (MTLTextureSwizzle)}}`: views made after every
-//!   texture, in the textures' namespace (`newTextureViewWithPixelFormat:textureType:levels:
-//!   slices:swizzle:`, or `newTextureViewWithPixelFormat:` with no other key).
-//! - `samplers`: `{SID: {"min", "mag", "mip", "s", "t", "r", "normalized", "border", "lodMin",
-//!   "lodMax", "maxAniso", "compare"}}`.
-//! - `renderPipelines`: `{PID: {"vertex", "fragment" (or null), "colors": [{"format",
-//!   "blending", "srcRGB", "dstRGB", "rgbOp", "srcA", "dstA", "alphaOp", "mask"} or null],
-//!   "depth", "stencil" (0 for none), "samples", "alphaToCoverage", "topology"}}`;
-//!   `tilePipelines`: `{PID: {"function", "colors": [format, ...], "matchesTileSize"}}`;
-//!   `computePipelines`: `{PID: {"function"}}`; `depthStencilStates`: `{DID: {"compare",
-//!   "write", "stencil"?: {"compare", "fail", "depthFail", "pass", "read", "write"}}}` (the
-//!   stencil descriptor both faces take).
-//! - `commandBuffers`: a list of command buffers, each a list of encoders, committed in order and
-//!   each waited on: `{"render": {"colors": [{"texture", "load", "store", "clear": [r, g, b, a]}
-//!   or null], "depth"?, "stencil"?, "tileWidth"?, "tileHeight"?, "imageblockSize"?,
-//!   "threadgroupMemoryLength"?, "width"?, "height"?, "commands": [...]}}` or `{"compute": {"commands": [...]}}`;
-//!   a render pass's `defaultRasterSampleCount` is 1 (a pass without attachments rasterizes one
-//!   sample; Metal ends the process at the default 0).
-//! - The commands, applied in order, each one of the encoder's own calls: `{"pipeline": PID}`;
-//!   `{"buffer" | "bytes" | "texture" | "sampler": {"stage": "vertex" | "fragment" | "tile" |
-//!   "kernel", "index", ...}}`; `{"threadgroupMemory": {"index", "length"}}`; `{"depthStencil":
-//!   DID}`; `{"stencilRef": n}`; `{"blendColor": [r, g, b, a]}`; `{"viewport": [x, y, w, h,
-//!   znear, zfar]}`; `{"scissor": [x, y, w, h]}`; `{"cull": n}`; `{"winding": n}`;
-//!   `{"useResource": {"id", "usage", "stages"}}`; `{"useHeap": HID}`; `{"draw": {"primitive",
-//!   "start", "count", "instances", "baseInstance"}}`; `{"drawIndexed": {"primitive", "count",
-//!   "indexType", "buffer", "offset", "instances", "baseVertex", "baseInstance"}}`; `{"tile":
-//!   {"threads": [w, h]}}`; `{"dispatchThreadgroups": {"groups", "threads"}}`;
-//!   `{"dispatchThreads": {"grid", "threads"}}`.
-//! - `readback`: the ids written out, each to `DIR/<id>.bin`: a texture's level 0, every slice
-//!   in turn, rows packed, through a blit into a shared buffer (a two-plane format's plane 0; a
-//!   memoryless or multisampled texture is not read), a buffer's whole length.
+//! With `--dump-command-buffers LIST --dump-dir DIR`, the play also writes into `DIR`, once each
+//! command buffer whose stream id `LIST` holds completed, every buffer its encoders named, with
+//! the ranges of it the cover rule held covered then, and every colour attachment its render
+//! passes stored, the parts of it they stored; no depth or stencil attachment
+//! (`docs/REPLAY-STREAM.md`, section 10). `LIST` is `FIRST..LAST` ranges (both ends held) and
+//! single ids, joined by commas.
 //!
-//! `DIR/status.txt` says `leg runtime`, `device <name>`, what the run's pipelines took from the
-//! shader cache (`cache` and its counts: functions translated, variant pipelines made, directory
-//! lookups hit and missed, driver records loaded, and the driver's pipeline cache hits and misses
-//! its creation feedback reported), each pipeline creation's line where
-//! `METAL2VULKAN_LOG_PIPELINES` is set (`pipeline <line>`), each degrade notice the run raised
-//! (`notice <code>`), and `ok` or `error <where>: <message>`: the first failure stops the run,
-//! and the readbacks done so far stay. The exit status is 0 for `ok`, 1 for a run that stopped,
-//! and 2 for a harness failure (a bad manifest or command line).
+//! A check or dump of a buffer the play keeps two copies of (a Managed buffer of a stream recorded
+//! without unified memory) names the copy it read: its CPU copy, as Metal's `contents` answers, or
+//! with `--read-device-copies yes` its device copy, read back. On a
+//! device that keeps a device copy of each Managed buffer, the report's `managed digests` line
+//! after its `device` line says which.
 //!
-//! GUEST DATA: a manifest made from a guest's commands, its files and the outputs are the
-//! consumer's: they stay on the hosts the guest data rule allows and are never committed.
+//! The runtime's play stands in for a consumer's pre-pass: `--prepass-width N` threads of the
+//! player's own (4 where the command line names none, 0 for none) prepare each compute dispatch
+//! ahead of its encoding (`ComputePipelineState::prepare_dispatch`) once its command buffer and its
+//! state are made, while the play goes on. The report's `prepass width` line says how many ran.
+//!
+//! `command-replay compare-dumps --a DIR --b DIR` compares two plays' dumps word by word, leaving
+//! out the words either play held covered, and prints a line per buffer that differs outside every
+//! cover, per dump only one play has, per dump a play could not read and per buffer the two plays
+//! read different copies of, then a summary ending `agree` or `DIFFER`. The exit status is 0 where they agree, 1 where they differ, 2 for a bad
+//! command line or an unreadable dump.
+//!
+//! `command-replay dump --stream FILE` prints each call record as a line (a blob as its hash),
+//! then `cut SEGMENT OFFSET` where the last segment ends in a record cut short.
+//!
+//! `command-replay shapes --stream FILE` prints, for each selector, how many calls had each shape
+//! of arguments and answers (`Value::shape`: kinds and map keys, no data), most first: what a
+//! stream asks of a player without what it holds.
+//!
+//! GUEST DATA: a stream recorded from a guest, its blobs and the reports are the consumer's: they
+//! stay on the hosts the guest data rule allows and are never committed.
 
-use metal2vulkan::bind::SamplerDescriptor;
-use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
-use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
-use metal2vulkan::metal::{
-    BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType,
-    PixelFormat, PrimitiveTopologyClass, PrimitiveType, RenderStages, ResourceUsage,
-    SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter,
-    StencilOperation, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage, Winding,
-};
-use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource, TileRenderPipelineDescriptor,
-};
-use metal2vulkan_runtime::{
-    BlitOption, Buffer, CommandBuffer, CommandBufferStatus, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DepthStencilState, Device, DeviceOptions, Function, Heap, HeapDescriptor,
-    HeapType, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction, MessageSink, Origin,
-    PipelineOptions, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
-    ResourceOptions, ResourceRef, SamplerState, ScissorRect, ShaderCacheOptions, Size, StoreAction,
-    SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport,
-};
-use metal2vulkan_validation::candidate::runtime_case::open_device;
+use metal2vulkan_validation::gpu::wait::{parse_wait_timeout, set_wait_timeout, WAIT_TIMEOUT_FLAG};
 use metal2vulkan_validation::gpu::DeviceType;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use metal2vulkan_validation::replay::{
+    compare_dumps, compare_plays, display_library, judged_records, recording_range, segments,
+    shown_differences, Backend, CommandBufferList, ManagedCopies, NewRuntime, PlayError, Player,
+    RangeSource, RecordingRange, StreamError, StreamReader, Value, VideoHandle,
+    FLAG_COMPLETION_BYTES_RECORDED, RECORDED_RANGES,
+};
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-const USAGE: &str = "usage: command-replay run --manifest FILE --out DIR --device-type cpu|gpu \
-                     --shader-cache DIR";
-
-/// How long a command buffer may run.
-const WAIT: Duration = Duration::from_secs(300);
+const USAGE: &str = "usage: command-replay play --stream FILE --out DIR --device-type cpu|gpu \
+                     --shader-cache DIR [--blobs DIR] \
+                     [--managed one-copy|two-copy] [--until-frame F] [--past-range yes|no] \
+                     [--states-only yes|no] [--state-log FILE] [--state-threads N] \
+                     [--state-keys KEY,...] [--state-digests yes|no] [--gpu-wait-timeout SECONDS] [--video-handle dma-buf|opaque-fd|opaque-win32] \
+                     [--check-presents F,...] [--read-device-copies yes|no] [--prepass-width N] \
+                     [--dump-command-buffers LIST --dump-dir DIR]\n       \
+                     command-replay compare-dumps --a DIR --b DIR\n       \
+                     command-replay compare-plays --a REPORT --b REPORT [--frame F]\n       \
+                     command-replay dump \
+                     --stream FILE\n       command-replay shapes --stream FILE";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        Some("run") => match options(&args[1..]) {
-            Ok(options) => run(&options),
-            Err(why) => {
-                eprintln!("command-replay: {why}\n{USAGE}");
-                2
-            }
-        },
+        Some("play") => {
+            let required = ["stream", "out", "device-type", "shader-cache"];
+            with_options(&args[1..], &required, play)
+        }
+        Some("dump") => with_options(&args[1..], &["stream"], dump),
+        Some("compare-dumps") => with_options(&args[1..], &["a", "b"], compare),
+        Some("compare-plays") => with_options(&args[1..], &["a", "b"], compare_two_plays),
+        Some("shapes") => with_options(&args[1..], &["stream"], shapes),
         _ => {
             eprintln!("{USAGE}");
             2
@@ -123,7 +151,22 @@ fn main() {
     std::process::exit(code);
 }
 
-fn options(args: &[String]) -> Result<BTreeMap<String, String>, String> {
+/// `run` on the options `args` give, or 2 where they lack one of `required`.
+fn with_options(
+    args: &[String],
+    required: &[&str],
+    run: fn(&BTreeMap<String, String>) -> i32,
+) -> i32 {
+    match options(args, required) {
+        Ok(options) => run(&options),
+        Err(why) => {
+            eprintln!("command-replay: {why}\n{USAGE}");
+            2
+        }
+    }
+}
+
+fn options(args: &[String], required: &[&str]) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -133,1210 +176,722 @@ fn options(args: &[String]) -> Result<BTreeMap<String, String>, String> {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         out.insert(name.to_string(), value.clone());
     }
-    for name in ["manifest", "out", "device-type", "shader-cache"] {
-        if !out.contains_key(name) {
+    for name in required {
+        if !out.contains_key(*name) {
             return Err(format!("--{name} is required"));
         }
     }
     Ok(out)
 }
 
-/// The status file, written as the run goes.
-struct Status {
-    file: std::fs::File,
-}
-
-impl Status {
-    fn line(&mut self, line: &str) {
-        let _ = writeln!(self.file, "{line}");
-        let _ = self.file.flush();
+/// `compare-dumps`: two plays' dumps compared, a line each, then the summary; 0 where they agree,
+/// 1 where they differ, 2 where a dump cannot be read.
+fn compare(options: &BTreeMap<String, String>) -> i32 {
+    let (a, b) = (PathBuf::from(&options["a"]), PathBuf::from(&options["b"]));
+    match compare_dumps(&a, &b) {
+        Ok(comparison) => {
+            for line in comparison.lines() {
+                println!("{line}");
+            }
+            match comparison.agrees() {
+                true => 0,
+                false => 1,
+            }
+        }
+        Err(error) => {
+            eprintln!("command-replay: compare-dumps: {error}");
+            2
+        }
     }
 }
 
-fn run(options: &BTreeMap<String, String>) -> i32 {
-    let manifest_path = PathBuf::from(&options["manifest"]);
+/// `compare-plays`: two plays' reports (each a `report.txt` or the directory holding it) compared
+/// for a timing verdict, a line each, and with no frame named, the size of each picture difference
+/// whose bytes both plays kept (`shown_differences`); 0 where the frame `--frame` names has a verdict (or none is
+/// named), 1 where it has none, 2 where a report cannot be read.
+fn compare_two_plays(options: &BTreeMap<String, String>) -> i32 {
+    let frame = match options.get("frame").map(|f| f.parse::<u64>()) {
+        None => None,
+        Some(Ok(frame)) => Some(frame),
+        Some(Err(_)) => {
+            eprintln!("command-replay: --frame takes a frame number\n{USAGE}");
+            return 2;
+        }
+    };
+    let report = |name: &str| {
+        let path = PathBuf::from(&options[name]);
+        let path = match path.is_dir() {
+            true => path.join("report.txt"),
+            false => path,
+        };
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let (a, b) = match (report("a"), report("b")) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(why), _) | (_, Err(why)) => {
+            eprintln!("command-replay: compare-plays: {why}");
+            return 2;
+        }
+    };
+    let (lines, verdict) = compare_plays(&a, &b, frame);
+    for line in lines {
+        println!("{line}");
+    }
+    // The size of each picture difference, where both plays kept the shown texture's bytes in
+    // `presents` beside their reports: printed with the whole compare, so a verdict stays the last
+    // line of a compare at a frame.
+    if frame.is_none() {
+        let kept = |name: &str| {
+            let path = PathBuf::from(&options[name]);
+            let dir = match path.is_dir() {
+                true => path,
+                false => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            };
+            dir.join("presents")
+        };
+        for line in shown_differences(&a, &b, &kept("a"), &kept("b")) {
+            println!("{line}");
+        }
+    }
+    match verdict {
+        true => 0,
+        false => 1,
+    }
+}
+
+fn reader(options: &BTreeMap<String, String>) -> Result<StreamReader, StreamError> {
+    let first = PathBuf::from(&options["stream"]);
+    StreamReader::open(&segments(&first), options.get("blobs").map(PathBuf::from))
+}
+
+fn dump(options: &BTreeMap<String, String>) -> i32 {
+    let mut stdout = std::io::stdout().lock();
+    let ended = reader(options).and_then(|mut reader| {
+        while let Some(call) = reader.next_call()? {
+            if writeln!(stdout, "{call}").is_err() {
+                return Ok(());
+            }
+        }
+        if let Some((segment, offset)) = reader.truncated() {
+            let _ = writeln!(stdout, "cut {} {offset}", segment.display());
+        }
+        Ok(())
+    });
+    match ended {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("command-replay: {error}");
+            2
+        }
+    }
+}
+
+/// The most shapes `shapes` prints of one selector.
+const SHAPES_SHOWN: usize = 30;
+
+fn shapes(options: &BTreeMap<String, String>) -> i32 {
+    let mut counted: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let ended = reader(options).and_then(|mut reader| {
+        while let Some(call) = reader.next_call()? {
+            let args: Vec<String> = call.args.iter().map(Value::shape).collect();
+            let answers: Vec<String> = (call.answers.iter())
+                .map(|(key, value)| format!(" -> {key}: {}", value.shape()))
+                .collect();
+            let shape = format!("{}{}", args.join(" "), answers.concat());
+            *counted
+                .entry((call.selector.to_string(), shape))
+                .or_default() += 1;
+        }
+        Ok(reader.truncated().cloned())
+    });
+    let mut by_selector: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+    for ((selector, shape), count) in counted {
+        by_selector
+            .entry(selector)
+            .or_default()
+            .push((count, shape));
+    }
+    let mut stdout = std::io::stdout().lock();
+    for (selector, mut shapes) in by_selector {
+        shapes.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u64 = shapes.iter().map(|(count, _)| count).sum();
+        let _ = writeln!(stdout, "{selector}: {total} calls, {} shapes", shapes.len());
+        let more = shapes.len().saturating_sub(SHAPES_SHOWN);
+        for (count, shape) in shapes.into_iter().take(SHAPES_SHOWN) {
+            let _ = writeln!(stdout, "  {count} {shape}");
+        }
+        if more > 0 {
+            let _ = writeln!(stdout, "  ... {more} more shapes");
+        }
+    }
+    match ended {
+        Ok(cut) => {
+            if let Some((segment, offset)) = cut {
+                let _ = writeln!(stdout, "cut {} {offset}", segment.display());
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("command-replay: {error}");
+            2
+        }
+    }
+}
+
+/// The report's first line: which calls the play plays (`--states-only`).
+fn mode_line(states_only: bool) -> &'static str {
+    match states_only {
+        true => {
+            "mode states-only: the device, library, function and pipeline state records and the \
+             presents alone (--states-only yes)"
+        }
+        false => "mode full: every call",
+    }
+}
+
+/// The line by itself after the mode line of every report of a stream whose header lacks
+/// `FLAG_COMPLETION_BYTES_RECORDED`, so that no table relayed from the report loses it.
+const BEFORE_COMPLETION_FIX: &str =
+    "recorded before the recorder's completion fix: the stream may differ from what the program did";
+
+/// The report's `display library` line of a stream with the sidecar `metallib`: its length, its
+/// SHA-256, and its git blob id (the SHA-1 of `blob LENGTH\0` and the bytes), which names the
+/// file in the host's tree.
+fn display_line(metallib: &[u8]) -> String {
+    use sha1::Digest as _;
+    let sha256 = metal2vulkan_validation::replay::hex(&sha2::Sha256::digest(metallib));
+    let mut blob = sha1::Sha1::new();
+    blob.update(format!("blob {}\0", metallib.len()).as_bytes());
+    blob.update(metallib);
+    let blob = metal2vulkan_validation::replay::hex(&blob.finalize());
+    format!(
+        "display library the stream's sidecar, {} bytes, sha256 {sha256}, git blob {blob}",
+        metallib.len()
+    )
+}
+
+/// The report's `range` line: the recording range the play used, where it came from, and whether
+/// the play ends there or `--past-range yes` takes it past.
+fn range_line(range: RecordingRange, source: RangeSource, past: bool) -> String {
+    let source = match source {
+        RangeSource::Sidecar => "the stream's sidecar".to_owned(),
+        RangeSource::Table(label) => format!("the player's table, stream {label}"),
+        RangeSource::Unstated => "no sidecar and no table row".to_owned(),
+    };
+    match (range, past) {
+        (RecordingRange::Whole, _) => format!("range whole ({source})"),
+        (RecordingRange::LastFrame(last), false) => {
+            format!("range last-frame {last} ({source}); the play ends there")
+        }
+        (RecordingRange::LastFrame(last), true) => {
+            format!("range last-frame {last} ({source}); --past-range yes plays past it")
+        }
+    }
+}
+
+/// The report file, written as the play goes: every line it takes, the frame lines among them,
+/// goes to the standard error too, so a caller that loses the file keeps the lines.
+struct ReportFile {
+    file: std::fs::File,
+}
+
+impl ReportFile {
+    fn line(&mut self, line: &str) {
+        let _ = writeln!(self, "{line}");
+        let _ = self.flush();
+    }
+}
+
+impl std::io::Write for ReportFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write_all(bytes)?;
+        let _ = std::io::stderr().write_all(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn play(options: &BTreeMap<String, String>) -> i32 {
     let out = PathBuf::from(&options["out"]);
     if let Err(error) = std::fs::create_dir_all(&out) {
         eprintln!("command-replay: {}: {error}", out.display());
         return 2;
     }
-    let file = match std::fs::File::create(out.join("status.txt")) {
-        Ok(file) => file,
+    let mut report = match std::fs::File::create(out.join("report.txt")) {
+        Ok(file) => ReportFile { file },
         Err(error) => {
-            eprintln!("command-replay: status.txt: {error}");
+            eprintln!("command-replay: report.txt: {error}");
             return 2;
         }
     };
-    let mut status = Status { file };
-    status.line("leg runtime");
-    let manifest: Value = match std::fs::read(&manifest_path)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
-    {
-        Ok(v) => v,
-        Err(why) => {
-            status.line(&format!("error manifest: {why}"));
+    let states_only = match options.get("states-only").map(String::as_str) {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(other) => {
+            report.line(&format!("error states-only: {other} is neither yes nor no"));
             return 2;
         }
     };
-    let dir = manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    let device_type = match DeviceType::parse(&options["device-type"]) {
-        Ok(t) => t,
-        Err(why) => {
-            status.line(&format!("error device-type: {why}"));
-            return 2;
-        }
-    };
-    let notices: Arc<Mutex<Vec<String>>> = Arc::default();
-    let mut device_options = DeviceOptions::default();
-    device_options.shader_cache = ShaderCacheOptions::in_directory(&options["shader-cache"]);
-    let sink = Arc::clone(&notices);
-    device_options.messages = Some(MessageSink::new(move |m| {
-        if m.id_name.starts_with("metal2vulkan-degrade") || m.id_name.starts_with("VUID") {
-            if let Ok(mut n) = sink.lock() {
-                n.push(format!("notice {} {}", m.id_name, m.text));
+    report.line(mode_line(states_only));
+    let (state_log, state_threads, state_keys, state_digests) =
+        match state_options(options, states_only) {
+            Ok(states) => states,
+            Err(why) => {
+                report.line(&format!("error {why}"));
+                return 2;
             }
-        } else if m.id_name == "metal2vulkan-pipeline-creation" {
-            if let Ok(mut n) = sink.lock() {
-                n.push(format!("pipeline {}", m.text));
-            }
-        }
-    }));
-    device_options.announce_each = metal2vulkan_runtime::Degradation::ALL
-        .iter()
-        .copied()
-        .collect();
-    let device = match open_device(device_type, device_options) {
-        Ok(d) => d,
+        };
+    let mut reader = match reader(options) {
+        Ok(reader) => reader,
         Err(error) => {
-            status.line(&format!("error device: {error}"));
-            return 1;
+            report.line(&format!("error {error}"));
+            return 2;
         }
     };
-    status.line(&format!("device {}", device.name()));
-    let mut replay = Replay {
-        dir,
-        out,
-        device,
-        queue: None,
-        libraries: BTreeMap::new(),
-        functions: BTreeMap::new(),
-        heaps: BTreeMap::new(),
-        buffers: BTreeMap::new(),
-        textures: BTreeMap::new(),
-        samplers: BTreeMap::new(),
-        render: BTreeMap::new(),
-        compute: BTreeMap::new(),
-        depth: BTreeMap::new(),
-    };
-    let result = replay.all(&manifest, &mut status);
-    let read = replay.readback(&manifest, &mut status);
-    let (stats, counts) = (
-        replay.device.shader_cache_statistics(),
-        replay.device.work_counts(),
-    );
-    status.line(&format!(
-        "cache translated {} variant-pipelines {} lookups-hit {} lookups-missed {} driver-loads {} \
-         driver-pipeline-hits {} driver-pipeline-misses {}",
-        counts.functions_translated,
-        counts.variant_pipelines_made,
-        stats.hits,
-        stats.misses,
-        stats.driver_loads,
-        stats.driver_pipeline_hits,
-        stats.driver_pipeline_misses
-    ));
-    for line in notices.lock().map(|n| n.clone()).unwrap_or_default() {
-        status.line(&line);
+    if reader.flags() & FLAG_COMPLETION_BYTES_RECORDED == 0 {
+        report.line(BEFORE_COMPLETION_FIX);
     }
-    match result.and(read) {
+    let (range, source) = match recording_range(&PathBuf::from(&options["stream"]), RECORDED_RANGES)
+    {
+        Ok(found) => found,
+        Err(why) => {
+            report.line(&format!("error range: {why}"));
+            return 2;
+        }
+    };
+    let past = match options.get("past-range").map(String::as_str) {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(other) => {
+            report.line(&format!("error past-range: {other} is neither yes nor no"));
+            return 2;
+        }
+    };
+    report.line(&range_line(range, source, past));
+    // The host's display library, which its library from source of no arguments is made of.
+    let display = display_library(&PathBuf::from(&options["stream"]));
+    let display = match std::fs::read(&display) {
+        Ok(metallib) => {
+            report.line(&display_line(&metallib));
+            Some(metallib)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.line("display library none: the host's library from source is skipped");
+            None
+        }
+        Err(error) => {
+            report.line(&format!(
+                "error display library: {}: {error}",
+                display.display()
+            ));
+            return 2;
+        }
+    };
+    let device_type = match DeviceType::parse(&options["device-type"]) {
+        Ok(device_type) => device_type,
+        Err(why) => {
+            report.line(&format!("error device-type: {why}"));
+            return 2;
+        }
+    };
+    let flag = WAIT_TIMEOUT_FLAG.trim_start_matches("--");
+    if let Some(seconds) = options.get(flag) {
+        if let Err(why) = parse_wait_timeout(seconds).and_then(set_wait_timeout) {
+            report.line(&format!("error {flag}: {why}"));
+            return 2;
+        }
+    }
+    let device_copies = match options.get("read-device-copies").map(String::as_str) {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(other) => {
+            report.line(&format!(
+                "error read-device-copies: {other} is neither yes nor no"
+            ));
+            return 2;
+        }
+    };
+    // The consumer's pre-pass the runtime's play stands in for: its threads, 4 where the
+    // command line names none, 0 for none.
+    let prepass = match options
+        .get("prepass-width")
+        .map(|width| width.parse::<usize>())
+    {
+        None => None,
+        Some(Ok(width)) => Some(width),
+        Some(Err(_)) => {
+            report.line("error prepass-width: not a count of threads");
+            return 2;
+        }
+    };
+    let managed = match options.get("managed").map(String::as_str) {
+        None => None,
+        Some("one-copy") => Some(ManagedCopies::One),
+        Some("two-copy") => Some(ManagedCopies::Two),
+        Some(other) => {
+            report.line(&format!(
+                "error managed: {other} is neither one-copy nor two-copy"
+            ));
+            return 2;
+        }
+    };
+    let video = match options
+        .get("video-handle")
+        .map(|name| VideoHandle::parse(name))
+    {
+        None => VideoHandle::DmaBuf,
+        Some(Some(handle)) => handle,
+        Some(None) => {
+            report.line(&format!(
+                "error video-handle: {} is none of dma-buf, opaque-fd and opaque-win32",
+                options["video-handle"]
+            ));
+            return 2;
+        }
+    };
+    let until = match options.get("until-frame").map(|f| f.parse::<usize>()) {
+        None => None,
+        Some(Ok(last)) => Some(last),
+        Some(Err(_)) => {
+            report.line(&format!(
+                "error until-frame: {} is no frame number",
+                options["until-frame"]
+            ));
+            return 2;
+        }
+    };
+    let until = range.last_frame(past, until);
+    let presents = match options.get("check-presents").map(|listed| {
+        let frames = listed.split(',').map(|frame| frame.parse::<u64>());
+        frames.collect::<Result<Vec<_>, _>>()
+    }) {
+        None => (Vec::new(), out.join("presents")),
+        Some(Ok(frames)) => (frames, out.join("presents")),
+        Some(Err(_)) => {
+            report.line(&format!(
+                "error check-presents: {} is no list of frame numbers",
+                options["check-presents"]
+            ));
+            return 2;
+        }
+    };
+    let dump = match (options.get("dump-command-buffers"), options.get("dump-dir")) {
+        (None, None) => None,
+        (Some(listed), Some(dir)) => {
+            let Some(command_buffers) = CommandBufferList::parse(listed) else {
+                report.line(&format!(
+                    "error dump-command-buffers: {listed} is no list of FIRST..LAST ranges and \
+                     ids joined by commas"
+                ));
+                return 2;
+            };
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                report.line(&format!("error dump-dir: {dir}: {error}"));
+                return 2;
+            }
+            Some((command_buffers, PathBuf::from(dir)))
+        }
+        _ => {
+            report.line("error dump: --dump-command-buffers and --dump-dir go together");
+            return 2;
+        }
+    };
+    let cache = PathBuf::from(&options["shader-cache"]);
+    let mut backend = match open_rt(device_type, cache) {
+        Ok((backend, name)) => {
+            report.line(&format!("device {name} runtime rt"));
+            let backend = match device_copies {
+                true => backend.reading_device_copies(),
+                false => backend,
+            };
+            if let Some(line) = backend.managed_digests() {
+                report.line(&line);
+            }
+            let backend = match managed {
+                Some(copies) => backend.with_managed(copies),
+                None => backend,
+            };
+            let backend = backend.with_video_handle(video);
+            if state_log.is_some() || state_threads > 0 || state_keys.is_some() || state_digests {
+                report.line(&format!(
+                    "state makes on {}, {}{}",
+                    match state_threads {
+                        0 => "the play's thread".to_owned(),
+                        n => format!("{n} threads"),
+                    },
+                    state_keys
+                        .as_ref()
+                        .map_or("every state made".to_owned(), |keys| format!(
+                            "only the render states of {} listed keys made",
+                            keys.len()
+                        )),
+                    if state_digests {
+                        ", each render state's content digest written"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+            let backend = backend.with_states(state_log, state_threads, state_keys, state_digests);
+            let backend = backend.with_prepass(prepass.unwrap_or(4));
+            report.line(&format!("prepass width {}", backend.prepass_width()));
+            match display {
+                Some(metallib) => backend.with_display_library(metallib),
+                None => backend,
+            }
+        }
+        Err(error) => {
+            report.line(&format!("error device: {error}"));
+            return 2;
+        }
+    };
+    let first = PathBuf::from(&options["stream"]);
+    // A states-only play runs none of the work the matrix's judged metrics count.
+    let judged = (!states_only).then_some(first.as_path());
+    let code = run(
+        &mut backend,
+        &mut reader,
+        &mut report,
+        (until, dump, presents, judged, states_only),
+    );
+    // The device ends here, not in `exit()`, where the driver's own exit teardown would
+    // run beside the runtime's threads. Its gauges read after it dropped go out as the
+    // matrix's lines, which the matrix's zero-at-drop rule reads.
+    let ended = backend.end();
+    for line in ended.lines() {
+        report.line(&line);
+    }
+    match ended.result() {
+        Ok(()) => code,
+        Err(error) => {
+            report.line(&format!("error teardown: {error}"));
+            code.max(1)
+        }
+    }
+}
+
+/// A play's state log, its state threads, its state keys and whether it writes the render states'
+/// content digests (`NewRuntime::with_states`).
+type StateOptions = (Option<std::fs::File>, usize, Option<HashSet<String>>, bool);
+
+/// The play's state options: the state log `--state-log` names, made; the threads of
+/// `--state-threads`, 0 where it names none; the keys of `--state-keys`, each 64 hex digits; and
+/// `--state-digests`, no where it is not given. The threads and the keys need a states-only play,
+/// which binds no state.
+fn state_options(
+    options: &BTreeMap<String, String>,
+    states_only: bool,
+) -> Result<StateOptions, String> {
+    let threads = match options.get("state-threads").map(|n| n.parse::<usize>()) {
+        None => 0,
+        Some(Ok(threads)) => threads,
+        Some(Err(_)) => return Err("state-threads: not a count of threads".to_owned()),
+    };
+    let keys = match options.get("state-keys") {
+        None => None,
+        Some(listed) => {
+            let keys: HashSet<String> = (listed.split(',')).map(str::to_ascii_lowercase).collect();
+            let hex = |key: &String| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+            if let Some(bad) = keys.iter().find(|key| !hex(key)) {
+                return Err(format!("state-keys: {bad} is no key of 64 hex digits"));
+            }
+            Some(keys)
+        }
+    };
+    if (threads > 0 || keys.is_some()) && !states_only {
+        return Err("state-threads and state-keys: they need --states-only yes".to_owned());
+    }
+    let digests = match options.get("state-digests").map(String::as_str) {
+        None | Some("no") => false,
+        Some("yes") => true,
+        Some(other) => return Err(format!("state-digests: {other} is neither yes nor no")),
+    };
+    let log = match options.get("state-log") {
+        None => None,
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => Some(file),
+            Err(error) => return Err(format!("state-log: {path}: {error}")),
+        },
+    };
+    Ok((log, threads, keys, digests))
+}
+
+/// The runtime's backend on the first physical device of `device_type` that opens (a GPU:
+/// discrete, then integrated, then virtual), its compiled kernels kept in `cache`, and its name.
+/// A GPU opens only while the hang tripwire is absent.
+fn open_rt(device_type: DeviceType, cache: PathBuf) -> Result<(NewRuntime, String), String> {
+    use ash::vk::PhysicalDeviceType as Kind;
+    if device_type == DeviceType::Gpu {
+        metal2vulkan_validation::gpu::tripwire::refuse_if_tripped()?;
+    }
+    let instance = metal2vulkan_runtime::Instance::new(&[]).map_err(|error| error.to_string())?;
+    let (_, vk_instance) = instance.raw();
+    let ranks: &[Kind] = match device_type {
+        DeviceType::Cpu => &[Kind::CPU],
+        DeviceType::Gpu => &[Kind::DISCRETE_GPU, Kind::INTEGRATED_GPU, Kind::VIRTUAL_GPU],
+    };
+    let mut candidates = Vec::new();
+    for physical in instance
+        .physical_devices()
+        .map_err(|error| error.to_string())?
+    {
+        // SAFETY: `physical` is one of the instance's physical devices, and the instance is live.
+        let properties = unsafe { vk_instance.get_physical_device_properties(physical.raw()) };
+        if let Some(rank) = ranks
+            .iter()
+            .position(|&kind| kind == properties.device_type)
+        {
+            let name = (properties.device_name_as_c_str()).map_or_else(
+                |_| "?".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            candidates.push((rank, name, physical));
+        }
+    }
+    candidates.sort_by_key(|(rank, ..)| *rank);
+    let mut refused = Vec::new();
+    for (_, name, physical) in candidates {
+        let mut options = metal2vulkan_runtime::DeviceOptions::default();
+        options.pipeline_cache_dir = Some(cache.clone());
+        let opened = metal2vulkan_runtime::Device::new(&physical, options)
+            .and_then(|device| NewRuntime::new(device, device_type));
+        match opened {
+            Ok(backend) => return Ok((backend, name)),
+            Err(why) => refused.push(format!("{name}: {why}")),
+        }
+    }
+    Err(format!(
+        "no {device_type:?} device opens: {}",
+        refused.join("; ")
+    ))
+}
+
+/// The command buffers a play dumps and where (`--dump-command-buffers`, `--dump-dir`).
+type Dumped = Option<(CommandBufferList, PathBuf)>;
+
+/// The frames whose present a play checks (`--check-presents`), and where it keeps their bytes.
+type Presents = (Vec<u64>, PathBuf);
+
+/// Play `reader` through `backend` into `report`, its state records and presents alone where
+/// `states_only`, to the last frame where one is given, dumping
+/// the command buffers where asked, checking the shown texture at the listed frames' presents and
+/// keeping its bytes in the directory given, and on the runtime,
+/// where `judged`
+/// names the stream's first segment, writing the matrix's judged metrics of a play that finished
+/// its range (`judged_records`): the exit status.
+fn run<B: Backend>(
+    backend: &mut B,
+    reader: &mut StreamReader,
+    report: &mut ReportFile,
+    (until, dump, presents, judged, states_only): (
+        Option<usize>,
+        Dumped,
+        Presents,
+        Option<&Path>,
+        bool,
+    ),
+) -> i32 {
+    let player = Player::new(backend).with_frame_lines(&mut *report);
+    let player = match states_only {
+        true => player.states_only(),
+        false => player,
+    };
+    let player = match until {
+        Some(last) => player.until_frame(last),
+        None => player,
+    };
+    let player = match dump {
+        Some((command_buffers, dir)) => player.dumping(command_buffers, dir),
+        None => player,
+    };
+    let (presents, kept) = presents;
+    let player = match presents.is_empty() {
+        true => player,
+        false => player.checking_presents(presents).keeping_presents(kept),
+    };
+    let (played, ended) = player.play(reader);
+    let counters = backend.counters();
+    // The objects whose ID the program saw that the runtime gives otherwise: a word that names one
+    // in the program's memory names something else in the play. The IDs nothing in the play can
+    // read are aside: the compute pipeline states' (a typed gap) and the skipped objects'.
+    let unread = |key: &str| counters.get(key).copied().unwrap_or(0);
+    let unread_ids = unread("gap_pipeline_ids") + unread("skipped_resource_ids");
+    let differing_ids = (played.ids.len() as u64).saturating_sub(unread_ids);
+    let stream = &played.total.stream;
+    let fixed = |key: &str| stream.get(key).copied().unwrap_or(0);
+    let notes = match played.escape_notes {
+        0 => "the stream predates the escape note".to_owned(),
+        notes => format!("escape notes {notes}"),
+    };
+    report.line(&format!(
+        "addresses address_looking_words={} misaligned_address_words={} noted_words={} \
+         address_arguments={} relocated_words={} differing_ids={differing_ids}: written words play \
+         as recorded, the noted ones moved; {notes}",
+        fixed("address_looking_words"),
+        fixed("misaligned_address_words"),
+        fixed("noted_words"),
+        fixed("address_arguments"),
+        fixed("relocated_words"),
+    ));
+    for line in played.lines_but_frames() {
+        report.line(&line);
+    }
+    for line in backend.lines() {
+        report.line(&line);
+    }
+    if let Some(last) = until.filter(|&last| played.frames.len() > last) {
+        report.line(&format!("until-frame {last}"));
+    }
+    if let Some((segment, offset)) = reader.truncated() {
+        report.line(&format!("cut {} {offset}", segment.display()));
+    }
+    let counted = |prefix: &str| -> Vec<String> {
+        (counters.iter())
+            .filter(|(name, count)| name.starts_with(prefix) && **count > 0)
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect()
+    };
+    let skips = counted("skipped_");
+    // Past the first skip the play is no verdict: the skipped line and the verdict line say so.
+    let note = (played.verdict_note()).map_or(String::new(), |note| format!("; {note}"));
+    if !skips.is_empty() {
+        report.line(&format!(
+            "skipped {}: no gate result{note}",
+            skips.join(" ")
+        ));
+    }
+    let gaps = counted("gap_");
+    if !gaps.is_empty() {
+        report.line(&format!("gaps {}", gaps.join(" ")));
+    }
+    if let Some(first) = judged {
+        for line in judged_records(first, &played, &ended, until) {
+            report.line(&line);
+        }
+    }
+    match ended {
+        // Played to the end, the IDs a shader reads differing from the program's: no fault, hang
+        // or refusal, its own status.
+        Ok(()) if differing_ids > 0 => {
+            report.line(&format!(
+                "ids: played to the end; {differing_ids} objects' gpuResourceID differ from the \
+                 recording's{note}"
+            ));
+            3
+        }
         Ok(()) => {
-            status.line("ok");
+            report.line(&format!("ok{note}"));
             0
         }
-        Err(why) => {
-            status.line(&format!("error {why}"));
-            1
-        }
-    }
-}
-
-/// The objects a run made, by their manifest ids.
-struct Replay {
-    dir: PathBuf,
-    out: PathBuf,
-    device: Device,
-    queue: Option<CommandQueue>,
-    /// The manifest's libraries: its `library` under the empty id, and its `libraries`.
-    libraries: BTreeMap<String, Library>,
-    functions: BTreeMap<String, Function>,
-    heaps: BTreeMap<String, Heap>,
-    buffers: BTreeMap<String, Buffer>,
-    textures: BTreeMap<String, (Texture, TextureDescriptor)>,
-    samplers: BTreeMap<String, SamplerState>,
-    render: BTreeMap<String, RenderPipelineState>,
-    compute: BTreeMap<String, ComputePipelineState>,
-    depth: BTreeMap<String, DepthStencilState>,
-}
-
-// ---- Manifest access ----
-
-fn table(v: &Value, key: &str) -> Vec<(String, Value)> {
-    v.get(key)
-        .and_then(Value::as_object)
-        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default()
-}
-
-fn u(v: &Value, key: &str, default: u64) -> u64 {
-    v.get(key).and_then(Value::as_u64).unwrap_or(default)
-}
-
-fn f(v: &Value, key: &str, default: f64) -> f64 {
-    v.get(key).and_then(Value::as_f64).unwrap_or(default)
-}
-
-fn b(v: &Value, key: &str, default: bool) -> bool {
-    v.get(key).and_then(Value::as_bool).unwrap_or(default)
-}
-
-fn s<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{key} is missing"))
-}
-
-fn nums(v: &Value, key: &str) -> Vec<f64> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_f64).collect())
-        .unwrap_or_default()
-}
-
-fn size3(v: &Value, key: &str) -> Result<Size, String> {
-    let n = nums(v, key);
-    let at = |k: usize| n.get(k).copied().unwrap_or(1.0) as u64;
-    match n.is_empty() {
-        true => Err(format!("{key} is missing")),
-        false => Ok(Size::new(at(0), at(1), at(2))),
-    }
-}
-
-/// A Metal enum of raw value `key` (`default` where absent).
-fn raw<T: TryFrom<u32>>(v: &Value, key: &str, default: u32) -> Result<T, String>
-where
-    T::Error: std::fmt::Display,
-{
-    let r = u32::try_from(u(v, key, u64::from(default))).map_err(|e| e.to_string())?;
-    T::try_from(r).map_err(|e| format!("{key} {r}: {e}"))
-}
-
-fn hex(text: &str) -> Result<Vec<u8>, String> {
-    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !text.len().is_multiple_of(2) {
-        return Err("odd hex length".into());
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
-
-/// The bytes of one texel of `format` (plane 0's for a two-plane format).
-fn texel_bytes(format: PixelFormat) -> Option<u64> {
-    use PixelFormat as P;
-    Some(match format {
-        P::A8Unorm | P::R8Unorm | P::R8UnormSRGB | P::R8Snorm | P::R8Uint | P::R8Sint => 1,
-        P::R16Unorm
-        | P::R16Snorm
-        | P::R16Uint
-        | P::R16Sint
-        | P::R16Float
-        | P::RG8Unorm
-        | P::RG8UnormSRGB
-        | P::RG8Snorm
-        | P::RG8Uint
-        | P::RG8Sint
-        | P::B5G6R5Unorm
-        | P::A1BGR5Unorm
-        | P::ABGR4Unorm
-        | P::BGR5A1Unorm => 2,
-        P::R32Uint
-        | P::R32Sint
-        | P::R32Float
-        | P::RG16Unorm
-        | P::RG16Snorm
-        | P::RG16Uint
-        | P::RG16Sint
-        | P::RG16Float
-        | P::RGBA8Unorm
-        | P::RGBA8UnormSRGB
-        | P::RGBA8Snorm
-        | P::RGBA8Uint
-        | P::RGBA8Sint
-        | P::BGRA8Unorm
-        | P::BGRA8UnormSRGB
-        | P::ARGB8Unorm
-        | P::RGB10A2Unorm
-        | P::RGB10A2Uint
-        | P::RG11B10Float
-        | P::RGB9E5Float
-        | P::BGR10A2Unorm
-        | P::BGR10XR
-        | P::BGR10XRSRGB
-        | P::RGB10A82PXR10
-        | P::RGB10A82PXR10SRGB
-        | P::Depth32Float => 4,
-        P::RG32Uint
-        | P::RG32Sint
-        | P::RG32Float
-        | P::RGBA16Unorm
-        | P::RGBA16Snorm
-        | P::RGBA16Uint
-        | P::RGBA16Sint
-        | P::RGBA16Float
-        | P::BGRA10XR
-        | P::BGRA10XRSRGB => 8,
-        P::RGBA32Uint | P::RGBA32Sint | P::RGBA32Float => 16,
-        _ => return None,
-    })
-}
-
-fn e<E: std::fmt::Display>(at: &str) -> impl Fn(E) -> String + '_ {
-    move |error| format!("{at}: {error}")
-}
-
-impl Replay {
-    fn all(&mut self, m: &Value, status: &mut Status) -> Result<(), String> {
-        self.queue = Some(self.device.new_command_queue().map_err(e("queue"))?);
-        let named = m
-            .get("library")
-            .and_then(Value::as_str)
-            .map(|file| (String::new(), Value::from(file)));
-        for (id, file) in named.into_iter().chain(table(m, "libraries")) {
-            let at = format!("library {id:?}");
-            let file = file
-                .as_str()
-                .ok_or_else(|| format!("{at}: not a file name"))?;
-            let bytes = std::fs::read(self.dir.join(file)).map_err(e(&at))?;
-            let library = self.device.new_library_with_data(&bytes).map_err(e(&at))?;
-            self.libraries.insert(id, library);
-        }
-        self.functions(m)?;
-        self.heaps(m)?;
-        self.buffers(m)?;
-        self.textures(m)?;
-        self.views(m)?;
-        self.samplers(m)?;
-        self.pipelines(m)?;
-        let buffers = m
-            .get("commandBuffers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for (k, encoders) in buffers.iter().enumerate() {
-            let at = format!("command buffer {k}");
-            let cb = self.queue().command_buffer().map_err(e(&at))?;
-            for (j, encoder) in encoders.as_array().into_iter().flatten().enumerate() {
-                let at = format!("command buffer {k} encoder {j}");
-                if let Some(r) = encoder.get("render") {
-                    self.render_encoder(&cb, r)
-                        .map_err(|w| format!("{at}: {w}"))?;
-                } else if let Some(c) = encoder.get("compute") {
-                    self.compute_encoder(&cb, c)
-                        .map_err(|w| format!("{at}: {w}"))?;
-                } else {
-                    return Err(format!("{at}: neither render nor compute"));
-                }
-            }
-            finish(&cb).map_err(|w| format!("{at}: {w}"))?;
-            status.line(&format!("committed {k}"));
-        }
-        Ok(())
-    }
-
-    fn queue(&self) -> &CommandQueue {
-        self.queue.as_ref().expect("the queue is made first")
-    }
-
-    fn functions(&mut self, m: &Value) -> Result<(), String> {
-        for (id, fv) in table(m, "functions") {
-            let name = s(&fv, "name")?;
-            let lid = fv.get("library").and_then(Value::as_str).unwrap_or("");
-            let library = self
-                .libraries
-                .get(lid)
-                .ok_or_else(|| format!("function {id}: no library {lid:?}"))?;
-            let mut constants = FunctionConstantValues::defaults();
-            for c in fv
-                .get("constants")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let ty: DataType = raw(c, "type", 0)?;
-                let bytes = hex(s(c, "hex")?)?;
-                let index = u32::try_from(u(c, "index", 0)).map_err(|e| e.to_string())?;
-                constants = constants.with_index(index, FunctionConstantValue::new(ty, bytes));
-            }
-            let function = match constants.is_empty() {
-                true => library.new_function_with_name(name),
-                false => library.new_function_with_name_constant_values(name, &constants),
-            }
-            .map_err(|error| format!("function {id} ({name}): {error}"))?;
-            self.functions.insert(id, function);
-        }
-        Ok(())
-    }
-
-    fn function(&self, id: &str) -> Result<StageSource, String> {
-        let f = self
-            .functions
-            .get(id)
-            .ok_or_else(|| format!("no function {id}"))?;
-        Ok(StageSource::Function(f.function_descriptor()))
-    }
-
-    fn heaps(&mut self, m: &Value) -> Result<(), String> {
-        for (id, hv) in table(m, "heaps") {
-            let options =
-                ResourceOptions::from_raw(u(&hv, "options", 0)).map_err(e("heap options"))?;
-            let heap_type = HeapType::from_raw(u(&hv, "type", 0)).map_err(e("heap type"))?;
-            let descriptor = HeapDescriptor::new(heap_type, u(&hv, "size", 0), options);
-            let heap = self
-                .device
-                .new_heap(&descriptor)
-                .map_err(|error| format!("heap {id}: {error}"))?;
-            self.heaps.insert(id, heap);
-        }
-        Ok(())
-    }
-
-    fn buffers(&mut self, m: &Value) -> Result<(), String> {
-        let mut uploads = Vec::new();
-        for (id, bv) in table(m, "buffers") {
-            let at = format!("buffer {id}");
-            let length = u(&bv, "length", 0);
-            let options = ResourceOptions::from_raw(u(&bv, "options", 0)).map_err(e(&at))?;
-            let buffer = match bv.get("heap").and_then(Value::as_str) {
-                Some(h) => {
-                    let heap = self
-                        .heaps
-                        .get(h)
-                        .ok_or_else(|| format!("{at}: no heap {h}"))?;
-                    match bv.get("offset").and_then(Value::as_u64) {
-                        Some(offset) => heap.new_buffer_at_offset(length, options, offset),
-                        None => heap.new_buffer(length, options),
-                    }
-                }
-                None => self.device.new_buffer(length, options),
-            }
-            .map_err(e(&at))?;
-            if let Some(file) = bv.get("file").and_then(Value::as_str) {
-                let bytes = std::fs::read(self.dir.join(file)).map_err(e(&at))?;
-                match buffer.contents() {
-                    Some(at_ptr) => {
-                        let n = bytes.len().min(length as usize);
-                        // SAFETY: a host-visible buffer of `length` bytes no command uses yet.
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at_ptr.as_ptr(), n);
-                        }
-                    }
-                    None => uploads.push((buffer.clone(), bytes)),
-                }
-            }
-            self.buffers.insert(id, buffer);
-        }
-        if uploads.is_empty() {
-            return Ok(());
-        }
-        let cb = self.queue().command_buffer().map_err(e("buffer uploads"))?;
-        let mut staging = Vec::new();
-        let mut blit = cb.blit_command_encoder().map_err(e("buffer uploads"))?;
-        for (buffer, bytes) in &uploads {
-            let shared = self
-                .device
-                .new_buffer_with_bytes(bytes, ResourceOptions::shared())
-                .map_err(e("buffer uploads"))?;
-            let n = (bytes.len() as u64).min(buffer.length());
-            blit.copy_from_buffer_to_buffer(&shared, 0, buffer, 0, n)
-                .map_err(e("buffer uploads"))?;
-            staging.push(shared);
-        }
-        blit.end_encoding().map_err(e("buffer uploads"))?;
-        finish(&cb).map_err(|w| format!("buffer uploads: {w}"))
-    }
-
-    fn views(&mut self, m: &Value) -> Result<(), String> {
-        for (id, v) in table(m, "views") {
-            let at = format!("view {id}");
-            let (of, of_d) = self
-                .textures
-                .get(s(&v, "of")?)
-                .cloned()
-                .ok_or(format!("{at}: no texture"))?;
-            let format: PixelFormat = raw(&v, "format", 0)?;
-            let pair = |key: &str, all: u64| -> std::ops::Range<u64> {
-                let p: Vec<u64> = v
-                    .get(key)
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_u64).collect())
-                    .unwrap_or_default();
-                match p.as_slice() {
-                    [first, count] => *first..first + count,
-                    _ => 0..all,
-                }
-            };
-            let whole = ["type", "levels", "slices", "swizzle"]
-                .iter()
-                .all(|k| v.get(*k).is_none());
-            let view = if whole {
-                of.new_texture_view(format)
-            } else {
-                let texture_type = raw::<TextureType>(&v, "type", of_d.texture_type.as_raw())?;
-                let levels = pair("levels", of_d.mipmap_level_count);
-                let slices = pair(
-                    "slices",
-                    of_d.array_length.max(1)
-                        * match of_d.texture_type {
-                            TextureType::Cube | TextureType::CubeArray => 6,
-                            _ => 1,
-                        },
-                );
-                let channel = |at: usize, own: u32| -> Result<TextureSwizzle, String> {
-                    let r = v
-                        .get("swizzle")
-                        .and_then(|s| s.get(at))
-                        .and_then(Value::as_u64)
-                        .map_or(own, |r| r as u32);
-                    TextureSwizzle::try_from(r).map_err(|e| format!("swizzle {r}: {e}"))
-                };
-                let swizzle = TextureSwizzleChannels {
-                    red: channel(0, 2)?,
-                    green: channel(1, 3)?,
-                    blue: channel(2, 4)?,
-                    alpha: channel(3, 5)?,
-                };
-                of.new_texture_view_with_swizzle(format, texture_type, levels, slices, swizzle)
-            }
-            .map_err(e(&at))?;
-            let mut d = of_d;
-            d.pixel_format = format;
-            self.textures.insert(id, (view, d));
-        }
-        Ok(())
-    }
-
-    fn textures(&mut self, m: &Value) -> Result<(), String> {
-        let mut uploads = Vec::new();
-        for (id, tv) in table(m, "textures") {
-            let at = format!("texture {id}");
-            let format: PixelFormat = raw(&tv, "format", 0)?;
-            let mut d = TextureDescriptor::texture_2d(
-                format,
-                u(&tv, "width", 1),
-                u(&tv, "height", 1),
-                false,
-            );
-            d.texture_type = raw::<TextureType>(&tv, "type", 2)?;
-            d.depth = u(&tv, "depth", 1);
-            d.mipmap_level_count = u(&tv, "levels", 1);
-            d.array_length = u(&tv, "array", 1);
-            d.sample_count = u(&tv, "samples", 1);
-            d.usage = raw::<TextureUsage>(&tv, "usage", 1)?;
-            d.resource_options = ResourceOptions::from_raw(u(&tv, "options", 0)).map_err(e(&at))?;
-            if let Some(sv) = tv.get("surface") {
-                let (buffer, texture) = self.surface_texture(&at, &d, sv)?;
-                self.buffers.insert(format!("surface:{id}"), buffer);
-                self.textures.insert(id, (texture, d));
-                continue;
-            }
-            let texture = match tv.get("heap").and_then(Value::as_str) {
-                Some(h) => {
-                    let heap = self
-                        .heaps
-                        .get(h)
-                        .ok_or_else(|| format!("{at}: no heap {h}"))?;
-                    match tv.get("offset").and_then(Value::as_u64) {
-                        Some(offset) => heap.new_texture_at_offset(&d, offset),
-                        None => heap.new_texture(&d),
-                    }
-                }
-                None => self.device.new_texture(&d),
-            }
-            .map_err(e(&at))?;
-            if let Some(file) = tv.get("file").and_then(Value::as_str) {
-                let bytes = std::fs::read(self.dir.join(file)).map_err(e(&at))?;
-                uploads.push((texture.clone(), d, bytes));
-            }
-            self.textures.insert(id, (texture, d));
-        }
-        if uploads.is_empty() {
-            return Ok(());
-        }
-        let cb = self
-            .queue()
-            .command_buffer()
-            .map_err(e("texture uploads"))?;
-        let mut blit = cb.blit_command_encoder().map_err(e("texture uploads"))?;
-        let mut staging = Vec::new();
-        for (texture, d, bytes) in &uploads {
-            let texel = texel_bytes(d.pixel_format)
-                .ok_or_else(|| format!("upload: no texel size for {:?}", d.pixel_format))?;
-            let row = texel * d.width;
-            let image = row * d.height;
-            let slices = d.array_length.max(1)
-                * match d.texture_type {
-                    TextureType::Cube | TextureType::CubeArray => 6,
-                    _ => 1,
-                };
-            let shared = self
-                .device
-                .new_buffer_with_bytes(bytes, ResourceOptions::shared())
-                .map_err(e("texture uploads"))?;
-            for slice in 0..slices {
-                if (slice + 1) * image > bytes.len() as u64 {
-                    break;
-                }
-                blit.copy_from_buffer_to_texture(
-                    &shared,
-                    slice * image,
-                    row,
-                    image,
-                    Size::new(d.width, d.height, d.depth.max(1)),
-                    texture,
-                    slice,
-                    0,
-                    Origin::new(0, 0, 0),
-                    BlitOption::None,
-                )
-                .map_err(e("texture uploads"))?;
-            }
-            staging.push(shared);
-        }
-        blit.end_encoding().map_err(e("texture uploads"))?;
-        finish(&cb).map_err(|w| format!("texture uploads: {w}"))
-    }
-
-    /// The surface `sv` describes (the manifest's `surface`) as a shared buffer of its file's
-    /// bytes, and the texture of `d` over its plane 0 with its YCbCr facts.
-    fn surface_texture(
-        &self,
-        at: &str,
-        d: &TextureDescriptor,
-        sv: &Value,
-    ) -> Result<(Buffer, Texture), String> {
-        let ostype: [u8; 4] = s(sv, "ostype")?
-            .as_bytes()
-            .try_into()
-            .map_err(|_| format!("{at}: an ostype is four characters"))?;
-        let bytes = std::fs::read(self.dir.join(s(sv, "file")?)).map_err(e(at))?;
-        let buffer = self
-            .device
-            .new_buffer_with_bytes(&bytes, ResourceOptions::shared())
-            .map_err(e(at))?;
-        let facts = IoSurfaceYCbCr::new(
-            u32::from_be_bytes(ostype),
-            0,
-            [d.width, d.height],
-            u(sv, "chromaOffset", 0),
-            u(sv, "chromaRow", 0),
-        );
-        let facts = match sv.get("matrix").and_then(Value::as_str) {
-            None => facts,
-            Some("601") => facts.with_matrix(SurfaceYCbCrMatrix::Itu601),
-            Some("709") => facts.with_matrix(SurfaceYCbCrMatrix::Itu709),
-            Some("2020") => facts.with_matrix(SurfaceYCbCrMatrix::Itu2020),
-            Some(other) => return Err(format!("{at}: no matrix {other:?}")),
-        };
-        let plane = IoSurfacePlane::new(0, u(sv, "lumaRow", 0), true).with_ycbcr(facts);
-        let texture = buffer
-            .new_texture_with_iosurface_plane(d, plane)
-            .map_err(e(at))?;
-        Ok((buffer, texture))
-    }
-
-    fn samplers(&mut self, m: &Value) -> Result<(), String> {
-        for (id, sv) in table(m, "samplers") {
-            let mut d = SamplerDescriptor::default();
-            d.min_filter = raw::<SamplerMinMagFilter>(&sv, "min", 0)?;
-            d.mag_filter = raw::<SamplerMinMagFilter>(&sv, "mag", 0)?;
-            d.mip_filter = raw::<SamplerMipFilter>(&sv, "mip", 0)?;
-            d.s_address_mode = raw::<SamplerAddressMode>(&sv, "s", 0)?;
-            d.t_address_mode = raw::<SamplerAddressMode>(&sv, "t", 0)?;
-            d.r_address_mode = raw::<SamplerAddressMode>(&sv, "r", 0)?;
-            d.border_color = raw::<SamplerBorderColor>(&sv, "border", 0)?;
-            d.normalized_coordinates = b(&sv, "normalized", true);
-            d.lod_min_clamp = f(&sv, "lodMin", 0.0) as f32;
-            d.lod_max_clamp = f(&sv, "lodMax", f64::from(f32::MAX)) as f32;
-            d.max_anisotropy = u(&sv, "maxAniso", 1) as u32;
-            d.compare_function = raw::<CompareFunction>(&sv, "compare", 0)?;
-            let sampler = self
-                .device
-                .new_sampler_state(&d)
-                .map_err(|error| format!("sampler {id}: {error}"))?;
-            self.samplers.insert(id, sampler);
-        }
-        Ok(())
-    }
-
-    fn pipelines(&mut self, m: &Value) -> Result<(), String> {
-        let options = PipelineOptions::default();
-        for (id, pv) in table(m, "renderPipelines") {
-            let at = format!("render pipeline {id}");
-            let mut d = RenderPipelineDescriptor::new(self.function(s(&pv, "vertex")?)?);
-            d.fragment = match pv.get("fragment").and_then(Value::as_str) {
-                Some(fid) => Some(self.function(fid)?),
-                None => None,
-            };
-            for (k, c) in pv
-                .get("colors")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if c.is_null() || k >= 8 {
-                    continue;
-                }
-                let mut color = ColorAttachmentDescriptor::new(raw::<PixelFormat>(c, "format", 0)?);
-                color.blending_enabled = b(c, "blending", false);
-                color.source_rgb_blend_factor = raw::<BlendFactor>(c, "srcRGB", 1)?;
-                color.destination_rgb_blend_factor = raw::<BlendFactor>(c, "dstRGB", 0)?;
-                color.rgb_blend_operation = raw::<BlendOperation>(c, "rgbOp", 0)?;
-                color.source_alpha_blend_factor = raw::<BlendFactor>(c, "srcA", 1)?;
-                color.destination_alpha_blend_factor = raw::<BlendFactor>(c, "dstA", 0)?;
-                color.alpha_blend_operation = raw::<BlendOperation>(c, "alphaOp", 0)?;
-                color.write_mask = raw::<ColorWriteMask>(c, "mask", 15)?;
-                d.color_attachments[k] = Some(color);
-            }
-            let format = |key: &str| -> Result<Option<PixelFormat>, String> {
-                match u(&pv, key, 0) {
-                    0 => Ok(None),
-                    _ => raw::<PixelFormat>(&pv, key, 0).map(Some),
-                }
-            };
-            d.depth_format = format("depth")?;
-            d.stencil_format = format("stencil")?;
-            d.raster_sample_count = u(&pv, "samples", 1) as u32;
-            d.alpha_to_coverage = b(&pv, "alphaToCoverage", false);
-            d.input_primitive_topology = raw::<PrimitiveTopologyClass>(&pv, "topology", 0)?;
-            let state = self
-                .device
-                .new_render_pipeline_state(&d, &options)
-                .map_err(e(&at))?;
-            self.render.insert(id, state);
-        }
-        for (id, pv) in table(m, "tilePipelines") {
-            let at = format!("tile pipeline {id}");
-            let mut d = TileRenderPipelineDescriptor::new(self.function(s(&pv, "function")?)?);
-            for (k, c) in pv
-                .get("colors")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                if let (Some(raw_format), true) = (c.as_u64(), k < 8) {
-                    let pf = u32::try_from(raw_format).map_err(e(&at))?;
-                    d.color_attachment_formats[k] =
-                        Some(PixelFormat::try_from(pf).map_err(e(&at))?);
-                }
-            }
-            d.threadgroup_size_matches_tile_size = b(&pv, "matchesTileSize", false);
-            let state = self
-                .device
-                .new_tile_render_pipeline_state(&d, &options)
-                .map_err(e(&at))?;
-            self.render.insert(id, state);
-        }
-        for (id, pv) in table(m, "computePipelines") {
-            let at = format!("compute pipeline {id}");
-            let fid = s(&pv, "function")?;
-            let function = self
-                .functions
-                .get(fid)
-                .ok_or_else(|| format!("{at}: no function {fid}"))?;
-            let state = self
-                .device
-                .new_compute_pipeline_state_with_function(function, &options)
-                .map_err(e(&at))?;
-            self.compute.insert(id, state);
-        }
-        for (id, dv) in table(m, "depthStencilStates") {
-            let mut d = DepthStencilDescriptor::default();
-            d.depth_compare_function = raw::<CompareFunction>(&dv, "compare", 7)?;
-            d.depth_write_enabled = b(&dv, "write", false);
-            if let Some(sv) = dv.get("stencil").filter(|v| v.is_object()) {
-                let mut face = StencilDescriptor::default();
-                face.stencil_compare_function = raw::<CompareFunction>(sv, "compare", 7)?;
-                face.stencil_failure_operation = raw::<StencilOperation>(sv, "fail", 0)?;
-                face.depth_failure_operation = raw::<StencilOperation>(sv, "depthFail", 0)?;
-                face.depth_stencil_pass_operation = raw::<StencilOperation>(sv, "pass", 0)?;
-                face.read_mask = u(sv, "read", 0xffff_ffff) as u32;
-                face.write_mask = u(sv, "write", 0xffff_ffff) as u32;
-                d.front_face_stencil = face;
-                d.back_face_stencil = face;
-            }
-            let state = self
-                .device
-                .new_depth_stencil_state(&d)
-                .map_err(|error| format!("depth-stencil state {id}: {error}"))?;
-            self.depth.insert(id, state);
-        }
-        Ok(())
-    }
-
-    fn texture(&self, id: &str) -> Result<&Texture, String> {
-        self.textures
-            .get(id)
-            .map(|(t, _)| t)
-            .ok_or_else(|| format!("no texture {id}"))
-    }
-
-    fn buffer(&self, id: &str) -> Result<&Buffer, String> {
-        self.buffers
-            .get(id)
-            .ok_or_else(|| format!("no buffer {id}"))
-    }
-
-    fn pass(&self, r: &Value) -> Result<RenderPassDescriptor, String> {
-        let mut pass = RenderPassDescriptor::new();
-        for (k, c) in r
-            .get("colors")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            if c.is_null() || k >= pass.color_attachments.len() {
-                continue;
-            }
-            let a = &mut pass.color_attachments[k];
-            a.texture = Some(self.texture(s(c, "texture")?)?.clone());
-            a.load_action = LoadAction::from_raw(u(c, "load", 0)).map_err(e("load"))?;
-            a.store_action = StoreAction::from_raw(u(c, "store", 1)).map_err(e("store"))?;
-            let cc = nums(c, "clear");
-            let at = |i: usize| cc.get(i).copied().unwrap_or(0.0);
-            a.clear_color = metal2vulkan_runtime::ClearColor::new(at(0), at(1), at(2), at(3));
-        }
-        if let Some(dv) = r.get("depth").filter(|v| !v.is_null()) {
-            let a = &mut pass.depth_attachment;
-            a.texture = Some(self.texture(s(dv, "texture")?)?.clone());
-            a.load_action = LoadAction::from_raw(u(dv, "load", 0)).map_err(e("depth load"))?;
-            a.store_action = StoreAction::from_raw(u(dv, "store", 0)).map_err(e("depth store"))?;
-            a.clear_depth = f(dv, "clear", 1.0);
-        }
-        if let Some(sv) = r.get("stencil").filter(|v| !v.is_null()) {
-            let a = &mut pass.stencil_attachment;
-            a.texture = Some(self.texture(s(sv, "texture")?)?.clone());
-            a.load_action = LoadAction::from_raw(u(sv, "load", 0)).map_err(e("stencil load"))?;
-            a.store_action =
-                StoreAction::from_raw(u(sv, "store", 0)).map_err(e("stencil store"))?;
-            a.clear_stencil = u(sv, "clear", 0) as u32;
-        }
-        pass.tile_width = u(r, "tileWidth", 0);
-        pass.tile_height = u(r, "tileHeight", 0);
-        pass.imageblock_sample_length = u(r, "imageblockSize", 0);
-        pass.threadgroup_memory_length = u(r, "threadgroupMemoryLength", 0);
-        pass.render_target_width = u(r, "width", 0);
-        pass.render_target_height = u(r, "height", 0);
-        // A pass without attachments rasterizes one sample: Metal ends the process at the
-        // default 0; a pass with attachments takes theirs.
-        pass.default_raster_sample_count = 1;
-        Ok(pass)
-    }
-
-    fn render_encoder(&self, cb: &CommandBuffer, r: &Value) -> Result<(), String> {
-        let pass = self.pass(r)?;
-        let mut enc = cb
-            .render_command_encoder(&pass)
-            .map_err(e("render_command_encoder"))?;
-        for (k, cmd) in r
-            .get("commands")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            self.render_command(&mut enc, cmd)
-                .map_err(|w| format!("command {k}: {w}"))?;
-        }
-        enc.end_encoding().map_err(e("end_encoding"))
-    }
-
-    fn render_command(&self, enc: &mut RenderCommandEncoder, cmd: &Value) -> Result<(), String> {
-        let (name, v) = cmd
-            .as_object()
-            .and_then(|o| o.iter().next())
-            .ok_or("an empty command")?;
-        match name.as_str() {
-            "pipeline" => {
-                let id = v.as_str().ok_or("pipeline id")?;
-                let state = self
-                    .render
-                    .get(id)
-                    .ok_or_else(|| format!("no pipeline {id}"))?;
-                enc.set_render_pipeline_state(state).map_err(e(name))
-            }
-            "buffer" => {
-                let index = u(v, "index", 0) as u32;
-                let buffer = self.buffer(s(v, "buffer")?)?;
-                let offset = u(v, "offset", 0);
-                match s(v, "stage")? {
-                    "vertex" => enc.set_vertex_buffer(Some(buffer), offset, index),
-                    "fragment" => enc.set_fragment_buffer(Some(buffer), offset, index),
-                    "tile" => enc.set_tile_buffer(Some(buffer), offset, index),
-                    other => return Err(format!("stage {other}")),
-                }
-                .map_err(e(name))
-            }
-            "bytes" => {
-                let index = u(v, "index", 0) as u32;
-                let bytes = hex(s(v, "hex")?)?;
-                match s(v, "stage")? {
-                    "vertex" => enc.set_vertex_bytes(&bytes, index),
-                    "fragment" => enc.set_fragment_bytes(&bytes, index),
-                    "tile" => enc.set_tile_bytes(&bytes, index),
-                    other => return Err(format!("stage {other}")),
-                }
-                .map_err(e(name))
-            }
-            "texture" => {
-                let index = u(v, "index", 0) as u32;
-                let texture = self.texture(s(v, "texture")?)?;
-                match s(v, "stage")? {
-                    "vertex" => enc.set_vertex_texture(Some(texture), index),
-                    "fragment" => enc.set_fragment_texture(Some(texture), index),
-                    "tile" => enc.set_tile_texture(Some(texture), index),
-                    other => return Err(format!("stage {other}")),
-                }
-                .map_err(e(name))
-            }
-            "sampler" => {
-                let index = u(v, "index", 0) as u32;
-                let id = s(v, "sampler")?;
-                let sampler = self
-                    .samplers
-                    .get(id)
-                    .ok_or_else(|| format!("no sampler {id}"))?;
-                match s(v, "stage")? {
-                    "vertex" => enc.set_vertex_sampler_state(Some(sampler), index),
-                    "fragment" => enc.set_fragment_sampler_state(Some(sampler), index),
-                    "tile" => enc.set_tile_sampler_state(Some(sampler), index),
-                    other => return Err(format!("stage {other}")),
-                }
-                .map_err(e(name))
-            }
-            "threadgroupMemory" => enc
-                .set_threadgroup_memory_length(u(v, "length", 0), 0, u(v, "index", 0) as u32)
-                .map_err(e(name)),
-            "depthStencil" => {
-                let id = v.as_str().ok_or("depth-stencil id")?;
-                let state = self
-                    .depth
-                    .get(id)
-                    .ok_or_else(|| format!("no depth-stencil state {id}"))?;
-                enc.set_depth_stencil_state(state).map_err(e(name))
-            }
-            "stencilRef" => {
-                enc.set_stencil_reference_value(v.as_u64().unwrap_or(0) as u32);
-                Ok(())
-            }
-            "blendColor" => {
-                let c: Vec<f32> = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_f64)
-                    .map(|x| x as f32)
-                    .collect();
-                let at = |i: usize| c.get(i).copied().unwrap_or(0.0);
-                enc.set_blend_color(at(0), at(1), at(2), at(3));
-                Ok(())
-            }
-            "viewport" => {
-                let n: Vec<f64> = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_f64)
-                    .collect();
-                let at = |i: usize| n.get(i).copied().unwrap_or(0.0);
-                enc.set_viewport(Viewport::new(at(0), at(1), at(2), at(3), at(4), at(5)))
-                    .map_err(e(name))
-            }
-            "scissor" => {
-                let n: Vec<u64> = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_u64)
-                    .collect();
-                let at = |i: usize| n.get(i).copied().unwrap_or(0);
-                enc.set_scissor_rect(ScissorRect::new(at(0), at(1), at(2), at(3)))
-                    .map_err(e(name))
-            }
-            "cull" => {
-                let mode = CullMode::try_from(v.as_u64().unwrap_or(0) as u32).map_err(e(name))?;
-                enc.set_cull_mode(mode);
-                Ok(())
-            }
-            "winding" => {
-                let w = Winding::try_from(v.as_u64().unwrap_or(0) as u32).map_err(e(name))?;
-                enc.set_front_facing_winding(w);
-                Ok(())
-            }
-            "useResource" => {
-                let id = s(v, "id")?;
-                let usage = raw::<ResourceUsage>(v, "usage", 1)?;
-                let stages = raw::<RenderStages>(v, "stages", 3)?;
-                let resource = match (self.textures.get(id), self.buffers.get(id)) {
-                    (Some((t, _)), _) => ResourceRef::Texture(t),
-                    (None, Some(b)) => ResourceRef::Buffer(b),
-                    _ => return Err(format!("no resource {id}")),
-                };
-                enc.use_resource(resource, usage, stages).map_err(e(name))
-            }
-            "useHeap" => {
-                let id = v.as_str().ok_or("heap id")?;
-                let heap = self.heaps.get(id).ok_or_else(|| format!("no heap {id}"))?;
-                enc.use_heap(heap, RenderStages::try_from(3).map_err(e(name))?)
-                    .map_err(e(name))
-            }
-            "draw" => enc
-                .draw_primitives(
-                    raw::<PrimitiveType>(v, "primitive", 3)?,
-                    u(v, "start", 0) as u32,
-                    u(v, "count", 3) as u32,
-                    u(v, "instances", 1) as u32,
-                    u(v, "baseInstance", 0) as u32,
-                )
-                .map_err(e(name)),
-            "drawIndexed" => {
-                let buffer = self.buffer(s(v, "buffer")?)?;
-                enc.draw_indexed_primitives(
-                    raw::<PrimitiveType>(v, "primitive", 3)?,
-                    u(v, "count", 0) as u32,
-                    raw::<IndexType>(v, "indexType", 0)?,
-                    buffer,
-                    u(v, "offset", 0),
-                    u(v, "instances", 1) as u32,
-                    v.get("baseVertex").and_then(Value::as_i64).unwrap_or(0) as i32,
-                    u(v, "baseInstance", 0) as u32,
-                )
-                .map_err(e(name))
-            }
-            "tile" => {
-                let n = nums(v, "threads");
-                let at = |i: usize| n.get(i).copied().unwrap_or(1.0) as u64;
-                enc.dispatch_threads_per_tile(Size::new(at(0), at(1), 1))
-                    .map_err(e(name))
-            }
-            other => Err(format!("unknown render command {other}")),
-        }
-    }
-
-    fn compute_encoder(&self, cb: &CommandBuffer, c: &Value) -> Result<(), String> {
-        let mut enc = cb
-            .compute_command_encoder()
-            .map_err(e("compute_command_encoder"))?;
-        for (k, cmd) in c
-            .get("commands")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            self.compute_command(&mut enc, cmd)
-                .map_err(|w| format!("command {k}: {w}"))?;
-        }
-        enc.end_encoding().map_err(e("end_encoding"))
-    }
-
-    fn compute_command(&self, enc: &mut ComputeCommandEncoder, cmd: &Value) -> Result<(), String> {
-        let (name, v) = cmd
-            .as_object()
-            .and_then(|o| o.iter().next())
-            .ok_or("an empty command")?;
-        match name.as_str() {
-            "pipeline" => {
-                let id = v.as_str().ok_or("pipeline id")?;
-                let state = self
-                    .compute
-                    .get(id)
-                    .ok_or_else(|| format!("no pipeline {id}"))?;
-                enc.set_compute_pipeline_state(state).map_err(e(name))
-            }
-            "buffer" => enc
-                .set_buffer(
-                    Some(self.buffer(s(v, "buffer")?)?),
-                    u(v, "offset", 0),
-                    u(v, "index", 0) as u32,
-                )
-                .map_err(e(name)),
-            "bytes" => enc
-                .set_bytes(&hex(s(v, "hex")?)?, u(v, "index", 0) as u32)
-                .map_err(e(name)),
-            "texture" => enc
-                .set_texture(
-                    Some(self.texture(s(v, "texture")?)?),
-                    u(v, "index", 0) as u32,
-                )
-                .map_err(e(name)),
-            "sampler" => {
-                let id = s(v, "sampler")?;
-                let sampler = self
-                    .samplers
-                    .get(id)
-                    .ok_or_else(|| format!("no sampler {id}"))?;
-                enc.set_sampler_state(Some(sampler), u(v, "index", 0) as u32)
-                    .map_err(e(name))
-            }
-            "threadgroupMemory" => enc
-                .set_threadgroup_memory_length(u(v, "length", 0) as u32, u(v, "index", 0) as u32)
-                .map_err(e(name)),
-            "useResource" => {
-                let id = s(v, "id")?;
-                let usage = raw::<ResourceUsage>(v, "usage", 1)?;
-                let resource = match (self.textures.get(id), self.buffers.get(id)) {
-                    (Some((t, _)), _) => ResourceRef::Texture(t),
-                    (None, Some(b)) => ResourceRef::Buffer(b),
-                    _ => return Err(format!("no resource {id}")),
-                };
-                enc.use_resource(resource, usage).map_err(e(name))
-            }
-            "useHeap" => {
-                let id = v.as_str().ok_or("heap id")?;
-                let heap = self.heaps.get(id).ok_or_else(|| format!("no heap {id}"))?;
-                enc.use_heap(heap).map_err(e(name))
-            }
-            "dispatchThreadgroups" => enc
-                .dispatch_threadgroups(size3(v, "groups")?, size3(v, "threads")?)
-                .map_err(e(name)),
-            "dispatchThreads" => enc
-                .dispatch_threads(size3(v, "grid")?, size3(v, "threads")?)
-                .map_err(e(name)),
-            other => Err(format!("unknown compute command {other}")),
-        }
-    }
-
-    /// Every readback the manifest asks for, written to the output directory.
-    fn readback(&self, m: &Value, status: &mut Status) -> Result<(), String> {
-        let ids: Vec<String> = m
-            .get("readback")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        if self.queue.is_none() {
-            return Ok(());
-        }
-        for id in ids {
-            let bytes = if let Some((texture, d)) = self.textures.get(&id) {
-                if d.sample_count > 1
-                    || d.resource_options
-                        .storage_mode()
-                        .is_ok_and(|m| m.raw() == 3)
-                {
-                    status.line(&format!("skip {id}: memoryless or multisampled"));
-                    continue;
-                }
-                self.read_texture(texture, d)
-            } else if let Some(buffer) = self.buffers.get(&id) {
-                self.read_buffer(buffer)
-            } else {
-                Err(format!("no resource {id}"))
-            };
-            match bytes {
-                Ok(bytes) => {
-                    std::fs::write(self.out.join(format!("{id}.bin")), &bytes)
-                        .map_err(e("readback"))?;
-                    status.line(&format!("read {id} {}", bytes.len()));
-                }
-                Err(why) => status.line(&format!("skip {id}: {why}")),
-            }
-        }
-        Ok(())
-    }
-
-    fn read_texture(&self, texture: &Texture, d: &TextureDescriptor) -> Result<Vec<u8>, String> {
-        let texel = texel_bytes(d.pixel_format)
-            .ok_or_else(|| format!("no texel size for {:?}", d.pixel_format))?;
-        let row = texel * d.width;
-        let image = row * d.height * d.depth.max(1);
-        let slices = d.array_length.max(1)
-            * match d.texture_type {
-                TextureType::Cube | TextureType::CubeArray => 6,
+        Err(error) => {
+            report.line(&format!("error {error}{note}"));
+            match error {
+                PlayError::Stream(_) => 2,
                 _ => 1,
-            };
-        let out = self
-            .device
-            .new_buffer(image * slices, ResourceOptions::shared())
-            .map_err(e("readback buffer"))?;
-        let cb = self.queue().command_buffer().map_err(e("readback"))?;
-        let mut blit = cb.blit_command_encoder().map_err(e("readback"))?;
-        for slice in 0..slices {
-            blit.copy_from_texture_to_buffer(
-                texture,
-                slice,
-                0,
-                Origin::new(0, 0, 0),
-                Size::new(d.width, d.height, d.depth.max(1)),
-                &out,
-                slice * image,
-                row,
-                row * d.height,
-                BlitOption::None,
-            )
-            .map_err(e("readback"))?;
+            }
         }
-        blit.end_encoding().map_err(e("readback"))?;
-        finish(&cb)?;
-        contents(&out)
     }
-
-    fn read_buffer(&self, buffer: &Buffer) -> Result<Vec<u8>, String> {
-        if buffer.contents().is_some() {
-            return contents(buffer);
-        }
-        let out = self
-            .device
-            .new_buffer(buffer.length(), ResourceOptions::shared())
-            .map_err(e("readback buffer"))?;
-        let cb = self.queue().command_buffer().map_err(e("readback"))?;
-        let mut blit = cb.blit_command_encoder().map_err(e("readback"))?;
-        blit.copy_from_buffer_to_buffer(buffer, 0, &out, 0, buffer.length())
-            .map_err(e("readback"))?;
-        blit.end_encoding().map_err(e("readback"))?;
-        finish(&cb)?;
-        contents(&out)
-    }
-}
-
-fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
-    command_buffer.commit().map_err(e("commit"))?;
-    command_buffer
-        .wait_until_completed_for(WAIT)
-        .map_err(|_| format!("the command buffer did not complete within {WAIT:?}"))?;
-    match command_buffer.status() {
-        CommandBufferStatus::Completed => Ok(()),
-        status => Err(format!(
-            "the command buffer ended {status:?}: {:?}",
-            command_buffer.error()
-        )),
-    }
-}
-
-/// The bytes of `buffer`, which no command buffer writes any more.
-fn contents(buffer: &Buffer) -> Result<Vec<u8>, String> {
-    let at = buffer.contents().ok_or("a buffer without host contents")?;
-    let length = usize::try_from(buffer.length()).map_err(|error| error.to_string())?;
-    // SAFETY: the buffer is shared, `contents` holds its `length` bytes, and the command buffer
-    // that wrote it completed.
-    Ok(unsafe { std::slice::from_raw_parts(at.as_ptr(), length) }.to_vec())
 }

@@ -56,7 +56,7 @@
 //! **And it corrects the reason, which is the more useful half.** "A pitch equal to the row is the
 //! refused shape" was the reading that made this ordering feel necessary, and it is **wrong**. The
 //! rule the `R8Unorm` row broke is that a 2D texture over a buffer takes a `bytesPerRow` that is a
-//! **multiple of 16** (`metal2vulkan-runtime`'s `linear_plan`, `LINEAR_ALIGNMENT`), which is the
+//! **multiple of 16**, which is the
 //! alignment Metal's own `minimumLinearTextureAlignmentForPixelFormat:` answers for every format a
 //! buffer can back. 8 is not a multiple of 16; that row's pitch being its row as well was a
 //! coincidence of an 8 x 8 `R8Unorm` texture. 16, 32 and 256 all satisfy the rule, and a pitch
@@ -84,9 +84,17 @@
 //!   Each cleared texel holds `20 60 9F DF`, the four clear channels as `RGBA8Unorm` codes 32, 96,
 //!   159 and 223.
 //! - **`DontCare`, at every pitch: not one of the 2,048 bytes moved** — the texels included. The
-//!   clear value never reaches the buffer at all. That is the answer
-//!   `metal2vulkan-runtime`'s own `kept_bytes` states from its own `DontCare`-store probe, and it
-//!   is now a recorded Metal fact of the suite's rather than a module's prose.
+//!   clear value never reaches the buffer at all. That is a recorded Metal fact of the suite's.
+//!
+//! **What Metal promises of those texels is less than what it did.** Apple's page for
+//! `MTLStoreAction.dontCare`: "The GPU has permission to discard the rendered contents of the
+//! attachment at the end of the render pass, replacing them with arbitrary data." and "Some GPUs
+//! may still store the contents back to the texture, but you can't rely on that behavior."
+//! (`MTLRenderPass.h` says only that it is the default.) The M3 Max's kept bytes are one outcome
+//! of that and the clear another, and `metal2vulkan-runtime` stores the clear. So a `DontCare` row's
+//! 64 texel bytes are unchecked on the runtime's run, under the accepted difference
+//! `the-runtime-s-dontcare-store-writes-what-the-pass-rendered`, and every byte outside the texels
+//! compares.
 //!
 //! So a clearing pass treats the inter-row bytes exactly as a blit does, which is what the landed
 //! [`super::buffer_texture_blits`] family measured: the padding keeps its original fill throughout.
@@ -95,40 +103,14 @@
 //! of, the `DontCare` row is the only thing distinguishing a pass that wrote nothing from one that
 //! wrote the clear.
 //!
-//! # The two venues run different code of ours, and neither sees both halves
-//!
-//! Metal's answer above is one answer. **Our own side reaches it two different ways**, and which
-//! way depends on the device, so the second venue here is not breadth over the first — it is cover
-//! for a path the first never takes.
-//!
-//! `metal2vulkan-runtime` renders a target whose rows the device's own linear image cannot lay out
-//! as Metal does into a **shadow** image and copies back (`shadowed-texture`). Where the image
-//! really does lie over the buffer's bytes and the pass stores nothing of it, it renders into a
-//! **kept image** instead so the buffer keeps its bytes (`kept_bytes`, `dont-care-stand-in`). The
-//! two are exclusive: `kept_bytes` skips an attachment that already has a shadow, and it is reached
-//! only by an attachment the pass does not store.
-//!
-//! Measured on both:
-//!
-//! - **MoltenVK on this M3 Max**: all six rows shadow, so all six announce `shadowed-texture` and
-//!   **no row reaches the kept-image path at all**.
-//! - **lavapipe**: the tight pitch of 16 aliases the buffer rather than shadowing, so
-//!   `shadowed-texture` fires for five of the six and not for `pitch-16-stored`, and
-//!   `pitch-16-dont-care` takes the kept-image path and announces `dont-care-stand-in` — a code
-//!   MoltenVK never announces for any row of this family.
-//!
-//! So a one-venue run of this family leaves one of our own two implementations of the answer
-//! unexercised, whichever venue it is. That is the reason to run both, and it is why the
-//! declarations name two codes where no single run announces more than one of them.
-//!
 //! Nothing here faults a GPU, hangs one or trips a watchdog: one 4 x 4 target a case, one clear and
 //! no draw, over two kilobytes of shared memory, committed once and read back.
 
 use crate::case::{call, made, Abort, Case, Handle, Input, MetalSource, Side};
 use crate::render::{OverBuffer, PassColor, RenderPass, RenderWork, TargetSpec};
 use crate::transcript::{ByteLayout, Element, Gaps, Node, Observed, Region, Sites, Value};
+use crate::values::StoreAction;
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::StoreAction;
 
 /// The buffer's bytes. Two kilobytes: enough for the widest pitch's rows, bytes before the target
 /// and a long tail after it that no pass should reach, and an exact multiple of all three pitches,
@@ -170,6 +152,11 @@ const CLEAR: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
 /// case: see where it is pushed.
 const BUFFER_SITE: &str = "buffer-after-the-pass";
 
+/// The slug of `docs/API.md`'s accepted difference that says what a `DontCare` store leaves in the
+/// texels on `metal2vulkan-runtime`: what the pass rendered, where Apple's page lets the GPU replace
+/// them with arbitrary data.
+const DONT_CARE_TEXELS: &str = "the-runtime-s-dontcare-store-writes-what-the-pass-rendered";
+
 /// The buffer's bytes before anything runs: byte `i` holds `1 + 11i mod 251`.
 ///
 /// **Never zero**, deliberately. A `DontCare` store's answer is that the buffer keeps its bytes, and
@@ -188,20 +175,6 @@ struct Row {
     /// `bytesPerRow`: how far apart the target's rows lie in the buffer.
     pitch: u64,
     store: StoreAction,
-    /// Whether a venue has been **measured** announcing the kept-image notice
-    /// (`dont-care-stand-in`) for this row, which is what the row must declare.
-    ///
-    /// Measured rather than reasoned, and narrow on purpose. The path is reachable only by a row
-    /// the pass does not store, so a `Store` row can never need it -- but of the three `DontCare`
-    /// rows only the tight pitch has been seen to take it, on lavapipe, where its target aliases
-    /// the buffer instead of being shadowed. On MoltenVK no row of this family takes it, and on
-    /// lavapipe the two padded pitches are shadowed and do not either.
-    ///
-    /// So the padded rows declare nothing here. A declaration no run of the suite can check is the
-    /// noise the unfired tally exists to show, and the failure direction is the better one: a
-    /// device that does announce it for a padded row fails loudly as an undeclared notice, and
-    /// whoever sees that adds the declaration with the measurement that earned it.
-    kept_image: bool,
 }
 
 /// The six rows: three pitches, each stored and each thrown away.
@@ -210,37 +183,31 @@ const ROWS: [Row; 6] = [
         case: "buffer-target-clears-pitch-32-stored",
         pitch: 32,
         store: StoreAction::Store,
-        kept_image: false,
     },
     Row {
         case: "buffer-target-clears-pitch-32-dont-care",
         pitch: 32,
         store: StoreAction::DontCare,
-        kept_image: false,
     },
     Row {
         case: "buffer-target-clears-pitch-256-stored",
         pitch: 256,
         store: StoreAction::Store,
-        kept_image: false,
     },
     Row {
         case: "buffer-target-clears-pitch-256-dont-care",
         pitch: 256,
         store: StoreAction::DontCare,
-        kept_image: false,
     },
     Row {
         case: "buffer-target-clears-pitch-16-stored",
         pitch: 16,
         store: StoreAction::Store,
-        kept_image: false,
     },
     Row {
         case: "buffer-target-clears-pitch-16-dont-care",
         pitch: 16,
         store: StoreAction::DontCare,
-        kept_image: true,
     },
 ];
 
@@ -267,6 +234,35 @@ impl Row {
     /// buffer's, which [`TargetSpec::over_buffer`] states for it.
     fn target(&self, buffer: Handle) -> TargetSpec {
         TargetSpec::plain(FORMAT, [SIDE, SIDE]).over_buffer(self.backing(buffer))
+    }
+
+    /// The byte offsets in the buffer of the target's texels: `SIDE` rows of `ROW_BYTES` from
+    /// `OFFSET`, `pitch` apart.
+    fn texel_offsets(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..u64::from(SIDE))
+            .flat_map(move |row| (0..ROW_BYTES).map(move |byte| OFFSET + row * self.pitch + byte))
+    }
+
+    /// A `DontCare` row's declarations of its texels, one a byte of [`BUFFER_SITE`], unchecked
+    /// ([`DONT_CARE_TEXELS`]); none for a `Store` row.
+    ///
+    /// Apple's page for `MTLStoreAction.dontCare` lets the GPU replace the attachment's contents
+    /// with arbitrary data, and Metal's own answer on the M3 Max (the texels keep the buffer's
+    /// bytes) is one outcome of that, the runtime's (the clear) another. The bytes outside the
+    /// texels compare.
+    fn dont_care_texels(&self) -> Vec<crate::allowance::Allowance> {
+        if self.store != StoreAction::DontCare {
+            return Vec::new();
+        }
+        self.texel_offsets()
+            .map(|at| {
+                crate::allowance::Allowance::new(
+                    format!("case/{BUFFER_SITE}/{at}"),
+                    crate::allowance::Loosening::Unchecked,
+                    crate::allowance::Justification::accepted(DONT_CARE_TEXELS),
+                )
+            })
+            .collect()
     }
 
     /// The pass: one color attachment, cleared, stored as the row says, and **no step at all**.
@@ -320,50 +316,10 @@ impl Case for BufferTargetClear {
     }
 
     fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Not a byte of the buffer is loosened: the texels and the padding compare exactly,
-        // Metal's against ours. What differs is the **announcing**. Our runtime keeps a target
-        // whose rows the device's own linear image does not lay out as Metal does as a shadow
-        // image the pass renders into and the encoders copy back, and it announces that once per
-        // device (`shadowed-texture`); Metal announces nothing, ever, because nothing of the kind
-        // is a thing Metal has to do.
-        //
-        // **One declaration per code the case announces, measured on both venues.** A code a case
-        // announces and declares nowhere is a divergence at the notices site
-        // (`DivergenceKind::UndeclaredNotice`), so this list is a measured set and not a guess.
-        // On this M3 Max through MoltenVK all six rows announce `shadowed-texture` and nothing
-        // else. On lavapipe the tight pitch of 16 announces it for no row at all and the
-        // `DontCare` one announces `dont-care-stand-in` instead, so the union is two codes and
-        // neither venue sees both.
-        //
-        // `dont-care-stand-in` is declared on the one row a venue has been **measured**
-        // announcing it for (`Row::kept_image`), not on every row that could in principle take the
-        // path. The first shape of this declared it on all three `DontCare` rows, and the M3 Max
-        // replay reported three declarations fired on no venue of which three "name nothing this
-        // run justifies either, so no run of this suite has checked them" -- two of them true of
-        // lavapipe as well, since the padded pitches are shadowed there too.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        let mut named = vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::ShadowedTexture.code(),
-            ),
-        ];
-        if self.row.kept_image {
-            named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::DontCareStandIn.code(),
-            ));
-        }
-        named
+        // One set of bytes is loosened: a `DontCare` row's texels, which Apple's page lets the GPU
+        // replace with arbitrary data (`DONT_CARE_TEXELS`, `dont_care_texels`). The padding and the
+        // bytes before and after the target compare exactly, Metal's against ours.
+        self.row.dont_care_texels()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -426,6 +382,60 @@ mod tests {
             code(CLEAR[2]),
             code(CLEAR[3]),
         ]
+    }
+
+    /// **A `DontCare` row's texels are unchecked, and nothing else is.** Against Metal's kept
+    /// bytes, ours with the clear in every texel is no divergence; a padding byte or a byte before
+    /// the target that moved is a divergence. A `Store` row declares no byte at all.
+    #[test]
+    fn a_dont_care_row_leaves_its_texels_unchecked_and_nothing_else() {
+        use crate::allowance::Offered;
+        use crate::compare::compare;
+        use crate::transcript::Transcript;
+        let site = |row: &Row, bytes: Vec<u8>| {
+            Transcript::new(vec![Node::leaf(
+                BUFFER_SITE,
+                Observed::bytes(bytes, row.layout()),
+            )])
+        };
+        let paths = |found: &crate::compare::Comparison| -> Vec<String> {
+            found.divergences.iter().map(|at| at.path.clone()).collect()
+        };
+        for row in ROWS.iter().filter(|row| row.store == StoreAction::DontCare) {
+            let kept = pattern(LEN as usize);
+            let mut stored = kept.clone();
+            for at in row.texel_offsets() {
+                stored[at as usize] = cleared()[(at - OFFSET) as usize % 4];
+            }
+            let allowances = row.dont_care_texels();
+            assert_eq!(allowances.len(), 64, "{}", row.case);
+            let rt = Offered::notices(&[]);
+            let found = compare(
+                &site(row, kept.clone()),
+                &site(row, stored.clone()),
+                &allowances,
+                rt,
+            );
+            assert!(found.divergences.is_empty(), "{}: {found:?}", row.case);
+            assert!(found.bad_allowances.is_empty(), "{}: {found:?}", row.case);
+            for at in [0, OFFSET - 1, OFFSET + ROW_BYTES, LEN - 1] {
+                if row.texel_offsets().any(|texel| texel == at) {
+                    continue;
+                }
+                let mut moved = stored.clone();
+                moved[at as usize] ^= 0xff;
+                let found = compare(&site(row, kept.clone()), &site(row, moved), &allowances, rt);
+                assert_eq!(
+                    paths(&found),
+                    [format!("case/{BUFFER_SITE}")],
+                    "{} byte {at}: {found:?}",
+                    row.case
+                );
+            }
+        }
+        for row in ROWS.iter().filter(|row| row.store == StoreAction::Store) {
+            assert!(row.dont_care_texels().is_empty(), "{}", row.case);
+        }
     }
 
     /// Every case has a name of its own, so no case's answers are read as another's.
@@ -566,107 +576,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-/// The safety guard this family rests on, run on a device: **the pitch-16 rows go through our
-/// runtime before they go to Metal.**
-///
-/// Record mode hands every row of the table to Metal, and the runtime's own model is what tells a
-/// shape Metal *stops* from one it answers nil for: `Error::Invalid` is "Metal stops this call",
-/// `Error::Nil` is "plain Metal answers nil and the process goes on". So a row that makes the
-/// runtime answer `Invalid` is a row that must never be recorded, and this is the check that says
-/// so before anybody runs `conformance record`.
-///
-/// A pitch equal to the target's own row is exactly the shape that needs it. The sub-row guard
-/// ([`OverBuffer::unsafe_stride`]) lets it through, and while the buffer-backed texture family was
-/// being written the runtime answered `Invalid` for an `R8Unorm` 8 x 8 texture at a pitch of its
-/// own row of 8. That one broke the **multiple-of-16** rule a 2D texture over a buffer is held to,
-/// not a pitch-equals-row rule, so 16 here is fine — but the way to know that is to ask our own
-/// side, where an `Invalid` costs nothing, and not the oracle.
-///
-/// **It carries its own control**, because a sweep that only ever walks shapes the runtime answers
-/// is a sweep that would pass with the check removed. A pitch of 24 is at or above the target's row
-/// of 16, so the sub-row guard lets it through, and it breaks the rule the `R8Unorm` row broke —
-/// `bytesPerRow` must be a multiple of 16 — so the runtime must answer `Invalid` for it. The second
-/// half asserts that, in the same run on the same device: where it holds, the first half is a check
-/// that can fail rather than a walk that always passes.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    /// The variant a failure names, where it names one.
-    fn variant(value: &Value) -> String {
-        match value {
-            Value::Variant { name, payload } if name == "Err" => match payload.as_ref() {
-                Value::Variant { name, .. } => name.clone(),
-                other => format!("{other:?}"),
-            },
-            other => format!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn no_row_of_the_table_is_one_metal_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_row_of_the_table_is_one_metal_stops"),
-        );
-        let mut stopped = Vec::new();
-        for row in &ROWS {
-            let buffer = match side.buffer(&pattern(LEN as usize)) {
-                Ok(buffer) => buffer,
-                Err(failure) => {
-                    stopped.push(format!(
-                        "{}: its buffer: {}",
-                        row.case,
-                        variant(&failure.recorded())
-                    ));
-                    continue;
-                }
-            };
-            if let Err(failure) = side.target(&row.target(buffer)) {
-                let named = variant(&failure.recorded());
-                if named.contains("Invalid") {
-                    stopped.push(format!("{}: {named}", row.case));
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these rows are ones the runtime says Metal stops, so record mode would end Metal's \
-             process; take them out of the table:\n{}",
-            stopped.join("\n")
-        );
-        // The control: a pitch of 24 passes the sub-row guard and breaks the 16-byte pitch rule,
-        // so the runtime says Metal stops it. Without this the walk above would read the same with
-        // the `Invalid` test deleted.
-        let buffer = side
-            .buffer(&pattern(LEN as usize))
-            .expect("a buffer for the control shape");
-        let control = TargetSpec::plain(FORMAT, [SIDE, SIDE])
-            .over_buffer(OverBuffer::new(buffer, OFFSET, 24, ROW_BYTES));
-        let answered = side
-            .target(&control)
-            .map(|_| ())
-            .map_err(|failure| variant(&failure.recorded()));
-        assert!(
-            matches!(&answered, Err(named) if named.contains("Invalid")),
-            "a target at a pitch of 24 is not one the runtime says Metal stops ({answered:?}), so \
-             the sweep above is not a check: either the rule moved, in which case say so here, or \
-             the test no longer reads a refusal"
-        );
     }
 }

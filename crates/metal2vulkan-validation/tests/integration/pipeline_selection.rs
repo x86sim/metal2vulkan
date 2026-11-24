@@ -31,7 +31,9 @@ fn engine_selection_reads_only_the_selected_row_and_names_its_engine() {
             .output()
             .unwrap()
     };
-    let output = run(&["--profile", "vk12-floor", "--hash", &hash, "--compile-only"]);
+    // The kernel's threadgroup memory starts zeroed, which takes the device's
+    // `shaderZeroInitializeWorkgroupMemory`: a profile on the floor, not `vk12-floor`.
+    let output = run(&["--profile", "lavapipe", "--hash", &hash, "--compile-only"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
@@ -54,7 +56,7 @@ fn engine_selection_reads_only_the_selected_row_and_names_its_engine() {
         &["--hash", hash.as_str(), "--compile-only"][..],
         &[
             "--profile",
-            "vk12-floor",
+            "runtime-floor",
             "--hash",
             hash.as_str(),
             "--compile-only",
@@ -66,9 +68,8 @@ fn engine_selection_reads_only_the_selected_row_and_names_its_engine() {
     }
 }
 
-/// A fragment function that fetches its color attachment compiles on a profile with no ordered
-/// form of the fetch (neither rasterization-order attachment access nor the pixel interlock):
-/// through input attachments the consumer orders between draws alone, its row naming
+/// A fragment function that fetches its color attachment compiles on a profile without the pixel
+/// interlock: through input attachments the consumer orders between draws alone, its row naming
 /// `PrecisionNote::UnorderedFetchWithinDraw`.
 #[test]
 fn a_fetch_without_an_ordered_form_compiles_noted() {
@@ -90,7 +91,13 @@ fn a_fetch_without_an_ordered_form_compiles_noted() {
         eprintln!("SKIPPED the compile check: {why}");
         return;
     }
-    let args = ["--profile", "vk12-floor", "--hash", &hash, "--compile-only"];
+    let args = [
+        "--profile",
+        "runtime-floor",
+        "--hash",
+        &hash,
+        "--compile-only",
+    ];
     let compiled = String::from_utf8(run(&args).stdout).unwrap();
     assert_eq!(compiled.lines().count(), 1, "{compiled}");
     assert!(compiled.contains("\tCOMPILED\t"), "{compiled}");

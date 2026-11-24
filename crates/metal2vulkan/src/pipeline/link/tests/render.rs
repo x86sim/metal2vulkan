@@ -154,16 +154,14 @@ fn a_safe_one_zero_blend_of_a_sixteen_bit_float_attachment_blends() {
 }
 
 /// A fragment function links only under the color writes its pipeline gives the attachments it
-/// writes. On lavapipe and RADV a `float4` output to an `RGBA8Unorm` attachment takes the unorm
+/// writes. On lavapipe, RADV and MoltenVK a `float4` output to an `RGBA8Unorm` attachment takes the unorm
 /// rule, blended with (one, zero) too (`color_writes::takes_metal_rule`); under another blend, and
 /// for alpha-to-coverage's alpha, the channel is the device's. The map names the unorm rule the
 /// device's all the same, since the lowering stores and notes the two alike, so the four
 /// pipelines give one map and a fragment compiled for one links into the others. An
-/// `RGBA16Float` attachment takes the half-float rule, and an `RGBA32Float` one no entry; an
-/// `RGBA16Unorm` one Metal's 16-bit rule where the profile stores those codes as Metal does, else
-/// the device's. A fragment compiled for one map links into a pipeline of that map alone:
-/// compiled for another, or without the map, it is `NeedsInput(ColorWrites)`. On MoltenVK, which
-/// converts as Metal does, the map names only the half-float channels, blended or not.
+/// `RGBA16Float` attachment takes the half-float rule, an `RGBA32Float` one no entry, and an
+/// `RGBA16Unorm` one the device's. A fragment compiled for one map links into a pipeline of that
+/// map alone: compiled for another, or without the map, it is `NeedsInput(ColorWrites)`.
 #[test]
 fn color_writes_are_the_pipelines() {
     use crate::error::RuntimeInput;
@@ -199,7 +197,7 @@ fn color_writes_are_the_pipelines() {
         ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float),
         false,
     );
-    for stem in ["lavapipe", "amd-rdna3-radv"] {
+    for stem in ["lavapipe", "amd-780m-radv", "moltenvk-m3"] {
         let p = profile(stem);
         let writes = |inputs: &LinkInputs| match inputs {
             LinkInputs::Render(r) => {
@@ -257,76 +255,16 @@ fn color_writes_are_the_pipelines() {
             needs,
             "{stem}"
         );
-        let norm16 =
-            p.takes_driver_deviation(crate::error::DriverDeviation::MetalNorm16ColorWrites);
-        let wide_rule = match norm16 {
-            true => Some(C::Unorm { bits: 16 }),
-            false => device,
-        };
-        assert_eq!(
-            writes(&wide).get(&0).copied(),
-            Some([wide_rule; 4]),
-            "{stem}"
-        );
+        assert_eq!(writes(&wide).get(&0).copied(), Some([device; 4]), "{stem}");
         let for_wide = compiled_for(&fa, &wide, &p);
-        assert_eq!(
-            crate::pipeline::link::link(&[&va, &for_wide], &plain, &p).map(|_| ()),
-            match norm16 {
-                true => needs.clone(),
-                false => Ok(()),
-            },
-            "{stem}"
-        );
+        crate::pipeline::link::link(&[&va, &for_wide], &plain, &p)
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert_eq!(
             crate::pipeline::link::link(&[&va, &for_wide], &float, &p).map(|_| ()),
             needs,
             "{stem}"
         );
     }
-    let p = profile("moltenvk-m3");
-    let default = crate::metal::TextureWriteRoundingMode::TowardZero;
-    assert!(
-        crate::pipeline::color_writes::wanted(&fa, &[None; 8], (false, default), &p).is_empty()
-    );
-    crate::pipeline::link::link(&[&va, &fa], &plain, &p).expect("moltenvk-m3");
-    // There the map keeps the half-float channels alone, whatever the blend.
-    let half = Some(crate::pipeline::color_writes::HALF);
-    let mut blended_half = ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float);
-    blended_half.blending_enabled = true;
-    blended_half.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
-    let half_target = render(
-        ColorAttachmentDescriptor::new(PixelFormat::RGBA16Float),
-        false,
-    );
-    for (inputs, want) in [
-        (&plain, None),
-        (&float, None),
-        (
-            &render(
-                ColorAttachmentDescriptor::new(PixelFormat::RG11B10Float),
-                false,
-            ),
-            None,
-        ),
-        (&half_target, Some([half; 4])),
-        (&render(blended_half, true), Some([half; 4])),
-    ] {
-        let LinkInputs::Render(r) = inputs else {
-            unreachable!()
-        };
-        let got = crate::pipeline::color_writes::wanted(
-            &fa,
-            &r.color_attachments,
-            (r.alpha_to_coverage, r.texture_write_rounding_mode),
-            &p,
-        );
-        assert_eq!(got.get(&0).copied(), want, "{:?}", r.color_attachments[0]);
-        link(&[&va, &fa], inputs, &p).expect("moltenvk-m3");
-    }
-    assert_eq!(
-        crate::pipeline::link::link(&[&va, &fa], &half_target, &p).map(|_| ()),
-        Err(Error::NeedsInput(RuntimeInput::ColorWrites))
-    );
 }
 
 /// Under `TextureWriteRoundingMode::NearestEven` a half-float attachment's channels round to
@@ -490,19 +428,16 @@ fn render_with(d: VertexDescriptor) -> LinkInputs {
 
 /// Fixed-function attributes sit at dense locations in attribute order, bindings are dense in
 /// buffer order with their rate and stride, and every committed profile agrees with the
-/// projection.
+/// projection: under the identity domains every attribute is fixed function where the profile's
+/// format table lists its format for vertex buffers (and the projection is refused elsewhere);
+/// outside them every attribute is pulled.
 #[test]
 fn vertex_input_follows_the_projection_on_every_committed_profile() {
-    let profiles = crate::spirv::testing::committed_profiles().expect("profiles");
+    let profiles =
+        crate::spirv::testing::committed_profiles_with(DevicePolicy::default()).expect("profiles");
     assert!(!profiles.is_empty());
     for (stem, p) in &profiles {
         let d = descriptor();
-        let vs = vertex_stage(p, &d, &[0, 1, 4]);
-        let va = artifact(vs, None);
-        let l = link(&[&va], &render_with(d), p).unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let vi = &l.vertex_input;
-        // Every attribute is fixed function exactly where the profile's format table lists its
-        // format for vertex buffers, and pulled elsewhere.
         let fixed =
             |f| p.supports_format(f, crate::device::requirements::FormatUsage::VertexBuffer);
         let want = [
@@ -510,6 +445,15 @@ fn vertex_input_follows_the_projection_on_every_committed_profile() {
             (1, 0, vk::Format::R32G32_SFLOAT, 16),
             (4, 3, vk::Format::R32_SFLOAT, 0),
         ];
+        if !want.iter().all(|w| fixed(w.2)) {
+            let proj = vertex::vertex_fetch_projection(Some(&d), &floats(&[0, 1, 4]), p);
+            assert!(proj.is_err(), "{stem}: {proj:?}");
+            continue;
+        }
+        let vs = vertex_stage(p, &d, &[0, 1, 4]);
+        let va = artifact(vs, None);
+        let l = link(&[&va], &render_with(d), p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let vi = &l.vertex_input;
         let mut binds_want = Vec::new();
         let mut locs_want = Vec::new();
         let mut pulled_want = Vec::new();
@@ -562,14 +506,25 @@ fn vertex_input_follows_the_projection_on_every_committed_profile() {
             "{stem}"
         );
     }
+    // Outside the identity domains every attribute is pulled: no binding, no location.
+    for (stem, p) in &crate::spirv::testing::committed_profiles().expect("profiles") {
+        let d = descriptor();
+        let va = artifact(vertex_stage(p, &d, &[0, 1, 4]), None);
+        let l = link(&[&va], &render_with(d), p).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let vi = &l.vertex_input;
+        assert!(vi.attributes.is_empty() && vi.bindings.is_empty(), "{stem}");
+        let pulled: Vec<u32> = vi.pulled.iter().map(|a| a.attribute).collect();
+        assert_eq!(pulled, [0, 1, 4], "{stem}");
+    }
 }
 
-/// Constant step functions, attributes beyond the device's attribute or binding limits, and
-/// attributes whose format class differs from the declared type are pulled; a stage compiled
-/// under another projection is refused.
+/// A constant step function is pulled outside the identity domains, as every attribute is there.
+/// Under them an attribute set past the device's attribute or binding limit is refused
+/// (`VertexInputLayout`, naming the limit), and outside them a pulled attribute links with its
+/// layout's step; a stage compiled under another projection is refused.
 #[test]
-fn limits_pull_attributes_and_a_foreign_projection_is_refused() {
-    let mut p = profile("moltenvk-m3");
+fn limits_refuse_attributes_and_a_foreign_projection_is_refused() {
+    let p = profile("moltenvk-m3");
     let mut d = descriptor();
     d.layouts.get_mut(&3).expect("layout 3").step_function = VertexStepFunction::Constant;
     let used = floats(&[0, 1, 4]);
@@ -585,25 +540,36 @@ fn limits_pull_attributes_and_a_foreign_projection_is_refused() {
         }
     );
     let d = descriptor();
-    p.edit(|x| x.limits.max_vertex_input_attributes = 2);
-    let proj = vertex::vertex_fetch_projection(Some(&d), &used, &p).expect("projection");
-    assert!(matches!(proj.attributes[&4], VertexFetch::Pulled { .. }));
-    assert!(matches!(proj.attributes[&1], VertexFetch::FixedFunction));
-    let mut p = profile("moltenvk-m3");
-    p.edit(|x| x.limits.max_vertex_input_bindings = 1);
-    let proj = vertex::vertex_fetch_projection(Some(&d), &used, &p).expect("projection");
-    assert!(matches!(proj.attributes[&4], VertexFetch::Pulled { .. }));
-    assert!(matches!(proj.attributes[&0], VertexFetch::FixedFunction));
-    // Linking the pulled attribute lists it as pulled with its layout's step.
+    let fixed = |p: &DeviceProfile| {
+        vertex::vertex_fetch_projection(Some(&d), &used, p).map(|proj| {
+            proj.attributes
+                .values()
+                .all(|f| matches!(f, VertexFetch::FixedFunction))
+        })
+    };
+    let refused = |p: &DeviceProfile, limit: &str| {
+        let got = vertex::vertex_fetch_projection(Some(&d), &used, p);
+        layout_refused(&got) && format!("{got:?}").contains(limit)
+    };
+    let mut ip = identity_profile("moltenvk-m3");
+    assert_eq!(fixed(&ip), Ok(true));
+    ip.edit(|x| x.limits.max_vertex_input_attributes = 2);
+    assert!(refused(&ip, "MaxVertexInputAttributes"));
+    let mut ip = identity_profile("moltenvk-m3");
+    ip.edit(|x| x.limits.max_vertex_input_bindings = 1);
+    assert!(refused(&ip, "MaxVertexInputBindings"));
+    // Linking the pulled attributes lists them as pulled with their layouts' steps.
     let vs = vertex_stage(&p, &d, &[0, 4]);
     let va = artifact(vs, None);
     let l = link(&[&va], &render_with(d.clone()), &p).expect("link");
-    assert_eq!(l.vertex_input.pulled.len(), 1);
-    assert_eq!(l.vertex_input.pulled[0].attribute, 4);
-    assert_eq!(l.vertex_input.pulled[0].buffer_index, 3);
-    assert_eq!(l.vertex_input.bindings.len(), 1);
-    // The same stage against a device where attribute 4 is fixed function: refused.
-    let full = profile("moltenvk-m3");
+    let pulled: Vec<(u32, u32)> = (l.vertex_input.pulled.iter())
+        .map(|a| (a.attribute, a.buffer_index))
+        .collect();
+    assert_eq!(pulled, [(0, 0), (4, 3)]);
+    assert!(l.vertex_input.bindings.is_empty());
+    // A stage pulling attribute 4 against a device where it is fixed function: refused.
+    let va = artifact(vertex_stage(&p, &d, &[4]), None);
+    let full = identity_profile("moltenvk-m3");
     assert_eq!(
         link(&[&va], &render_with(d.clone()), &full).unwrap_err(),
         Error::InvalidDescriptor(DescriptorError::VertexAttribute { attribute: 4 })
@@ -626,16 +592,17 @@ fn limits_pull_attributes_and_a_foreign_projection_is_refused() {
     );
 }
 
-/// A constant-step layout links to one binding of instance rate, divisor 0 and **stride 0**: the
-/// zero divisor fetches element `firstInstance` at that stride, so a stride of 0 reads the
-/// layout's first element for every base instance, which is what Metal's constant step reads. The
-/// layout's own stride does not reach the binding -- here it is set per bind
-/// (`MTLBufferLayoutStrideDynamic`) and the binding is static all the same, because a fetch of one
-/// element has no use for a stride. On the portability subset, where a stride of 0 is illegal, the
-/// attribute stays pulled (`limits_pull_attributes_and_a_foreign_projection_is_refused`).
+/// A constant-step layout under the identity domains links to one binding of vertex rate, divisor
+/// 1 and **stride 0**: a stride of 0 reads the layout's first element for every vertex, instance
+/// and base instance, which is what Metal's constant step reads. The layout's own stride does not
+/// reach the binding -- here it is set per bind (`MTLBufferLayoutStrideDynamic`) and the binding
+/// is static all the same, because a fetch of one element has no use for a stride. Outside the
+/// identity domains the attribute is pulled
+/// (`limits_refuse_attributes_and_a_foreign_projection_is_refused`).
 #[test]
-fn a_constant_step_links_to_a_zero_divisor_binding_of_zero_stride() {
-    let p = profile("nvidia-rtx5080-laptop");
+fn a_constant_step_links_to_a_vertex_binding_of_zero_stride() {
+    let p = crate::pipeline::testing::profile("nvidia-rtx5080-laptop", DevicePolicy::default())
+        .expect("profile");
     let mut d = descriptor();
     d.layouts.get_mut(&3).expect("layout 3").step_function = VertexStepFunction::Constant;
     let proj =
@@ -655,7 +622,7 @@ fn a_constant_step_links_to_a_zero_divisor_binding_of_zero_stride() {
         binds,
         vec![
             (0, vk::VertexInputRate::VERTEX, 1, VertexStride::Static(32)),
-            (3, vk::VertexInputRate::INSTANCE, 0, VertexStride::Static(0)),
+            (3, vk::VertexInputRate::VERTEX, 1, VertexStride::Static(0)),
         ]
     );
     // The one layout whose stride is set per bind reads it no longer, so the pipeline needs no
@@ -666,23 +633,25 @@ fn a_constant_step_links_to_a_zero_divisor_binding_of_zero_stride() {
         .contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE));
 }
 
-/// An attribute is fixed function when fixed-function input delivers the class the shader
-/// declares (`float` for float, normalized, and packed formats, `uint` for unsigned-integer
-/// ones), and so is an unnormalized 8- or 16-bit integer format read into a `float` attribute,
-/// in its scaled form; signed-integer formats into `uint` are pulled and sign-extended. A 32-bit
-/// integer format into `float` is an invalid descriptor, as on Metal, and a float-class format into
-/// `uint` is refused by the one projection.
+/// Under the identity domains an attribute is fixed function when fixed-function input delivers
+/// the class the shader declares (`float` for float, normalized, and packed formats, `uint` for
+/// unsigned-integer ones), and so is an unnormalized 8- or 16-bit integer format read into a
+/// `float` attribute, in its scaled form; a signed-integer format into `uint` is fetched in fixed
+/// function into an `int` variable. Outside them each of those is pulled (a signed one
+/// sign-extended in the shader). A 32-bit integer format into `float` is an invalid descriptor,
+/// as on Metal, and a float-class format into `uint` is refused by the one projection, in either.
 #[test]
 fn the_format_class_must_match_the_declared_type() {
     use crate::error::{Feature, LowerFamily, Needs};
     #[derive(Debug)]
     enum Want {
         Fixed,
-        Pulled,
+        Signed,
         Refused,
         Invalid,
     }
-    let p = profile("moltenvk-m3");
+    let tables = profile("moltenvk-m3");
+    let p = identity_profile("moltenvk-m3");
     let mut d = VertexDescriptor::new();
     d.layouts
         .insert(0, VertexBufferLayoutDescriptor::new(Some(64)));
@@ -699,8 +668,8 @@ fn the_format_class_must_match_the_declared_type() {
         (VertexFormat::Char2, IoNumeric::Float, Want::Fixed),
         (VertexFormat::UShort2, IoNumeric::Float, Want::Fixed),
         (VertexFormat::Short4, IoNumeric::Float, Want::Fixed),
-        (VertexFormat::Char4, IoNumeric::Uint, Want::Pulled),
-        (VertexFormat::Int, IoNumeric::Uint, Want::Pulled),
+        (VertexFormat::Char4, IoNumeric::Uint, Want::Signed),
+        (VertexFormat::Int, IoNumeric::Uint, Want::Signed),
         (VertexFormat::UInt, IoNumeric::Float, Want::Invalid),
         (VertexFormat::Int3, IoNumeric::Float, Want::Invalid),
         (VertexFormat::Float2, IoNumeric::Uint, Want::Refused),
@@ -714,7 +683,16 @@ fn the_format_class_must_match_the_declared_type() {
         let i = i as u32;
         d.attributes
             .insert(i, VertexAttributeDescriptor::new(format, 0, 0));
-        let got = vertex::vertex_fetch_projection(Some(&d), &BTreeMap::from([(i, numeric)]), &p);
+        let used = BTreeMap::from([(i, numeric)]);
+        let got = vertex::vertex_fetch_projection(Some(&d), &used, &p);
+        if matches!(want, Want::Fixed | Want::Signed) {
+            let proj = vertex::vertex_fetch_projection(Some(&d), &used, &tables);
+            let fetch = proj.map(|proj| proj.attributes[&i]);
+            assert!(
+                matches!(fetch, Ok(VertexFetch::Pulled { format: f, .. }) if f == format),
+                "{format:?} as {numeric:?} outside the identity domains: {fetch:?}"
+            );
+        }
         match (want, got) {
             (Want::Fixed, Ok(proj)) => {
                 assert_eq!(
@@ -723,10 +701,10 @@ fn the_format_class_must_match_the_declared_type() {
                     "{format:?}"
                 )
             }
-            (Want::Pulled, Ok(proj)) => assert!(
-                matches!(proj.attributes[&i], VertexFetch::Pulled { format: f, .. } if f == format),
-                "{format:?} as {numeric:?}: {:?}",
-                proj.attributes[&i]
+            (Want::Signed, Ok(proj)) => assert_eq!(
+                proj.attributes[&i],
+                VertexFetch::SignedFixedFunction,
+                "{format:?} as {numeric:?}"
             ),
             (Want::Refused, Err(Error::Unsupported(u))) => {
                 assert_eq!(u.feature, Feature::Lowering(LowerFamily::StageIo));
@@ -743,11 +721,13 @@ fn the_format_class_must_match_the_declared_type() {
 
 /// Metal allows any byte offset and stride on Apple5 and later; Vulkan's fixed-function
 /// attribute address must be a multiple of the component size (the whole size of a packed
-/// format). An attribute whose offset or static stride is not is pulled; a per-bind stride is the
-/// binder's runtime fact and does not decide the projection.
+/// format). Under the identity domains an attribute whose offset or static stride is not is
+/// refused (`VertexInputLayout`); outside them every attribute is pulled (the pulled fetch reads
+/// bytes). A per-bind stride is the binder's runtime fact and does not decide the projection.
 #[test]
-fn unaligned_attributes_are_pulled() {
-    let p = profile("moltenvk-m3");
+fn unaligned_attributes_are_refused_under_the_identity_domains() {
+    let tables = profile("moltenvk-m3");
+    let p = identity_profile("moltenvk-m3");
     let cases = [
         // (format, offset, stride, aligned)
         (VertexFormat::Float3, 0, Some(12), true),
@@ -789,24 +769,35 @@ fn unaligned_attributes_are_pulled() {
         ) {
             assert!(base, "{format:?}");
         }
-        let proj = vertex::vertex_fetch_projection(Some(&d), &BTreeMap::from([(0, numeric)]), &p)
-            .expect("projection");
-        assert_eq!(
-            proj.attributes[&0] == VertexFetch::FixedFunction,
-            aligned && base,
-            "{format:?} at {offset} stride {stride:?}: {:?}",
-            proj.attributes[&0]
+        let used = BTreeMap::from([(0, numeric)]);
+        let got = vertex::vertex_fetch_projection(Some(&d), &used, &p);
+        let what = format!("{format:?} at {offset} stride {stride:?}: {got:?}");
+        match (aligned, base) {
+            // The format's own refusal.
+            (_, false) => assert!(got.is_err(), "{what}"),
+            (true, true) => assert_eq!(
+                got.map(|proj| proj.attributes[&0]),
+                Ok(VertexFetch::FixedFunction),
+                "{what}"
+            ),
+            (false, true) => assert!(layout_refused(&got), "{what}"),
+        }
+        let proj = vertex::vertex_fetch_projection(Some(&d), &used, &tables).expect("projection");
+        assert!(
+            matches!(proj.attributes[&0], VertexFetch::Pulled { .. }),
+            "{format:?} outside the identity domains"
         );
     }
 }
 
 /// On a portability-subset device a static stride must be a multiple of
 /// `minVertexInputBindingStrideAlignment` and at least as large
-/// (`VUID-VkVertexInputBindingDescription-stride-04456`); a layout that is not is pulled.
-/// MoltenVK's committed capture reports 1, so there only a zero stride is pulled; a device
+/// (`VUID-VkVertexInputBindingDescription-stride-04456`): under the identity domains a layout
+/// that is not is refused (`VertexInputLayout`), and outside them every attribute is pulled.
+/// MoltenVK's committed capture reports 1, so there only a zero stride is refused; a device
 /// without the rule keeps a zero stride fixed function.
 #[test]
-fn portability_stride_alignment_pulls_static_strides() {
+fn portability_stride_alignment_refuses_static_strides() {
     let fetch = |p: &DeviceProfile, stride: u32| {
         let mut d = VertexDescriptor::new();
         d.layouts
@@ -816,11 +807,10 @@ fn portability_stride_alignment_pulls_static_strides() {
             VertexAttributeDescriptor::new(VertexFormat::UChar4, 0, 0),
         );
         vertex::vertex_fetch_projection(Some(&d), &BTreeMap::from([(0, IoNumeric::Uint)]), p)
-            .expect("projection")
-            .attributes[&0]
+            .map(|proj| proj.attributes[&0])
     };
-    let fixed = VertexFetch::FixedFunction;
-    let mvk = profile("moltenvk-m3");
+    let fixed = Ok(VertexFetch::FixedFunction);
+    let mvk = identity_profile("moltenvk-m3");
     assert_eq!(
         mvk.fields()
             .limits
@@ -829,24 +819,29 @@ fn portability_stride_alignment_pulls_static_strides() {
     );
     assert_eq!(fetch(&mvk, 4), fixed);
     assert_eq!(fetch(&mvk, 5), fixed);
-    assert_ne!(fetch(&mvk, 0), fixed);
+    assert!(layout_refused(&fetch(&mvk, 0)));
     let mut four = mvk.clone();
     four.edit(|x| x.limits.min_vertex_input_binding_stride_alignment = Some(4));
     assert_eq!(fetch(&four, 8), fixed);
-    assert_ne!(fetch(&four, 6), fixed);
-    assert_ne!(fetch(&four, 2), fixed);
-    let lavapipe = profile("lavapipe");
+    assert!(layout_refused(&fetch(&four, 6)));
+    assert!(layout_refused(&fetch(&four, 2)));
+    let lavapipe = identity_profile("lavapipe");
     assert_eq!(fetch(&lavapipe, 0), fixed);
     assert_eq!(fetch(&lavapipe, 6), fixed);
+    assert!(matches!(
+        fetch(&profile("moltenvk-m3"), 4),
+        Ok(VertexFetch::Pulled { .. })
+    ));
 }
 
 /// On a portability-subset device without `vertexAttributeAccessBeyondStride` an attribute must
 /// end within its binding's stride
-/// (`VUID-VkVertexInputAttributeDescription-vertexAttributeAccessBeyondStride-04457`): one whose
-/// static stride it passes is pulled. MoltenVK's capture has the feature, which keeps it fixed
-/// function, as does a device without the subset.
+/// (`VUID-VkVertexInputAttributeDescription-vertexAttributeAccessBeyondStride-04457`): under the
+/// identity domains one whose static stride it passes is refused (`VertexInputLayout`), and
+/// outside them every attribute is pulled. MoltenVK's capture has the feature, which keeps it
+/// fixed function, as does a device without the subset.
 #[test]
-fn the_portability_subset_can_pull_attributes_past_their_stride() {
+fn the_portability_subset_refuses_attributes_past_their_stride() {
     let fetch = |p: &DeviceProfile, stride: u32| {
         let mut d = VertexDescriptor::new();
         d.layouts
@@ -856,22 +851,24 @@ fn the_portability_subset_can_pull_attributes_past_their_stride() {
             0,
             VertexAttributeDescriptor::new(VertexFormat::Float4, 8, 0),
         );
-        vertex::vertex_fetch_projection(Some(&d), &floats(&[0]), p)
-            .expect("projection")
-            .attributes[&0]
+        vertex::vertex_fetch_projection(Some(&d), &floats(&[0]), p).map(|proj| proj.attributes[&0])
     };
-    let fixed = VertexFetch::FixedFunction;
+    let fixed = Ok(VertexFetch::FixedFunction);
     let beyond = VkFeature::VertexAttributeAccessBeyondStride;
-    let mvk = profile("moltenvk-m3");
+    let mvk = identity_profile("moltenvk-m3");
     assert!(mvk.fields().enabled.features.contains(&beyond));
     assert_eq!(fetch(&mvk, 16), fixed);
     let mut withheld = mvk.clone();
     withheld.edit(|x| {
         x.enabled.features.remove(&beyond);
     });
-    assert_ne!(fetch(&withheld, 16), fixed);
+    assert!(layout_refused(&fetch(&withheld, 16)));
     assert_eq!(fetch(&withheld, 24), fixed);
-    assert_eq!(fetch(&profile("lavapipe"), 16), fixed);
+    assert_eq!(fetch(&identity_profile("lavapipe"), 16), fixed);
+    assert!(matches!(
+        fetch(&profile("moltenvk-m3"), 16),
+        Ok(VertexFetch::Pulled { .. })
+    ));
 }
 
 /// A constant-alpha RGB blend factor (Metal's `BlendAlpha`, `OneMinusBlendAlpha`) is refused at
@@ -1002,9 +999,10 @@ fn the_constant_alpha_drop_follows_the_descriptor_checks() {
 
 /// Under dynamic strides (a fixed-function per-bind layout on a profile with extended dynamic
 /// state) every binding's stride is passed per bind, and a nonzero static stride must cover the
-/// attributes its binding fetches (`VUID-vkCmdBindVertexBuffers2-pStrides-06209`): an attribute
-/// ending past it is pulled, one within it and a zero stride stay fixed function. Without dynamic
-/// strides the static stride is pipeline state and nothing is pulled.
+/// attributes its binding fetches (`VUID-vkCmdBindVertexBuffers2-pStrides-06209`): under the
+/// identity domains an attribute ending past it is refused (`VertexInputLayout`), one within it
+/// and a zero stride stay fixed function. Without dynamic strides the static stride is pipeline
+/// state and nothing is refused. Outside the identity domains every attribute is pulled.
 #[test]
 fn static_strides_under_dynamic_strides_cover_their_attributes() {
     let project = |p: &DeviceProfile, stride: u32| {
@@ -1021,28 +1019,29 @@ fn static_strides_under_dynamic_strides_cover_their_attributes() {
             .insert(1, VertexAttributeDescriptor::new(VertexFormat::Float, 8, 0));
         d.attributes
             .insert(2, VertexAttributeDescriptor::new(VertexFormat::Float, 0, 1));
-        vertex::vertex_fetch_projection(Some(&d), &floats(&[0, 1, 2]), p).expect("projection")
+        vertex::vertex_fetch_projection(Some(&d), &floats(&[0, 1, 2]), p)
     };
-    let fixed = |proj: &crate::pipeline::lower_inputs::VertexFetchProjection| {
+    let fixed = |p: &DeviceProfile, stride: u32| {
+        let proj = project(p, stride).expect("projection");
         proj.attributes
             .iter()
             .filter(|(_, f)| matches!(f, VertexFetch::FixedFunction))
             .map(|(a, _)| *a)
             .collect::<Vec<u32>>()
     };
-    let lavapipe = profile("lavapipe");
+    let lavapipe = identity_profile("lavapipe");
     assert!(lavapipe.fields().dynamic_vertex_stride);
-    assert_eq!(fixed(&project(&lavapipe, 12)), [0, 1, 2]);
-    assert_eq!(fixed(&project(&lavapipe, 0)), [0, 1, 2]);
-    assert_eq!(
-        fixed(&project(&lavapipe, 8)),
-        [0, 2],
+    assert_eq!(fixed(&lavapipe, 12), [0, 1, 2]);
+    assert_eq!(fixed(&lavapipe, 0), [0, 1, 2]);
+    assert!(
+        layout_refused(&project(&lavapipe, 8)),
         "the float at 8 ends past 8"
     );
-    assert_eq!(fixed(&project(&lavapipe, 4)), [2], "both end past 4");
+    assert!(layout_refused(&project(&lavapipe, 4)), "both end past 4");
     let mut static_only = lavapipe.clone();
     static_only.edit(|x| x.dynamic_vertex_stride = false);
-    assert_eq!(fixed(&project(&static_only, 4)), [0, 1, 2]);
+    assert_eq!(fixed(&static_only, 4), [0, 1, 2]);
+    assert_eq!(fixed(&profile("lavapipe"), 12), [0u32; 0]);
 }
 
 /// Color attachments, depth, samples, input attachments, and dynamic states map through the
@@ -1051,7 +1050,7 @@ fn static_strides_under_dynamic_strides_cover_their_attributes() {
 fn graphics_state_maps_the_descriptor() {
     use crate::pipeline::descriptor::ColorAttachmentDescriptor;
     // Profiles whose format tables list the attachment formats (the floor profiles carry none).
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna3-radv"] {
+    for stem in ["moltenvk-m3", "lavapipe", "amd-780m-radv"] {
         let p = profile(stem);
         let mut r = RenderLinkInputs::new();
         r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
@@ -1089,17 +1088,6 @@ fn graphics_state_maps_the_descriptor() {
         assert_eq!(g.input_attachments.len(), 1);
         assert_eq!(g.input_attachments[0].color_index, 2);
         assert_eq!(g.input_attachments[0].format_class, SampledType::Float);
-        // The fetch is ordered wherever the device can order it.
-        assert_eq!(
-            g.rasterization_order_attachment_access,
-            p.fields().fragment.rasterization_order_color_access,
-            "{stem}"
-        );
-        assert_eq!(
-            g.rasterization_order_attachment_access,
-            stem == "lavapipe",
-            "{stem}: lavapipe alone of these orders attachment reads"
-        );
         // Extended dynamic state makes the cull mode dynamic; the topology and its restart
         // follow with `extendedDynamicState2` too, together.
         assert_eq!(
@@ -1178,22 +1166,16 @@ fn alpha_to_one_is_refused_only_without_the_feature() {
     let va = artifact(iface(Stage::Vertex, vec![], vec![]), None);
     let fa = artifact(iface(Stage::Fragment, vec![], vec![]), None);
     let inputs = LinkInputs::Render(Box::new(r));
-    // `swiftshader` lists `alphaToOne` as unsupported, and `vk12-floor` states no such member.
-    for stem in ["swiftshader", "vk12-floor"] {
-        let p = profile(stem);
-        assert!(
-            !p.fields().enabled.features.contains(&VkFeature::AlphaToOne),
-            "{stem} has the feature"
-        );
-        assert_eq!(
-            link(&[&va, &fa], &inputs, &p).unwrap_err(),
-            Error::Unsupported(Unsupported::needs(
-                Feature::AlphaToOne,
-                Capability::Feature(VkFeature::AlphaToOne)
-            )),
-            "{stem}"
-        );
-    }
+    // `runtime-floor`, whose floor does not require `alphaToOne`.
+    let p = profile("runtime-floor");
+    assert!(!p.fields().enabled.features.contains(&VkFeature::AlphaToOne));
+    assert_eq!(
+        link(&[&va, &fa], &inputs, &p).unwrap_err(),
+        Error::Unsupported(Unsupported::needs(
+            Feature::AlphaToOne,
+            Capability::Feature(VkFeature::AlphaToOne)
+        ))
+    );
     // The same inputs on a device with the feature link, and carry it.
     let p = profile("moltenvk-m3");
     let g = link(&[&va, &fa], &inputs, &p)
@@ -1203,12 +1185,9 @@ fn alpha_to_one_is_refused_only_without_the_feature() {
     assert!(g.alpha_to_one);
 }
 
-/// The graphics state states whether the vertex function writes memory, and a rate-mapped pass
-/// drawn in more than one region refuses such a pipeline, where one region, or a vertex function
-/// without side effects, is drawn as Metal draws it.
+/// The graphics state states whether the vertex function writes memory.
 #[test]
-fn a_vertex_function_that_writes_memory_is_refused_in_a_pass_of_several_regions() {
-    use crate::bind::{RasterizationRateMap, RateMapAxis, RegionError, RegionLimits};
+fn the_graphics_state_states_a_vertex_function_that_writes_memory() {
     let p = profile("lavapipe");
     let r = RenderLinkInputs::new();
     let state = |writes: bool| {
@@ -1223,33 +1202,6 @@ fn a_vertex_function_that_writes_memory_is_refused_in_a_pass_of_several_regions(
     let (writes, pure) = (state(true), state(false));
     assert!(writes.vertex_writes_memory);
     assert!(!pure.vertex_writes_memory);
-    let axis = |tiles: &[(u32, u32)]| RateMapAxis::from_tiles(32, tiles).expect("axis");
-    let limits = RegionLimits::new([4096, 4096], [-8192.0, 8191.0]);
-    // Two horizontal lines (63 to 32, then 4 to 4) make two regions; the identity makes one.
-    let coarse = RasterizationRateMap::from_layers(
-        [256, 32],
-        vec![[
-            axis(&[(63, 32), (63, 32), (63, 32), (63, 32), (4, 4)]),
-            axis(&[(32, 32)]),
-        ]],
-    )
-    .expect("map")
-    .regions(0, [0.0, 0.0, 256.0, 32.0], None, &limits)
-    .expect("plan");
-    let identity = RasterizationRateMap::from_layers(
-        [256, 32],
-        vec![[axis(&[(32, 32); 8]), axis(&[(32, 32)])]],
-    )
-    .expect("map")
-    .regions(0, [0.0, 0.0, 256.0, 32.0], None, &limits)
-    .expect("plan");
-    assert_eq!((coarse.regions().len(), identity.regions().len()), (2, 1));
-    assert_eq!(
-        coarse.admits(&writes),
-        Err(RegionError::VertexSideEffects { regions: 2 })
-    );
-    assert_eq!(coarse.admits(&pure), Ok(()));
-    assert_eq!(identity.admits(&writes), Ok(()));
 }
 
 /// The pipeline's interface lists each stage whose function may write a texture, in stage order,
@@ -1275,14 +1227,10 @@ fn the_interface_lists_the_stages_that_write_textures() {
     assert_eq!(stages(true, true), vec![Stage::Vertex, Stage::Fragment]);
 }
 
-/// The graphics state states whether the vertex function selects its viewport, and a rate-mapped
-/// pass refuses a pipeline that does, or that is layered (a stage declares `Layer`, or it amplifies
-/// vertices), even in one region: the plan sets one viewport per region for one map layer. A
-/// layered pipeline whose slices the consumer bounds to the plan's layer is admitted
-/// (`admits_planned_layers`).
+/// The graphics state states whether the vertex function selects its viewport and whether a stage
+/// declares `Layer`.
 #[test]
-fn a_layered_or_viewport_selecting_pipeline_is_refused_in_a_rate_mapped_pass() {
-    use crate::bind::{RasterizationRateMap, RateMapAxis, RegionError, RegionLimits};
+fn the_graphics_state_states_a_viewport_selecting_or_layered_vertex_function() {
     use crate::pipeline::stage_io::StageBuiltin as B;
     let p = profile("lavapipe");
     let r = RenderLinkInputs::new();
@@ -1303,33 +1251,6 @@ fn a_layered_or_viewport_selecting_pipeline_is_refused_in_a_rate_mapped_pass() {
     assert!(!plain.writes_viewport_index && !plain.declares_layer);
     assert!(viewport.writes_viewport_index);
     assert!(layer.declares_layer);
-    let mut amplified = plain.clone();
-    amplified.max_vertex_amplification_count = 2;
-    let axis = |tiles: &[(u32, u32)]| RateMapAxis::from_tiles(32, tiles).expect("axis");
-    let one =
-        RasterizationRateMap::from_layers([64, 32], vec![[axis(&[(64, 32)]), axis(&[(32, 32)])]])
-            .expect("map")
-            .regions(
-                0,
-                [0.0, 0.0, 64.0, 32.0],
-                None,
-                &RegionLimits::new([4096, 4096], [-8192.0, 8191.0]),
-            )
-            .expect("plan");
-    assert_eq!(one.regions().len(), 1);
-    assert_eq!(one.admits(&plain), Ok(()));
-    assert_eq!(one.admits(&viewport), Err(RegionError::ViewportArray));
-    assert_eq!(one.admits(&layer), Err(RegionError::LayeredPipeline));
-    assert_eq!(one.admits(&amplified), Err(RegionError::LayeredPipeline));
-    // A draw whose slices the consumer bounds to the plan's layer: the layered pipelines are
-    // admitted, the viewport-selecting one is not.
-    assert_eq!(one.admits_planned_layers(&plain), Ok(()));
-    assert_eq!(one.admits_planned_layers(&layer), Ok(()));
-    assert_eq!(one.admits_planned_layers(&amplified), Ok(()));
-    assert_eq!(
-        one.admits_planned_layers(&viewport),
-        Err(RegionError::ViewportArray)
-    );
 }
 
 /// A fragment stage that reads its color attachments was compiled for its pipeline's sample
@@ -1360,7 +1281,7 @@ fn a_framebuffer_fetch_links_into_the_sample_count_it_was_compiled_for() {
     let sa = artifact(per_sample, None);
     let plain = artifact(iface(fr, vec![], vec![]), None);
     let recompile = Error::NeedsInput(RuntimeInput::Multisampled);
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna3-radv"] {
+    for stem in ["moltenvk-m3", "lavapipe", "amd-780m-radv"] {
         let p = profile(stem);
         let mut r = RenderLinkInputs::new();
         r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
@@ -1410,138 +1331,6 @@ fn a_framebuffer_fetch_links_into_the_sample_count_it_was_compiled_for() {
     }
 }
 
-/// A fragment stage that reads color attachment 0 in the interlocked storage form links into a
-/// pipeline whose state chooses that form with the format the stage declares: the attachment is a
-/// storage attachment, with no color attachment state and no input attachment. A pipeline whose
-/// state chooses otherwise (another format, a blending attachment) did not compile the stage:
-/// `NeedsInput(FramebufferFetch)`, and one of more samples did not compile it for its sample count:
-/// `NeedsInput(Multisampled)`, and one with a depth attachment did not compile it with early tests.
-/// A device that orders fetch otherwise never compiles such a stage. Compiled for more than one
-/// sample, the stage reads planes where the device has no multisampled storage image (MoltenVK),
-/// which need no sample count of storage images, and the pipeline's multisampled attachment
-/// elsewhere (RADV).
-#[test]
-fn an_interlocked_fetch_links_only_into_the_state_it_was_compiled_for() {
-    use crate::error::{InternalKind, RuntimeInput};
-    use crate::metal::BlendFactor;
-    use crate::pipeline::descriptor::ColorAttachmentDescriptor;
-    use crate::pipeline::facts::RuntimeFact;
-    use crate::pipeline::graphics::{StorageAttachmentUse, StorageAttachmentView};
-    let p = profile("moltenvk-m3");
-    let va = artifact(iface(Stage::Vertex, vec![], vec![]), None);
-    let fr = Stage::Fragment;
-    let storage = StageDescriptor::new(
-        res(fr, ResourceKind::TileAttachment(0), 0),
-        vk::DescriptorType::STORAGE_IMAGE,
-        1,
-    );
-    let mut fa = artifact(iface(fr, vec![storage], vec![]), None);
-    // Compiled without a depth or stencil attachment: no early tests.
-    fa.facts.push(RuntimeFact::InterlockedFramebufferFetch {
-        color: 0,
-        format: vk::Format::R32_SFLOAT,
-        writes: true,
-        early_tests: false,
-        kept: vk::ColorComponentFlags::empty(),
-        blend: None,
-        rounded: false,
-    });
-    // Blending adds the destination: a blend of one and zero, added, stores the source as no
-    // blending does, and links into the storage form.
-    let state_with = |format, blending: bool, samples: u32, depth: bool| {
-        let mut r = RenderLinkInputs::new();
-        let mut c = ColorAttachmentDescriptor::new(format);
-        if blending {
-            c.blending_enabled = true;
-            c.destination_rgb_blend_factor = BlendFactor::One;
-        }
-        r.color_attachments[0] = Some(c);
-        r.raster_sample_count = samples;
-        r.depth_format = depth.then_some(PixelFormat::Depth32Float);
-        LinkInputs::Render(Box::new(r))
-    };
-    let state = |format, blending: bool, samples: u32| state_with(format, blending, samples, false);
-    let g = link(&[&va, &fa], &state(PixelFormat::R32Float, false, 1), &p)
-        .expect("link")
-        .graphics
-        .expect("graphics");
-    assert_eq!(
-        g.storage_attachments,
-        [StorageAttachmentUse {
-            color_index: 0,
-            format: vk::Format::R32_SFLOAT,
-            writes: true,
-            // Declared without a format where the device grants that.
-            formatless: crate::metal::format::accessed_without_format(
-                vk::Format::R32_SFLOAT,
-                crate::metal::format::StorageUse::texture(true, true),
-                &p
-            ),
-            view: StorageAttachmentView::Attachment,
-            view_alias: None,
-            kept: vk::ColorComponentFlags::empty(),
-        }]
-    );
-    assert_eq!(g.color_attachments, [None]);
-    assert!(g.input_attachments.is_empty());
-    assert!(!g.rasterization_order_attachment_access);
-    for other in [
-        state(PixelFormat::RGBA8Unorm, false, 1),
-        state(PixelFormat::R32Float, true, 1),
-        // Its writes would precede a failed depth test.
-        state_with(PixelFormat::R32Float, false, 1, true),
-    ] {
-        assert_eq!(
-            link(&[&va, &fa], &other, &p).unwrap_err(),
-            Error::NeedsInput(RuntimeInput::FramebufferFetch),
-            "{other:?}"
-        );
-    }
-    assert_eq!(
-        link(&[&va, &fa], &state(PixelFormat::R32Float, false, 4), &p).unwrap_err(),
-        Error::NeedsInput(RuntimeInput::Multisampled)
-    );
-    // Compiled for more than one sample: planes without multisampled storage images.
-    let mut per_sample = fa.clone();
-    per_sample.interface.io.multisampled = true;
-    per_sample
-        .interface
-        .io
-        .builtins
-        .push(crate::pipeline::stage_io::StageBuiltin::SampleId);
-    let radv = profile("amd-rdna3-radv");
-    for (p, view) in [
-        (&p, StorageAttachmentView::SamplePlanes { layers: 4 }),
-        (&radv, StorageAttachmentView::Attachment),
-    ] {
-        let g = link(
-            &[&va, &per_sample],
-            &state(PixelFormat::R32Float, false, 4),
-            p,
-        )
-        .expect("link")
-        .graphics
-        .expect("graphics");
-        assert_eq!(
-            g.storage_attachments
-                .iter()
-                .map(|a| a.view)
-                .collect::<Vec<_>>(),
-            [view]
-        );
-        assert_eq!(g.rasterization_samples, vk::SampleCountFlags::COUNT_4);
-    }
-
-    match link(
-        &[&va, &fa],
-        &state(PixelFormat::R32Float, false, 1),
-        &profile("lavapipe"),
-    ) {
-        Err(Error::Internal(e)) => assert_eq!(e.kind, InternalKind::Invariant),
-        other => panic!("{other:?}"),
-    }
-}
-
 /// A color attachment that no output of the fragment function names keeps its contents, as Metal
 /// kept one where measured: its write mask is empty, while every attachment the function writes
 /// keeps the descriptor's mask and every attachment its blend state. A pipeline without a fragment
@@ -1558,7 +1347,7 @@ fn a_color_attachment_the_fragment_does_not_write_keeps_its_contents() {
     let u4 = io_ty(IoNumeric::Uint, 4);
     let partial = ColorWriteMask::RED | ColorWriteMask::ALPHA;
     let none = vk::ColorComponentFlags::empty();
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna3-radv"] {
+    for stem in ["moltenvk-m3", "lavapipe", "amd-780m-radv"] {
         let p = profile(stem);
         let mut r = RenderLinkInputs::new();
         let mut masked = ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm);
@@ -1634,7 +1423,13 @@ fn attachment_states_are_identical_or_need_independent_blend() {
         a.write_mask = mask;
         a
     };
-    let floor = profile("vk12-floor");
+    // `runtime-floor` without `independentBlend`, which the runtime's floor requires.
+    let floor = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::IndependentBlend],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
     let lavapipe = profile("lavapipe");
     assert!(!floor.fields().fragment.independent_blend);
     assert!(lavapipe.fields().fragment.independent_blend);
@@ -1862,7 +1657,13 @@ fn a_dual_source_blend_needs_dual_src_blend() {
             "{factor:?}"
         );
     }
-    let floor = profile("vk12-floor");
+    // `runtime-floor` without `dualSrcBlend`, which the runtime's floor requires.
+    let floor = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::DualSrcBlend],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
     assert!(!floor.fields().fragment.dual_src_blend);
     assert_eq!(
         link(
@@ -1938,7 +1739,13 @@ fn color_outputs_follow_metals_measured_rules() {
         })
     };
     let lavapipe = profile("lavapipe");
-    let floor = profile("vk12-floor");
+    // `runtime-floor` without `independentBlend`, which the runtime's floor requires.
+    let floor = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::IndependentBlend],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
     for p in [&lavapipe, &profile("moltenvk-m3")] {
         // Components against channels.
         for (format, components, ok) in [
@@ -2302,28 +2109,23 @@ fn the_raster_sample_count_needs_the_framebuffer_sample_counts() {
     );
 }
 
-/// Under multisampling Metal (Apple M3 Max, 4x) runs a fragment function that writes memory once
-/// per covered sample, whatever its inputs, and every invocation reads its position, its center
-/// and centroid varyings, its point and barycentric coordinates, and its sample mask as the
-/// pixel's. Vulkan runs per sample only under sample shading, which `SampleId` turns on, a `Sample`
-/// input may, and the pipeline enables for a function that writes memory; it moves those reads to
-/// the sample there. The same pipelines at one sample, a pixel-rate function that reads them (but
-/// its `[[sample_mask]]` on lavapipe, whose split of a clipped triangle's fragments changes it), a
+/// Under multisampling Metal (Apple M3 Max, 4x) runs a fragment function that reads
+/// `[[sample_id]]` or a sample-qualified varying once per covered sample, and every invocation
+/// reads its position, its center and centroid varyings, its point and barycentric coordinates,
+/// and its sample mask as the pixel's. Vulkan runs per sample only under sample shading, which
+/// `SampleId` turns on and a `Sample` input may, and moves those reads to the sample there. A
+/// function that writes memory runs as any other, as the device runs it
+/// (`PrecisionNote::DeviceFragmentRuns`): its writes change nothing link decides. The same
+/// pipelines at one sample, a pixel-rate function that reads them, with side effects or without, a
 /// per-sample one that does not, one compiled for the pipeline that reads `[[position]]`'s x and y
 /// or its center varyings at the pixel, and a per-sample one that reads `[[position]]`'s z or w, a
 /// centroid varying, or its point or barycentric coordinates where Vulkan evaluates them (which
-/// the compile layer notes), link, with sample shading exactly where the function writes memory
-/// at four samples. A per-sample function whose pixel reads all have forms on the
-/// device, compiled without `multisampled`, needs that input. A center varying has no pixel form on
-/// `moltenvk-m3` at a release not measured to read it at the pixel center itself (1.4.0), whose
-/// `InterpolateAtOffset` reads off the center, which the refusal names; at 1.4.1, measured so, its
-/// read as it is is the pixel form, as on a device whose offset reads from the center. A device
-/// without `sampleRateShading` is named for the side effects and for a read that recompiling would
-/// not fix.
+/// the compile layer notes), link, and none needs `sampleRateShading` for its multisample state.
+/// A per-sample function whose pixel reads all have forms on the device, compiled without
+/// `multisampled`, needs that input. A device without `sampleRateShading` is named for a read that
+/// recompiling would not fix, and links the side effects.
 #[test]
 fn multisampled_fragment_invocations_follow_metals_measured_rules() {
-    use crate::device::requirements::VkProperty;
-    use crate::device::DriverWorkaround;
     use crate::error::RuntimeInput;
     use crate::pipeline::descriptor::ColorAttachmentDescriptor;
     use crate::pipeline::stage_io::StageBuiltin as B;
@@ -2390,17 +2192,17 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
             fragment(vec![center.clone(), centroid.clone()], pixel_reads, false),
             Links,
         ),
-        // Side effects: the pipeline's sample shading runs them once per covered sample.
+        // Side effects: the function runs as the device runs it, and its pixel reads stay the
+        // pixel's, as without them.
         (fragment(vec![], vec![], true), Links),
         (
             fragment(vec![flat.clone()], vec![B::FrontFacing], true),
             Links,
         ),
         (fragment(vec![sample.clone()], vec![], true), Links),
-        // ... and moves the pixel reads to the sample, where they have no pixel form.
-        (fragment(vec![center.clone()], vec![], true), Center),
-        (fragment(vec![], vec![B::FragCoord], true), Recompile),
-        (fragment(vec![], vec![B::SampleMaskIn], true), Coverage),
+        (fragment(vec![center.clone()], vec![], true), Links),
+        (fragment(vec![], vec![B::FragCoord], true), Links),
+        (fragment(vec![], vec![B::SampleMaskIn], true), Links),
         // Side effects with `SampleId`: once per covered sample in both.
         (
             fragment(
@@ -2488,7 +2290,7 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
             compiled(vec![sample], vec![B::SampleMaskIn], true, false),
             Coverage,
         ),
-        // Side effects beside the pixel forms, and beside a center varying without its form.
+        // Side effects compiled for the pipeline, with the pixel forms and without them.
         (
             {
                 let mut a = compiled(vec![center.clone()], vec![B::FragCoord], true, false);
@@ -2503,7 +2305,7 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
                 a.interface.writes_memory = true;
                 a
             },
-            Center,
+            Links,
         ),
     ];
     let mut r = RenderLinkInputs::new();
@@ -2518,102 +2320,28 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
         Feature::PixelCoverageAtSampleRate,
     ));
     let recompile = Error::NeedsInput(RuntimeInput::Multisampled);
-    // The portability profile as another device, from its committed description changed by
-    // `edit`.
-    let mvk_as = |edit: &dyn Fn(&mut crate::device::DeviceDescription)| {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
-        let mut d = crate::device::DeviceDescription::from_khronos_json(
-            &std::fs::read_to_string(path).expect("profile"),
-            None,
-        )
-        .expect("description");
-        edit(&mut d);
-        crate::device::Device::new(d, DevicePolicy::default())
-            .expect("device")
-            .profile()
-            .clone()
-    };
-    // A device whose `InterpolateAtOffset` reads from the center: a driver other than
-    // MoltenVK's.
-    let centered_mvk = mvk_as(&|d| d.driver_id = None);
-    // MoltenVK on the Apple8 family under macOS 27 (`deviceID` 0x1B00_0208), whose
-    // `InterpolateAtOffset` reads off the center and which is not measured to read center
-    // varyings at the pixel center itself: it refuses a per-sample function's center varying
-    // naming the property it lacks; every other case links or is refused as on the same device
-    // without the deviation.
-    let unmeasured_mvk = mvk_as(&|d| d.device_id = 0x1B00_0208);
-    let needs_centered = Error::Unsupported(Unsupported::needs(
-        Feature::SampleRateShading,
-        Capability::Property(VkProperty::InterpolateAtOffsetCentered),
-    ));
-    let committed = profile("moltenvk-m3");
-    assert!(committed
-        .fields()
-        .enabled
-        .properties
-        .contains(&VkProperty::MetalCenterVaryings));
-    for (stem, p, biased) in [
-        ("moltenvk-m3", committed, false),
-        ("moltenvk-m3 as Apple8", unmeasured_mvk, true),
-        ("moltenvk-m3 centered", centered_mvk, false),
-        ("lavapipe", profile("lavapipe"), false),
-    ] {
+    for stem in ["moltenvk-m3", "lavapipe"] {
+        let p = profile(stem);
         for (i, (fa, expect)) in cases.iter().enumerate() {
             let one =
                 link(&[&va, fa], &at(1), &p).unwrap_or_else(|e| panic!("{stem} case {i}: {e}"));
-            assert!(
-                !one.graphics.expect("graphics").sample_shading,
+            assert_eq!(
+                one.graphics.expect("graphics").multisample_features(),
+                BTreeSet::new(),
                 "{stem} case {i}"
             );
             let four = link(&[&va, fa], &at(4), &p).map(|l| {
-                let g = l.graphics.expect("graphics");
+                // No multisample state of these needs `sampleRateShading`.
                 assert_eq!(
-                    g.sample_shading, fa.interface.writes_memory,
-                    "{stem} case {i}"
-                );
-                // Sample shading needs `sampleRateShading`.
-                assert_eq!(
-                    g.multisample_features(),
-                    if g.sample_shading {
-                        BTreeSet::from([VkFeature::SampleRateShading])
-                    } else {
-                        BTreeSet::new()
-                    },
+                    l.graphics.expect("graphics").multisample_features(),
+                    BTreeSet::new(),
                     "{stem} case {i}"
                 );
             });
-            // lavapipe splits a clipped triangle's pixel-rate fragments, which a read of the
-            // coverage sees (`split_pixel_fragments_are_refused_where_measured`).
-            let split = DriverWorkaround::ClippedTrianglesSplitPixelFragments;
             let want = match expect {
-                Links
-                    if p.fields().workarounds.contains(&split)
-                        && fa.interface.io.builtins.contains(&B::SampleMaskIn) =>
-                {
-                    Err(Error::Unsupported(Unsupported::driver_defect(
-                        Feature::PixelCoverage,
-                        split,
-                    )))
-                }
-                // ... and a centroid varying of a function that sample shading may leave at pixel
-                // rate (only a `Sample` input makes it per sample); one that surely runs per sample
-                // reads it at its sample, which no split moves.
-                Links
-                    if p.fields().workarounds.contains(&split)
-                        && fa.interface.io.inputs.contains(&centroid)
-                        && !fa.interface.io.builtins.contains(&B::SampleId)
-                        && !fa.interface.writes_memory =>
-                {
-                    Err(Error::Unsupported(Unsupported::driver_defect(
-                        Feature::CentroidVarying,
-                        split,
-                    )))
-                }
                 Links => Ok(()),
                 Coverage => Err(coverage.clone()),
                 Recompile => Err(recompile.clone()),
-                Center if biased => Err(needs_centered.clone()),
                 // Compiled for the pipeline, the function would read them at the pixel.
                 Center if !fa.interface.io.multisampled => Err(recompile.clone()),
                 Center => Err(refused.clone()),
@@ -2621,15 +2349,17 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
             assert_eq!(four, want, "{stem} case {i} at 4 samples");
         }
     }
-    let p = profile("vk12-floor");
+    // `runtime-floor` without `sampleRateShading`, which the runtime's floor requires.
+    let p = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::SampleRateShading],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
     assert!(!p.fields().fragment.sample_rate_shading);
-    assert_eq!(
-        link(&[&va, &cases[1].0], &at(4), &p).unwrap_err(),
-        Error::Unsupported(Unsupported::needs(
-            Feature::SampleRateShading,
-            Capability::Feature(VkFeature::SampleRateShading)
-        ))
-    );
+    // The side effects need no sample shading, so the device links them at four samples.
+    assert!(cases[1].0.interface.writes_memory);
+    link(&[&va, &cases[1].0], &at(4), &p).expect("side effects at four samples");
     link(&[&va, &cases[1].0], &at(1), &p).expect("one sample");
     assert_eq!(cases[12].1, Recompile);
     assert_eq!(
@@ -2642,114 +2372,10 @@ fn multisampled_fragment_invocations_follow_metals_measured_rules() {
     // The pixel's coverage at sample rate is no device's to gain: a device without
     // `sampleRateShading` refuses it as not representable too, not as the feature it lacks.
     let covering: Vec<_> = cases.iter().filter(|(_, at4)| *at4 == Coverage).collect();
-    assert_eq!(covering.len(), 3);
+    assert_eq!(covering.len(), 2);
     for (fa, _) in covering {
         assert_eq!(link(&[&va, fa], &at(4), &p).unwrap_err(), coverage);
     }
-}
-
-/// Lavapipe rasterizes a triangle it clips as several, so at more than one sample a pixel-rate
-/// fragment runs once per piece in a pixel on their shared edge, with that piece's coverage.
-/// Measured with a bare Vulkan program: `SampleMask` holds part of the pixel's samples and a
-/// `Centroid` input moves to the first covered sample; a center input
-/// stays at the pixel center. So every committed profile whose driver is lavapipe, and only those,
-/// carries the defect, and link refuses there exactly a multisampled pixel-rate function that reads
-/// `[[sample_mask]]` or a centroid varying, naming the defect; at one sample, and with a center or
-/// flat varying alone, it links.
-#[test]
-fn split_pixel_fragments_are_refused_where_measured() {
-    use crate::device::DriverWorkaround;
-    use crate::pipeline::descriptor::ColorAttachmentDescriptor;
-    use crate::pipeline::stage_io::StageBuiltin as B;
-    let defect = DriverWorkaround::ClippedTrianglesSplitPixelFragments;
-    let f4 = io_ty(IoNumeric::Float, 4);
-    let smooth = |sampling| {
-        Some(Interpolation::Smooth {
-            sampling,
-            perspective: true,
-        })
-    };
-    let mut vs = iface(Stage::Vertex, vec![], vec![]);
-    vs.io = positioned(
-        Stage::Vertex,
-        stage_io(
-            vec![],
-            ["c", "k", "f"]
-                .iter()
-                .map(|n| varying(n, f4, None))
-                .collect(),
-        ),
-    );
-    let va = artifact(vs, None);
-    let fragment = |inputs: Vec<IoVariable>, builtins: Vec<B>| {
-        let mut fs = iface(Stage::Fragment, vec![], vec![]);
-        fs.io = stage_io(inputs, vec![color(0, 0, f4)]);
-        fs.io.builtins = builtins;
-        artifact(fs, None)
-    };
-    let center = varying("c", f4, smooth(Sampling::Center));
-    let centroid = varying("k", f4, smooth(Sampling::Centroid));
-    let flat = varying("f", f4, Some(Interpolation::Flat));
-    // Each function, and the feature a split device refuses at 4 samples.
-    let cases = [
-        (
-            fragment(vec![], vec![B::SampleMaskIn]),
-            Some(Feature::PixelCoverage),
-        ),
-        (
-            fragment(vec![centroid.clone()], vec![]),
-            Some(Feature::CentroidVarying),
-        ),
-        (
-            fragment(vec![centroid, center.clone()], vec![B::SampleMaskIn]),
-            Some(Feature::PixelCoverage),
-        ),
-        (
-            fragment(vec![center, flat], vec![B::FragCoord, B::SampleMaskOut]),
-            None,
-        ),
-    ];
-    let mut r = RenderLinkInputs::new();
-    r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
-    let at = |samples: u32| {
-        let mut r = r.clone();
-        r.raster_sample_count = samples;
-        LinkInputs::Render(Box::new(r))
-    };
-    let profiles = crate::spirv::testing::committed_profiles().expect("profiles");
-    let mut split = Vec::new();
-    for (stem, p) in &profiles {
-        let has = p.fields().workarounds.contains(&defect);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../metal2vulkan-validation/profiles/{stem}.json"));
-        let description = crate::device::DeviceDescription::from_khronos_json(
-            &std::fs::read_to_string(path).expect("profile"),
-            None,
-        )
-        .expect("description");
-        assert_eq!(
-            has,
-            description.driver_id == Some(vk::DriverId::MESA_LLVMPIPE),
-            "{stem}"
-        );
-        if has {
-            split.push(stem.as_str());
-        }
-        for (i, (fa, refused)) in cases.iter().enumerate() {
-            link(&[&va, fa], &at(1), p).unwrap_or_else(|e| panic!("{stem} case {i}: {e}"));
-            let four = link(&[&va, fa], &at(4), p).map(|_| ());
-            let want = match refused {
-                Some(feature) if has => Err(Error::Unsupported(Unsupported::driver_defect(
-                    feature.clone(),
-                    defect,
-                ))),
-                _ => Ok(()),
-            };
-            assert_eq!(four, want, "{stem} case {i} at 4 samples");
-        }
-    }
-    split.sort_unstable();
-    assert_eq!(split, ["gate-lavapipe", "gate-lavapipe-x86_64", "lavapipe"]);
 }
 
 /// The graphics state states whether the fragment function reads `[[barycentric_coord]]`, from the
@@ -2798,60 +2424,6 @@ fn the_graphics_state_states_whether_the_fragment_function_reads_barycentric_coo
     }
     let none = stage(Stage::Fragment, StageIo::default());
     assert!(!reads(&va, Some(&none)), "no inputs");
-    assert!(!reads(&va, None), "no fragment function");
-}
-
-/// The graphics state states whether the fragment function may read its position's z or w lanes,
-/// from the fragment stage's `FragCoord` builtin and `position_depth`: the position read for its
-/// depth does; read for its x and y alone, it does not, nor a function that reads no position, nor
-/// a pipeline without a fragment function.
-#[test]
-fn the_graphics_state_states_whether_the_fragment_function_reads_its_position_s_depth() {
-    use crate::pipeline::stage_io::StageBuiltin;
-    let p = profile("lavapipe");
-    let inputs = LinkInputs::Render(Box::default());
-    let f4 = io_ty(IoNumeric::Float, 4);
-    let stage = |stage: Stage, io: StageIo| {
-        let mut i = iface(stage, vec![], vec![]);
-        i.io = positioned(stage, io);
-        artifact(i, None)
-    };
-    let reads = |va: &FunctionArtifact, fa: Option<&FunctionArtifact>| {
-        let stages: Vec<&FunctionArtifact> = std::iter::once(va).chain(fa).collect();
-        link(&stages, &inputs, &p)
-            .unwrap()
-            .graphics
-            .expect("graphics")
-            .reads_position_depth
-    };
-    let va = stage(
-        Stage::Vertex,
-        stage_io(vec![], vec![varying("v", f4, None)]),
-    );
-    let with = |builtins: Vec<StageBuiltin>, position_depth: bool| StageIo {
-        builtins,
-        position_depth,
-        ..stage_io(vec![varying("v", f4, Some(Interpolation::Flat))], vec![])
-    };
-    let cases = [
-        (
-            "its position's depth",
-            vec![StageBuiltin::FragCoord],
-            true,
-            true,
-        ),
-        (
-            "its position's x and y",
-            vec![StageBuiltin::FragCoord],
-            false,
-            false,
-        ),
-        ("no position", vec![], false, false),
-    ];
-    for (name, builtins, position_depth, want) in cases {
-        let fa = stage(Stage::Fragment, with(builtins, position_depth));
-        assert_eq!(reads(&va, Some(&fa)), want, "{name}");
-    }
     assert!(!reads(&va, None), "no fragment function");
 }
 
@@ -2930,67 +2502,6 @@ fn the_graphics_state_masks_the_colors_the_fragment_function_writes() {
     );
     assert_eq!(outputs(Some(vec![])), 0, "no output");
     assert_eq!(outputs(None), 0, "no fragment function");
-}
-
-/// The graphics state states whether the fragment function reads a flat input, from the fragment
-/// stage's inputs: a flat varying does; a smooth one, perspective-correct or not, does not, nor a
-/// function of no inputs, nor a pipeline without a fragment function; the render target array index
-/// the vertex function writes, read as the `Layer` builtin, does.
-#[test]
-fn the_graphics_state_states_whether_the_fragment_function_reads_a_flat_input() {
-    use crate::pipeline::stage_io::StageBuiltin;
-    let p = profile("lavapipe");
-    let inputs = LinkInputs::Render(Box::default());
-    let f4 = io_ty(IoNumeric::Float, 4);
-    let stage = |stage: Stage, io: StageIo| {
-        let mut i = iface(stage, vec![], vec![]);
-        i.io = positioned(stage, io);
-        artifact(i, None)
-    };
-    let flat = |va: &FunctionArtifact, fa: Option<&FunctionArtifact>| {
-        let stages: Vec<&FunctionArtifact> = std::iter::once(va).chain(fa).collect();
-        link(&stages, &inputs, &p)
-            .unwrap()
-            .graphics
-            .expect("graphics")
-            .flat_fragment_inputs
-    };
-    let va = stage(
-        Stage::Vertex,
-        stage_io(vec![], vec![varying("v", f4, None)]),
-    );
-    let smooth = |perspective| {
-        Some(Interpolation::Smooth {
-            sampling: Sampling::Center,
-            perspective,
-        })
-    };
-    let cases = [
-        ("flat", Some(Interpolation::Flat), true),
-        ("perspective", smooth(true), false),
-        ("no perspective", smooth(false), false),
-    ];
-    for (name, interpolation, want) in cases {
-        let io = stage_io(vec![varying("v", f4, interpolation)], vec![]);
-        assert_eq!(flat(&va, Some(&stage(Stage::Fragment, io))), want, "{name}");
-    }
-    let none = stage(Stage::Fragment, StageIo::default());
-    assert!(!flat(&va, Some(&none)), "no inputs");
-    assert!(!flat(&va, None), "no fragment function");
-    let layered = |io: StageIo| StageIo {
-        builtins: vec![StageBuiltin::Layer],
-        ..io
-    };
-    let vl = stage(
-        Stage::Vertex,
-        layered(stage_io(vec![], vec![varying("v", f4, None)])),
-    );
-    let fl = stage(Stage::Fragment, layered(StageIo::default()));
-    assert!(flat(&vl, Some(&fl)), "the layer builtin");
-    assert!(
-        !flat(&vl, Some(&none)),
-        "a layer the fragment function does not read"
-    );
 }
 
 /// Refusal `u` tied to render pipeline attachment `attachment`, as link refuses that

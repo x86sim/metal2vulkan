@@ -1,42 +1,36 @@
-//! How BC1 to BC5 texels decode, ported from `runtime_lane::compressed_decode`.
+//! How BC1 to BC5 texels decode.
 //!
 //! The consumer's x86 guests hold BC textures, so what one texel of a block decodes to is a value a
-//! guest shader reads. The lane's expectation is not a table but a **rule** fitted bit for bit on an
+//! guest shader reads. The expectation is not a table but a **rule** fitted bit for bit on an
 //! Apple M4 ([`model`]): each endpoint widened by replicating its bits, an index's weight of 64,
 //! the sum `(64 - w) a + w b`, BC1 to BC3's channels rounded half up, BC4 and BC5's unrounded, an
 //! sRGB channel through Metal's twelve-bit table.
 //!
-//! **The port re-measures it here.** Record mode runs the case on this M3 Max, so each recording
-//! holds Metal's own 1,024 texels per format rather than a model's output, and the fitted rule
-//! becomes a cross-check instead of the expectation
-//! (the test `every_recorded_texel_is_the_lanes_fitted_rule`). That is the one thing the port adds:
-//! if Apple's decode ever moves, the recording moves with it and the rule's test says so, where the
-//! lane would have failed without saying which side was wrong.
+//! **Measured here too.** Record mode runs the case on an Apple M3 Max, so each recording holds
+//! Metal's own 1,024 texels per format rather than a model's output, and the fitted rule is a
+//! cross-check (the test `every_recorded_texel_is_the_fitted_rule`): if Apple's decode ever moves,
+//! the recording moves with it and the rule's test says which side moved.
 //!
 //! **One case per format**, so a venue that holds no texture of one answers its typed refusal there
-//! and the suite counts that format as [`LacksFeature`](crate::verdict::Verdict::LacksFeature). The
-//! lane walks the ten formats in one test, where a device missing one would take the whole lane
-//! down.
+//! and the suite counts that format as [`LacksFeature`](crate::verdict::Verdict::LacksFeature).
 //!
-//! Each case is four 16 x 16 textures of pseudorandom blocks — the lane's own splitmix64 stream at
-//! the lane's own seeds, so the bytes are the bytes the lane measured — read whole by the owned
-//! fixture `format_scout`'s `scout_read_f`, one thread a texel. A signed format's first round
-//! starts its first block with an endpoint of -128, which reads -1: the one hand-placed byte the
-//! lane uses, kept.
+//! Each case is four 16 x 16 textures of pseudorandom blocks — a splitmix64 stream at fixed seeds,
+//! so the bytes are the bytes the rule was fitted on — read whole by the owned fixture
+//! `format_scout`'s `scout_read_f`, one thread a texel. A signed format's first round starts its
+//! first block with an endpoint of -128, which reads -1: the one hand-placed byte.
 //!
-//! **The device's decode is the answer.** A BC texture keeps no decoded twin: every device samples
-//! its own BC image through its own decode, and one whose driver is not measured to decode a
-//! format as Metal does announces `compressed-texel-decode`, one of the device's native answers the
-//! suite declares for every case ([`crate::replay::NATIVE_NOTES`]). Like every native note it
-//! loosens no value, so where such a device's texels differ from Metal's the site is a
-//! `known-gaps.tsv` row of that venue naming the note and whether its stated bound covers the
-//! difference. On MoltenVK, whose driver has both facts, every texel compares exactly.
+//! **The device's decode is the answer.** Every device samples its own BC image through its own
+//! decode, the runtime's static note `compressed-texel-decode` of every block-compressed texture.
+//! Each round's texels are loosened by the largest difference that notice's catalogue entry
+//! (docs/API.md) states for the format's family on any driver, justified by the notice alone
+//! (`CompressedDecode::decode_bound`): a texel past it is the note's claim failing, a divergence.
 //!
 //! Nothing here can fault a GPU: one compute pass a round, one read-only texture, one buffer, one
 //! thread a texel inside the texture, no loop and no sampling.
 
-use crate::allowance::Allowance;
+use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{call, made, Abort, Bindings, Case, Failure, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::texture::{TextureRequest, Upload};
@@ -60,7 +54,7 @@ const TEXELS: usize = (SIDE * SIDE) as usize;
 /// The bytes one `float4` texel reads back as.
 const TEXEL_BYTES: usize = 16;
 
-/// The textures read per format, as the lane reads them.
+/// The textures read per format.
 const ROUNDS: u64 = 4;
 
 /// How Metal decodes a format's block.
@@ -90,7 +84,7 @@ impl Kind {
     }
 }
 
-/// One format the lane reads: the case's name, the raw `MTLPixelFormat` and how Metal decodes its
+/// One format the case reads: its name, the raw `MTLPixelFormat` and how Metal decodes its
 /// block. Whether its color is sRGB follows from the format number ([`model::srgb`]).
 struct Format {
     name: &'static str,
@@ -102,8 +96,8 @@ struct Format {
     kind: Kind,
 }
 
-/// Every BC1 to BC5 format, in the lane's order, because the seed of a round is the format's place
-/// in that order and the bytes must stay the bytes the lane measured.
+/// Every BC1 to BC5 format, in a fixed order, because the seed of a round is the format's place in
+/// that order and the bytes must stay the bytes the rule was fitted on.
 const FORMATS: [Format; 10] = [
     Format {
         name: "bc1-rgba",
@@ -169,7 +163,7 @@ const FORMATS: [Format; 10] = [
     },
 ];
 
-/// A splitmix64 stream of bytes: the lane's own, so a round's blocks are the lane's blocks.
+/// A splitmix64 stream of bytes, so a round's blocks are the same on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -186,9 +180,8 @@ impl Rng {
     }
 }
 
-/// The blocks of round `round` of the format at place `at`: the lane's seed, the lane's stream, and
-/// the lane's one hand-placed byte for a signed format's first round (an endpoint of -128, which
-/// reads -1 and is the inference the lane's Metal venues check).
+/// The blocks of round `round` of the format at place `at`: its seed, the stream, and the one
+/// hand-placed byte for a signed format's first round (an endpoint of -128, which reads -1).
 fn blocks(at: usize, round: u64, kind: Kind) -> Vec<u8> {
     let mut rng = Rng(0x5eed_bc00 + 0x100 * at as u64 + round);
     let mut blocks = rng.bytes(16 * kind.block_bytes());
@@ -203,7 +196,7 @@ pub struct CompressedDecode {
     at: usize,
 }
 
-/// Every format's case, in the lane's order.
+/// Every format's case, in `FORMATS` order.
 pub fn all() -> Vec<CompressedDecode> {
     (0..FORMATS.len())
         .map(|at| CompressedDecode { at })
@@ -228,6 +221,30 @@ impl CompressedDecode {
     /// round's blocks at four blocks a row.
     fn request<'a>(&self, uploads: &'a [Upload<'a>]) -> TextureRequest<'a> {
         TextureRequest::read_2d(self.format().format, SIDE, SIDE).loaded(uploads)
+    }
+
+    /// The largest difference from Metal's texel that `compressed-texel-decode`'s catalogue entry
+    /// (docs/API.md) states for the format's family, the largest of the drivers it names: a BC1
+    /// or BC2 channel 4/255 and BC3's 6/255 (its alpha), a BC4 or BC5 channel 7.4/255 and a signed
+    /// one 0.065, all on NVIDIA. An sRGB form's colour is the device's sRGB decode of a code within
+    /// 4/255 of Metal's, so its bound is that decode's largest step over 4/255, at the top of the
+    /// curve, which also covers its alpha. Both texels are `float`s, each its decode rounded by
+    /// up to half an ulp of a value below 1, so the bound takes that rounding of both on top: two
+    /// codes 6/255 apart can read 6/255 and a few billionths apart.
+    fn decode_bound(&self) -> f64 {
+        let format = self.format();
+        let rounding = f64::from(f32::EPSILON) / 2.0;
+        if model::srgb(format.format) {
+            let decode = |value: f64| ((value + 0.055) / 1.055).powf(2.4);
+            return decode(1.0) - decode(1.0 - 4.0 / 255.0) + rounding;
+        }
+        let bound = match format.kind {
+            Kind::Bc1 | Kind::Bc2 => 4.0 / 255.0,
+            Kind::Bc3 => 6.0 / 255.0,
+            Kind::Channels { signed: false, .. } => 7.4 / 255.0,
+            Kind::Channels { signed: true, .. } => 0.065,
+        };
+        bound + rounding
     }
 
     /// The bytes a row of blocks takes: four blocks of a 16-texel row.
@@ -270,25 +287,23 @@ impl Case for CompressedDecode {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // A driver not measured to decode this format as Metal does reads the device's decode of
-        // the texture's own BC image, announced `compressed-texel-decode`, and a texel's `float`
-        // value is the device's conversion of its decoded codes, announced
-        // `device-texel-conversion`: both native notes the suite declares for every case. They
-        // loosen no texel, and a texel they move is a `known-gaps.tsv` row of the venue. On a
-        // device whose sampler is Metal's neither fires, and every texel compares exactly there
-        // too.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 10 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
+        // The device's decode of the texture's own blocks, announced `compressed-texel-decode`
+        // where the runtime makes it, declared at the notices site, moves a texel by up to the
+        // largest difference its catalogue entry states for the format's family: each round's
+        // texels are loosened by that number and no further, justified by the notice, so a run
+        // past it is the note's claim failing. A texel's `float` value is also the device's
+        // conversion of its decoded codes (`device-texel-conversion`), which loosens nothing.
+        let mut all = vec![crate::replay::notice_allowance(
+            Degradation::CompressedTexelDecode.code(),
+        )];
+        for round in 0..ROUNDS {
+            all.push(Allowance::new(
+                format!("case/round/{round}/texels"),
+                Loosening::Absolute(self.decode_bound()),
+                Justification::notice(Degradation::CompressedTexelDecode),
+            ));
+        }
+        all
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -397,7 +412,7 @@ impl Case for CompressedDecode {
     }
 }
 
-/// Metal's decode of BC1 to BC5, as `runtime_lane::compressed_decode` fitted it on an Apple M4.
+/// Metal's decode of BC1 to BC5, as a rule fitted to an Apple M4's texels.
 ///
 /// It is **not** what any case here expects: the recordings hold Metal's own texels, measured on
 /// this M3 Max. The rule is kept so a test can hold the two against each other, which is the one
@@ -590,17 +605,17 @@ mod tests {
         assert_eq!(CompressedDecode::layout().extent(), TEXELS * TEXEL_BYTES);
     }
 
-    /// Every texel of every committed recording is the lane's fitted rule's.
+    /// Every texel of every committed recording is the fitted rule's.
     ///
-    /// This is the cross-check the port exists for. The recordings hold what Metal answered on this
-    /// M3 Max; the rule was fitted on an Apple M4. A difference means one of two things, and either
+    /// The recordings hold what Metal answered on an Apple M3 Max; the rule was fitted on an Apple
+    /// M4. A difference means one of two things, and either
     /// is a finding rather than something to edit away: Apple's decode moved between the chips or
     /// the releases, or the rule was never Metal's.
     ///
     /// A case with no recording yet is skipped by name, so the test says which: a missing recording
     /// is record mode's work, not a silent pass.
     #[test]
-    fn every_recorded_texel_is_the_lanes_fitted_rule() {
+    fn every_recorded_texel_is_the_fitted_rule() {
         let mut unrecorded = Vec::new();
         let mut differ = Vec::new();
         let mut checked = 0usize;
@@ -662,8 +677,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{checked} channels checked; Metal's recorded texels differ from the lane's fitted \
-             rule:\n{}",
+            "{checked} channels checked; Metal's recorded texels differ from the fitted rule:\n{}",
             differ.join("\n")
         );
         assert!(

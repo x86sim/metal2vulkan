@@ -35,6 +35,7 @@
 
 use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -45,7 +46,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture whose full-screen triangle and fills every draw here runs.
 pub(super) const FILLS: &str = "rt6_samples";
@@ -278,8 +278,8 @@ pub(super) fn shape(width: u32, samples: u32) -> Vec<u8> {
 }
 
 /// The clear colors: Metal's specials, every sixteenth code's value, and code and alpha-byte
-/// boundaries with their `f64` and `f32` neighbours — the subset of the probe's the lane kept, in
-/// the probe's order.
+/// boundaries with their `f64` and `f32` neighbours — a subset of the probe's, in the probe's
+/// order.
 fn clear_values() -> Vec<f64> {
     let mut values = vec![
         0.0,
@@ -357,7 +357,7 @@ pub(super) struct Format {
     pub(super) copies: bool,
 }
 
-/// Every extended-range render-target format, as the lane sweeps them.
+/// Every extended-range render-target format, in a fixed order.
 pub(super) const FORMATS: [Format; 6] = [
     Format {
         slug: "bgra10xr",
@@ -535,7 +535,7 @@ pub struct TargetDraw {
     half: bool,
 }
 
-/// Every draw the lane runs: each format from `half` and from `float`.
+/// Every draw the family runs: each format from `half` and from `float`.
 pub fn draws() -> Vec<TargetDraw> {
     let names: [[&str; 2]; 6] = [
         ["xr-draw-bgra10xr-half", "xr-draw-bgra10xr-float"],
@@ -593,29 +593,8 @@ impl Case for TargetDraw {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 22 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        let mut named = vec![crate::replay::shared_memory_notice()];
-        // A copying format's target is read back by a blit, through the compression Metal keeps
-        // a `BGRA10_XR` texture in: the note of the encoding the device's copy keeps
-        // (`compressed_blits::kept_encoding_notice`). The draw stores each field in its canonical
-        // encoding, so every value still compares exactly.
-        if self.format.copies {
-            named.extend(super::compressed_blits::kept_encoding_notice(
-                self.format.format.as_raw(),
-            ));
-        }
         if !self.half {
-            return named;
+            return Vec::new();
         }
         // `rt6_samples` is a fast-math module, so a pipeline that stores its `half4` fill into a
         // color attachment announces that the half output's rounding into the attachment may not be
@@ -626,10 +605,9 @@ impl Case for TargetDraw {
         // allowance fails the case if the notice stops firing, so it cannot outlive its reason. The
         // `float4` fill of the same outputs announces nothing and carries no allowance, which is
         // what makes the pairing worth recording.
-        named.push(crate::replay::notice_allowance(
+        vec![crate::replay::notice_allowance(
             Degradation::HalfOutputFastMathBlend.code(),
-        ));
-        named
+        )]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -797,21 +775,6 @@ impl Case for ClearTexels {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 22 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shader_refs(PLANES, &[READ_FLOAT])
     }
@@ -946,8 +909,8 @@ const ROUTE_COLORS: [[f64; 4]; 4] = [
     ],
 ];
 
-/// One shape whose clear route the lane measured: the target's side, whether it is of
-/// `ShaderWrite` usage, and whether the pass draws into the other attachment.
+/// One shape whose clear route was measured: the target's side, whether it is of `ShaderWrite`
+/// usage, and whether the pass draws into the other attachment.
 #[derive(Clone, Copy, Debug)]
 struct Route {
     name: &'static str,
@@ -1051,32 +1014,13 @@ impl Case for ClearRoutes {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 22 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        //
-        // The shapes Metal keeps compressed are read back by a blit through that compression:
-        // the note of the encoding the device's copy keeps, as the draws declare it.
-        let mut named = vec![crate::replay::shared_memory_notice()];
-        named.extend(super::compressed_blits::kept_encoding_notice(
-            self.format.format.as_raw(),
-        ));
         // On a venue that presents no texture compression the blit that reads `plain-16` back,
-        // through the texture the recording's Mac compressed, keeps the device's encoding where
-        // the recording holds the compressor's canonical one, and the runtime rewrites none
-        // under the suite's exact policy (`compressed_blits`'s declaration says why). Measured on
-        // the RTX 5080 Laptop: `case/plain-16/texels/*` alone differ against the recording with
-        // the key and matched before it.
-        named.push(crate::replay::without_compression("plain-16"));
-        named
+        // through the texture the recording's Mac compressed, keeps the device's encoding where the
+        // recording holds the compressor's canonical one, and the runtime announces no note for it
+        // (`compressed_blits`'s declaration says why). Measured on the RTX 5080 Laptop:
+        // `case/plain-16/texels/*` alone differ against the recording with the key and matched
+        // before it.
+        vec![crate::replay::without_compression("plain-16")]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

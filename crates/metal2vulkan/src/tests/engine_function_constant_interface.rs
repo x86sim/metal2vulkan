@@ -7,16 +7,14 @@
 //!   through a gated-off sampler, is an absent read: the texture is not declared in the specialized
 //!   function, so Metal leaves the read undefined, and its compiler's answer is that undefined
 //!   behaviour's fallout (a store of the value dropped, arithmetic on it NaN, a texture write of it
-//!   zero: the write of `kernel_absent_texture_reads_zero`'s authored case). The kernel sets
-//!   `StatusBits::ABSENT_ARGUMENT_READ` where the read runs and takes zero for it, and states
-//!   `RuntimeFact::AbsentArgumentRead`, reaching the status by address where the profile addresses
-//!   buffers and through the stage's binding of it elsewhere. An element of a gated-off texture
-//!   table, and a
-//!   gated-off sampler merged with a present one before the sample, are the absent handle where the
-//!   read reaches them (`src/tests/engine_absent_handles.rs` follows the handle through memory,
-//!   aggregates and merges). A write to (or fence of) the gated-off texture itself is dropped, as
-//!   Metal drops it on every device and layer measured. Gated on, the same kernels compile, without
-//!   the fact.
+//!   zero: the write of `kernel_absent_texture_reads_zero`'s authored case). The read takes zero
+//!   and marks nothing: no execution status, no status push
+//!   field or binding. An element of a gated-off texture table, and a gated-off sampler merged
+//!   with a present one before the sample, are the absent handle where the read reaches them
+//!   (`src/tests/engine_absent_handles.rs` follows the handle through memory, aggregates and
+//!   merges). A write to (or fence of) the gated-off texture itself is dropped, as Metal drops it
+//!   on every device and layer measured. Gated on, the same kernels compile.
+//! - A fragment function's read of a gated-off texture is the same absent read.
 //! - A gated-off input that only feeds an output gated by the same constant is not observed (the
 //!   return stores only declared outputs), so the entry compiles without either.
 //! - A gated-off value argument whose read nothing observes compiles (the read is `undef`); an
@@ -52,10 +50,10 @@ use crate::pipeline::link::LinkInputs;
 use crate::pipeline::lower_inputs::LoweringInputs;
 use crate::pipeline::relocate::relocate;
 use crate::pipeline::stage_io::{IoRole, StageBuiltin};
-use crate::pipeline::sym::{SlotClass, Stage};
+use crate::pipeline::sym::SlotClass;
 use crate::pipeline::testing::{
-    engine_dir, fixtures_dir, llvm_assemble, meter, profile, status_reach, status_reach_on,
-    AssembleError, Scratch,
+    engine_dir, fixtures_dir, llvm_assemble, llvm_assemble_text, meter, profile, status_reach,
+    AssembleError, Scratch, StatusReach,
 };
 use crate::spirv::testing::{check_words_valid, committed_profiles};
 
@@ -81,7 +79,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 /// `entry` compiled with the boolean constants `on` true and every other constant undefined.
@@ -139,7 +137,7 @@ fn varyings(a: &FunctionArtifact) -> Vec<String> {
 #[test]
 fn gated_off_vertex_outputs_leave_the_interface() {
     let Some(bc) = fixture() else { return };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         let off = compile_with(&bc, "fc_vertex_gated_outputs", &[], &p);
         assert_eq!(varyings(&off), ["generated(5shadeDv4_f)"], "{stem}");
@@ -187,7 +185,7 @@ fn a_gated_off_color_output_leaves_the_interface() {
             })
             .collect()
     };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         let off = compile_with(&bc, "fc_fragment_gated_color", &[], &p);
         assert_eq!(colors(&off), [0], "{stem}");
@@ -203,18 +201,16 @@ fn a_gated_off_color_output_leaves_the_interface() {
 #[test]
 fn an_unobserved_gated_off_input_compiles() {
     let Some(bc) = fixture() else { return };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         let off = compile_with(&bc, "fc_fragment_unobserved_input", &[], &p);
         assert!(off.interface.io.inputs.is_empty(), "{stem}");
         assert!(off.facts.is_empty(), "{stem}: {:?}", off.facts);
         validate(&off, &p);
     }
-    // Defined (and so declared), the color input is read: a framebuffer fetch. `vk12-floor` has
-    // neither ordered form, so it reads color 0's input attachment, ordered between draws alone
-    // and noted; `moltenvk-m3` orders a fetch only through the pixel interlock, in a storage form
-    // that needs its pipeline's state, which a standalone compile does not have.
-    for stem in ["vk12-floor", "moltenvk-m3"] {
+    // Defined (and so declared), the color input is read: a framebuffer fetch. Each profile reads
+    // color 0's input attachment, ordered between draws alone and noted.
+    for stem in ["runtime-floor", "moltenvk-m3"] {
         let r = compile_bitcode(
             &bc,
             EntryRef::Name("fc_fragment_unobserved_input"),
@@ -225,8 +221,8 @@ fn an_unobserved_gated_off_input_compiles() {
             &mut meter(),
             SPIRV_WORDS,
         );
-        match (stem, r) {
-            ("vk12-floor", Ok(a)) => {
+        match r {
+            Ok(a) => {
                 assert!(
                     a.facts
                         .contains(&RuntimeFact::FramebufferFetch { color: 0 }),
@@ -240,8 +236,7 @@ fn an_unobserved_gated_off_input_compiles() {
                     a.precision
                 );
             }
-            ("moltenvk-m3", Err(Error::NeedsInput(RuntimeInput::FramebufferFetch))) => {}
-            (_, other) => panic!("{stem}: declared color input: {:?}", other.map(|_| ())),
+            other => panic!("{stem}: declared color input: {:?}", other.map(|_| ())),
         }
     }
 }
@@ -269,24 +264,19 @@ fn compile_result(
     )
 }
 
-/// Assert that `entry` with `bools` set compiles, on every committed profile, into a kernel that
-/// states its absent reads (`AbsentArgumentRead`, and the `ExecutionStatus` the read marks,
-/// reached by address where the profile addresses buffers and through the stage's binding of it
-/// elsewhere) and validates, or needs a storage texture's format.
+/// Assert that `entry` with `bools` set compiles, on every committed profile, into a kernel whose
+/// absent reads take zero and mark nothing (no `ExecutionStatus`, no status push field or
+/// binding) and validates, or needs a storage texture's format.
 fn absent_read(bc: &[u8], entry: &str, bools: &[(u32, bool)]) {
     for (stem, p) in committed_profiles().expect("profiles") {
         match compile_result(bc, entry, bools, &p) {
             Ok(a) => {
-                let fact = RuntimeFact::AbsentArgumentRead {
-                    stage: Stage::Kernel,
-                };
-                assert!(a.facts.contains(&fact), "{stem}: {:?}", a.facts);
                 assert!(
-                    a.facts.contains(&RuntimeFact::ExecutionStatus),
+                    !a.facts.contains(&RuntimeFact::ExecutionStatus),
                     "{stem}: {:?}",
                     a.facts
                 );
-                assert_eq!(status_reach(&a), status_reach_on(&p), "{stem}: {entry}");
+                assert_eq!(status_reach(&a), StatusReach::None, "{stem}: {entry}");
                 validate(&a, &p);
             }
             Err(Error::NeedsInput(_)) => {}
@@ -300,16 +290,7 @@ fn absent_read(bc: &[u8], entry: &str, bools: &[(u32, bool)]) {
 fn compiles(bc: &[u8], entry: &str, bools: &[(u32, bool)]) {
     for (stem, p) in committed_profiles().expect("profiles") {
         match compile_result(bc, entry, bools, &p) {
-            Ok(a) => {
-                assert!(
-                    !a.facts
-                        .iter()
-                        .any(|f| matches!(f, RuntimeFact::AbsentArgumentRead { .. })),
-                    "{stem}: {:?}",
-                    a.facts
-                );
-                validate(&a, &p);
-            }
+            Ok(a) => validate(&a, &p),
             Err(Error::NeedsInput(_)) => {}
             Err(e) => panic!("{stem}: {entry} {bools:?}: {e}"),
         }
@@ -356,7 +337,7 @@ fn a_present_texture_through_an_absent_sampler_is_an_absent_read() {
 #[test]
 fn an_absent_input_feeding_only_an_absent_output_compiles() {
     let Some(bc) = fixture() else { return };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         let v = compile_with(&bc, "fc_vertex_input_to_output", &[], &p);
         assert!(varyings(&v).is_empty(), "{stem}");
@@ -503,7 +484,7 @@ fn inputs(a: &FunctionArtifact) -> Vec<String> {
 #[test]
 fn an_absent_input_stored_into_private_memory_nothing_reads_compiles() {
     let Some(bc) = private_input() else { return };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         let off = compile_with(&bc, "fc_fragment_private_input", &[], &p);
         assert_eq!(inputs(&off), ["generated(2stDv2_f)"], "{stem}");
@@ -784,4 +765,97 @@ fn an_observed_element_of_an_absent_texture_table_is_an_absent_read() {
     let entry = "fc_kernel_absent_table";
     absent_read(&bc, entry, &[(0, false)]);
     compiles(&bc, entry, &[(0, true)]);
+}
+
+/// Two functions whose one texture `t`, which the boolean constant 0 gates, each reads at (0, 0)
+/// on its one path: a fragment function returning the texel plus (0, 1, 0, 0), and a kernel
+/// storing the texel and `t`'s width into `out`.
+const ABSENT_READS: &str = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
+target triple = "air64_v28-apple-macosx26.0.0"
+
+@has_t.MTL_FC_INIT_0_b = linkonce_odr hidden local_unnamed_addr addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@__metal_implicit_fc_pred_0 = internal addrspace(2) global i8 0, align 1
+@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @_GLOBAL__sub_I_, ptr null }]
+
+define <4 x float> @fc_fragment_absent_read(ptr addrspace(1) %t) {
+  %s = tail call ptr addrspace(2) @air.get_read_sampler()
+  %r = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %t, ptr addrspace(2) %s, <2 x i32> zeroinitializer, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %v = extractvalue { <4 x float>, i8 } %r, 0
+  %c = fadd <4 x float> %v, <float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float 0.000000e+00>
+  ret <4 x float> %c
+}
+
+define void @fc_kernel_absent_read(ptr addrspace(1) %t, ptr addrspace(1) %out) {
+  %s = tail call ptr addrspace(2) @air.get_read_sampler()
+  %r = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %t, ptr addrspace(2) %s, <2 x i32> zeroinitializer, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %v = extractvalue { <4 x float>, i8 } %r, 0
+  store <4 x float> %v, ptr addrspace(1) %out, align 4
+  %w = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %t, i32 0)
+  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 4
+  store i32 %w, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+declare ptr addrspace(2) @air.get_read_sampler()
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+declare i8 @air.normalize_function_constant_predicate.i8(i8)
+
+define internal void @_GLOBAL__sub_I_() section "air.static_init" {
+  %1 = load i8, ptr addrspace(2) @has_t.MTL_FC_INIT_0_b, align 1
+  %2 = tail call i8 @air.normalize_function_constant_predicate.i8(i8 %1)
+  store i8 %2, ptr addrspace(2) @__metal_implicit_fc_pred_0, align 1
+  ret void
+}
+
+!air.fragment = !{!0}
+!air.kernel = !{!6}
+!air.function_constants = !{!10}
+!air.version = !{!20}
+!air.language_version = !{!21}
+
+!0 = !{ptr @fc_fragment_absent_read, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"t"}
+!5 = !{ptr addrspace(2) @__metal_implicit_fc_pred_0, !"bool", !"has_t"}
+!6 = !{ptr @fc_kernel_absent_read, !7, !8}
+!7 = !{}
+!8 = !{!4, !9}
+!9 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!10 = !{ptr addrspace(2) @has_t.MTL_FC_INIT_0_b, !"bool", !"has_t", i32 0}
+!20 = !{i32 2, i32 8, i32 0}
+!21 = !{!"Metal", i32 4, i32 0, i32 0}
+"#;
+
+/// With `t` gated off, each of [`ABSENT_READS`]' reads, in the fragment function and in the
+/// kernel, takes zero and marks nothing on every committed profile: no fact, no status push field
+/// or binding, and no texture slot. Each module validates.
+#[test]
+fn an_absent_read_takes_zero_and_marks_nothing() {
+    let bc = match llvm_assemble_text(ABSENT_READS) {
+        Ok(b) => b,
+        Err(AssembleError::Missing(why)) => {
+            eprintln!("SKIPPED: {why}");
+            return;
+        }
+        Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected the module: {why}"),
+    };
+    let off = [(0, false)];
+    for entry in ["fc_fragment_absent_read", "fc_kernel_absent_read"] {
+        for (stem, p) in committed_profiles().expect("profiles") {
+            let a = compile_result(&bc, entry, &off, &p)
+                .unwrap_or_else(|e| panic!("{stem} {entry}: {e}"));
+            assert!(
+                !a.facts.contains(&RuntimeFact::ExecutionStatus),
+                "{stem} {entry}: {:?}",
+                a.facts
+            );
+            assert_eq!(status_reach(&a), StatusReach::None, "{stem} {entry}");
+            assert_eq!(texture_slots(&a), Vec::<u32>::new(), "{stem} {entry}");
+            validate(&a, &p);
+        }
+    }
 }

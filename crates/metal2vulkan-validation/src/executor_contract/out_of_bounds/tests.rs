@@ -1,7 +1,38 @@
 use super::*;
 use crate::case::out_of_bounds::OutOfBounds;
-use crate::coverage::HostClass;
-use metal2vulkan::vk;
+
+/// A mechanism as the tests compare it: `<medium>:<check>`.
+pub(crate) trait Label {
+    fn label(self) -> String;
+}
+
+impl Label for Mechanism {
+    fn label(self) -> String {
+        let medium = match self.medium {
+            Medium::DescriptorView => "descriptor-view",
+            Medium::DeviceAddress => "device-address",
+            Medium::Arena => "arena",
+            Medium::TexelBuffer => "texel-buffer",
+            Medium::Image => "image",
+            Medium::TypedObject => "typed-object",
+            Medium::HandleTable => "handle-table",
+            Medium::ResourceId => "resource-id",
+            Medium::VertexInput => "vertex-input",
+            Medium::IndexBuffer => "index-buffer",
+            Medium::HandleArray => "handle-array",
+        };
+        let check = match self.check {
+            Check::Shader => "shader",
+            Check::ShaderReads => "shader-reads",
+            Check::Robust => "robust",
+            Check::Robust2 => "robust2",
+            Check::Binder => "binder",
+            Check::Padded => "padded",
+            Check::Unchecked => "unchecked",
+        };
+        format!("{medium}:{check}")
+    }
+}
 
 /// A kernel case reading `src` (binding 0, 16 bytes) out of bounds into `out` (binding 1, 32
 /// bytes): bytes 16..32 of the output are the out-of-bounds reads of target 0.
@@ -45,8 +76,6 @@ fn run(form: ContainmentForm, medium: Medium, check: Check, written: bool) -> Ou
             written,
             escaped: Some(0),
             past_end: Some(0),
-            escape_cause: None,
-            read_cause: None,
         }],
     }
 }
@@ -265,45 +294,6 @@ fn the_metal_oracle_records_zeros_in_the_read_bytes() {
     assert_eq!(threadgroup_reach(&case, 0), 0);
 }
 
-/// MoltenVK leaves a descriptor view's loads, stores, and atomics uncontained under its robust
-/// buffer encoding; an in-shader check, a device address, and a texel buffer are contained there,
-/// and no form is uncontained on another driver.
-#[test]
-fn moltenvk_refuses_exactly_the_forms_its_robust_encoding_leaves_uncontained() {
-    let moltenvk = Some(ExecutionClass::Host(HostClass(vk::DriverId::MOLTENVK)));
-    let radv = Some(ExecutionClass::Host(HostClass(vk::DriverId::MESA_RADV)));
-    let target = |form, medium, check| TargetRun {
-        resource: OutOfBoundsResource::Buffer { binding: 0 },
-        form,
-        mechanism: Mechanism { medium, check },
-        written: true,
-        escaped: Some(0),
-        past_end: Some(0),
-        escape_cause: None,
-        read_cause: None,
-    };
-    use ContainmentForm as F;
-    let robust_load = target(F::StorageBuffer, Medium::DescriptorView, Check::Robust);
-    let robust_atomic = target(F::BufferAtomic, Medium::DescriptorView, Check::Robust);
-    assert_eq!(
-        uncontained(&[robust_load.clone(), robust_atomic], moltenvk),
-        BTreeSet::from([RobustBufferForm::LoadStore, RobustBufferForm::Atomic])
-    );
-    assert!(uncontained(&[robust_load], radv).is_empty());
-    for contained in [
-        target(F::StorageBuffer, Medium::DescriptorView, Check::Shader),
-        target(F::DeviceAddress, Medium::DeviceAddress, Check::Shader),
-        target(F::TexelBuffer, Medium::TexelBuffer, Check::Robust),
-        target(F::Texture, Medium::Image, Check::Robust2),
-    ] {
-        assert!(
-            uncontained(std::slice::from_ref(&contained), moltenvk).is_empty(),
-            "{contained:?}"
-        );
-    }
-    assert!(uncontained(&[], None).is_empty());
-}
-
 /// [`case`] whose target is the texture at binding 0 (`texture_type` `ty`, four `r32_uint`
 /// texels), of `form`, with `reach_after`, and no read bytes: Metal defines its out-of-bounds
 /// results, so the whole output compares with Metal.
@@ -345,8 +335,6 @@ fn a_texel_buffer_target_is_judged_by_its_guard() {
             written: true,
             escaped,
             past_end,
-            escape_cause: None,
-            read_cause: None,
         }],
     };
     let output = golden();
@@ -373,8 +361,6 @@ fn a_texel_buffer_target_is_judged_by_its_guard() {
             written: true,
             escaped,
             past_end,
-            escape_cause: None,
-            read_cause: None,
         }],
     };
     let judge = |run: OutOfBoundsRun| matches(&image, &class, &output, &output, Some(&run));
@@ -460,8 +446,6 @@ fn embedded_run(
             written: true,
             escaped: guard,
             past_end: guard,
-            escape_cause: None,
-            read_cause: None,
         }],
     }
 }
@@ -521,8 +505,8 @@ fn a_loaded_pointers_buffer_reads_zero_and_is_guarded() {
 
 /// A thread-local array is a typed object and a handle array lies in its argument buffer: no
 /// host memory holds either beside the case's own, so neither has a guard. A read past the array is
-/// zero; a read past the handle array is a texel of a texture the case binds, or zero (the null
-/// handle), never another value.
+/// zero; a read past the handle array, through the handle table or a masked resource id, is a texel
+/// of a texture the case binds, or zero (the null handle or descriptor), never another value.
 #[test]
 fn an_in_layout_target_has_no_guard_and_its_own_read_rule() {
     let class = ComparisonClass::Exact;
@@ -540,6 +524,14 @@ fn an_in_layout_target_has_no_guard_and_its_own_read_rule() {
             },
             ContainmentForm::HandleArrayIndex,
             Medium::HandleTable,
+        ),
+        (
+            OutOfBoundsResource::ArgumentBufferTextureArray {
+                buffer_binding: 0,
+                field_offset: 0,
+            },
+            ContainmentForm::HandleArrayIndex,
+            Medium::ResourceId,
         ),
     ] {
         let case = embedded_case(resource, form, texel);
@@ -561,7 +553,7 @@ fn an_in_layout_target_has_no_guard_and_its_own_read_rule() {
         let resident = with_reads([texel, 0, texel, 0]);
         assert_eq!(
             matches(&case, &class, &golden(), &resident, Some(&ran(None))),
-            medium == Medium::HandleTable,
+            medium != Medium::TypedObject,
             "{form}"
         );
         let foreign = with_reads([0xA000_0005, 0, 0, 0]);
@@ -583,14 +575,6 @@ fn an_in_layout_target_has_no_guard_and_its_own_read_rule() {
     for check in [Check::Shader, Check::Robust, Check::Robust2] {
         assert_eq!(rule(Medium::TypedObject, check), ReadRule::Zero);
         assert_eq!(rule(Medium::HandleTable, check), ReadRule::ResidentTexels);
-        assert_eq!(
-            Mechanism {
-                medium: Medium::HandleTable,
-                check
-            }
-            .robust_buffer_form(ContainmentForm::HandleArrayIndex),
-            None
-        );
     }
 }
 
@@ -632,11 +616,10 @@ fn candidate_row(
         air_sha256: metal.air_sha256.clone(),
         input_sha256: metal.input_sha256.clone(),
         golden_output_sha256: metal.metal_output_sha256.clone(),
-        spv_sha256: SPV_SHA256.into(),
+        spv_sha256: Some(SPV_SHA256.into()),
         translator_fingerprint: TRANSLATOR.into(),
         candidate_output_sha256: crate::hash::sha256_bytes(output),
         output_b64: b64(output),
-        backend: crate::observation::Backend::Vulkan,
         environment_id: "vk-env".into(),
         environment: serde_json::json!({}),
         executor_abi: "executor-v1".into(),
@@ -645,13 +628,13 @@ fn candidate_row(
             device: None,
             product: "p".into(),
             restricted_to: None,
-            leg: None,
             modules: vec![],
             out_of_bounds: Some(run),
             rate_map_pass: None,
             artifact: None,
         }),
         status,
+        held_open_by: None,
     }
 }
 
@@ -662,9 +645,8 @@ fn dependencies<'a>(
     crate::observation::CandidateDependencies {
         case,
         metal,
-        spv_sha256: SPV_SHA256,
+        spv_sha256: Some(SPV_SHA256),
         translator_fingerprint: TRANSLATOR,
-        backend: crate::observation::Backend::Vulkan,
         environment_id: "vk-env",
         executor_abi: "executor-v1",
     }
@@ -794,6 +776,7 @@ fn thread_memory_is_contained_by_the_typed_arrays_check_only() {
             attributes: &BTreeMap::new(),
             resident_roots: true,
             handle_table: true,
+            policy: DevicePolicy::RESIDENT_TABLES,
             strategies: &strategies,
         };
         let target = OutOfBoundsTarget {
@@ -857,9 +840,135 @@ fn thread_memory_is_contained_by_the_typed_arrays_check_only() {
     }
 }
 
-/// A draw's targets: a fixed-function attribute is contained by the device's buffer robustness, and
-/// only there; a direct indexed draw's index buffer by the padded copy of its indices on every
-/// device; a top-level texture array by the clamped handle-array load. A pulled attribute is
+/// Under the identity domains a pointer loaded from an argument buffer is the device address it
+/// holds, which nothing checks, so the run is refused before anything is made; an argument
+/// buffer's texture array is the descriptor arrays the loaded id's masked index reads, whose read
+/// past the array is a texel of a texture the case binds or zero. Under the resident table and the
+/// handle table, the same module facts without the table's reads access neither target.
+#[test]
+fn the_identity_domains_leave_a_loaded_pointer_unchecked_and_mask_a_resource_id() {
+    use crate::candidate::engine::out_of_bounds_run;
+    use crate::check::admission::{ExecutorError, NotSupported};
+    use metal2vulkan::pipeline::{StrategyCensus, StrategyUse};
+    let profiles = crate::coverage::tier_table::committed_profiles().unwrap();
+    let profile = &profiles
+        .iter()
+        .find(|entry| entry.tier.stem == "lavapipe")
+        .unwrap()
+        .profile;
+    let mut identity = DevicePolicy::default();
+    identity.pointer_domain = PointerDomain::Identity;
+    identity.handle_domain = HandleDomain::Identity;
+    let slots = BTreeMap::from([(
+        SlotRef {
+            stage: SymStage::Kernel,
+            class: SlotClass::Buffer,
+            index: 1,
+        },
+        // The argument buffer's slot, read through its device address (the interface has no
+        // constructor outside the product).
+        serde_json::from_value::<SlotInterface>(serde_json::json!({"Buffer": {
+            "access": {"read": true, "write": false},
+            "window": "Whole",
+            "form": "Psb",
+            "kind": "Buffer",
+        }}))
+        .unwrap(),
+    )]);
+    let mut strategies = StrategyCensus::default();
+    for name in [
+        "access.dynamic.load_pointer",
+        "access.dynamic.load",
+        "access.handle.lookup",
+    ] {
+        strategies
+            .entries
+            .insert(name.into(), StrategyUse::default());
+    }
+    let attributes = BTreeMap::new();
+    let module = |policy| ModuleFacts {
+        stage: SymStage::Kernel,
+        slots: &slots,
+        attributes: &attributes,
+        resident_roots: false,
+        handle_table: false,
+        policy,
+        strategies: &strategies,
+    };
+    let target = |resource, form| OutOfBoundsTarget {
+        resource,
+        form,
+        reach_before: 0,
+        reach_after: 16,
+    };
+    let pointer = target(
+        OutOfBoundsResource::ArgumentBufferBuffer {
+            buffer_binding: 1,
+            field_offset: 0,
+        },
+        ContainmentForm::LoadedPointer,
+    );
+    let handles = target(
+        OutOfBoundsResource::ArgumentBufferTextureArray {
+            buffer_binding: 1,
+            field_offset: 0,
+        },
+        ContainmentForm::HandleArrayIndex,
+    );
+    let loaded = containment(&pointer, &module(identity), profile).unwrap();
+    assert_eq!(
+        (loaded.form, loaded.mechanism.label(), loaded.written),
+        (
+            ContainmentForm::LoadedPointer,
+            "device-address:unchecked".into(),
+            false
+        )
+    );
+    let masked = containment(&handles, &module(identity), profile).unwrap();
+    assert_eq!(
+        (masked.form, masked.mechanism.label()),
+        (
+            ContainmentForm::HandleArrayIndex,
+            "resource-id:shader".into()
+        )
+    );
+    assert_eq!(
+        read_rule(ContainmentForm::HandleArrayIndex, masked.mechanism, false),
+        ReadRule::ResidentTexels
+    );
+    assert!(
+        containment(&pointer, &module(DevicePolicy::RESIDENT_TABLES), profile)
+            .unwrap_err()
+            .contains("no memory through a pointer loaded")
+    );
+    assert!(
+        containment(&handles, &module(DevicePolicy::RESIDENT_TABLES), profile)
+            .unwrap_err()
+            .contains("resolves no handle")
+    );
+    // The unchecked target refuses the run, naming its form; the masked one runs.
+    match out_of_bounds_run(profile, &module(identity), &[pointer, handles.clone()]) {
+        Err(ExecutorError::NotSupported(refused @ NotSupported::Uncontained { .. })) => {
+            assert_eq!(
+                refused.outcome(),
+                "not_supported{uncontained:unchecked loaded_pointer}"
+            );
+            assert!(
+                refused.to_string().contains("checks the accesses"),
+                "{refused}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let run = out_of_bounds_run(profile, &module(identity), &[handles])
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.targets[0].mechanism, masked.mechanism);
+}
+
+/// A draw's targets: a fixed-function attribute is unchecked on every device (no buffer
+/// robustness bounds it); a direct indexed draw's index buffer is contained by the padded copy of
+/// its indices on every device; a top-level texture array by the clamped handle-array load. A pulled attribute is
 /// contained as the slot its fetch names, which a module that does not bind it does not access.
 #[test]
 fn a_draws_targets_are_contained_by_their_fetch() {
@@ -879,6 +988,7 @@ fn a_draws_targets_are_contained_by_their_fetch() {
             attributes,
             resident_roots: false,
             handle_table: false,
+            policy: DevicePolicy::RESIDENT_TABLES,
             strategies,
         };
         let target = OutOfBoundsTarget {
@@ -906,24 +1016,11 @@ fn a_draws_targets_are_contained_by_their_fetch() {
                 strategies,
             )
         };
-        let shader = !matches!(
-            profile.containment(),
-            Containment::On {
-                robust: Robustness::Rba2
-            }
-        ) && profile.checks_buffers_in_shader();
-        match vertex(attribute, ContainmentForm::VertexInput, &fixed, &strategies) {
-            Ok(contained) => {
-                assert!(!shader, "{label}");
-                assert_eq!(contained.mechanism.medium, Medium::VertexInput, "{label}");
-                assert_ne!(contained.mechanism.check, Check::Shader, "{label}");
-                assert!(!contained.written, "{label}");
-            }
-            Err(why) => assert!(
-                shader && why.contains("which contains nothing"),
-                "{label}: {why}"
-            ),
-        }
+        let contained = vertex(attribute, ContainmentForm::VertexInput, &fixed, &strategies)
+            .unwrap_or_else(|why| panic!("{label}: {why}"));
+        assert_eq!(contained.mechanism.medium, Medium::VertexInput, "{label}");
+        assert_eq!(contained.mechanism.check, Check::Unchecked, "{label}");
+        assert!(!contained.written, "{label}");
         assert!(
             vertex(
                 attribute,
@@ -955,13 +1052,7 @@ fn a_draws_targets_are_contained_by_their_fetch() {
             },
             "{label}"
         );
-        // It leaves nothing to a driver's robust buffer encoding, and a read past it is zero.
-        assert_eq!(
-            index
-                .mechanism
-                .robust_buffer_form(ContainmentForm::IndexBuffer),
-            None
-        );
+        // A read past it is zero.
         assert_eq!(
             read_rule(ContainmentForm::IndexBuffer, index.mechanism, false),
             ReadRule::Zero
@@ -1005,24 +1096,5 @@ fn a_draws_targets_are_contained_by_their_fetch() {
     assert_eq!(
         read_rule(ContainmentForm::HandleArrayIndex, handle_array, false),
         ReadRule::ResidentTexels
-    );
-    // The robust vertex fetch is MoltenVK's uncontained vertex input.
-    let moltenvk = Some(ExecutionClass::Host(HostClass(vk::DriverId::MOLTENVK)));
-    let vertex_input = TargetRun {
-        resource: attribute,
-        form: ContainmentForm::VertexInput,
-        mechanism: Mechanism {
-            medium: Medium::VertexInput,
-            check: Check::Robust,
-        },
-        written: false,
-        escaped: Some(0),
-        past_end: Some(0),
-        escape_cause: None,
-        read_cause: None,
-    };
-    assert_eq!(
-        uncontained(&[vertex_input], moltenvk),
-        BTreeSet::from([RobustBufferForm::VertexInput])
     );
 }

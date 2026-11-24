@@ -1,5 +1,4 @@
-//! What an event orders, measured on Metal: the four ordering facts `runtime_lane::events` holds
-//! as assertions of the runtime against itself.
+//! What an event orders, measured on Metal: four ordering facts.
 //!
 //! An event's value only rises ([`super::shared_events`]) — these cases are about what it
 //! **orders**. A command buffer's `encodeWaitForEvent:value:` holds that command buffer, and the
@@ -36,14 +35,15 @@
 //! alone ([`LONG_FILLS`] of [`LONG_FILL_BYTES`] into a private buffer): no loop runs on the GPU,
 //! so nothing can hang.
 //!
+//! On `metal2vulkan-runtime` the `MTLEvent` row's waiting command buffer may still read `Committed`,
+//! with no handler run, though its wait is met: the runtime schedules a command buffer once
+//! its device's one submit thread is free, and Metal promises no time between a command buffer's
+//! dependencies resolving and its scheduling. The case declares that in its allowances.
+//!
 //! # What this pulls forward
 //!
-//! Every one of these numbers was ours before. `runtime_lane::events` runs the shapes on the
-//! runtime and asserts the answers the module's prose says Metal gave — "as measured on Metal",
-//! "measured on the M3 and the M4" — with no Metal leg in the test and, for the statuses, no
-//! measurement written down at all beyond the word in the comment. Here both sides run and the
-//! answers are compared field by field, so the statuses, the handler order and the bytes are
-//! Metal's.
+//! Both sides run and the answers are compared field by field, so the statuses, the handler order
+//! and the bytes are Metal's.
 //!
 //! The commit order of [`CROSS_QUEUE_WAIT`] is the one that can deadlock. Two logical queues share
 //! the device's `VkQueue`s — one on most devices — so a wait committed ahead of its signal
@@ -64,28 +64,68 @@
 //!
 //! # What is deliberately not here
 //!
-//! The lane's **tracked** resources across queues (`a_tracked_buffer_across_queues_follows_the_
-//! commit_order` and its texture twin) are left out: the answer there is "what the order the
-//! runtime schedules them in gives it", which is a fact about our scheduler with Metal's own
-//! answer attached by a comment naming an M4. It is a real question and it deserves a case; it
-//! needs the hazard-tracking vocabulary first, and a hazard between two queues needs work big
-//! enough to overlap, which a bytes record of a small buffer cannot stand in for.
+//! **Tracked** resources across queues, a buffer's and a texture's, are left out: the answer there
+//! is "what the order the runtime schedules them in gives it", which is a fact about our scheduler.
+//! A case of it needs the hazard-tracking vocabulary, and a hazard between two queues needs work
+//! big enough to overlap, which a bytes record of a small buffer cannot stand in for.
 //!
-//! The lane's refusals of an event command **with an encoder open** and **after the commit** are
-//! left out, and must stay out: the lane's own prose says Metal asserts there, which ends Metal's
-//! process. They are the shape the suite has no outcome kind for, and the round's rule is that
-//! such a design is written down and left unbuilt. The runtime's typed refusals of both stay
-//! `runtime_lane` assertions.
+//! An event command **with an encoder open** and **after the commit** is left out, and must stay
+//! out: Metal asserts there, which ends Metal's process. It is the shape the suite has no outcome
+//! kind for.
 
+use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{Abort, Case, Input, MetalSource, Side};
 use crate::event_orders::{
     COMPLETED, HELD_FOR, LONG_FILLS, LONG_FILL_BYTES, RUNNING_WINDOW, SCHEDULED, SCRATCH,
     SIGNAL_WAIT,
 };
-use crate::transcript::{Node, Observed, Sites, Value};
+use crate::transcript::{Negative, Node, Observed, Sites, Value};
 
 /// A wait committed before the signal that meets it.
 pub const CROSS_QUEUE_WAIT: &str = "event-cross-queue-wait";
+
+/// The slug of `docs/API.md`'s accepted difference that says `metal2vulkan-runtime` schedules a
+/// command buffer waiting for a shared event's value as it is submitted
+/// ([`shared_wait_scheduled_as_submitted`]).
+const SHARED_WAIT_SCHEDULED_AS_SUBMITTED: &str =
+    "a-command-buffer-that-waits-for-a-shared-event-s-value-is-scheduled-as-it-is-submitted";
+
+/// The declaration [`WAIT_BEHIND_A_RUNNING_SIGNAL`]'s `MTLSharedEvent` row needs on
+/// `metal2vulkan-runtime`: the waiting command buffer's status while the signaller runs may be
+/// `Committed` or `Scheduled`, and its handlers then none or the scheduled one.
+///
+/// **What it rests on**, the accepted difference [`SHARED_WAIT_SCHEDULED_AS_SUBMITTED`] names:
+/// MTLCommandBuffer.h describes `Scheduled` as "All dependencies have been resolved and the
+/// command buffer has been scheduled for execution", and `encodeWaitForEvent:value:` as a command
+/// that "pauses execution of this command buffer until the specified event reaches a given
+/// value", so execution pauses after scheduling. The runtime schedules a waiter whose signal is
+/// submitted as it is submitted, for a shared event as for a plain one, once its submit thread is
+/// free ([`SCHEDULED_ONCE_THE_SUBMIT_THREAD_IS_FREE`]). The M3 Max holds it at `Committed` with no
+/// handler run until the value lands, which no documented Metal states.
+///
+/// **It loosens those two sites alone**; the event's value while the signaller runs still
+/// compares exactly.
+fn shared_wait_scheduled_as_submitted() -> Vec<Allowance> {
+    let justified = || Justification::accepted(SHARED_WAIT_SCHEDULED_AS_SUBMITTED);
+    vec![
+        Allowance::new(
+            "case/order/shared-event/waiting/status-while-the-signaller-runs",
+            Loosening::AnyOf(vec![
+                Value::unit_variant("Committed"),
+                Value::unit_variant("Scheduled"),
+            ]),
+            justified(),
+        ),
+        Allowance::new(
+            "case/order/shared-event/waiting/handlers-while-the-signaller-runs",
+            Loosening::AnyOf(vec![
+                Value::Nothing(Negative::RanNothing),
+                Value::Lines(vec![SCHEDULED.to_owned()]),
+            ]),
+            justified(),
+        ),
+    ]
+}
 
 /// Two queues signalling one shared event, in both orders.
 pub const HIGHEST_SIGNAL: &str = "event-highest-signal";
@@ -163,23 +203,17 @@ impl Case for EventOrder {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // The cross-queue row is the one row of the family that reads an answer back out of a
-        // `Shared` buffer, and on a device without unified memory the runtime announces
-        // `shared-in-system-memory` for it (`crate::replay::shared_memory_notice` holds the whole
-        // reason). It declares the notices site alone: the scratch words still compare exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): the notice fired for
-        // `event-cross-queue-wait` alone, which was divergent on that field and nothing else, and
-        // the other three rows were exact (replay-nvidia.log). So the other three name nothing:
-        // what they read back is a count our side holds, not a buffer the device wrote.
+    fn allowances(&self) -> Vec<Allowance> {
         match self.shape {
-            // The waiting command buffer's scratch is read back out of a `Shared` buffer, as
-            // the cross-queue row's is.
-            Shape::CrossQueueWait | Shape::WaitBehindRunningSignal => {
-                vec![crate::replay::shared_memory_notice()]
+            Shape::WaitBehindRunningSignal => {
+                let mut allowances = scheduled_once_the_submit_thread_is_free();
+                allowances.extend(shared_wait_scheduled_as_submitted());
+                allowances
             }
-            Shape::HighestSignal | Shape::Held | Shape::SignalBeforeWait => Vec::new(),
+            Shape::CrossQueueWait
+            | Shape::HighestSignal
+            | Shape::Held
+            | Shape::SignalBeforeWait => Vec::new(),
         }
     }
 
@@ -289,4 +323,45 @@ impl Case for EventOrder {
         }
         Ok(())
     }
+}
+
+/// The slug of `docs/API.md`'s accepted difference that says when `metal2vulkan-runtime` schedules a
+/// command buffer ([`scheduled_once_the_submit_thread_is_free`]).
+const SCHEDULED_ONCE_THE_SUBMIT_THREAD_IS_FREE: &str =
+    "the-runtime-schedules-a-command-buffer-once-its-submit-thread-is-free";
+
+/// The declaration [`WAIT_BEHIND_A_RUNNING_SIGNAL`]'s `MTLEvent` row needs on `metal2vulkan-runtime`:
+/// the waiting command buffer's status while the signaller runs may be `Committed` or
+/// `Scheduled`, and its handlers then none or the scheduled one.
+///
+/// **What it rests on**, the accepted difference [`SCHEDULED_ONCE_THE_SUBMIT_THREAD_IS_FREE`]
+/// names: Apple's `Scheduled` is "All dependencies have been resolved and the command buffer has
+/// been scheduled for execution", with no time promised between the two, and the runtime
+/// schedules a command buffer on its device's one submit thread, once that thread's earlier
+/// `vkQueueSubmit2` calls have returned, whichever queue they were for. Where the signaller's call
+/// outlasts the reading, the waiting one, its wait already met by that signal, is still
+/// `Committed` with no handler run.
+///
+/// **It loosens those two sites alone.** The shared event's row has its own declaration
+/// ([`shared_wait_scheduled_as_submitted`]).
+fn scheduled_once_the_submit_thread_is_free() -> Vec<Allowance> {
+    let justified = || Justification::accepted(SCHEDULED_ONCE_THE_SUBMIT_THREAD_IS_FREE);
+    vec![
+        Allowance::new(
+            "case/order/event/waiting/status-while-the-signaller-runs",
+            Loosening::AnyOf(vec![
+                Value::unit_variant("Committed"),
+                Value::unit_variant("Scheduled"),
+            ]),
+            justified(),
+        ),
+        Allowance::new(
+            "case/order/event/waiting/handlers-while-the-signaller-runs",
+            Loosening::AnyOf(vec![
+                Value::Nothing(Negative::RanNothing),
+                Value::Lines(vec![SCHEDULED.to_owned()]),
+            ]),
+            justified(),
+        ),
+    ]
 }

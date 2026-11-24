@@ -13,23 +13,16 @@
 //! leaf (`memory::leaf`) through the slot's descriptor view (`memory::views`): the
 //! descriptor-relative byte offset is the slot's `SlotBindOffset` residual plus the pointer's
 //! offset. A pointer with several candidate slots is dispatched by a switch-at-use on its root; the
-//! default arm is the null root, whose load is 0 and whose store is dropped. Containment is the
-//! profile's encoding (`memory::contain`): none with robust descriptors, else the normative check
-//! against the storage view's bound size (`OpArrayLength`, the padded range).
+//! default arm is the null root, whose load is 0 and whose store is dropped. A narrow float's arms
+//! carry its bits beside its value (`leaf::carried`), so a load stored unchanged keeps the bits
+//! its arm read, a NaN's payload included. Containment is the
+//! normative check (`memory::contain`) against the storage view's bound size (`OpArrayLength`,
+//! the padded range).
 //!
-//! **Slots** ([`finish_slots`]). An accessed slot is a descriptor view: with robust descriptors (or
-//! containment off), a uniform view for a read-only `constant` slot whose `Bounded` window's
-//! descriptor range fits `maxUniformBufferRange` (`u32[]` with `uniformBufferStandardLayout`, else
-//! `uvec4[]`); a storage view otherwise. The in-shader encoding never uses a uniform view: its
-//! declared size is the window's range, while the binder may bind a shorter range (the binder
-//! clamps it to the allocation), and a shader cannot query a uniform range. A storage slot whose
-//! range is not provably within `maxStorageBufferRange` declares `RuntimeFact::BufferRangeLimit`.
-//! On Profile F an exceeded per-stage storage-buffer limit views read-only slots as uniform buffers
-//! instead: sized to the window where it bounds the range, else to `maxUniformBufferRange`, with
-//! the range (`UniformViewRange`) and, for a `device` slot, the absence of aliasing writes
-//! (`UniformViewAliasing`) left to the binder. On Profile A a `BufferRangeLimit` variant
-//! (`LowerInputs.psb_slots`) and the per-stage descriptor-limit fallback move storage slots to
-//! their device addresses (`BufferForm::Psb`, the PSB leaf of `psb`, reached through the root
+//! **Slots** ([`finish_slots`]). An accessed slot is a storage view. A storage slot whose range is
+//! not provably within `maxStorageBufferRange` declares `RuntimeFact::BufferRangeLimit`. On
+//! Profile A a `BufferRangeLimit` variant (`LowerInputs.psb_slots`) and the per-stage
+//! descriptor-limit fallback move storage slots to their device addresses (`BufferForm::Psb`, the PSB leaf of `psb`, reached through the root
 //! table), which declare `RuntimeFact::DeviceAddresses`. The pulled vertex fetch's source buffers
 //! are slots under the same rules ([`pulled`]): one sharing a read-only buffer argument's Metal
 //! index is that argument's slot, widened to a `Whole` storage slot; any other is a read-only
@@ -39,8 +32,8 @@
 //! census name reads the finished plan ([`AccessPlan::check`], [`BufferReach`]): an access that
 //! reaches a device-address slot or a wide pointer's allocation is named apart from a descriptor
 //! access of the same strategy (`.psb`, or `.psb_and_view` when it may reach both), and `.checked`
-//! names the check its targets take as emitted, a device-address slot's in-shader one whatever the
-//! profile's encoding. A strategy whose side may be an arena or buffer memory names that side's
+//! names the check its targets take as emitted. A strategy whose side may be an arena or buffer
+//! memory names that side's
 //! [`SideReach`] (`.arena`), and a memory intrinsic names each side apart (`.to_<reach>`,
 //! `.from_<reach>`, `copy::MemOp::name`).
 //!
@@ -85,8 +78,8 @@
 //! **Volatile accesses**. A volatile load or store is selected as the same instruction without
 //! `volatile` and then takes its volatile form (`volatile_form`): every word load and store it
 //! composes carries SPIR-V's `Volatile` (performed, once, never combined), in the function's memory
-//! model, whose coherence it keeps. Loads of read-only memories (uniform views, the constant blob,
-//! typed constant objects) stay plain, and a handle-array or buffer-table element load, which reads
+//! model, whose coherence it keeps. Loads of read-only memories (the constant blob, typed constant
+//! objects) stay plain, and a handle-array or buffer-table element load, which reads
 //! no memory at the access, is refused volatile.
 //!
 //! Not lowered yet (`Unsupported{Lowering(Access), NotImplemented}`): coherent accesses of
@@ -101,15 +94,16 @@ pub mod cell;
 pub mod copy;
 pub mod dynamic;
 mod emit;
-pub mod encode;
 pub mod function_table;
 pub mod handle;
+pub mod icb;
 pub mod imageblock;
 pub mod index;
 pub mod local;
+pub mod object;
 pub(crate) mod phis;
 pub mod pointer;
-mod psb;
+pub(crate) mod psb;
 pub mod pulled;
 pub(crate) mod root_sets;
 pub mod table;
@@ -124,22 +118,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::air::abi::{AbiInt, ParamBinding, ParamRole};
 use crate::air::ir::{AddrSpace, CastOp, Const, Inst, InstId, InstKind, Type, Value, ValueId};
 use crate::budget::Meter;
-use crate::device::profile::{BufferAccess, Containment, Limits};
+use crate::device::profile::{BufferAccess, Limits};
 use crate::device::requirements::VkLimit;
 use crate::device::DeviceProfile;
 use crate::error::{Capability, Error, Feature, LowerFamily, Unsupported};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::{DescriptorCounts, FamilyPlans, Plan, SelectCx, SlotChoice};
 use crate::lower::strategy::FamilyStrategy;
-use crate::memory::contain::{self, Check};
+use crate::memory::contain::Check;
 use crate::memory::leaf::{self, Coherence, Leaf, Units};
 use crate::memory::plan::SlotPlan;
-use crate::memory::provenance::Repr;
-use crate::memory::views::{self, View, ViewKind};
-use crate::pipeline::facts::{RuntimeFact, UniformViewChoice};
-use crate::pipeline::interface::{
-    AccessSet, BufferForm, DescriptorView, PushLoc, PushPlacement, Window,
-};
+use crate::memory::provenance::{Repr, Root};
+use crate::memory::views::{self, View};
+use crate::pipeline::facts::RuntimeFact;
+use crate::pipeline::interface::{AccessSet, BufferForm, PushLoc, PushPlacement, Window};
 use crate::pipeline::sym::{PushField, SlotRef};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
@@ -188,8 +180,11 @@ pub enum AccessStrategy {
     Cell(cell::CellStrategy),
     /// A kernel imageblock's cell pointer or extent.
     Imageblock(imageblock::ImageblockStrategy),
-    /// An indirect-command object's word, or an encoder operation's record writes.
-    Encode(encode::EncodeStrategy),
+    /// An indirect-command object's word.
+    Object(object::ObjectWord),
+    /// An indirect-command operation's writes into its command's records under the identity
+    /// domains.
+    Commands(icb::Command),
     /// A word of a visible-function table read by its resource id.
     FunctionTable(function_table::TableWord),
     /// A read of an argument the function constants removed.
@@ -276,8 +271,6 @@ pub struct Target {
     pub slot: usize,
     /// Its root number (the switch-at-use literal).
     pub root: u32,
-    /// Its containment check.
-    pub check: Check,
 }
 
 /// A leaf load or store through a static-root pointer.
@@ -295,9 +288,9 @@ pub struct Access {
     pub coherence: Option<Coherence>,
     /// A volatile access: every word it loads or stores carries `Volatile`.
     pub volatile: bool,
-    /// The pointer may point into the constant blob (a load only): the blob's containment check,
-    /// read under [`BLOB_ROOT`] in the switch-at-use.
-    pub blob: Option<Check>,
+    /// The pointer may point into the constant blob (a load only): the blob, read under
+    /// [`BLOB_ROOT`] in the switch-at-use, checked in the shader.
+    pub blob: bool,
 }
 
 impl Access {
@@ -305,20 +298,15 @@ impl Access {
         let per = self
             .targets
             .iter()
-            .map(|t| {
+            .map(|_| {
                 // The residual or root-table reads, and the containment check (the PSB form,
                 // which a slot may take after selection, costs the most).
-                leaf_words(&self.leaf)
-                    + match t.check {
-                        Check::None => 24,
-                        Check::InShader => 64,
-                    }
-                    + 160
+                leaf_words(&self.leaf) + 64 + 160
             })
             .fold(0u32, u32::saturating_add);
         let blob = match self.blob {
-            Some(_) => leaf_words(&self.leaf).saturating_add(96),
-            None => 0,
+            true => leaf_words(&self.leaf).saturating_add(96),
+            false => 0,
         };
         per.saturating_add(blob)
             .saturating_add(16u32.saturating_mul(self.targets.len() as u32 + 2))
@@ -333,7 +321,7 @@ impl Access {
     /// The buffer memory the access reaches in the finished plan `slots`: its targets' slots, and
     /// the constant blob's view when the pointer may point there.
     pub fn reach(&self, slots: &AccessPlan) -> BufferReach {
-        let blob = if self.blob.is_some() {
+        let blob = if self.blob {
             BufferReach::VIEWS
         } else {
             BufferReach::NONE
@@ -365,10 +353,9 @@ impl Access {
     }
 }
 
-/// How a strategy's accesses reach buffer memory: through descriptor views, which the profile's
-/// containment encoding contains (no check with robust descriptors, the in-shader check otherwise),
-/// by device address (a `BufferForm::Psb` slot, or a wide pointer's root entry), which is checked
-/// in the shader whatever the profile (unless containment is off), or both. Arenas and typed
+/// How a strategy's accesses reach buffer memory: through descriptor views, which the shader
+/// checks, by device address (a `BufferForm::Psb` slot, or a wide pointer's root entry), which is
+/// checked in the shader unless containment is off, or both. Arenas and typed
 /// objects are neither: their containment is their own ([`SideReach`]).
 ///
 /// The census names a strategy that may reach either by its reach ([`BufferReach::qualify`]), so
@@ -473,14 +460,12 @@ impl AccessPlan {
         )
     }
 
-    /// The containment check target `t` takes as emitted (`emit::prepare`): its view's, the
-    /// profile's encoding (`t.check`), or for a device-address slot the in-shader check, which
-    /// robust buffer access does not replace, unless containment is off (`psb_contained`).
+    /// The containment check target `t` takes as emitted (`emit::prepare`): the in-shader check,
+    /// unless it is a device-address slot and containment is off (`psb_contained`).
     pub fn check(&self, t: &Target) -> Check {
         match (self.by_address(t), self.psb_contained) {
-            (false, _) => t.check,
-            (true, true) => Check::InShader,
             (true, false) => Check::None,
+            _ => Check::InShader,
         }
     }
 
@@ -511,7 +496,7 @@ impl AccessPlan {
     pub fn source_reach(&self, slot: SlotRef) -> BufferReach {
         match self.source_lowering(slot) {
             Some(SlotLowering::Psb { .. }) => BufferReach::ADDRESSES,
-            Some(SlotLowering::View(_)) => BufferReach::VIEWS,
+            Some(SlotLowering::View) => BufferReach::VIEWS,
             None => BufferReach::NONE,
         }
     }
@@ -526,7 +511,7 @@ impl FamilyStrategy for AccessStrategy {
             AccessStrategy::Pointer(PtrOp::Select { .. }) => "access.pointer_select".into(),
             AccessStrategy::Load(a) => a.name("access.load", slots),
             AccessStrategy::Store(a) => a.name("access.store", slots),
-            AccessStrategy::Local(l) => l.name().into(),
+            AccessStrategy::Local(l) => l.name(&slots.local).into(),
             AccessStrategy::Atomic(a) => a.name(slots),
             AccessStrategy::Blob(b) => b.name().into(),
             AccessStrategy::Memory(m) => m.name(slots),
@@ -536,7 +521,8 @@ impl FamilyStrategy for AccessStrategy {
             AccessStrategy::Value(p) => p.name(slots),
             AccessStrategy::Cell(c) => c.name().into(),
             AccessStrategy::Imageblock(i) => i.name().into(),
-            AccessStrategy::Encode(e) => e.name(slots),
+            AccessStrategy::Object(o) => o.name(slots),
+            AccessStrategy::Commands(c) => c.name(),
             AccessStrategy::FunctionTable(t) => t.name(),
             AccessStrategy::AbsentRead(a) => a.name().into(),
         }
@@ -560,7 +546,8 @@ impl FamilyStrategy for AccessStrategy {
             AccessStrategy::Value(p) => p.words(),
             AccessStrategy::Cell(c) => c.words(),
             AccessStrategy::Imageblock(i) => i.words(),
-            AccessStrategy::Encode(e) => e.words(),
+            AccessStrategy::Object(o) => o.words(),
+            AccessStrategy::Commands(c) => c.words(),
             AccessStrategy::FunctionTable(t) => t.words(),
             AccessStrategy::AbsentRead(a) => a.words(),
         }
@@ -628,7 +615,7 @@ fn held(s: &root_sets::Statics, m: &mut Meter) -> Result<Vec<Target>, Error> {
 /// materializes (`pointer::phi_incoming`); any other constant incoming pointer, and a blob offset
 /// (which would need a conversion on its edge), is refused.
 pub fn lowered_pointer(cx: &SelectCx<'_>, v: Value) -> Result<DemoteTy, Error> {
-    if let Some(d) = encode::lowered_pointer(cx, v) {
+    if let Some(d) = object::lowered_pointer(cx, v) {
         return Ok(d);
     }
     if let Some(d) = handle::lowered_pointer(cx, v)? {
@@ -656,10 +643,15 @@ pub fn lowered_pointer(cx: &SelectCx<'_>, v: Value) -> Result<DemoteTy, Error> {
 }
 
 /// The SPIR-V type of a pointer representation `ty`: `uvec2` for a narrow fat pointer, `u32`
-/// for an arena offset or a handle index, `u64vec2` for a wide fat pointer, `None` for the others.
+/// for an arena offset or a handle index, `u64vec4` for a wide fat pointer, `u64` for a device
+/// address, `None` for the others.
 pub fn spirv_type(mb: &mut ModuleBuilder, ty: &DemoteTy) -> BResult<Option<TypeId>> {
     match ty {
         DemoteTy::FatPtr { wide: true } => Ok(Some(dynamic::wide_type(mb)?)),
+        DemoteTy::Address => Ok(Some(mb.ty(SType::Int {
+            width: 64,
+            signed: false,
+        })?)),
         DemoteTy::ArenaOffset | DemoteTy::HandleIndex => Ok(Some(mb.ty(SType::Int {
             width: 32,
             signed: false,
@@ -678,8 +670,8 @@ pub fn spirv_type(mb: &mut ModuleBuilder, ty: &DemoteTy) -> BResult<Option<TypeI
 /// How an accessed slot is reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlotLowering {
-    /// Through its descriptor view.
-    View(ViewKind),
+    /// Through its storage view.
+    View,
     /// Through its device address (`BufferForm::Psb`). `start` is the start of the slot's window
     /// relative to the bind offset (0 for `Window::Whole`): the `u32` pointer offset is recovered
     /// as the unique 64-bit displacement in `[start, start + 2³²)` congruent to it (`psb`).
@@ -691,12 +683,21 @@ pub enum SlotLowering {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccessPlan {
     pub slots: Vec<Option<SlotLowering>>,
-    /// Device-address accesses are contained (robust buffer access does not cover them, so only
-    /// `Containment::UnsafeOff` turns this off).
+    /// Device-address accesses are bounds-checked (robust buffer access does not cover them):
+    /// every profile's but the identity domains', whose slots are checked against their pushed
+    /// lengths instead.
     pub psb_contained: bool,
     /// The narrow units device-address accesses load and store directly (`psb::narrow_units` of
     /// the profile): a sub-word store there is one narrow store instead of two word atomics.
     pub psb_units: Units,
+    /// The function compiles under the identity domains: a device-address slot's address is its
+    /// own field ([`address_field`]).
+    pub identity: bool,
+    /// Under the identity domains with containment on ([`identity_contained`]), the buffer slots
+    /// an access may reach at a byte offset that is not a translation-time constant
+    /// ([`note_variable`]): each reads its `PushField::SlotBounds`, and each of those accesses
+    /// whose emitted offset is not a constant is checked against its buffer (`emit::prepare`).
+    pub variable: BTreeSet<SlotRef>,
     /// The arenas the function uses.
     pub local: local::LocalPlan,
     /// The function's index extensions ([`index`]): planned before any instruction is selected
@@ -744,13 +745,28 @@ pub struct AccessPlan {
     /// and writes the field.
     pub observed: BTreeSet<usize>,
     /// Memory-plan slots a volatile, coherent, or atomic access reaches: what they read may change
-    /// while the dispatch or draw runs, and an atomic needs a storage view's word pointer, so the
-    /// per-stage storage-buffer fallback never views them as uniform buffers.
+    /// while the dispatch or draw runs.
     pub ordered: BTreeSet<usize>,
-    /// Memory-plan slots read through a storage view whose memory nothing in the module writes
-    /// ([`unwritten_slots`]): their views are decorated `NonWritable`, so the device may read them
-    /// as read-only memory (on RADV a uniform read is a scalar load).
+    /// Memory-plan slots whose memory nothing in the module writes ([`unwritten_slots`]), read
+    /// through a storage view or, under the identity domains, their device address: their views
+    /// are decorated `NonWritable`, and their device-address loads go through `NonWritable` places
+    /// (`psb::PsbMem::read_only`), so the device may read them as read-only memory (on RADV a
+    /// uniform read is a scalar load).
     pub unwritten: BTreeSet<usize>,
+    /// Memory-plan slots reached under the identity domains from their address as it is, which
+    /// the binder holds to a multiple of their argument's alignment ([`address_alignment`],
+    /// `RuntimeFact::AddressAlignment`), at least the granularity their accesses reach
+    /// ([`AccessPlan::reach`]): no access rounds the address (`psb::prepare_direct`), and a leaf
+    /// at an offset proven a multiple of 8 or 16 is accessed at that alignment (`memory::leaf`'s
+    /// whole words). Every other device-address slot is reached from the word below each access
+    /// (`psb::prepare_at`).
+    pub aligned: BTreeSet<usize>,
+    /// The granularity in bytes at which the static-root accesses of each memory-plan slot reach
+    /// its memory, the widest over them ([`note_reach`]): an access whose leaf is one narrow unit
+    /// ([`leaf_reach`]) that unit's size, and any other 4, as it reaches words or wider units
+    /// from a 4-aligned base. A slot whose alignment is below 4 is reached from its address as
+    /// it is only where its alignment is at least this.
+    pub reach: BTreeMap<usize, u32>,
     /// The units ([`Units`]) the static-root accesses of each slot read or write whole, by
     /// memory-plan slot index: narrow units whose storage access the profile has, and `uvec2`
     /// and `uvec4` units. The slot gets a view of each that its final view kind holds
@@ -759,7 +775,7 @@ pub struct AccessPlan {
     /// A tile function's attachments and the ones it stages ([`tile`]).
     pub tile: Option<tile::TilePlan>,
     /// The handle loads of indirect-command objects whose every use is an encoder operand
-    /// ([`encode::plan_objects`]): each is its field's word, a `u64`.
+    /// ([`object::plan_objects`]): each is its field's word, a `u64`.
     pub objects: BTreeSet<InstId>,
     /// The typed loads and stores whose access chain takes its defining `getelementptr`'s own
     /// index operands ([`local`]'s line-up rule), each with those operands: the access reads them
@@ -775,25 +791,21 @@ pub struct AccessPlan {
     pub heap_alpha: bool,
     /// Some visible-function table is read by its resource id ([`function_table`]): the function
     /// reads the stage's function-table directory, one more storage descriptor, whose search reads
-    /// the ids as this states, and the heap's function-table array, or, on a device without the
-    /// array's features, the stage's function-table snapshot, one more again.
+    /// the ids as this states, and the stage's function-table snapshot, one more again.
     pub function_tables: Option<function_table::TableReads>,
-    /// A heap texture's access reads its texel class: the handle-table search carries the class's index
-    /// (`memory::handles::Lookup::Flagged`), so every heap handle carries it beside its element.
-    pub heap_class: bool,
     /// A heap texture's float write the function makes tests its texel class's index
-    /// (`lower::texture::emit`): the handle-table search carries the index, as under
-    /// [`heap_class`](Self::heap_class), but the module needs no table of the classes.
+    /// (`lower::texture::emit`): the handle-table search carries the index
+    /// (`memory::handles::Lookup::Flagged`), so every heap handle carries it beside its element.
     pub heap_class_index: bool,
     /// A heap storage access the function makes converts a member by its texel class and its
     /// red-blue order (`lower::texture::heap_storage_conversions`): the handle-table search
     /// carries the entry's `FLAG_RED_BLUE` too (`memory::handles::Lookup::Flagged`).
     pub heap_red_blue: bool,
-    /// A `float` or `half` texel the function writes through a heap handle marks the texel it
-    /// stores in a member's write shadow where the handle carries the entry's
-    /// `FLAG_YCBCR_WRITES` (`lower::texture::emit`): the handle-table search carries it, under
-    /// the stage's `SpecKey::HeapYCbCrWrites` (`memory::handles::Lookup::Flagged`).
-    pub heap_ycbcr_writes: bool,
+    /// A heap storage read the function makes on a device that reads storage without a format by
+    /// the formats' own bits alone reads the null element where the handle carries the entry's
+    /// `FLAG_STORAGE_UNREADABLE` (`lower::texture::emit`): the handle-table search carries it
+    /// (`memory::handles::Lookup::Flagged`).
+    pub heap_unreadable: bool,
     /// A heap texture's read through a sampler may hand back its border texels
     /// (`lower::texture::Through`), which its handle-table entry holds
     /// (`memory::handles::FLAG_BORDER_TEXELS`): the search yields each heap handle's entry index
@@ -812,27 +824,27 @@ pub struct AccessPlan {
 impl AccessPlan {
     /// Whether the handle-table search carries each heap handle's texel class index.
     pub fn carries_class(&self) -> bool {
-        self.heap_class || self.heap_class_index
+        self.heap_class_index
     }
 
     /// What the function's handle-table search yields.
     pub fn lookup(&self) -> crate::memory::handles::Lookup {
         use crate::memory::handles::Lookup;
         let (alpha, class, red_blue) = (self.heap_alpha, self.carries_class(), self.heap_red_blue);
-        let ycbcr = self.heap_ycbcr_writes;
+        let unreadable = self.heap_unreadable;
         if self.heap_border {
             Lookup::Indexed {
                 alpha,
                 class,
                 red_blue,
-                ycbcr,
+                unreadable,
             }
-        } else if alpha || class || red_blue || ycbcr {
+        } else if alpha || class || red_blue || unreadable {
             Lookup::Flagged {
                 alpha,
                 class,
                 red_blue,
-                ycbcr,
+                unreadable,
             }
         } else {
             Lookup::Element
@@ -849,8 +861,8 @@ pub struct Declared {
     pub local: local::LocalDecl,
     /// The stage's `ArgumentTable`, when the placement spilled fields there.
     pub table: Option<table::Table>,
-    /// The constant blob's storage view, when the function reads the blob.
-    pub blob: Option<View>,
+    /// The constant blob's words, when the function reads the blob.
+    pub blob: Option<crate::memory::blob::BlobDecl>,
     /// The storage view of each pulled source buffer with a descriptor slot of its own, by Metal
     /// index ([`pulled`]).
     pub pulled: Vec<(u32, View)>,
@@ -867,30 +879,12 @@ pub struct Declared {
     pub resolve: Option<crate::spirv::ids::FuncId>,
     /// A tile function's attachment images and render area ([`tile`]).
     pub tile: tile::TileDecl,
-    /// The stage's function-table directory and search and the heap's function-table array,
-    /// when a table is read by its resource id.
+    /// The stage's function-table directory and search and its snapshot, when a table is read by
+    /// its resource id.
     pub function_tables: Option<function_table::FunctionTables>,
     /// The stage's view of the command buffer's `ExecutionStatus` buffer, where it binds the
     /// buffer ([`absent::declare`]).
     pub status: Option<View>,
-    /// The `RangeAtBindOffset` specialization of each slot read through a uniform view, by
-    /// memory-plan slot index: where it holds, an access reads the view at the Metal offset alone
-    /// ([`range_at_bind_offset`]).
-    pub at_bind: Vec<Option<SValue>>,
-}
-
-/// Slot `slot`'s `RangeAtBindOffset` specialization: a `bool`, false by default, fixed at pipeline
-/// creation, true where the binder starts the slot's descriptor range at its bind offset, so its
-/// `SlotBindOffset` residual is 0 and an access reads the Metal offset alone: a constant for a
-/// constant member, which a driver can push ahead of the shader.
-fn range_at_bind_offset(mb: &mut ModuleBuilder, slot: SlotRef) -> BResult<SValue> {
-    let b = mb.ty(SType::Bool)?;
-    let c = mb.spec(
-        crate::pipeline::sym::SpecKey::RangeAtBindOffset(slot),
-        b,
-        ConstBits(0),
-    )?;
-    mb.const_value(c)
 }
 
 /// The module's routines the access family's strategies call, each charged once to the census: the
@@ -982,86 +976,6 @@ pub fn param_value(
     fb.module().const_value(c)
 }
 
-/// The view kind of a slot on profile `p`: a uniform view for a read-only `constant` slot with a
-/// `Bounded` window whose descriptor range fits `maxUniformBufferRange`, when the profile's
-/// containment encoding emits no check; a storage view otherwise.
-///
-/// Under the in-shader encoding a uniform view could not be contained: the bound range may be
-/// shorter than the view's declared size (the binder clamps it to the padded allocation), a uniform
-/// block has no `OpArrayLength`, and the proven window bounds Metal-defined accesses only. A
-/// storage view's check reads the size actually bound.
-pub fn view_kind(p: &DeviceProfile, s: &SlotPlan) -> ViewKind {
-    let limits = &p.fields().limits;
-    let uniform = match s.window {
-        Some(window)
-            if s.space == AddrSpace::Constant
-                && !s.access.write
-                && !s.atomic
-                && contain::encoding(p) == Check::None =>
-        {
-            uniform_bytes(window, limits)
-        }
-        _ => None,
-    };
-    match uniform {
-        Some(bytes) => uniform_view(p, bytes),
-        None => ViewKind::Storage,
-    }
-}
-
-/// The uniform view of `bytes` bytes (a multiple of 16) on `p`: `u32[]` with
-/// `uniformBufferStandardLayout`, `uvec4[]` without.
-fn uniform_view(p: &DeviceProfile, bytes: u32) -> ViewKind {
-    if p.fields().descriptors.uniform_buffer_standard_layout {
-        ViewKind::UniformWords { words: bytes / 4 }
-    } else {
-        ViewKind::UniformVec4 { vecs: bytes / 16 }
-    }
-}
-
-/// Whether a uniform view's descriptor range is provably within `maxUniformBufferRange`: a
-/// `Bounded` window's range is at most `uniform_range(len, A)`, with `A` the descriptor base
-/// alignment `max(minUniformBufferOffsetAlignment, 16)`.
-fn uniform_range_fits(window: Window, limits: &Limits) -> bool {
-    uniform_bytes(window, limits).is_some()
-}
-
-/// The uniform range of a `Bounded` window that provably fits `maxUniformBufferRange`.
-fn uniform_bytes(window: Window, limits: &Limits) -> Option<u32> {
-    match window {
-        Window::Bounded { len, .. } => {
-            let align = views::base_alignment(limits.min_uniform_buffer_offset_alignment);
-            views::uniform_range(len, align)
-                .filter(|r| *r <= u64::from(limits.max_uniform_buffer_range))
-                .and_then(|r| u32::try_from(r).ok())
-        }
-        _ => None,
-    }
-}
-
-/// The uniform view the per-stage storage-buffer fallback gives a read-only slot with `window`:
-/// sized to the window's range where that provably fits `maxUniformBufferRange`, else the largest
-/// whole number of 16-byte vectors within it, which covers every range instantiation accepts
-/// (`BindError::DescriptorRangeExceeded` above the limit).
-fn fallback_view(p: &DeviceProfile, window: Window) -> ViewKind {
-    let limits = &p.fields().limits;
-    let bytes = uniform_bytes(window, limits).unwrap_or(limits.max_uniform_buffer_range & !15);
-    uniform_view(p, bytes)
-}
-
-/// The fallback's order among read-only storage slots, lowest first: a window whose uniform range
-/// provably fits, then a `constant` slot, then a `device` slot, which also needs instantiation's
-/// alias check. Within a rank the highest Metal index moves first, as the Profile A fallback does.
-fn fallback_rank(plan: &SlotPlan, window: Window, limits: &Limits) -> u8 {
-    if uniform_range_fits(window, limits) {
-        0
-    } else if plan.space == AddrSpace::Constant {
-        1
-    } else {
-        2
-    }
-}
-
 /// Whether a storage slot's descriptor range is provably within `maxStorageBufferRange`: a
 /// `Bounded` window's range is at most `round_up(len + align - 1, 16)`, with `align` the descriptor
 /// base alignment `max(minStorageBufferOffsetAlignment, 16)`.
@@ -1069,18 +983,10 @@ fn storage_range_fits(window: Window, limits: &Limits) -> bool {
     match window {
         Window::Bounded { len, .. } => {
             let align = views::base_alignment(limits.min_storage_buffer_offset_alignment);
-            views::uniform_range(len, align)
+            views::descriptor_range(len, align)
                 .is_some_and(|r| r <= u64::from(limits.max_storage_buffer_range))
         }
         _ => false,
-    }
-}
-
-fn descriptor_view(kind: ViewKind) -> DescriptorView {
-    match kind {
-        ViewKind::Storage => DescriptorView::Storage,
-        ViewKind::UniformWords { .. } => DescriptorView::UniformWords,
-        ViewKind::UniformVec4 { .. } => DescriptorView::UniformVec4,
     }
 }
 
@@ -1088,29 +994,22 @@ fn descriptor_view(kind: ViewKind) -> DescriptorView {
 /// descriptors to `cx.descriptors`. Returns the form of each accessed slot, by memory-plan slot
 /// index (`None` for slots the function does not access).
 ///
-/// A slot is a descriptor view unless a `BufferRangeLimit` variant (`LowerInputs.psb_slots`)
+/// A slot is a storage view unless a `BufferRangeLimit` variant (`LowerInputs.psb_slots`)
 /// moves it to its device address, or, on Profile A, the per-stage descriptor limits are exceeded:
 /// then the highest-index storage slots move to device addresses, one at a time, until the
 /// storage-buffer and resource counts fit (a deterministic per-function choice). Every
 /// device-address slot declares `DeviceAddresses` and reads the root table
 /// (`PushField::RootTableAddress`) instead of its bind residual.
 ///
-/// On Profile F with robust descriptors (or containment off), an exceeded per-stage
-/// storage-buffer limit moves read-only storage slots to uniform views instead, one at a time in
-/// `fallback_rank` order, while a uniform buffer is left. Every candidate whose window does not
-/// bound its range declares `UniformViewRange` whether or not the fallback ran (so a plan can ask
-/// for the variant that keeps them all storage views), each slot the compile keeps a storage view
-/// declares it `Kept`, and a viewed `device` slot declares `UniformViewAliasing`.
-///
 /// A pulled source buffer ([`pulled`]) shares the accessed slot of its Metal index, widened to a
 /// `Whole` storage slot that the fetch reads too (a window outside the first 2³² bytes above the
 /// bind offset is refused), or is a read-only `Whole` storage slot of its own; either takes part
 /// in the rules above like any storage slot.
 ///
-/// Each step of either fallback moves one storage view, so the descriptors and push fields of the
+/// Each step of the fallback moves one storage view, so the descriptors and push fields of the
 /// slots' forms are kept in a census the step updates, and the order of the slots it moves is
-/// sorted once: the fallbacks take one pass over the slots, metered, where they recounted every
-/// slot per slot moved before. The working tables are charged while they run.
+/// sorted once: the fallback takes one pass over the slots, metered, where it recounted every slot
+/// per slot moved before. The working tables are charged while they run.
 pub fn finish_slots(
     cx: &mut SelectCx<'_>,
     m: &mut Meter,
@@ -1122,21 +1021,24 @@ pub fn finish_slots(
     result
 }
 
-/// The ledger bytes `place_slots` works in per memory-plan slot: its form and window, whether
-/// the fallback viewed it, and its places in the two fallbacks' orders.
+/// The ledger bytes `place_slots` works in per memory-plan slot: its form and window, and its
+/// place in the fallback's order.
 const SLOT_WORK_BYTES: usize = std::mem::size_of::<Option<SlotLowering>>()
     + std::mem::size_of::<Option<Window>>()
-    + 1
-    + std::mem::size_of::<(usize, u8, u32)>()
     + std::mem::size_of::<(u32, Moved)>();
 
 /// The descriptors and push fields of the slots' forms while [`finish_slots`] moves them: the
-/// storage and uniform views, and the push fields with each device-address slot's
-/// `SlotBindOffset` replaced by the root table. A move updates it in place.
+/// storage views, and the push fields with each device-address slot's `SlotBindOffset` replaced by
+/// the field its address is read from ([`slot_address_field`]). A move updates it in place.
 struct Census {
     storage: u32,
-    uniform: u32,
     fields: BTreeSet<PushField>,
+    /// Under the identity domains the spilled fields are a parameter block at a pushed address.
+    identity: bool,
+    /// A device-address slot reads its own address ([`slot_address_field`]).
+    own_addresses: bool,
+    /// The stage's push base and the device's window bytes, which decide where the fields spill.
+    push_window: (u32, u32),
 }
 
 impl Census {
@@ -1144,52 +1046,44 @@ impl Census {
     /// pointer reads the root table.
     fn new(
         push: &BTreeSet<PushField>,
-        dynamic: bool,
+        (dynamic, identity, own_addresses, push_window): (bool, bool, bool, (u32, u32)),
         forms: impl Iterator<Item = (SlotRef, SlotLowering)>,
         m: &mut Meter,
     ) -> Result<Census, Error> {
         let mut c = Census {
             storage: 0,
-            uniform: 0,
             fields: push.clone(),
+            identity,
+            own_addresses,
+            push_window,
         };
-        let mut psb = dynamic;
+        if dynamic {
+            c.fields.insert(PushField::RootTableAddress);
+        }
         for (slot, l) in forms {
             m.tick(1)?;
             match l {
-                SlotLowering::View(ViewKind::Storage) => c.storage = c.storage.saturating_add(1),
-                SlotLowering::View(_) => c.uniform = c.uniform.saturating_add(1),
+                SlotLowering::View => c.storage = c.storage.saturating_add(1),
                 SlotLowering::Psb { .. } => {
                     c.fields.remove(&PushField::SlotBindOffset(slot));
-                    psb = true;
+                    c.fields.insert(slot_address_field(own_addresses, slot));
                 }
             }
-        }
-        if psb {
-            c.fields.insert(PushField::RootTableAddress);
         }
         Ok(c)
     }
 
-    /// The slots' descriptors in `stage`: their views, and the `ArgumentTable` when the push
-    /// fields spill.
+    /// The slots' descriptors in `stage`: their views, and the `ArgumentTable` when the push fields
+    /// spill.
     fn counts(&self, stage: crate::pipeline::sym::Stage) -> DescriptorCounts {
         DescriptorCounts {
-            uniform_buffers: u32::from(table::spills(stage, &self.fields))
-                .saturating_add(self.uniform),
+            // Under the identity domains the spilled fields are a parameter block at a pushed
+            // address, no descriptor.
+            uniform_buffers: u32::from(
+                !self.identity && table::spills(stage, self.push_window, &self.fields),
+            ),
             storage_buffers: self.storage,
             ..DescriptorCounts::default()
-        }
-    }
-
-    /// A storage view became a view of `kind`.
-    fn viewed(&mut self, kind: ViewKind) {
-        self.storage = self.storage.saturating_sub(1);
-        match kind {
-            ViewKind::Storage => self.storage = self.storage.saturating_add(1),
-            ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } => {
-                self.uniform = self.uniform.saturating_add(1)
-            }
         }
     }
 
@@ -1197,8 +1091,70 @@ impl Census {
     fn addressed(&mut self, slot: SlotRef) {
         self.storage = self.storage.saturating_sub(1);
         self.fields.remove(&PushField::SlotBindOffset(slot));
-        self.fields.insert(PushField::RootTableAddress);
+        self.fields
+            .insert(slot_address_field(self.own_addresses, slot));
     }
+}
+
+/// The push field a device-address slot's address is read from: its own ([`address_field`]) where
+/// `own`, under the identity domains outside a device-replay variant, else the root table, where a
+/// replay variant's slots are its replayed command's (`replay_guest_base`). The identity domains
+/// read no root table, so they refuse a replay variant once its fields are placed
+/// (`select::identity_admits`).
+fn slot_address_field(own: bool, slot: SlotRef) -> PushField {
+    match own {
+        true => address_field(slot),
+        false => PushField::RootTableAddress,
+    }
+}
+
+/// The field a slot's device address is read from under the identity domains: its Metal address,
+/// the bound buffer's `gpuAddress` plus the bind offset, which is its Vulkan device address there,
+/// less [`SLOT_ADDRESS_BIAS`] (`SlotGuestBase`'s value, a `uvec2`, low word first).
+fn address_field(slot: SlotRef) -> PushField {
+    PushField::SlotGuestBase(slot)
+}
+
+/// The bias of a buffer slot's `SlotGuestBase` word under the identity domains, 2^31: the runtime
+/// pushes the slot's address less it. An access adds its 32-bit byte offset plus the bias to the
+/// word, zero-extended ([`psb::prepare_direct`]), which is the address plus the offset read as
+/// signed in one 32-bit add, and every other read of the word adds the bias back
+/// ([`pointer::slot_address`]).
+pub(crate) const SLOT_ADDRESS_BIAS: u64 = 1 << 31;
+
+/// Whether profile `p` takes the identity domains, where a pointer is a device address used
+/// directly.
+pub(crate) fn identity(p: &DeviceProfile) -> bool {
+    p.fields().pointer_domain == crate::device::PointerDomain::Identity
+}
+
+/// Whether a function selected in `cx` bounds its slots' device-address accesses under the
+/// identity domains: the function is no device-replay variant, whose slots' addresses are its
+/// replayed command's.
+pub(crate) fn identity_contained(cx: &SelectCx<'_>) -> bool {
+    identity(cx.profile) && !cx.inputs.replay_bindings
+}
+
+/// An access of buffer slot `slot`, a read where `read`, whose byte offset is a translation-time
+/// constant only where `fixed`. Under the identity domains with containment on
+/// ([`identity_contained`]), a slot an access may reach at another offset is checked
+/// ([`AccessPlan::variable`]): it reads its `PushField::SlotBounds`, and a read of it reads
+/// `PushField::ZeroAddress` outside. An access at a constant offset stays unchecked.
+pub(crate) fn note_variable(cx: &mut SelectCx<'_>, slot: SlotRef, fixed: bool, read: bool) {
+    if fixed || !identity_contained(cx) {
+        return;
+    }
+    cx.families.access.variable.insert(slot);
+    cx.push.insert(PushField::SlotBounds(slot));
+    if read {
+        cx.push.insert(PushField::ZeroAddress);
+    }
+}
+
+/// Whether static-root pointer `ptr`'s byte offset from its roots is a translation-time
+/// constant: the memory plan proves it one value.
+pub(crate) fn fixed_offset(cx: &SelectCx<'_>, ptr: Value) -> bool {
+    cx.memory.offset(ptr).and_then(|o| o.exact()).is_some()
 }
 
 /// [`finish_slots`]'s placement, in its charged working tables.
@@ -1223,6 +1179,7 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     if replay || cx.inputs.flat_grid || cx.inputs.folded_groups {
         plan_replay(cx, &sources)?;
     }
+    let own_addresses = identity(p) && !replay;
     let shared_slot = |s: SlotRef| {
         memory
             .slots
@@ -1256,43 +1213,38 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
         // reaches needs a typed pointer, which only its device address gives; a replay variant
         // reads every slot through its root entry, which the replay's preprocess writes from the
         // replayed command's record.
+        // Under the identity domains every slot is its device address.
         if replay
+            || identity(p)
             || cx.families.access.dynamic.slots.contains(&i)
             || cx.families.access.typed_slots.contains(&i)
         {
             lowering.push(Some(psb_lowering(window)?));
             continue;
         }
-        // The fetch's unbounded read needs a storage view.
-        let kind = if shared {
-            ViewKind::Storage
-        } else {
-            view_kind(p, plan)
-        };
-        let mut l = SlotLowering::View(kind);
-        if kind == ViewKind::Storage {
-            if !storage_range_fits(window, limits) {
-                cx.facts
-                    .insert(RuntimeFact::BufferRangeLimit { slot: plan.slot });
+        let mut l = SlotLowering::View;
+        if !storage_range_fits(window, limits) {
+            cx.facts
+                .insert(RuntimeFact::BufferRangeLimit { slot: plan.slot });
+        }
+        if cx.inputs.psb_slots.contains(&plan.slot) {
+            if !addressed {
+                return Err(range_variant());
             }
-            if cx.inputs.psb_slots.contains(&plan.slot) {
-                if !addressed {
-                    return Err(range_variant());
-                }
-                l = psb_lowering(window)?;
-            }
+            l = psb_lowering(window)?;
         }
         lowering.push(Some(l));
     }
     // Source buffers no accessed slot shares: read-only `Whole` storage slots of their own, whose
     // range is never provably within `maxStorageBufferRange`; a replay variant's are read through
-    // their root entries, as its other slots are.
+    // their root entries, as its other slots are, and under the identity domains each is its device
+    // address, as every slot is there.
     let mut own: Vec<(SlotRef, SlotLowering)> = Vec::new();
     for &s in &sources {
         if shared_slot(s).is_some() {
             continue;
         }
-        if replay {
+        if replay || identity(p) {
             own.push((s, psb_lowering(Window::Whole)?));
             continue;
         }
@@ -1303,7 +1255,7 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
             }
             psb_lowering(Window::Whole)?
         } else {
-            SlotLowering::View(ViewKind::Storage)
+            SlotLowering::View
         };
         own.push((s, l));
     }
@@ -1316,116 +1268,23 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
         .zip(&lowering)
         .filter_map(|(plan, l)| l.map(|l| (plan.slot, l)))
         .chain(own.iter().copied());
-    let mut census = Census::new(&cx.push, cx.families.access.dynamic.used, forms, m)?;
-    // Profile F's per-stage storage-buffer fallback: with robust descriptors (or containment off),
-    // while the storage-buffer count exceeds its limit and a uniform buffer is left, the first
-    // read-only storage slot in `fallback_rank` order becomes a uniform view. Slots the variant
-    // keeps (`LowerInputs::storage_view_slots`), a pulled fetch's source, and slots a volatile,
-    // coherent, or atomic access reaches stay storage views.
-    let inputs = cx.inputs;
-    let fallback = !addressed && contain::encoding(p) == Check::None;
-    let candidates: Vec<(usize, u8)> = if fallback {
-        memory
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, plan)| {
-                let window = windows.get(i).copied().flatten()?;
-                let storage = lowering.get(i).copied().flatten()
-                    == Some(SlotLowering::View(ViewKind::Storage));
-                let read_only = !plan.access.write && !plan.atomic;
-                let eligible = storage
-                    && read_only
-                    && !sources.contains(&plan.slot)
-                    && !cx.families.access.ordered.contains(&i);
-                eligible.then(|| (i, fallback_rank(plan, window, limits)))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // The order the fallback views the candidates in: by rank, the highest Metal index first. The
-    // sort is stable, so equal keys keep memory-plan order, the first of which the fallback
-    // takes, as the search for the least key per step once did.
-    let mut order: Vec<(usize, u8, u32)> = Vec::new();
-    for &(i, rank) in &candidates {
-        m.tick(1)?;
-        if let Some(plan) = memory.slots.get(i) {
-            if !inputs.storage_view_slots.contains(&plan.slot) {
-                order.push((i, rank, plan.slot.index));
-            }
-        }
-    }
-    order.sort_by_key(|&(_, rank, index)| (rank, std::cmp::Reverse(index)));
-    let mut viewed = vec![false; memory.slots.len()];
-    for (i, _, _) in order {
-        m.tick(1)?;
-        let total = cx.descriptors.plus(&census.counts(stage));
-        if total.storage_buffers <= limits.max_per_stage_descriptor_storage_buffers
-            || total.uniform_buffers >= limits.max_per_stage_descriptor_uniform_buffers
-        {
-            break;
-        }
-        let Some(window) = windows.get(i).copied().flatten() else {
-            break;
-        };
-        let kind = fallback_view(p, window);
-        if let Some(l) = lowering.get_mut(i) {
-            *l = Some(SlotLowering::View(kind));
-            census.viewed(kind);
-        }
-        if let Some(v) = viewed.get_mut(i) {
-            *v = true;
-        }
-    }
-    // The fallback's facts, on every compile where it can run: each candidate whose window does
-    // not bound its uniform range states what this compile made of it (`Viewed`, or `Spare`
-    // whether or not the fallback ran), so a plan can name every slot a variant must keep a
-    // storage view, a variant that pulls a vertex layout included (it adds a storage buffer); a
-    // viewed `device` slot needs the alias check. Every slot the compile keeps states `Kept`,
-    // candidate or not, so the plan of the variant restates its key.
-    for &(i, _) in &candidates {
-        let (Some(plan), Some(window)) = (memory.slots.get(i), windows.get(i).copied().flatten())
-        else {
-            continue;
-        };
-        let slot = plan.slot;
-        if inputs.storage_view_slots.contains(&slot) {
-            continue;
-        }
-        let is_viewed = viewed.get(i).copied().unwrap_or(false);
-        if is_viewed {
-            // The slot is no storage view any more. A slot nothing reads (only compared) cannot
-            // observe a write, so it needs no alias check.
-            cx.facts.remove(&RuntimeFact::BufferRangeLimit { slot });
-            if plan.space != AddrSpace::Constant && plan.access.read {
-                cx.facts.insert(RuntimeFact::UniformViewAliasing { slot });
-            }
-        }
-        if !uniform_range_fits(window, limits) {
-            let choice = if is_viewed {
-                UniformViewChoice::Viewed
-            } else {
-                UniformViewChoice::Spare
-            };
-            cx.facts
-                .insert(RuntimeFact::UniformViewRange { slot, choice });
-        }
-    }
-    for plan in &memory.slots {
-        if inputs.storage_view_slots.contains(&plan.slot) {
-            cx.facts.insert(RuntimeFact::UniformViewRange {
-                slot: plan.slot,
-                choice: UniformViewChoice::Kept,
-            });
-        }
-    }
+    let mut census = Census::new(
+        &cx.push,
+        (
+            cx.families.access.dynamic.used,
+            identity(p),
+            own_addresses,
+            (crate::lower::push::base(cx), p.push_window()),
+        ),
+        forms,
+        m,
+    )?;
     if addressed {
         // The storage views the step may move, the highest Metal index first: the accessed slots
         // (by their chosen windows) in memory-plan order, then the source buffers of their own.
         // A stable sort read from its end takes the last of equal indices, as the search for the
         // greatest index per step once did.
-        let storage = SlotLowering::View(ViewKind::Storage);
+        let storage = SlotLowering::View;
         let mut order: Vec<(u32, Moved)> = Vec::new();
         for (i, (plan, (l, w))) in memory
             .slots
@@ -1486,17 +1345,34 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     let addressed_slot = |cx: &mut SelectCx<'_>, slot: SlotRef| {
         cx.facts.insert(RuntimeFact::DeviceAddresses { slot });
         cx.push.remove(&PushField::SlotBindOffset(slot));
-        cx.push.insert(PushField::RootTableAddress);
+        cx.push.insert(slot_address_field(own_addresses, slot));
     };
-    for (plan, (l, w)) in memory.slots.iter().zip(lowering.iter().zip(&windows)) {
+    for (i, (plan, (l, w))) in (memory.slots.iter())
+        .zip(lowering.iter().zip(&windows))
+        .enumerate()
+    {
         let (Some(l), Some(window)) = (l, w) else {
             slots.push(None);
             continue;
         };
         let form = match l {
-            SlotLowering::View(kind) => BufferForm::Descriptor(descriptor_view(*kind)),
+            SlotLowering::View => BufferForm::Descriptor,
             SlotLowering::Psb { .. } => {
                 addressed_slot(cx, plan.slot);
+                if let Some(align) = address_alignment(cx, plan) {
+                    if align >= 2 {
+                        cx.facts.insert(RuntimeFact::AddressAlignment {
+                            slot: plan.slot,
+                            align,
+                        });
+                    }
+                    // A word memory's base is a multiple of 4; a slot each of whose accesses is
+                    // one narrow unit needs only that unit's alignment.
+                    let reach = cx.families.access.reach.get(&i).copied().unwrap_or(4);
+                    if align >= reach.min(4) {
+                        cx.families.access.aligned.insert(i);
+                    }
+                }
                 BufferForm::Psb
             }
         };
@@ -1525,7 +1401,14 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     }
     let counts = census.counts(stage);
     cx.descriptors = cx.descriptors.plus(&counts);
-    cx.families.access.argument_table = table::spills(stage, &cx.push);
+    let window = (crate::lower::push::base(cx), p.push_window());
+    cx.families.access.argument_table = table::spills(stage, window, &cx.push);
+    // Under the identity domains a function whose fields spill, of any stage, reads them from a
+    // parameter block whose address its window holds first: a render pipeline's stages too, in
+    // their shares of the device's one range (`push::vertex_end`).
+    if cx.families.access.argument_table && identity(p) {
+        cx.push.insert(PushField::ArgumentTableAddress);
+    }
     let mut sourced: Vec<pulled::PulledSlot> = own
         .iter()
         .map(|&(s, l)| pulled::PulledSlot {
@@ -1545,9 +1428,32 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     cx.families.access.pulled = sourced;
     cx.families.access.unwritten = unwritten_slots(cx, &lowering, &sources);
     cx.families.access.slots = lowering;
-    cx.families.access.psb_contained = p.fields().containment != Containment::UnsafeOff;
+    // The root table's bounds; under the identity domains a slot's accesses are checked against
+    // its pushed length instead (`variable`).
+    cx.families.access.psb_contained = !identity(p);
     cx.families.access.psb_units = psb::narrow_units(p);
+    cx.families.access.identity = identity(p);
     Ok(slots)
+}
+
+/// The alignment (2, 4, 8 or 16) the binder holds a device-address slot's address to under the
+/// identity domains: its argument's `air.arg_type_align_size`, at most 16. Metal's API validation
+/// refuses a buffer bound at an offset that is not a multiple of its argument type's alignment
+/// ("must be a multiple of 4 but was set to 2" for a `uint *` argument, "of 16 ... 8" for a
+/// `float4 *`, "of 2 ... 1" for a `ushort *`; `probes/vector_access_placement.m` in the conformance
+/// crate). A slot whose alignment is at least 4 is then reached from its address as it is
+/// ([`AccessPlan::aligned`]), and one held to less where each of its accesses is one narrow unit
+/// no wider than its alignment ([`AccessPlan::reach`]). 1 for an argument with no alignment or
+/// one of 1, which states none; `None` for a buffer-table element and an argument buffer.
+fn address_alignment(cx: &SelectCx<'_>, plan: &SlotPlan) -> Option<u32> {
+    if !identity(cx.profile) || plan.element.is_some() || plan.argument_buffer {
+        return None;
+    }
+    let twos = cx
+        .memory
+        .base_twos(cx.entry, Root::Param(plan.param))
+        .min(4);
+    Some(1 << twos)
 }
 
 /// The string attribute by which Metal's compiler declares that a buffer argument's memory is
@@ -1555,12 +1461,14 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
 const BUFFER_NO_ALIAS: &[u8] = b"air-buffer-no-alias";
 
 /// The memory-plan slots whose memory nothing in the module writes, among those read through a
-/// storage view (`lowering`): a plain buffer argument the AIR declares unaliased
-/// ([`BUFFER_NO_ALIAS`]) that no store or atomic of the function reaches, through the slot or
-/// through a pointer its address may come back as (`SlotPlan::wide`), and that no volatile or
-/// coherent access reads (what it reads may change while the dispatch runs). Being unaliased, its
-/// memory is no other argument's, so no write of the module lands on it. A buffer-table element
-/// and a pulled fetch's source are left out.
+/// storage view (`lowering`) or, under the identity domains, through their device address: a
+/// plain buffer argument the AIR declares unaliased ([`BUFFER_NO_ALIAS`]) that no store or atomic
+/// of the function reaches, through the slot or through a pointer its address may come back as
+/// (`SlotPlan::wide`), and that no volatile or coherent access reads (what it reads may change
+/// while the dispatch runs). Being unaliased, its memory is no other argument's, so no write of
+/// the module lands on it. A device-address `constant` argument is one too, aliased or not: Metal's
+/// `constant` address space is read-only, so no write of a Metal program lands on it while it
+/// runs. A buffer-table element and a pulled fetch's source are left out.
 fn unwritten_slots(
     cx: &SelectCx<'_>,
     lowering: &[Option<SlotLowering>],
@@ -1578,21 +1486,26 @@ fn unwritten_slots(
                 .any(|&(key, _)| module.symbols().get(key) == Some(BUFFER_NO_ALIAS))
         })
     };
-    let storage = Some(SlotLowering::View(ViewKind::Storage));
+    let identity = identity(cx.profile);
     cx.memory
         .slots
         .iter()
         .zip(lowering)
         .enumerate()
         .filter(|&(i, (plan, l))| {
-            *l == storage
+            let unwritten = !plan.access.write && !plan.wide.write && unaliased(plan.param);
+            let read_only = match l {
+                Some(SlotLowering::View) => unwritten,
+                Some(SlotLowering::Psb { .. }) if identity => {
+                    unwritten || plan.space == AddrSpace::Constant
+                }
+                _ => false,
+            };
+            read_only
                 && plan.element.is_none()
                 && !sources.contains(&plan.slot)
-                && !plan.access.write
-                && !plan.wide.write
                 && !plan.atomic
                 && !cx.families.access.ordered.contains(&i)
-                && unaliased(plan.param)
         })
         .map(|(i, _)| i)
         .collect()
@@ -1628,16 +1541,20 @@ fn plan_replay(cx: &mut SelectCx<'_>, sources: &[SlotRef]) -> Result<(), Error> 
     // A replayed command is a compute dispatch with no stage-in region and no tile pass, or a
     // draw whose vertex function fetches no attribute in fixed function: its buffers are the
     // record's, read through the slot table, which a pulled attribute's read reaches and
-    // fixed-function input does not (the replay pulls every layout,
-    // `bind::draw_replay_vertex_layouts`).
+    // fixed-function input does not (the replay pulls every fixed-function binding's layout).
     use crate::pipeline::sym::Stage;
     let drawn = cx.inputs.replay_bindings && matches!(cx.stage, Stage::Vertex | Stage::Fragment);
     // A folded object function: its draw's pieces fold Metal's object grid
     // (`bind::mesh_arguments`).
     let pieces = cx.inputs.folded_groups && cx.stage == Stage::Object;
     let fetches = (cx.inputs.vertex_fetch.as_ref()).is_some_and(|f| {
-        (f.attributes.values())
-            .any(|a| *a == crate::pipeline::lower_inputs::VertexFetch::FixedFunction)
+        (f.attributes.values()).any(|a| {
+            use crate::pipeline::lower_inputs::VertexFetch;
+            matches!(
+                a,
+                VertexFetch::FixedFunction | VertexFetch::SignedFixedFunction
+            )
+        })
     });
     // A drawn vertex function's sources are its pulled attributes' buffers, which its slot table
     // holds; a kernel's are its stage-in fetch's.
@@ -1770,7 +1687,7 @@ pub fn accept_placement(cx: &SelectCx<'_>, placement: &PushPlacement) -> Result<
         );
     }
     let range = cx.profile.fields().limits.max_uniform_buffer_range;
-    if placement.argument_table_size > range {
+    if placement.argument_table_size > range && !cx.families.access.identity {
         return Err(Unsupported::needs(
             Feature::DescriptorCount,
             Capability::Limit {
@@ -1793,6 +1710,24 @@ pub fn table_field(
 ) -> BResult<SValue> {
     let read = match &cx.decl.families.access.table {
         Some(t) => table::read(fb, t, field)?,
+        // Under the identity domains the table is the parameter block at the pushed address.
+        None if cx.plan.families.access.identity => {
+            let offset = cx.plan.push.fields.iter().find_map(|f| match f.loc {
+                PushLoc::ArgumentTable { offset } if f.field == field => Some(offset),
+                _ => None,
+            });
+            match offset {
+                Some(offset) => {
+                    let block = cx.push_field(fb, PushField::ArgumentTableAddress)?;
+                    let mut lines = Vec::new();
+                    for line in table::lines(offset, field) {
+                        lines.push((line, cx.block_line(fb, block, line)?));
+                    }
+                    Some(table::field_of_lines(fb, &lines, offset, field)?)
+                }
+                None => None,
+            }
+        }
         None => None,
     };
     match read {
@@ -1811,9 +1746,12 @@ pub fn declare(
 ) -> BResult<Declared> {
     let mut d = Declared {
         local: local::declare(mb, plan)?,
-        table: table::declare(mb, &plan.push)?,
-        blob: match plan.families.access.blob {
-            Some(_) => Some(crate::memory::blob::declare(mb, plan.stage)?),
+        table: match plan.families.access.identity {
+            true => None,
+            false => table::declare(mb, &plan.push)?,
+        },
+        blob: match &plan.families.access.blob {
+            Some(b) => Some(crate::memory::blob::declare(mb, plan.stage, b)?),
             None => None,
         },
         pulled: pulled::declare(mb, &plan.families.access)?,
@@ -1834,19 +1772,13 @@ pub fn declare(
     for (i, s) in plan.slots.iter().enumerate() {
         let lowering = plan.families.access.slots.get(i).copied().flatten();
         let view = match (s, lowering) {
-            (Some(c), Some(SlotLowering::View(kind))) => Some(views::declare(mb, c.slot, kind)?),
+            (Some(c), Some(SlotLowering::View)) => Some(views::declare(mb, c.slot)?),
             _ => None,
         };
-        if let (Some(c), true) = (s, plan.families.access.unwritten.contains(&i)) {
+        if let (Some(c), Some(_), true) = (s, view, plan.families.access.unwritten.contains(&i)) {
             mb.unwritten_buffer(views::binding_symbol(c.slot));
         }
         d.views.push(view);
-        d.at_bind.push(match (s, view.map(|v| v.kind)) {
-            (Some(c), Some(ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. })) => {
-                Some(range_at_bind_offset(mb, c.slot)?)
-            }
-            _ => None,
-        });
         let units = plan
             .families
             .access
@@ -1855,7 +1787,7 @@ pub fn declare(
             .copied()
             .unwrap_or(Units::NONE);
         d.units.push(match (s, view) {
-            (Some(c), Some(view)) => views::UnitViews::declare(mb, c.slot, view, units)?,
+            (Some(c), Some(_)) => views::UnitViews::declare(mb, c.slot, units)?,
             _ => views::UnitViews::NONE,
         });
     }
@@ -2048,59 +1980,76 @@ fn select_access(
     align: Option<crate::air::ir::Align>,
     m: &mut Meter,
 ) -> Result<Access, Error> {
-    let (targets, null, blob_check) = blob_roots(cx, ptr, value.is_some(), m)?;
+    let (targets, null, blob) = blob_roots(cx, ptr, value.is_some(), m)?;
     let align = align.map_or(1, |a| a.bytes());
     let proven = cx.memory.proven_align(cx.entry, ptr);
     let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align, proven)?;
-    access_with_leaf(cx, ptr, value, leaf, targets, null, blob_check)
+    access_with_leaf(cx, ptr, value, leaf, targets, null, blob)
 }
 
 /// The candidate targets of static-root pointer `ptr` ([`buffer_roots`]), accessed as a write
-/// when `write`, and the constant blob's containment check when `ptr` may point into the blob,
-/// which the function then reads. The blob is constant: a write through such a pointer is
-/// refused. Loads, stores, and memory intrinsics' endpoints (`copy::endpoint`) share it.
+/// when `write`, and whether `ptr` may point into the constant blob, which the function then
+/// reads. The blob is constant: a write through such a pointer is refused. Loads, stores, and
+/// memory intrinsics' endpoints (`copy::endpoint`) share it.
 fn blob_roots(
     cx: &mut SelectCx<'_>,
     ptr: Value,
     write: bool,
     m: &mut Meter,
-) -> Result<(Vec<Target>, bool, Option<Check>), Error> {
+) -> Result<(Vec<Target>, bool, bool), Error> {
     let (targets, null, in_blob) = buffer_roots(cx, ptr, m)?;
     if in_blob && write {
         return Err(refuse());
     }
-    let blob_check = if in_blob {
+    if in_blob {
         blob::use_blob(cx)?;
-        Some(contain::encoding(cx.profile))
-    } else {
-        None
-    };
-    Ok((targets, null, blob_check))
+    }
+    Ok((targets, null, in_blob))
 }
 
-/// Give each of `targets` the profile's containment check and read its slot's `SlotBindOffset`;
-/// a written target is a storage view. Every static-root access places its targets here
-/// ([`access_with_leaf`], `copy::endpoint`).
-fn place_targets(cx: &mut SelectCx<'_>, targets: &mut [Target], write: bool) -> Result<(), Error> {
-    let check = contain::encoding(cx.profile);
+/// Read the `SlotBindOffset` of each of `targets`' slots. Every static-root access places its
+/// targets here
+/// ([`access_with_leaf`], `copy::endpoint`), each at a byte offset that is a translation-time
+/// constant only where `fixed` ([`note_variable`]).
+fn place_targets(
+    cx: &mut SelectCx<'_>,
+    targets: &[Target],
+    (write, fixed): (bool, bool),
+    reach: u32,
+) -> Result<(), Error> {
     for t in targets {
-        t.check = check;
         let plan = cx
             .memory
             .slots
             .get(t.slot)
             .ok_or_else(|| cx.invariant("a target names a missing slot"))?;
-        if write && view_kind(cx.profile, plan) != ViewKind::Storage {
-            return Err(cx.invariant("a write through a uniform view"));
-        }
-        cx.push.insert(PushField::SlotBindOffset(plan.slot));
+        let slot = plan.slot;
+        cx.push.insert(PushField::SlotBindOffset(slot));
+        note_variable(cx, slot, fixed, !write);
+        note_reach(cx, t.slot, reach);
     }
     Ok(())
 }
 
+/// An access reaches memory-plan slot `slot` at the granularity `reach` ([`AccessPlan::reach`]).
+fn note_reach(cx: &mut SelectCx<'_>, slot: usize, reach: u32) {
+    let r = cx.families.access.reach.entry(slot).or_insert(0);
+    *r = (*r).max(reach);
+}
+
+/// The granularity at which an access of `leaf` reaches a device-address memory on profile `p`
+/// ([`AccessPlan::reach`]): a [`leaf::Path::OneWord`] leaf of a narrow unit the profile has is
+/// that one unit, so its size; any other leaf reaches words or wider units, so 4.
+fn leaf_reach(p: &DeviceProfile, leaf: &Leaf) -> u32 {
+    match leaf.path == leaf::Path::OneWord && psb::narrow_units(p).has(leaf.bytes) {
+        true => leaf.bytes,
+        false => 4,
+    }
+}
+
 /// Give each slot of `targets` the unit views that read or write `leaf` (a store when `write`)
-/// in whole units ([`leaf::leaf_units`]): a storage slot the narrow views the profile can access
-/// and a `uvec2` view, and any slot a `uvec4` view.
+/// in whole units ([`leaf::leaf_units`]): the narrow views the profile can access, and the `uvec2`
+/// and `uvec4` views.
 fn note_units(
     cx: &mut SelectCx<'_>,
     targets: &[Target],
@@ -2112,21 +2061,8 @@ fn note_units(
         return Ok(());
     }
     for t in targets {
-        let plan = cx
-            .memory
-            .slots
-            .get(t.slot)
-            .ok_or_else(|| cx.invariant("a target names a missing slot"))?;
-        let units = match view_kind(cx.profile, plan) {
-            ViewKind::Storage => units,
-            // A uniform view has no narrow or `uvec2` view.
-            ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. } => Units {
-                vec4: units.vec4,
-                ..Units::NONE
-            },
-        };
-        if units.is_empty() {
-            continue;
+        if cx.memory.slots.get(t.slot).is_none() {
+            return Err(cx.invariant("a target names a missing slot"));
         }
         let entry = cx
             .families
@@ -2146,11 +2082,17 @@ fn access_with_leaf(
     ptr: Value,
     value: Option<Value>,
     leaf: Leaf,
-    mut targets: Vec<Target>,
+    targets: Vec<Target>,
     null: bool,
-    blob_check: Option<Check>,
+    blob: bool,
 ) -> Result<Access, Error> {
-    place_targets(cx, &mut targets, value.is_some())?;
+    let fixed = fixed_offset(cx, ptr);
+    place_targets(
+        cx,
+        &targets,
+        (value.is_some(), fixed),
+        leaf_reach(cx.profile, &leaf),
+    )?;
     note_units(cx, &targets, &leaf, value.is_some())?;
     let ptr = operand(cx, ptr)?;
     let value = match value {
@@ -2180,7 +2122,7 @@ fn access_with_leaf(
         null,
         coherence: None,
         volatile: false,
-        blob: blob_check,
+        blob,
     })
 }
 
@@ -2258,8 +2200,13 @@ pub fn select(
     if let Some(s) = imageblock::select(cx, inst)? {
         return Ok(AccessStrategy::Imageblock(s));
     }
-    if let Some(s) = encode::select(cx, at, inst, m)? {
-        return Ok(AccessStrategy::Encode(s));
+    // Under the identity domains an indirect-command operation is `icb`'s; its object word's
+    // handle load stays `object`'s.
+    if let Some(c) = icb::select(cx, inst, m)? {
+        return Ok(AccessStrategy::Commands(c));
+    }
+    if let Some(s) = object::select(cx, at, inst, m)? {
+        return Ok(AccessStrategy::Object(s));
     }
     if let Some(s) = cell::select(cx, at, inst)? {
         return Ok(AccessStrategy::Cell(s));
@@ -2371,8 +2318,7 @@ pub fn select(
 }
 
 /// Record the static slots a volatile, coherent, or atomic access `s` reaches
-/// (`AccessPlan::ordered`). An atomic's words are reached through a storage-view pointer, which a
-/// uniform view has none of, and an atomic load reads words other invocations may write.
+/// (`AccessPlan::ordered`): an atomic load reads words other invocations may write.
 fn note_ordered(cx: &mut SelectCx<'_>, s: &AccessStrategy) {
     if let AccessStrategy::Atomic(atomic::AtomicAccess {
         mem: atomic::AtomicMem::Buffer { targets, .. },

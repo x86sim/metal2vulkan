@@ -76,8 +76,8 @@
 //!   the decoding of those sixteen is already compared exactly on the vertex path
 //!   (`vertex-format-float4`) and `tests::the_stage_in_decode_is_the_vertex_decode` holds Metal's
 //!   two fetches to one answer, so what is unknown of the stage-in path is the pipeline alone.
-//!   Asking no more also means one refused format costs one row of `known-gaps.tsv` rather than one
-//!   per leaf of a dispatch that never ran.
+//!   Asking no more also means one refused format costs one row of `known-gaps-rt.tsv` rather than
+//!   one per leaf of a dispatch that never ran.
 //!
 //! # What is not reached here, and why
 //!
@@ -102,7 +102,6 @@
 //! one dispatch and one wait a row; every fetch is inside the buffer the row bound; no texture, no
 //! loop.
 
-use crate::allowance::Allowance;
 use crate::attribute_coding as coding;
 use crate::attribute_coding::{shape, FILLER, ROWS, SLOT};
 use crate::case::{
@@ -516,23 +515,12 @@ impl Case for AttributeFormats {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // No value is loosened. Every decoding is exact arithmetic on the codes the record holds
-        // and every site is the raw bits the kernel reported, so a word that differs is a
-        // difference in the decode and not a rounding.
-        //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // this case, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
+    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
+        // One declaration, which loosens no value: `stage_in_fetch_wide` stores at an index of the
+        // grid's width, which the translator does not find disjoint between two threads of one
+        // SIMD-group, so the runtime's pipelines note SIMD-group access pairs on every device
+        // (`crate::replay::simdgroup_access_order_notice`).
+        vec![crate::replay::simdgroup_access_order_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -584,38 +572,39 @@ impl Case for AttributeFormats {
             let at = |site: &str| format!("{}/{site}", row.name());
             // A pipeline either side refuses is recorded at its own site and the sweep carries on,
             // so one refused row compares as a refusal there while every other row still compares.
-            // Its output then stays at the filler on that side, which is the same shape as every
-            // other row's: a refusal never arrives as a missing site.
-            let pipeline = probe(
+            // The row stops at its refusal: the sites after it are the other side's alone, which
+            // the comparison folds under the refusal (`compare`'s walk), so a refused row is one
+            // refusal and not a divergence for each leaf of a dispatch that never ran.
+            let Some(pipeline) = probe(
                 sites,
                 &at("pipeline"),
                 side.compute_pipeline_with_stage_input(library, ENTRY, &row.stage_input()),
                 |_| Value::Absent,
-            );
+            ) else {
+                continue;
+            };
             let output = made(
                 sites,
                 &at("buffer/output"),
                 side.buffer(&vec![FILLER; OUTPUT_BYTES]),
             )?;
-            if let Some(pipeline) = pipeline {
-                let command_buffer = made(
-                    sites,
-                    &at("dispatch"),
-                    side.dispatch_threads(
-                        pipeline,
-                        &Bindings::buffers(&[output, source]),
-                        &[REGION],
-                        [ROWS as u32, 1, 1],
-                        [ROWS as u32, 1, 1],
-                    ),
-                )?;
-                call(
-                    sites,
-                    &at("status"),
-                    side.wait(command_buffer),
-                    Clone::clone,
-                )?;
-            }
+            let command_buffer = made(
+                sites,
+                &at("dispatch"),
+                side.dispatch_threads(
+                    pipeline,
+                    &Bindings::buffers(&[output, source]),
+                    &[REGION],
+                    [ROWS as u32, 1, 1],
+                    [ROWS as u32, 1, 1],
+                ),
+            )?;
+            call(
+                sites,
+                &at("status"),
+                side.wait(command_buffer),
+                Clone::clone,
+            )?;
             let bytes = call(
                 sites,
                 &at("read-back"),
@@ -718,12 +707,12 @@ impl Case for ClassCrossings {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Nothing is loosened: whether a pipeline was made is not a number that can round, and
-        // the case reads no buffer back, so the notice a card without unified memory announces for
-        // a `Shared` buffer cannot reach it. Measured exact on the RTX 5080 Laptop (615.71.09)
-        // and on llvmpipe, which is why it declares nothing.
-        Vec::new()
+    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
+        // One declaration, which loosens no value: `stage_in_fetch_wide` stores at an index of the
+        // grid's width, which the translator does not find disjoint between two threads of one
+        // SIMD-group, so the runtime's pipelines note SIMD-group access pairs on every device
+        // (`crate::replay::simdgroup_access_order_notice`).
+        vec![crate::replay::simdgroup_access_order_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

@@ -35,7 +35,7 @@ use crate::pipeline::layout::BindingSource;
 use crate::pipeline::link::{link, LinkInputs};
 use crate::pipeline::sym::{ResourceKind, SamplerRef, SlotClass, SlotRef, SpecKey, Stage};
 use crate::pipeline::testing::{
-    compile, engine_dir, link_and_validate, llvm_assemble, profile, AssembleError,
+    compile, engine_dir, link_and_validate, llvm_assemble, profile, profile_without, AssembleError,
 };
 use crate::spirv::testing::committed_profiles;
 
@@ -91,7 +91,7 @@ fn assemble(name: &str, body: &str) -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn ok(bc: &[u8], entry: &str, p: &DeviceProfile) -> std::sync::Arc<FunctionArtifact> {
@@ -145,7 +145,6 @@ const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
 const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
 const OP_IMAGE_GATHER: u16 = 96;
 const OP_IMAGE_QUERY_LOD: u16 = 105;
-const OP_FUNCTION_CALL: u16 = 57;
 
 const OP_QUANTIZE_TO_F16: u16 = 116;
 const OP_F_ORD_EQUAL: u16 = 180;
@@ -329,14 +328,13 @@ fn runtime_samplers_select_pixel_coordinates_by_specialization() {
 /// A sample through a runtime sampler slot is the device's on every committed profile: the
 /// function reads only the coordinates bit of the slot's word (`SamplerWord::PIXEL_COORDINATES`),
 /// never its filter, address modes or levels, and the module requires the device's own sampler
-/// (`VkProperty::MetalSampler` on MoltenVK, `VkProperty::DeviceSampling` elsewhere) and validates.
+/// (`VkProperty::DeviceSampling`) and validates.
 #[test]
 fn a_runtime_samplers_sample_is_the_device_s() {
     let Some(bc) = fixture() else {
         return;
     };
     let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
-    let (mut metal, mut device) = (0, 0);
     for (stem, p) in committed_profiles().expect("profiles") {
         let a = ok(&bc, "sample_level", &p);
         assert_eq!(
@@ -345,24 +343,13 @@ fn a_runtime_samplers_sample_is_the_device_s() {
             "{stem}"
         );
         assert_eq!(uses(&a, "sampler.sample"), 1, "{stem}");
-        let property = match p
-            .fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::MetalSampler)
-        {
-            true => {
-                metal += 1;
-                VkProperty::MetalSampler
-            }
-            false => {
-                device += 1;
-                VkProperty::DeviceSampling
-            }
-        };
-        assert!(a.requirements.properties.contains(&property), "{stem}");
+        assert!(
+            a.requirements
+                .properties
+                .contains(&VkProperty::DeviceSampling),
+            "{stem}"
+        );
     }
-    assert!(metal > 0 && device > 0, "metal {metal}, device {device}");
 }
 
 /// A runtime sampler's sample at a level (a dynamic level, `1.5`, `1.0`, a kernel's dynamic bias)
@@ -492,13 +479,14 @@ fn runtime_pixel_accesses_hand_the_device_the_scaled_coordinate() {
 
 /// The notes a stage that samples through a runtime sampler slot or an argument buffer's sampler,
 /// or a runtime cubic sampler's variant, records on the M3 Max under MoltenVK where its state is
-/// normalized: the unconditional ones are these, as before a nearest pixel sample took its texel's
-/// centre, and that centre's `DeviceDenormals` is held only where the slot's `NearestPixelSampler`
-/// specialization is 1, which no normalized state's is (`Resources::nearest_pixel_sampler`), or,
-/// for an integer texture's centre, where the slot's word states pixel coordinates. An argument
-/// buffer's sampler records no `DeviceDenormals`: `ArgumentPixelSamplerScaling`, which the runtime
-/// announces only while a pixel state lives, records its centre's reading. The depth comparison
-/// records `RestrictedDepthRange`, as MoltenVK exposes no `VK_EXT_depth_range_unrestricted`. An
+/// normalized: the unconditional ones are these, the device's own sampling, texel conversion,
+/// denormals and NaN bits among them, and a held `DeviceDenormals` is held only where the slot's
+/// `NearestPixelSampler` specialization is 1, which no normalized state's is
+/// (`Resources::nearest_pixel_sampler`), or, for an integer texture's centre, where the slot's word
+/// states pixel coordinates. An argument buffer's pixel sampler records no `DeviceDenormals`:
+/// `ArgumentPixelSamplerScaling`, which the runtime announces only while a pixel state lives,
+/// records its centre's reading. The depth comparison
+/// records `RestrictedDepthRange`, as on every device. An
 /// argument buffer's raw texture sampled through the runtime slot holds its filter's
 /// `BicubicFilterArithmetic` only under the bound sampler's word (`SpecKey::BoundSamplerWord`)
 /// where its handles can name a raw texture (`SpecKey::HeapRawTextures`).
@@ -508,7 +496,7 @@ fn normalized_and_cubic_stages_record_no_note_their_states_cannot_run() {
     use crate::pipeline::testing::compile_with;
     use std::collections::BTreeSet;
     use PrecisionNote as N;
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let assembled = |name: &str| match llvm_assemble(&engine_dir().join(format!("{name}.ll"))) {
         Ok(b) => Some(b),
         Err(AssembleError::Missing(why)) => {
@@ -519,48 +507,73 @@ fn normalized_and_cubic_stages_record_no_note_their_states_cannot_run() {
     };
     let s = slot(Stage::Kernel, SlotClass::Sampler, 0);
     // Each stage, the cubic variant's bound word where it is one, and its unconditional notes.
-    let cubic_half = [N::BicubicFilterArithmetic, N::NativeHalfConversion];
+    // The notes of the device's own sampling, texel conversion and denormals, which every stage
+    // records, and of the device's NaN bits, which a stage that moves a `half` or a `float` it did
+    // not compute records too.
+    let device = [N::DeviceSampling, N::DeviceTexelConversion];
+    let held = [N::DeviceDenormals, N::NativeNanEncoding];
+    let base: Vec<N> = device.iter().chain(&held).copied().collect();
+    let with = |more: &[N]| -> Vec<N> { base.iter().chain(more).copied().collect() };
+    let half = [
+        N::DeviceDenormals,
+        N::DeviceSampling,
+        N::HalfTexelConversion,
+        N::NativeHalfConversion,
+        N::NativeNanEncoding,
+    ];
+    let cubic_half = [
+        N::BicubicFilterArithmetic,
+        N::NativeHalfConversion,
+        N::NativeNanEncoding,
+    ];
+    let cubic_half_plain = [
+        N::BicubicFilterArithmetic,
+        N::DeviceSampling,
+        N::HalfTexelConversion,
+        N::NativeHalfConversion,
+        N::NativeNanEncoding,
+    ];
+    let cubic_plain = [
+        N::BicubicFilterArithmetic,
+        N::DeviceSampling,
+        N::DeviceTexelConversion,
+    ];
+    let px_argument = [
+        N::ArgumentPixelSamplerScaling,
+        N::DeviceSampling,
+        N::DeviceTexelConversion,
+        N::SrgbTexelDecode,
+    ];
+    let fragment = with(&[N::FastMathRewrites, N::CubeGradientFootprint]);
+    let depth = with(&[N::RestrictedDepthRange]);
+    let grad = with(&[N::GradFromBias]);
+    let argument = with(&[N::SrgbTexelDecode]);
     let stages: [(&str, &str, Option<u32>, &[PrecisionNote]); 14] = [
-        ("sampling", "sample_level", None, &[]),
-        ("sampling", "sample_base", None, &[]),
-        ("sampling", "sample_grad", None, &[]),
-        (
-            "sampling",
-            "sample_fragment",
-            None,
-            &[N::FastMathRewrites, N::CubeGradientFootprint],
-        ),
-        (
-            "sampling",
-            "sample_compare_depth",
-            None,
-            &[N::RestrictedDepthRange],
-        ),
-        ("handles", "sampler_select", None, &[]),
+        ("sampling", "sample_level", None, &base),
+        ("sampling", "sample_base", None, &base),
+        ("sampling", "sample_grad", None, &half),
+        ("sampling", "sample_fragment", None, &fragment),
+        ("sampling", "sample_compare_depth", None, &depth),
+        ("handles", "sampler_select", None, &base),
+        ("handles", "fragment_select_sample", None, &grad),
         (
             "handles",
-            "fragment_select_sample",
+            "argument_buffer_runtime_sampler",
             None,
-            &[N::GradFromBias],
+            &argument,
         ),
-        ("handles", "argument_buffer_runtime_sampler", None, &[]),
-        (
-            "px_samplers",
-            "px_sample_argument",
-            None,
-            &[N::ArgumentPixelSamplerScaling],
-        ),
+        ("px_samplers", "px_sample_argument", None, &px_argument),
         (
             "gsm2_cubic_samplers",
             "gsm2_cubic_samples",
             None,
-            &[N::BicubicFilterArithmetic],
+            &cubic_plain,
         ),
         (
             "gsm2_cubic_samplers",
             "gsm2_cubic_half_samples",
             None,
-            &cubic_half,
+            &cubic_half_plain,
         ),
         (
             "gsm2_cubic_samplers",
@@ -581,6 +594,7 @@ fn normalized_and_cubic_stages_record_no_note_their_states_cannot_run() {
             &cubic_half,
         ),
     ];
+    let mut wrong = Vec::new();
     for (fixture, entry, cubic, unconditional) in stages {
         let Some(bc) = assembled(fixture) else {
             return;
@@ -598,12 +612,9 @@ fn normalized_and_cubic_stages_record_no_note_their_states_cannot_run() {
             .copied()
             .filter(|n| !held.contains(n))
             .collect();
-        assert_eq!(
-            always,
-            unconditional.iter().copied().collect(),
-            "{what}: {:?}",
-            a.specialized
-        );
+        if always != unconditional.iter().copied().collect() {
+            wrong.push(format!("{what}: {always:?} ({:?})", a.specialized));
+        }
         // The centre's note: under a nearest pixel state's specialization alone.
         let pixel_state = |t: &crate::pipeline::SpecTest| match t.key {
             SpecKey::NearestPixelSampler(_) => t.mask == 1 && t.bits == 1 && t.equal,
@@ -639,6 +650,7 @@ fn normalized_and_cubic_stages_record_no_note_their_states_cannot_run() {
             );
         }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A kernel whose one comparison samples `depth2d<float, sample>` slot 0 through runtime sampler
@@ -989,30 +1001,18 @@ fn gathers_gradients_and_pixel_constexpr_samplers() {
         .all(|k| !matches!(k, SpecKey::SamplerState { .. })));
 }
 
-/// A `half` sample of a texture slot converts its texel by the bound format's class: the slot's
-/// `TexelFormat` fact and specialization, a call of the module's conversion routine (whose words
-/// the census counts once), and the `HalfTexelConversion` note. A `float` sample takes none of
-/// them.
+/// A `half` sample of a texture slot is the device's texel rounded to nearest even, which records
+/// the `HalfTexelConversion` note outright. A `float` sample takes none.
 #[test]
-fn half_samples_convert_by_the_bound_format() {
+fn half_samples_take_the_device_s_texel_noted() {
     let Some(bc) = fixture() else {
         return;
     };
     let p = m3();
-    let t = slot(Stage::Kernel, SlotClass::Texture, 0);
     let h = ok(&bc, "sample_grad", &p);
-    assert!(h.facts.contains(&RuntimeFact::TexelFormat { slot: t }));
-    assert!(h.interface.reads_key(SpecKey::TexelFormat(t)));
     assert!(h.precision.contains(&PrecisionNote::HalfTexelConversion));
-    assert_eq!(count(&h, OP_FUNCTION_CALL), 1);
-    assert!(h.strategies.entries.contains_key("texture.half_texel"));
     let f = ok(&bc, "sample_level", &p);
-    assert!(f
-        .facts
-        .iter()
-        .all(|x| !matches!(x, RuntimeFact::TexelFormat { .. })));
     assert!(!f.precision.contains(&PrecisionNote::HalfTexelConversion));
-    assert!(!f.strategies.entries.contains_key("texture.half_texel"));
 }
 
 /// In a fragment function implicit-LOD samples and LOD queries use the fragment's derivatives; a
@@ -1267,8 +1267,8 @@ const OP_SWITCH: u16 = 251;
 
 /// A dynamic offset on a gather, and on a fragment's implicit-LOD sample, is the `Offset` operand
 /// of the value Metal applies, its low four bits sign-extended by one `OpBitFieldSExtract`; only
-/// the sample needs `maintenance8`. Without `shaderImageGatherExtended` (the floor) a dynamic gather
-/// offset is taken as `ConstOffset` arms: one switch on its dynamic lane's low four bits, 16 gathers
+/// the sample needs `maintenance8`. Without `shaderImageGatherExtended` (`runtime-floor` without it,
+/// below the runtime's floor) a dynamic gather offset is taken as `ConstOffset` arms: one switch on its dynamic lane's low four bits, 16 gathers
 /// each with a `ConstOffset` and none with `Offset`, and the module needs neither feature. A
 /// runtime sampler's gather snaps a pixel word's coordinate behind the word and moves nothing by
 /// the offset, which the device's sampler places, so it reads the offset once on every device
@@ -1278,7 +1278,7 @@ fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
     let Some(bc) = assemble("gather_dynamic_offset", &dynamic_offset_kernel(true)) else {
         return;
     };
-    let lavapipe = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let lavapipe = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = ok(&bc, "k", &lavapipe);
     assert_eq!(operand_masks(&a, OP_IMAGE_GATHER, 6), [MASK_OFFSET]);
     assert_eq!(sign_extracts(&a), 1);
@@ -1292,7 +1292,12 @@ fn dynamic_offsets_are_offset_operands_of_their_low_four_bits() {
         .features
         .contains(&VkFeature::ShaderImageGatherExtended));
     assert!(!a.requirements.features.contains(&VkFeature::Maintenance8));
-    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
+    let floor = profile_without(
+        "runtime-floor",
+        &[VkFeature::ShaderImageGatherExtended],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("below the runtime's floor");
     let a = ok(&bc, "k", &floor);
     assert_eq!(count(&a, OP_SWITCH), 1);
     assert_eq!(
@@ -1326,7 +1331,7 @@ fn m3_with(edit: impl FnOnce(&mut crate::device::profile::Limits)) -> DeviceProf
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     edit(&mut desc.limits);
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()

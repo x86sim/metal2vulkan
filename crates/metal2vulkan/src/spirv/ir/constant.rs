@@ -375,8 +375,11 @@ impl Consts {
     }
 
     /// Declare the module's `WorkgroupSize` composite of `ty` (a `u32` 3-vector) from three
-    /// positive `u32` constants, at least one of them a specialization constant. Declaring it again with the same parts returns the first
-    /// declaration; different parts are a conflict.
+    /// positive `u32` constants ([`Consts::positive`]), each a plain constant or a plain
+    /// specialization constant and at least one the latter. An `OpSpecConstantOp` part is
+    /// [`ConstRule::WorkgroupSizeOp`]: a driver may size the workgroup from the parts as declared,
+    /// and read such a part as 1 whatever the body computes from it. Declaring it again with the
+    /// same parts returns the first declaration; different parts are a conflict.
     pub fn workgroup_size(
         &mut self,
         ty: TypeId,
@@ -410,17 +413,15 @@ impl Consts {
         let mut specs = 0;
         for p in parts {
             let def = self.get(p)?;
-            // A local size of zero is invalid on every axis, so a part (a specialization
-            // constant's default, or a plain constant) must be positive.
-            let positive = match &def.kind {
-                ConstKind::Spec { default, .. } => {
-                    specs += 1;
-                    default.0 != 0
+            match def.kind {
+                ConstKind::Spec { .. } => specs += 1,
+                ConstKind::SpecOp { .. } => {
+                    return Err(BuildError::Constant(ConstRule::WorkgroupSizeOp))
                 }
-                ConstKind::Plain(Constant::Scalar { bits, .. }) => bits.0 != 0,
-                _ => false,
-            };
-            if def.ty != u32_elem || !positive {
+                _ => {}
+            }
+            // A local size of zero is invalid on every axis, so a part must be positive.
+            if def.ty != u32_elem || !self.positive(p)? {
                 return Err(BuildError::Constant(ConstRule::CompositeParts));
             }
         }
@@ -434,6 +435,16 @@ impl Consts {
             kind: ConstKind::WorkgroupSize { parts },
         });
         Ok((id, true))
+    }
+
+    /// Whether constant `c` is positive at its defaults: a plain scalar or a specialization
+    /// constant's default above 0.
+    fn positive(&self, c: ConstId) -> BResult<bool> {
+        Ok(match &self.get(c)?.kind {
+            ConstKind::Spec { default, .. } => default.0 != 0,
+            ConstKind::Plain(Constant::Scalar { bits, .. }) => bits.0 != 0,
+            _ => false,
+        })
     }
 
     /// The module's `WorkgroupSize` composite, if declared.
@@ -495,7 +506,13 @@ impl Consts {
                     | Type::Vector { .. }
                     | Type::Matrix { .. }
                     | Type::Struct { .. } => true,
-                    Type::Array { len, .. } => self.array_len(*len, types)?.is_some(),
+                    // Of any valid length, an `OpSpecConstantOp`'s too (a threadgroup arena whose
+                    // regions specialization sizes): `spirv-val`'s `IsTypeNullable` reads an
+                    // array's element type alone.
+                    Type::Array { len, .. } => {
+                        self.array_len(*len, types)?;
+                        true
+                    }
                     _ => false,
                 };
                 if ok && !types.facts(*id)?.runtime_sized {

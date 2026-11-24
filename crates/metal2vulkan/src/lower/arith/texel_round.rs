@@ -1,24 +1,15 @@
 //! Exact conversions of texel values, shared by the sampling lowerings: integer sequences only, so
 //! every device and every fast-math mode answers alike.
 //!
-//! - [`f32_to_half`]: an `f32` rounded to `half` to nearest even, to nearest with ties away from
-//!   zero, or toward zero saturating at the largest finite `half`; half denormals are kept.
+//! - [`f32_to_half`]: an `f32` rounded to `half` to nearest even, or toward zero saturating at the
+//!   largest finite `half`; half denormals are kept.
 //!   Metal converts a 32-bit float texel to a `half` result to nearest even when a shader reads
 //!   it and toward zero, saturating at `±65504`, when it samples it (authored case
 //!   `half-conversion-of-wider-texels-by-read-and-sample`).
-//! - [`ratio_to_f32`] and [`ratio_to_half`]: `k / d` correctly rounded to `f32` or to `half`
-//!   (nearest even) for a divisor known only at run time, as a normalized channel's value `n / D`
-//!   on a format's grid is (the 8- and 16-bit normalized formats' bicubic sums). [`ratio_to_half`]
-//!   rounds once: rounding the `f32` quotient to `half` instead differs from it at `±65455 /
-//!   65535`, `±65519 / 65535`, and `±32759 / 32767`.
-//! - [`f32_to_half_from_even`]: toward zero saturating or ties away, derived from an exact
-//!   rounding to nearest even.
-//! - [`grid_value`]: a signed step's value `n / D` on a normalized format's grid exactly, the
-//!   bicubic sums'.
 //!
 //! Metal's texture reads and samples decode a raw sRGB code through its twelve-bit table, as its
 //! `air.unpack` does: the step `k` of [`srgb`](crate::lower::arith::srgb), then `k / 4095`
-//! ([`div_exact`](crate::lower::arith::exact_division::div_exact); every code of the authored case
+//! correctly rounded (every code of the authored case
 //! `half-conversion-of-wider-texels-by-read-and-sample`, and every bicubic sum of
 //! `bicubic-rounding-of-random-float-and-srgb-texels`, read those steps).
 //!
@@ -36,8 +27,6 @@ use crate::spirv::ir::{BinOp, ConvOp, GlslOp};
 pub enum HalfRounding {
     /// To nearest, ties to even; past the largest finite `half` to the infinity of the sign.
     NearestEven,
-    /// To nearest, ties away from zero; past the largest finite `half` to the infinity.
-    NearestAway,
     /// Toward zero; a finite value past the largest finite `half` becomes `±65504`.
     TowardZeroSaturating,
 }
@@ -100,84 +89,6 @@ pub fn f32_to_half(
     to_half(fb, f, x, mode)
 }
 
-/// `x` (`f32` lanes of form `f`) rounded to `half` toward zero, saturating at `±65504`, where
-/// `toward_zero` (a `bool` scalar), else to nearest with ties away from zero, both derived from
-/// `even`, `x` rounded to nearest even. `even` must be exact: the nearest-even `half` of every
-/// finite `x` (either sign of a zero), an infinity's infinity, and a NaN `x` itself, as
-/// [`round_texel`](crate::lower::arith::narrow::round_texel) gives where the device's rounding is
-/// measured to be Metal's. The result is exact by construction:
-///
-/// - Each directed result is `even` or `o`, `even`'s neighbour on `x`'s side (its predecessor in
-///   magnitude where `|even| > |x|`, else its successor). Toward zero takes `o` where `even` lies
-///   past `x`, saturated at `65504` (a finite overflow's infinity steps back to the largest
-///   `half`); ties away take the larger of `even` and `o` where `x` is their midpoint.
-/// - Above the least normal `half` `2^-14`, `o` and the midpoint are `even`'s `f32` bits
-///   `± 0x2000` and `± 0x1000`: a carry or borrow through the exponent lands on the next binade's
-///   `half`, or its midpoint, exactly. At or below it they are `|even| ± 2^-24` and `± 2^-25` by
-///   one `f32` addition each, whose operands and result lie on the `2^-25` grid below `2^-13`, so
-///   exact in every rounding mode, and normal `f32`s or zero, so no mode flushes them. No
-///   multiplication feeds them, so nothing contracts.
-/// - Every test is on integer bits and the sign of `x` is set last, so no float mode changes the
-///   answer: an infinity or a NaN is `even`, which is `x`.
-///
-/// About thirty instructions.
-pub fn f32_to_half_from_even(
-    fb: &mut FunctionBuilder<'_>,
-    f: Form,
-    (x, even): (Value, Value),
-    toward_zero: Value,
-) -> BResult<Value> {
-    let u = words(f);
-    let ut = ty(fb, u)?;
-    let ft = ty(fb, floats(f))?;
-    let c = |fb: &mut FunctionBuilder<'_>, v: u64| splat(fb, u, v);
-    let fc = |fb: &mut FunctionBuilder<'_>, v: f32| splat(fb, floats(f), u64::from(v.to_bits()));
-    let abs = c(fb, 0x7FFF_FFFF)?;
-    let b = fb.convert(ConvOp::Bitcast, x, ut)?;
-    let mag = bin(fb, BinOp::BitwiseAnd, b, abs)?;
-    let sign_bit = c(fb, 0x8000_0000)?;
-    let sign = bin(fb, BinOp::BitwiseAnd, b, sign_bit)?;
-    let e = fb.convert(ConvOp::Bitcast, even, ut)?;
-    let e = bin(fb, BinOp::BitwiseAnd, e, abs)?;
-    // `even` past `x`: its neighbour toward zero, else away from it.
-    let past = bin(fb, BinOp::UGreaterThan, e, mag)?;
-    // Normal halves: on the bits.
-    let (down, up) = (c(fb, 0xFFFF_E000)?, c(fb, 0x2000)?);
-    let step = fb.select(past, down, up)?;
-    let o_normal = bin(fb, BinOp::IAdd, e, step)?;
-    let (half_down, half_up) = (c(fb, 0xFFFF_F000)?, c(fb, 0x1000)?);
-    let half_step = fb.select(past, half_down, half_up)?;
-    let mid_normal = bin(fb, BinOp::IAdd, e, half_step)?;
-    // Half denormals and the least normal half: on the `2^-24` grid, by exact `f32` additions.
-    let ef = fb.convert(ConvOp::Bitcast, e, ft)?;
-    let (down, up) = (fc(fb, -(2f32.powi(-24)))?, fc(fb, 2f32.powi(-24))?);
-    let step = fb.select(past, down, up)?;
-    let o_low = bin(fb, BinOp::FAdd, ef, step)?;
-    let o_low = fb.convert(ConvOp::Bitcast, o_low, ut)?;
-    // `2^-24 - 2^-24` is `+0` in every rounding mode; the mask keeps it so wherever a mode might
-    // not.
-    let o_low = bin(fb, BinOp::BitwiseAnd, o_low, abs)?;
-    let (half_down, half_up) = (fc(fb, -(2f32.powi(-25)))?, fc(fb, 2f32.powi(-25))?);
-    let half_step = fb.select(past, half_down, half_up)?;
-    let mid_low = bin(fb, BinOp::FAdd, ef, half_step)?;
-    let mid_low = fb.convert(ConvOp::Bitcast, mid_low, ut)?;
-    let least_normal = c(fb, 0x3880_0000)?;
-    let low = bin(fb, BinOp::ULessThanEqual, e, least_normal)?;
-    let o = fb.select(low, o_low, o_normal)?;
-    let mid = fb.select(low, mid_low, mid_normal)?;
-    // Toward zero: `o` where `even` is past `x`, saturated. Ties away: the larger where `x` is
-    // the midpoint.
-    let tie = bin(fb, BinOp::IEqual, mid, mag)?;
-    let moves = fb.select(toward_zero, past, tie)?;
-    let max = c(fb, 0x477F_E000)?;
-    let saturated = fb.glsl(GlslOp::UMin, &[o, max])?;
-    let larger = fb.glsl(GlslOp::UMax, &[o, e])?;
-    let moved = fb.select(toward_zero, saturated, larger)?;
-    let r = fb.select(moves, moved, e)?;
-    let r = bin(fb, BinOp::BitwiseOr, r, sign)?;
-    fb.convert(ConvOp::Bitcast, r, ft)
-}
-
 /// [`f32_to_half`]: the sequence of its docs.
 fn to_half(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, rule: HalfRounding) -> BResult<Value> {
     let u = words(f);
@@ -205,10 +116,6 @@ fn to_half(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, rule: HalfRounding) 
             let bias = even_bias(fb)?;
             bin(fb, BinOp::IAdd, mag, bias)?
         }
-        HalfRounding::NearestAway => {
-            let half = c(fb, 0x1000)?;
-            bin(fb, BinOp::IAdd, mag, half)?
-        }
         HalfRounding::TowardZeroSaturating => mag,
     };
     let normal = bin(fb, BinOp::BitwiseAnd, biased, keep)?;
@@ -216,7 +123,7 @@ fn to_half(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, rule: HalfRounding) 
     let over = bin(fb, BinOp::UGreaterThan, normal, max)?;
     let past = match rule {
         HalfRounding::TowardZeroSaturating => max,
-        HalfRounding::NearestEven | HalfRounding::NearestAway => inf,
+        HalfRounding::NearestEven => inf,
     };
     let normal = fb.select(over, past, normal)?;
     // A denormal half (or zero): round on the grid 2^-24.
@@ -251,7 +158,6 @@ fn to_half(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, rule: HalfRounding) 
     };
     let up = match rule {
         HalfRounding::NearestEven => Some(even_up(fb)?),
-        HalfRounding::NearestAway => Some(bin(fb, BinOp::UGreaterThanEqual, rem, tie)?),
         HalfRounding::TowardZeroSaturating => None,
     };
     let h = match up {
@@ -269,144 +175,4 @@ fn to_half(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, rule: HalfRounding) 
     let r = fb.select(special, b, r)?;
     let ft = ty(fb, floats(f))?;
     fb.convert(ConvOp::Bitcast, r, ft)
-}
-
-/// The leading part of [`ratio_to_f32`] and [`ratio_to_half`]: for `1 <= k <= d < 2^16`, the
-/// shift `e >= 0` that puts `a = k · 2^e` in `[d, 2d)`, and `a`.
-fn normalize(fb: &mut FunctionBuilder<'_>, u: Form, k: Value, d: Value) -> BResult<(Value, Value)> {
-    let one = splat(fb, u, 1)?;
-    let m = fb.glsl(GlslOp::FindUMsb, &[k])?;
-    let top = fb.glsl(GlslOp::FindUMsb, &[d])?;
-    let e = bin(fb, BinOp::ISub, top, m)?;
-    let a = bin(fb, BinOp::ShiftLeftLogical, k, e)?;
-    let short = bin(fb, BinOp::ULessThan, a, d)?;
-    let a2 = bin(fb, BinOp::ShiftLeftLogical, a, one)?;
-    let a = fb.select(short, a2, a)?;
-    let e1 = bin(fb, BinOp::IAdd, e, one)?;
-    let e = fb.select(short, e1, e)?;
-    Ok((e, a))
-}
-
-/// Whether quotient `q` with remainder `r` of a division by `d` rounds up to nearest even.
-fn round_up(fb: &mut FunctionBuilder<'_>, u: Form, q: Value, r: Value, d: Value) -> BResult<Value> {
-    let (z, one) = (splat(fb, u, 0)?, splat(fb, u, 1)?);
-    let twice = bin(fb, BinOp::ShiftLeftLogical, r, one)?;
-    let above = bin(fb, BinOp::UGreaterThan, twice, d)?;
-    let tie = bin(fb, BinOp::IEqual, twice, d)?;
-    let lsb = bin(fb, BinOp::BitwiseAnd, q, one)?;
-    let odd = bin(fb, BinOp::INotEqual, lsb, z)?;
-    let tie_up = bin(fb, BinOp::LogicalAnd, tie, odd)?;
-    bin(fb, BinOp::LogicalOr, above, tie_up)
-}
-
-/// `k / d` correctly rounded to `f32` (nearest even), for `u32` lanes (form `u`) with
-/// `0 <= k <= d` and `1 <= d < 2^16`, the divisor a run-time value:
-/// [`div_exact`](crate::lower::arith::exact_division::div_exact)'s sequence, the divisor's
-/// leading bit found at run time. `k = 0` is `+0`.
-pub fn ratio_to_f32(fb: &mut FunctionBuilder<'_>, u: Form, k: Value, d: Value) -> BResult<Value> {
-    let c = |fb: &mut FunctionBuilder<'_>, v: u64| splat(fb, u, v);
-    let (z, one) = (c(fb, 0)?, c(fb, 1)?);
-    let zero = bin(fb, BinOp::IEqual, k, z)?;
-    let k = fb.glsl(GlslOp::UMax, &[k, one])?;
-    let (e, a) = normalize(fb, u, k, d)?;
-    // q = floor(a · 2^23 / d) in two exact divisions (a · 2^12 < 2^29).
-    let (k11, k12) = (c(fb, 11)?, c(fb, 12)?);
-    let hi = bin(fb, BinOp::ShiftLeftLogical, a, k12)?;
-    let q1 = bin(fb, BinOp::UDiv, hi, d)?;
-    let t = bin(fb, BinOp::IMul, q1, d)?;
-    let r1 = bin(fb, BinOp::ISub, hi, t)?;
-    let lo = bin(fb, BinOp::ShiftLeftLogical, r1, k11)?;
-    let q2 = bin(fb, BinOp::UDiv, lo, d)?;
-    let t = bin(fb, BinOp::IMul, q2, d)?;
-    let r2 = bin(fb, BinOp::ISub, lo, t)?;
-    let q = bin(fb, BinOp::ShiftLeftLogical, q1, k11)?;
-    let q = bin(fb, BinOp::BitwiseOr, q, q2)?;
-    let up = round_up(fb, u, q, r2, d)?;
-    let inc = fb.select(up, one, z)?;
-    let k126 = c(fb, 126)?;
-    let be = bin(fb, BinOp::ISub, k126, e)?;
-    let k23 = c(fb, 23)?;
-    let be = bin(fb, BinOp::ShiftLeftLogical, be, k23)?;
-    let bits = bin(fb, BinOp::IAdd, be, q)?;
-    let bits = bin(fb, BinOp::IAdd, bits, inc)?;
-    let bits = fb.select(zero, z, bits)?;
-    let ft = ty(fb, floats(u))?;
-    fb.convert(ConvOp::Bitcast, bits, ft)
-}
-
-/// `k / d` correctly rounded to `half` (nearest even), held as its `f32`, for `u32` lanes (form
-/// `u`) with `0 <= k <= d` and `1 <= d < 2^16`, the divisor a run-time value. `k = 0` is `+0`.
-///
-/// A quotient of at least `2^-14` takes the 11-bit significand `floor(a · 2^10 / d)` of the
-/// normalized `a` (`normalize`, one exact division: `a · 2^10 < 2^27`) and rounds it on the
-/// remainder; the rounding carries into the exponent. A smaller one (then `k <= 3`) is
-/// `k · 2^24 / d` rounded to an integer, its value on the denormal grid `2^-24`: at most `2^10`,
-/// to which the step is clamped, so a lane that takes the normal quotient keeps the denormal
-/// one's shifts in range (a grid `d <= 3` puts `3 · 2^24 / d` at `2^24` or more).
-pub fn ratio_to_half(fb: &mut FunctionBuilder<'_>, u: Form, k: Value, d: Value) -> BResult<Value> {
-    let c = |fb: &mut FunctionBuilder<'_>, v: u64| splat(fb, u, v);
-    let (z, one) = (c(fb, 0)?, c(fb, 1)?);
-    let zero = bin(fb, BinOp::IEqual, k, z)?;
-    let kk = fb.glsl(GlslOp::UMax, &[k, one])?;
-    let (e, a) = normalize(fb, u, kk, d)?;
-    let k10 = c(fb, 10)?;
-    let hi = bin(fb, BinOp::ShiftLeftLogical, a, k10)?;
-    let q = bin(fb, BinOp::UDiv, hi, d)?;
-    let t = bin(fb, BinOp::IMul, q, d)?;
-    let r = bin(fb, BinOp::ISub, hi, t)?;
-    let up = round_up(fb, u, q, r, d)?;
-    let inc = fb.select(up, one, z)?;
-    // Bits: exponent 127 - e, significand (q - 2^10) << 13, the rounding added below it.
-    let k126 = c(fb, 126)?;
-    let be = bin(fb, BinOp::ISub, k126, e)?;
-    let k23 = c(fb, 23)?;
-    let be = bin(fb, BinOp::ShiftLeftLogical, be, k23)?;
-    let sig = bin(fb, BinOp::IAdd, q, inc)?;
-    let k13 = c(fb, 13)?;
-    let sig = bin(fb, BinOp::ShiftLeftLogical, sig, k13)?;
-    let normal = bin(fb, BinOp::IAdd, be, sig)?;
-    // Below 2^-14 (e >= 15): k <= 3, so k · 2^24 < 2^26.
-    let k3 = c(fb, 3)?;
-    let small_k = fb.glsl(GlslOp::UMin, &[kk, k3])?;
-    let k24 = c(fb, 24)?;
-    let n = bin(fb, BinOp::ShiftLeftLogical, small_k, k24)?;
-    let g = bin(fb, BinOp::UDiv, n, d)?;
-    let t = bin(fb, BinOp::IMul, g, d)?;
-    let gr = bin(fb, BinOp::ISub, n, t)?;
-    let gup = round_up(fb, u, g, gr, d)?;
-    let ginc = fb.select(gup, one, z)?;
-    let g = bin(fb, BinOp::IAdd, g, ginc)?;
-    let k1024 = c(fb, 1024)?;
-    let g = fb.glsl(GlslOp::UMin, &[g, k1024])?;
-    let denormal = grid_bits(fb, u, g)?;
-    let k15 = c(fb, 15)?;
-    let small = bin(fb, BinOp::UGreaterThanEqual, e, k15)?;
-    let bits = fb.select(small, denormal, normal)?;
-    let bits = fb.select(zero, z, bits)?;
-    let ft = ty(fb, floats(u))?;
-    fb.convert(ConvOp::Bitcast, bits, ft)
-}
-
-/// The value `n / D` of signed grid step `n` (`i32` bits in `u32` lanes of form `u`, within
-/// `[-D, D]`; `d` the grid `D` in `u32` lanes, `1 <= D < 2^16`): `+0` for zero, else the
-/// magnitude `|n| / D` correctly rounded by `round` ([`ratio_to_f32`], [`ratio_to_half`], or a
-/// choice of the two) with the sign of `n`.
-pub fn grid_value(
-    fb: &mut FunctionBuilder<'_>,
-    u: Form,
-    n: Value,
-    d: Value,
-    round: impl FnOnce(&mut FunctionBuilder<'_>, Value, Value) -> BResult<Value>,
-) -> BResult<Value> {
-    let z = splat(fb, u, 0)?;
-    let neg = bin(fb, BinOp::SLessThan, n, z)?;
-    let m = fb.glsl(GlslOp::SAbs, &[n])?;
-    let r = round(fb, m, d)?;
-    let ut = ty(fb, u)?;
-    let bits = fb.convert(ConvOp::Bitcast, r, ut)?;
-    let sign = splat(fb, u, 0x8000_0000)?;
-    let sign = fb.select(neg, sign, z)?;
-    let bits = bin(fb, BinOp::BitwiseOr, bits, sign)?;
-    let ft = ty(fb, floats(u))?;
-    fb.convert(ConvOp::Bitcast, bits, ft)
 }

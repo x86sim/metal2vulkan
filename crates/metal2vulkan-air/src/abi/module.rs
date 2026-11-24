@@ -15,7 +15,7 @@ use crate::bitcode::PointeeTable;
 use crate::budget::Meter;
 use crate::error::Error;
 use crate::error::{AbiError, DiagName, Location};
-use crate::ir::{Md, MdId, Module, Type, TypeId, TypeLayouts};
+use crate::ir::{AddrSpace, Const, Md, MdId, Module, Type, TypeId, TypeLayouts};
 
 /// The closed set of named metadata lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,16 +213,8 @@ pub(super) fn decode(
                 cx.meter.reserve(&mut abi.global_bindings, ops.len())?;
                 for &id in ops {
                     cx.meter.tick(1)?;
-                    let key = Some("air.global_binding");
-                    let mut n = Ops::node(m, id, site.clone())?;
-                    if n.string(key)? != b"air.global_binding" {
-                        return Err(site.err(AbiError::UnknownKey, key));
-                    }
-                    let global = n.global(key)?;
-                    let node = n.child(key)?;
-                    n.finish()?;
-                    let binding = cx.global_binding(node, global)?;
-                    abi.global_bindings.push(GlobalBinding { global, binding });
+                    abi.global_bindings
+                        .push(global_binding(&mut cx, id, &site)?);
                 }
             }
             Named::VisibleFunctionReferences => {
@@ -479,6 +471,34 @@ fn function_constant(
         name,
         type_name,
     })
+}
+
+/// `!{!"air.global_binding", ptr @g, !<parameter node>}`: a program-scope binding. The global is
+/// one Apple's compiler writes for it: a constant of the constant space, externally initialized and
+/// `undef`. The node is decoded as a parameter's ([`Cx::global_binding`]).
+fn global_binding(cx: &mut Cx<'_, '_>, id: MdId, site: &Site) -> Result<GlobalBinding, Error> {
+    let m = cx.m;
+    let key = Some("air.global_binding");
+    let mut n = Ops::node(m, id, site.clone())?;
+    let tag = n.string(key)?;
+    if tag != b"air.global_binding" {
+        return Err(site.unknown(key, saw_str(tag)));
+    }
+    let global = n.global(key)?;
+    let node = n.child(key)?;
+    n.finish()?;
+    let bound = m.global(global).is_some_and(|g| {
+        g.space == AddrSpace::Constant
+            && g.constant
+            && g.externally_initialized
+            && g.init
+                .and_then(|c| m.consts().get(c))
+                .is_some_and(|c| c.value == Const::Undef)
+    });
+    if !bound {
+        return Err(site.err(AbiError::BadValue, key));
+    }
+    cx.global_binding(node, global)
 }
 
 /// An entry node: `!{ptr @fn, !outputs, !inputs, <stage attribute>...}`.

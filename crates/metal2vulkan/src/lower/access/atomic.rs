@@ -34,15 +34,13 @@
 //! `f32` `xchg`, `load`, and `store` move the bit pattern.
 //!
 //! **Typed atomics through device addresses**. A descriptor view is one `u32` array and the arena
-//! one `u32` array, so an atomic on a `u64` or an `f32` word needs a typed alias only a device
+//! one `u32` array, so an atomic on a `u64` word needs a typed alias only a device
 //! address gives: a `PhysicalStorageBuffer` pointer to the type at the word's address. Such an
 //! atomic moves every slot it reaches to its device address (`AccessPlan::typed_slots`, read by
 //! `finish_slots`), on profiles with device addresses; through a wide pointer it is at a device
 //! address already. Every device-address atomic takes its pointer from one function (`device_ptr`).
-//! A 64-bit atomic is then one `u64` SPIR-V atomic (`Int64Atomics`); `f32` `add` and `sub` (the add
-//! of the negated operand, which IEEE 754 defines as the same operation) are `OpAtomicFAddEXT`
-//! where the profile has `shaderBufferFloat32AtomicAdd`, instead of an execution-bounded loop that
-//! contention could exhaust.
+//! A 64-bit atomic is then one `u64` SPIR-V atomic (`Int64Atomics`). An `f32` atomic is a
+//! compare-and-swap loop on its word's bits in every memory.
 //!
 //! **Narrow atomics** (`narrow`): an LLVM atomic on `i8` or `i16` operates on its field of the
 //! containing `u32` word, in any of these memories: `load`, `and`, `or`, and `xor` are one word
@@ -74,8 +72,7 @@
 //! access, Mesa's RADV and ANV never showed a relaxed one a store that arrived after its first
 //! read.
 //!
-//! **Containment** is the plain access's (`contain::atomic_encoding`): robust descriptors emit no
-//! check, except on a driver whose robustness leaves buffer atomics uncontained; an in-shader check
+//! **Containment** is the plain access's: an in-shader check
 //! guards a view's atomic with `if_(inb)` (its result is 0 out of bounds, where Metal's is
 //! unmeasured); a device-address atomic out of bounds (a static slot's or a wide pointer's, checked
 //! against the root entry's size) operates on the write-only sink and yields 0; an arena atomic
@@ -100,7 +97,6 @@ use crate::air::ir::{
 };
 use crate::budget::Meter;
 use crate::device::profile::BufferAccess;
-use crate::device::profile::Containment;
 use crate::device::requirements::VkFeature;
 use crate::error::{Capability, Error, Feature, Unsupported};
 use crate::lower::emit::EmitCx;
@@ -110,7 +106,7 @@ use crate::memory::arena::{Arena, ArenaMem};
 use crate::memory::contain::{self, Check};
 use crate::memory::leaf::{k32, WordOps};
 use crate::memory::provenance::{PrivForm, Repr};
-use crate::memory::views::{self, ViewKind};
+use crate::memory::views;
 use crate::pipeline::sym::{PushField, Stage};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn, LoopFn, LoopSpec};
 use crate::spirv::builder::FunctionBuilder;
@@ -123,7 +119,7 @@ use crate::spirv::ir::{
 
 use super::emit::{prepare, Mem, Prepared, ViewMem};
 use super::local::{self, LocalAccess, LocalPtr};
-use super::{not_lowered, refuse, static_roots, view_kind, AccessPlan, BufferReach, Target};
+use super::{not_lowered, refuse, static_roots, AccessPlan, BufferReach, Target};
 use crate::error::LowerFamily;
 
 mod narrow;
@@ -166,11 +162,6 @@ pub enum AtomicKind {
     CompareExchange,
     /// A read-modify-write as a compare-and-swap loop.
     Cas(CasOp),
-    /// `f32` `add` (or `sub`, as the add of the negated operand) as `OpAtomicFAddEXT` through a
-    /// typed device address.
-    FloatAdd {
-        negate: bool,
-    },
 }
 
 /// The memory an atomic operates on.
@@ -185,7 +176,7 @@ pub enum AtomicMem {
     /// The threadgroup arena.
     Threadgroup { ptr: LocalPtr, contained: bool },
     /// A wide (dynamic-root) buffer pointer: the device address its root entry names.
-    Wide { ptr: ValueId, contained: bool },
+    Wide { ptr: ValueId },
     /// A word of the private arena (`air.atomic.private`): its leaf, read and written by its own
     /// thread alone.
     Private(LocalAccess),
@@ -231,7 +222,7 @@ pub struct AtomicAccess {
 impl AtomicAccess {
     /// The census name (`access.atomic.<memory>.<kind>[<reach>][.checked]`) in the finished plan
     /// `slots`: `.checked` when an access is checked in the shader as emitted (a buffer target by
-    /// [`AccessPlan::check`]: its view's encoding, or a device-address slot's own check), and a
+    /// [`AccessPlan::check`]: a view's in-shader check, or a device-address slot's own), and a
     /// buffer atomic qualified by the reach of its targets ([`BufferReach`]).
     pub fn name(&self, slots: &AccessPlan) -> Cow<'static, str> {
         let (mem, reach, checked) = match &self.mem {
@@ -243,7 +234,7 @@ impl AtomicAccess {
             AtomicMem::Threadgroup { contained, .. } => {
                 ("threadgroup", BufferReach::NONE, *contained)
             }
-            AtomicMem::Wide { contained, .. } => ("wide", BufferReach::NONE, *contained),
+            AtomicMem::Wide { .. } => ("wide", BufferReach::NONE, true),
             AtomicMem::Private(a) => ("private", BufferReach::NONE, a.contained),
         };
         let kind = match self.kind {
@@ -256,7 +247,6 @@ impl AtomicAccess {
             AtomicKind::CompareExchange => "cmpxchg",
             AtomicKind::Cas(op) if op.is_float() => "float_cas",
             AtomicKind::Cas(_) => "cas",
-            AtomicKind::FloatAdd { .. } => "float_add",
         };
         let checked = if checked { ".checked" } else { "" };
         format!("access.atomic.{mem}.{kind}{}{checked}", reach.qualifier()).into()
@@ -637,19 +627,6 @@ pub fn select(
             .into());
         }
     }
-    // `f32` add and sub are native through a typed device address where the profile has the
-    // buffer float-add feature; otherwise, and for the arena, a compare-and-swap loop.
-    let kind = match r.kind {
-        AtomicKind::Cas(op @ (CasOp::FAdd | CasOp::FSub))
-            if !threadgroup && addressed && cx.profile.fields().leaf.buffer_float32_atomic_add =>
-        {
-            AtomicKind::FloatAdd {
-                negate: op == CasOp::FSub,
-            }
-        }
-        k => k,
-    };
-    let typed = wide || matches!(kind, AtomicKind::FloatAdd { .. });
     let value = match r.value {
         Some(v) => Some(value_id(cx, v)?),
         None => None,
@@ -676,6 +653,7 @@ pub fn select(
     };
     let mem = if threadgroup {
         local::use_arena(cx, Arena::Threadgroup)?;
+        local::composed(cx, Arena::Threadgroup);
         super::tile_memory::written(cx)?;
         AtomicMem::Threadgroup {
             ptr: local::access_ptr(
@@ -684,7 +662,7 @@ pub fn select(
                 Arena::Threadgroup,
                 u64::from(r.elem.bits().div_ceil(8)),
             )?,
-            contained: cx.profile.fields().containment != Containment::UnsafeOff,
+            contained: local::contained(cx, Arena::Threadgroup),
         }
     } else if through_root {
         // A wide pointer reaches every candidate through its root entry's device address, so a
@@ -692,23 +670,22 @@ pub fn select(
         memory_model::note_device_scope(cx);
         AtomicMem::Wide {
             ptr: super::dynamic::plan_deref(cx, r.ptr)?,
-            contained: cx.profile.fields().containment != Containment::UnsafeOff,
         }
     } else {
-        let (mut targets, null) = static_roots(cx, r.ptr, m)?;
-        let check = contain::atomic_encoding(cx.profile);
-        for t in &mut targets {
-            t.check = check;
+        let (targets, null) = static_roots(cx, r.ptr, m)?;
+        let fixed = super::fixed_offset(cx, r.ptr);
+        for t in &targets {
             let plan = cx
                 .memory
                 .slots
                 .get(t.slot)
                 .ok_or_else(|| cx.invariant("an atomic target names a missing slot"))?;
-            if view_kind(cx.profile, plan) != ViewKind::Storage {
-                return Err(cx.invariant("an atomic through a uniform view"));
-            }
-            cx.push.insert(PushField::SlotBindOffset(plan.slot));
-            if typed {
+            let slot = plan.slot;
+            cx.push.insert(PushField::SlotBindOffset(slot));
+            super::note_variable(cx, slot, fixed, false);
+            // An atomic reaches its word.
+            super::note_reach(cx, t.slot, 4);
+            if wide {
                 // A typed atomic's slot is reached by device address (`finish_slots`).
                 cx.families.access.typed_slots.insert(t.slot);
             }
@@ -720,10 +697,11 @@ pub fn select(
             null,
         }
     };
-    let spin = kind == AtomicKind::Load && r.order == MemoryOrder::Relaxed && spin::is_spin(cx, at);
+    let spin =
+        r.kind == AtomicKind::Load && r.order == MemoryOrder::Relaxed && spin::is_spin(cx, at);
     Ok(Some(AtomicAccess {
         mem,
-        kind,
+        kind: r.kind,
         value,
         float: r.elem == Elem::F32,
         wide,
@@ -825,9 +803,7 @@ fn private_new(
             fb.select(equal, x, old)?
         }
         AtomicKind::Cas(op) => cas_new(fb, op, word, old, x)?,
-        AtomicKind::Rmw(_) | AtomicKind::Load | AtomicKind::FloatAdd { .. } => {
-            return Err(dangling())
-        }
+        AtomicKind::Load => return Err(dangling()),
     })
 }
 
@@ -877,7 +853,7 @@ struct Op {
     failure: Semantics,
     /// The word type.
     word: STypeId,
-    /// The pointee of a typed device-address atomic (`u64` or `f32`), `None` for a word.
+    /// The pointee of a typed device-address atomic (`u64`), `None` for a word.
     typed: Option<STypeId>,
     /// A narrow atomic's width in bits: it operates on a field of the word.
     narrow: Option<u8>,
@@ -1077,16 +1053,6 @@ fn apply(fb: &mut FunctionBuilder<'_>, at: At, o: Op) -> BResult<Option<SValue>>
             )?
         }
         AtomicKind::Cas(op) => cas_loop(fb, p, op, o)?,
-        AtomicKind::FloatAdd { negate } => {
-            let f = f32_ty(fb)?;
-            let x = o.value.ok_or_else(dangling)?;
-            let mut x = fb.convert(ConvOp::Bitcast, x, f)?;
-            if negate {
-                x = fb.unary(UnOp::FNegate, x)?;
-            }
-            let old = fb.atomic(AtomicOp::FAdd, p, o.scope, o.sem, x)?;
-            fb.convert(ConvOp::Bitcast, old, o.word)?
-        }
     }))
 }
 
@@ -1109,16 +1075,13 @@ fn on_target(fb: &mut FunctionBuilder<'_>, p: Prepared, o: Op) -> BResult<Option
     let two = k32(fb, 2)?;
     let word = fb.binary(BinOp::ShiftRightLogical, p.off, two)?;
     let ptr = match (p.mem, o.typed) {
-        (Mem::View(ViewMem(view, ..)), None) => {
-            views::word_ptr(fb, view, word)?.ok_or_else(dangling)?
-        }
+        (Mem::View(ViewMem(view, ..)), None) => views::word_ptr(fb, view, word)?,
         (Mem::Psb(m), typed) => {
             let pointee = match typed {
                 Some(t) => t,
                 None => u32_ty(fb)?,
             };
-            let addr = m.word_address(fb, word)?;
-            device_ptr(fb, addr, pointee)?
+            m.word_place(fb, word, pointee)?
         }
         // Selection moved every slot of a typed atomic to its device address.
         (Mem::View(_), Some(_)) => return Err(dangling()),
@@ -1183,11 +1146,7 @@ pub fn emit(
     } else {
         u32_ty(fb)?
     };
-    let typed = match a.kind {
-        _ if a.wide => Some(word),
-        AtomicKind::FloatAdd { .. } => Some(f32_ty(fb)?),
-        _ => None,
-    };
+    let typed = a.wide.then_some(word);
     let bytes = match (a.wide, a.narrow) {
         (true, _) => 8,
         (false, Some(bits)) => u32::from(bits / 8),
@@ -1220,7 +1179,7 @@ pub fn emit(
     // buffer the whole device reaches: its atomics are `Device`-scope, and order it as device
     // memory.
     let tile_base = match a.mem {
-        AtomicMem::Threadgroup { .. } => local::decl_of(cx, fb, Arena::Threadgroup)?.tile_base,
+        AtomicMem::Threadgroup { .. } => local::words_decl(cx, fb)?.tile_base,
         _ => None,
     };
     let (own, scope) = match a.mem {
@@ -1300,37 +1259,45 @@ pub fn emit(
     let result = match &a.mem {
         AtomicMem::Private(leaf) => on_private(cx, fb, leaf, o, a.float)?,
         AtomicMem::Threadgroup { ptr, contained } => {
-            let decl = local::decl_of(cx, fb, Arena::Threadgroup)?;
+            let decl = local::words_decl(cx, fb)?;
             let off = match ptr {
                 LocalPtr::Value(v) => cx.operand(fb, *v)?,
                 LocalPtr::Offset(c) => k32(fb, *c)?,
             };
-            let two = k32(fb, 2)?;
-            let w = fb.binary(BinOp::ShiftRightLogical, off, two)?;
-            let at = At {
-                p: ArenaMem(decl, WordOps::default()).ptr(fb, w)?,
-                shift: field_shift(fb, o, off)?,
-            };
-            let inb = match *contained {
-                true => {
-                    let size = fb.module().const_value(decl.size)?;
-                    Some(contain::in_bounds(fb, off, size, u64::from(bytes))?)
+            // An unchecked atomic at a constant offset outside the arena lies outside every object
+            // in it, where Metal leaves it undefined, and no access chain may index the arena's
+            // words with a constant past them: it writes nothing and yields zero, as a contained
+            // one out of bounds does (`guarded`).
+            if !*contained && local::outside_arena(fb, off, &decl, u64::from(bytes))? {
+                o.yields().then(|| konst(fb, word, 0)).transpose()?
+            } else {
+                let two = k32(fb, 2)?;
+                let w = fb.binary(BinOp::ShiftRightLogical, off, two)?;
+                let at = At {
+                    p: ArenaMem(decl, WordOps::default()).ptr(fb, w)?,
+                    shift: field_shift(fb, o, off)?,
+                };
+                let inb = match *contained {
+                    true => {
+                        let size = fb.module().const_value(decl.size)?;
+                        Some(contain::in_bounds(fb, off, size, u64::from(bytes))?)
+                    }
+                    false => None,
+                };
+                // A word of a tile's cell the pass does not keep reads as zero and keeps no write
+                // (`access::tile::KeptCells`).
+                let kept = match super::tile::KeptCells::of(cx, fb)? {
+                    Some(cells) => Some(cells.kept(fb, w)?),
+                    None => None,
+                };
+                let guard = match (inb, kept) {
+                    (Some(inb), Some(kept)) => Some(fb.binary(BinOp::LogicalAnd, inb, kept)?),
+                    (inb, kept) => inb.or(kept),
+                };
+                match guard {
+                    Some(guard) => guarded(fb, guard, at, o)?,
+                    None => apply(fb, at, o)?,
                 }
-                false => None,
-            };
-            // A word of a tile's cell the pass does not keep reads as zero and keeps no write
-            // (`access::tile::KeptCells`).
-            let kept = match super::tile::KeptCells::of(cx, fb)? {
-                Some(cells) => Some(cells.kept(fb, w)?),
-                None => None,
-            };
-            let guard = match (inb, kept) {
-                (Some(inb), Some(kept)) => Some(fb.binary(BinOp::LogicalAnd, inb, kept)?),
-                (inb, kept) => inb.or(kept),
-            };
-            match guard {
-                Some(guard) => guarded(fb, guard, at, o)?,
-                None => apply(fb, at, o)?,
             }
         }
         AtomicMem::Wide { ptr, .. } => {
@@ -1349,7 +1316,7 @@ pub fn emit(
             let m = fb.composite_extract(fat, &[1])?;
             let mut prepared = Vec::with_capacity(targets.len());
             for t in targets {
-                let prep = prepare(cx, fb, t, m, bytes)?;
+                let prep = prepare(cx, fb, t, m, (bytes, false))?;
                 if typed.is_some() && !matches!(prep.mem, Mem::Psb(_)) {
                     return Err(cx.fail("a typed atomic through a descriptor view"));
                 }

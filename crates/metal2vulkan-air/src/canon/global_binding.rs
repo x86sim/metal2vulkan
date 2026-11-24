@@ -1,35 +1,74 @@
-//! MSL 3.2 program-scope bindings as parameters.
+//! Program-scope buffer bindings as buffer parameters.
 //!
-//! MSL 3.2 lets a program-scope variable be bound like an argument (`constant float* constant
-//! p [[buffer(1)]];`, `texture2d<half> t [[texture(9)]];`). `xcrun metal` compiles each to an
-//! `externally_initialized` constant global with an `undef` initializer, named by an
-//! `!air.global_binding` node whose argument node is an entry parameter's of index -1
-//! ([`GlobalBinding`]), and reads it with a load of the value the argument holds: the buffer's
-//! pointer, or the texture's handle (the only field of `metal::texture2d`, through a
-//! `getelementptr` of indices 0, 0). Each such read is the value the entry's parameter of that
-//! binding would hold, so `expand` adds to the entry one parameter per binding and type read this
-//! way (two globals of one binding share it: Apple's compiler duplicates a global per translation
-//! unit) and makes each load a read of it, as `global_builtin` does for built-ins. Lowering then
-//! binds the parameter as every parameter of its role, at the binding's location index. A binding
-//! not allowed in the entry's stage, or a global read another way, is left as it is.
+//! MSL 3.2 lets a program bind a buffer at program scope (`constant T * constant p
+//! [[buffer(n)]];`), which every function may read. `xcrun metal` 32023.922 makes it a
+//! constant-space global, externally initialized and `undef`, makes each read of it (`&p`
+//! included) a load of the pointer it holds, and lists it in `!air.global_bindings`
+//! ([`GlobalBinding`]). Metal fills it from the executing stage's own argument table: measured on
+//! an Apple M3 Max under macOS 27.0.1 (m3-max-70268), a kernel's global reads and writes the buffer
+//! bound at its index, a vertex and a fragment function that read one global each read their own
+//! stage's buffer there, and two globals of one type at one index, or a global and a parameter of
+//! one type, read the one buffer bound there. So `expand` makes each load of a bound buffer's
+//! pointer a read of a parameter of the entry: its own parameter of the binding's role and type
+//! where it takes one, else one `expand` adds, shared by the bindings of one role and type.
+//! Lowering then binds an added parameter where a `[[buffer(n)]]` parameter binds.
+//!
+//! x86Sim: a bound texture or sampler (`texture2d<half, sample> t [[texture(10)]];`, which
+//! MercuryPoster's wallpaper shaders declare) becomes a parameter the same way. Its global holds
+//! the resource's struct (`metal::texture2d`'s only field is the handle), read by a load of a
+//! pointer at the global or at its first leaf (a `getelementptr` of indices 0, 0); that load
+//! becomes a read of a parameter of the binding's role and the loaded handle's type ([`handle`]).
+//!
+//! Three shapes stay refused, each where it is found: an added parameter whose slot another
+//! parameter of the entry binds ([`shared_slot`]), and, through what pruning keeps, any read of a
+//! binding that did not become a parameter ([`left`]): threadgroup memory's, or another read of a
+//! buffer's, texture's or sampler's.
 
-use crate::abi::{AirAbi, GlobalBinding, ParamBinding, Stage};
+use crate::abi::{AbiInt, EntryPoint, GlobalBinding, ParamBinding, ParamRole, Slot};
 use crate::budget::Meter;
-use crate::error::Error;
-use crate::ir::{ArgIdx, Body, FuncId, InstId, InstKind, ModuleParts, Type, TypeId, Value};
+use crate::error::{DiagName, Error, Feature, Location, Unsupported};
+use crate::ir::{AddrSpace, ArgIdx, Body, Const, GlobalId, InstKind, ModuleParts, TypeId, Value};
 
 use super::const_loads::field_address;
-use super::rewrite::{append_params, apply, invariant, scoped, BodyEdit};
+use super::interface;
+use super::rewrite::{append_params, apply, scoped, BodyEdit};
 
-/// The binding a load of `body` reads whole, when `kind` is one: a non-volatile, non-atomic load
-/// of a pointer at the address of a bound global or of its first leaf at indices 0.
-fn read<'a>(
+/// The space of the pointer a load of binding `b`'s global reads, where `expand` makes such a load
+/// a parameter: `b` binds one buffer of the device or constant space at a stated slot.
+fn buffer_space(b: &GlobalBinding) -> Option<AddrSpace> {
+    match &b.role {
+        ParamRole::Buffer(arg)
+            if matches!(arg.space, AddrSpace::Device | AddrSpace::Constant)
+                && matches!(
+                    arg.location,
+                    Slot {
+                        index: AbiInt::Const(_),
+                        count: AbiInt::Const(1)
+                    }
+                ) =>
+        {
+            Some(arg.space)
+        }
+        _ => None,
+    }
+}
+
+/// Whether binding `b` is a texture or a sampler, whose handle a load of its global's first leaf
+/// reads (x86Sim).
+fn handle(b: &GlobalBinding) -> bool {
+    matches!(b.role, ParamRole::Texture(_) | ParamRole::Sampler { .. })
+}
+
+/// The binding of `bindings` whose global the load `kind` of a value of type `ty` in `body` reads,
+/// when `expand` makes the load a parameter: a bound buffer's pointer, loaded from the global
+/// itself, or a bound texture's or sampler's handle, loaded from the global or its first leaf.
+fn bound<'b>(
     body: &Body,
     parts: &ModuleParts,
-    abi: &'a AirAbi,
+    bindings: &'b [GlobalBinding],
     kind: &InstKind,
     ty: TypeId,
-) -> Option<&'a GlobalBinding> {
+) -> Option<&'b GlobalBinding> {
     let InstKind::Load {
         ptr,
         volatile: false,
@@ -39,87 +78,149 @@ fn read<'a>(
     else {
         return None;
     };
-    if !matches!(parts.types.get(ty), Some(Type::Ptr { .. })) {
-        return None;
+    if let Value::Const(c) = ptr {
+        if let Some(Const::GlobalAddr(g)) = parts.consts.get(c).map(|k| &k.value) {
+            if let Some(b) = bindings.iter().find(|b| b.global == *g) {
+                if let Some(space) = buffer_space(b) {
+                    return (parts.types.ptr_space(ty) == Some(space)).then_some(b);
+                }
+            }
+        }
     }
+    parts.types.ptr_space(ty)?;
     let (g, path) = field_address(body, parts, ptr)?;
     if path.iter().any(|&i| i != 0) {
         return None;
     }
-    abi.global_bindings.iter().find(|b| b.global == g)
+    bindings.iter().find(|b| b.global == g && handle(b))
 }
 
-/// Make each load of an MSL 3.2 program-scope binding in the `stage` entry `func`'s `body` a read
-/// of a parameter added to the entry (see the module), returning the new body and the added
-/// parameters' bindings (none, and `body` unchanged, when nothing reads one).
+/// Make each load of a bound buffer's pointer in the entry `ep`'s `body` a read of a parameter
+/// (see the module), returning the new body and the parameters added for them (none, and `body`
+/// unchanged, when it loads none).
 pub(super) fn expand(
     body: Body,
     parts: &mut ModuleParts,
-    func: FuncId,
-    abi: &AirAbi,
-    stage: &Stage,
+    ep: &EntryPoint,
+    bindings: &[GlobalBinding],
     m: &mut Meter,
 ) -> Result<(Body, Vec<ParamBinding>), Error> {
-    if abi.global_bindings.is_empty() {
-        return Ok((body, Vec::new()));
-    }
-    // The parameters to add, in the order the body first reads them: one per binding and type.
+    // The parameters to add, in the order the body first loads them: one per role and type.
     let mut added: Vec<(&GlobalBinding, TypeId)> = Vec::new();
-    let mut reads: Vec<(InstId, usize)> = Vec::new();
-    for (i, inst) in body.insts.iter() {
+    let mut loads = false;
+    for (_, inst) in body.insts.iter() {
         m.tick(1)?;
-        let Some(b) = read(&body, parts, abi, &inst.kind, inst.ty) else {
+        let Some(b) = bound(&body, parts, bindings, &inst.kind, inst.ty) else {
             continue;
         };
-        if !crate::abi::input_in_stage(&b.binding.role, stage) {
-            continue;
+        loads = true;
+        if own(ep, b).is_none() && !added.iter().any(|(a, _)| alike(a, b)) {
+            m.reserve(&mut added, 1)?;
+            added.push((b, inst.ty));
         }
-        let at = match added
-            .iter()
-            .position(|(a, t)| a.binding.role == b.binding.role && *t == inst.ty)
-        {
-            Some(at) => at,
-            None => {
-                m.reserve(&mut added, 1)?;
-                added.push((b, inst.ty));
-                added.len() - 1
-            }
-        };
-        m.reserve(&mut reads, 1)?;
-        reads.push((i, at));
     }
-    let release = |m: &mut Meter, reads: &Vec<(InstId, usize)>, added: &Vec<_>| {
-        m.release(reads.capacity() * std::mem::size_of::<(InstId, usize)>());
-        m.release(added.capacity() * std::mem::size_of::<(&GlobalBinding, TypeId)>());
-    };
-    if added.is_empty() {
-        release(m, &reads, &added);
+    if !loads {
         return Ok((body, Vec::new()));
     }
-    let tys: Vec<TypeId> = added.iter().map(|&(_, t)| t).collect();
-    let first = append_params(parts, func, &tys, m)?;
+    let first = if added.is_empty() {
+        0
+    } else {
+        let tys: Vec<TypeId> = added.iter().map(|&(_, ty)| ty).collect();
+        append_params(parts, ep.func, &tys, m)?
+    };
+    let param = |b: &GlobalBinding| -> Option<u32> {
+        own(ep, b).or_else(|| {
+            let at = added.iter().position(|(a, _)| alike(a, b))?;
+            first.checked_add(u32::try_from(at).ok()?)
+        })
+    };
     let out = scoped(m, |m, held| {
         let mut edit = BodyEdit::keep_all(&body, m, held)?;
-        for &(i, at) in &reads {
+        for (i, inst) in body.insts.iter() {
             m.tick(1)?;
-            let p = u32::try_from(at)
-                .ok()
-                .and_then(|at| first.checked_add(at))
-                .ok_or_else(|| invariant("entry parameters"))?;
-            edit.replace(i, Value::Arg(ArgIdx::new(p)));
+            if let Some(p) = bound(&body, parts, bindings, &inst.kind, inst.ty).and_then(param) {
+                edit.replace(i, Value::Arg(ArgIdx::new(p)));
+            }
         }
         apply(&body, &edit, &|c| c, m)
-    });
-    let bindings = added
+    })?;
+    body.release(m);
+    let params = added
         .iter()
         .zip(first..)
         .map(|(&(b, _), param)| ParamBinding {
             param,
-            ..b.binding.clone()
+            role: b.role.clone(),
+            unused: false,
+            predicate: None,
+            ty: b.ty.clone(),
+            name: b.name.clone(),
         })
         .collect();
-    release(m, &reads, &added);
-    let out = out?;
-    body.release(m);
-    Ok((out, bindings))
+    Ok((out, params))
+}
+
+/// Whether bindings `a` and `b` bind one argument: one role and one type.
+fn alike(a: &GlobalBinding, b: &GlobalBinding) -> bool {
+    a.role == b.role && a.ty == b.ty
+}
+
+/// The parameter of `ep` that binding `b`'s reads read: one of its role and type that no predicate
+/// gates and that the entry uses.
+fn own(ep: &EntryPoint, b: &GlobalBinding) -> Option<u32> {
+    ep.params
+        .iter()
+        .find(|p| p.role == b.role && p.ty == b.ty && p.predicate.is_none() && !p.unused)
+        .map(|p| p.param)
+}
+
+/// Refuse the first of the `added` parameters whose buffer slot a present parameter of the entry
+/// `params`, or an earlier added one, also binds: Metal reads the one buffer bound there through
+/// both, which two parameters do not model.
+pub(super) fn shared_slot(
+    name: &DiagName,
+    params: &[ParamBinding],
+    added: &[ParamBinding],
+) -> Result<(), Error> {
+    for (i, p) in added.iter().enumerate() {
+        let mut earlier = params.iter().chain(added.get(..i).unwrap_or_default());
+        if earlier.any(|q| interface::overlap(p, q)) {
+            return Err(refused(
+                Feature::ProgramScopeSharedSlot,
+                name,
+                p.name.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse the first of the `bindings` whose global `kept` (what pruning keeps of the entry's
+/// globals) still holds: a read of it did not become a parameter.
+pub(super) fn left(
+    name: &DiagName,
+    bindings: &[GlobalBinding],
+    kept: impl Fn(GlobalId) -> bool,
+) -> Result<(), Error> {
+    let Some(b) = bindings.iter().find(|b| kept(b.global)) else {
+        return Ok(());
+    };
+    let feature = match buffer_space(b) {
+        Some(_) => Feature::ProgramScopeRead,
+        None => Feature::ProgramScopeResource,
+    };
+    Err(refused(feature, name, b.name.clone()))
+}
+
+/// `feature`, refused in entry `name` at the binding named `binding`.
+fn refused(feature: Feature, name: &DiagName, binding: Option<DiagName>) -> Error {
+    let refusal = Unsupported::not_implemented(feature).at(Location::metadata(
+        Some(name.clone()),
+        None,
+        Some("air.global_bindings"),
+    ));
+    match binding {
+        Some(b) => refusal.naming(b).into(),
+        None => refusal.into(),
+    }
 }

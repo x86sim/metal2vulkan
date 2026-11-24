@@ -10,7 +10,8 @@ use crate::spirv::builder::{geometry_per_vertex, mesh_arrayed};
 use crate::spirv::error::Dangling;
 use crate::spirv::ids::{BlockId, FuncId, GlobalId};
 use crate::spirv::ir::{
-    ExecModel, GlobalKind, Inst, IoDir, StorageClass, Terminator, Type, TypedModule, ValueOrigin,
+    ConstKind, Constant, ExecModel, GlobalKind, Inst, IoDir, StorageClass, Terminator, Type,
+    TypedModule, ValueOrigin,
 };
 use crate::spirv::requirements::{derive, interface, metal_stage, ModuleView};
 
@@ -201,10 +202,8 @@ pub(super) fn check_stage(m: &TypedModule) -> Result<(), VerifyError> {
             let per_element = m.entry.model == ExecModel::MeshEXT && dir == IoDir::Output;
             let arrays_vertices = matches!(
                 (m.entry.model, dir),
-                (
-                    ExecModel::Geometry | ExecModel::TessellationEvaluation,
-                    IoDir::Input
-                ) | (ExecModel::TessellationControl, _)
+                (ExecModel::TessellationEvaluation, IoDir::Input)
+                    | (ExecModel::TessellationControl, _)
             );
             let per_vertex = arrays_vertices && geometry_per_vertex(builtin);
             let vertex_form = arrays_vertices && element_array(m, builtin, g.pointee)?;
@@ -372,26 +371,6 @@ fn builtin_in_model(b: crate::spv::BuiltIn, dir: IoDir, model: ExecModel) -> boo
                 | B::ViewIndex
         ),
         (ExecModel::TaskEXT, IoDir::Output) => false,
-        (ExecModel::Geometry, IoDir::Input) => matches!(
-            b,
-            B::Position
-                | B::PointSize
-                | B::ClipDistance
-                | B::CullDistance
-                | B::PrimitiveId
-                | B::InvocationId
-                | B::ViewIndex
-        ),
-        (ExecModel::Geometry, IoDir::Output) => matches!(
-            b,
-            B::Position
-                | B::PointSize
-                | B::ClipDistance
-                | B::CullDistance
-                | B::PrimitiveId
-                | B::Layer
-                | B::ViewportIndex
-        ),
         (ExecModel::MeshEXT, IoDir::Output) => matches!(
             b,
             B::Position
@@ -451,20 +430,24 @@ fn requirements_cover(
     expected == *recorded
 }
 
-/// The profile rules: no `Workgroup` initializer without `shaderZeroInitializeWorkgroupMemory`, and
-/// requirements ⊆ profile.
+/// The profile rules: a `Workgroup` initializer only where the profile enables
+/// `shaderZeroInitializeWorkgroupMemory`, and only `OpConstantNull`
+/// (`VUID-StandaloneSpirv-OpVariable-04734`); requirements ⊆ profile.
 pub(super) fn profile_rules(m: &TypedModule, p: &DeviceProfile) -> Result<(), VerifyError> {
     let zero_init = p
         .fields()
         .enabled
         .features
         .contains(&VkFeature::ShaderZeroInitializeWorkgroupMemory);
-    if !zero_init {
-        if let Some(gi) = m
-            .globals
-            .iter()
-            .position(|g| g.class == StorageClass::Workgroup && g.init.is_some())
-        {
+    for (gi, g) in m.globals.iter().enumerate() {
+        let Some(init) = g.init.filter(|_| g.class == StorageClass::Workgroup) else {
+            continue;
+        };
+        let null = matches!(
+            m.consts.get(init)?.kind,
+            ConstKind::Plain(Constant::Null { .. })
+        );
+        if !(zero_init && null) {
             return Err(Violation::WorkgroupInitializer(GlobalId::new(gi as u32)).into());
         }
     }

@@ -23,10 +23,9 @@
 //! The owned fixture `tns_mm_fp8` (built for macOS 27) multiplies 8-bit floats (e4m3 and e5m2)
 //! into float over 32 x 32 x 32 on one simdgroup, B transposed or not, accumulating C or not, A or
 //! B staged in threadgroup memory: each element decodes exactly, subnormals kept (an e4m3 `0x7F`
-//! reads 480, as measured on the M3 Max), and its float sums are the same reference's. On a device
-//! with its own 8-bit floats (`shaderFloat8`: the RTX 50 profile) each element widens through the
-//! device's type (the module declares `Float8EXT`), whose e4m3 `0x7F` and `0xFF` read NaN, and the
-//! artifact records `PrecisionNote::NativeFloat8`; every other code reads Metal's value.
+//! reads 480, as measured on the M3 Max), and its float sums are the same reference's, on every
+//! profile, one that lists `shaderFloat8` (the RTX 50 profile) included: the module declares no
+//! `Float8EXT`.
 //!
 //! The owned fixtures `tns_init` and `tns_init_left` (`tns_mm_left`'s second kernel) construct a
 //! cooperative tensor (a destination, a right input, or a left input) in a loop's body: each
@@ -42,18 +41,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::budget::SPIRV_WORDS;
-use crate::device::requirements::{SpirvCapability, VkProperty};
-use crate::device::subgroup::Tier;
+use crate::device::requirements::SpirvCapability;
 use crate::device::DevicePolicy;
 use crate::error::{Error, Feature, Needs};
 use crate::library::{FunctionArtifact, FunctionConstantValue, FunctionConstantValues};
 use crate::lower::select::Plan;
 use crate::metal::DataType;
-use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::lower_inputs::LoweringInputs;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     engine_dir, link_and_validate, llvm_assemble, meter, profile, typed_module_specialized,
     AssembleError, Scratch,
@@ -191,7 +188,7 @@ fn fp8_products_are_metals_sequential_fused_sums_on_lavapipe() {
 }
 
 #[test]
-fn fp8_products_are_sequential_fused_sums_of_the_devices_own_8_bit_floats_on_rtx50() {
+fn fp8_products_are_metals_sequential_fused_sums_on_rtx50() {
     fp8_fused_sums(RTX50);
 }
 
@@ -229,7 +226,7 @@ impl Rng {
 /// Kernel `entry` of `bc` specialized to variant `v` for profile `stem`, checked through L3: its
 /// plan and typed module.
 fn kernel(bc: &[u8], entry: &str, v: u32, stem: &str) -> Kernel {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
+    let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let consts = variant(v);
     let what = format!("{entry} variant {v} on {stem}");
     let a = compile_bitcode(
@@ -245,19 +242,6 @@ fn kernel(bc: &[u8], entry: &str, v: u32, stem: &str) -> Kernel {
     link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
     let (plan, module) =
         typed_module_specialized(bc, entry, &p, &consts).unwrap_or_else(|e| panic!("{what}: {e}"));
-    // Only lavapipe's 8-lane subgroups emulate simdgroups, and a 32-lane device whose simdgroups
-    // do not run in lockstep, where a kernel's threadgroup stores need it (`tns_mm_int`'s byte
-    // copies to threadgroup memory on `amd-rdna2-apu-radv`).
-    let lockstep = p
-        .fields()
-        .enabled
-        .properties
-        .contains(&VkProperty::SimdgroupLockstep);
-    assert!(
-        plan.simd.1 != Tier::Emulated || stem == "lavapipe" || !lockstep,
-        "{what}: {:?}",
-        plan.simd
-    );
     Kernel {
         what,
         plan,
@@ -299,10 +283,7 @@ impl Kernel {
 
 fn resources(plan: &Plan, threads: u32, init: &[Vec<u8>]) -> Resources {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(threads));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         assert!(
@@ -763,12 +744,8 @@ impl Fp8 {
     }
 
     /// The value of byte `b` as a float, exactly, subnormals kept: as Metal reads it (measured on
-    /// the M3 Max), or through a device's own 8-bit float (`native`), whose e4m3 is OCP's, reading
-    /// `0x7F` and `0xFF` as NaN.
-    fn widen(self, b: u8, native: bool) -> f32 {
-        if native && matches!(self, Fp8::E4M3) && b & 0x7f == 0x7f {
-            return f32::NAN;
-        }
+    /// the M3 Max).
+    fn widen(self, b: u8) -> f32 {
         let (mantissa, bias) = match self {
             Fp8::E4M3 => (3, 7),
             Fp8::E5M2 => (2, 15),
@@ -799,18 +776,12 @@ fn fp8_variant(v: u32) -> (Fp8, bool, bool) {
 
 /// Products of 8-bit floats into float are Metal's sequential fused sums on `profile`, of the
 /// exact decode of each byte, A and B in device memory or either in threadgroup memory
-/// (`tns_mm_fp8`, one 32 x 32 x 32 tile). On a device with its own 8-bit floats each byte widens
-/// through the device's type (`Float8EXT` declared, `PrecisionNote::NativeFloat8` recorded), whose
-/// e4m3 reads `0x7F` and `0xFF` as NaN: a sum of one is a NaN, whose bits are the device's.
+/// (`tns_mm_fp8`, one 32 x 32 x 32 tile), by the integer decode on every profile: no module
+/// declares `Float8EXT`, and no sum is a NaN.
 fn fp8_fused_sums((stem, widths): (&str, &[SubgroupSize])) {
     let Some(bc) = bitcode("tns_mm_fp8") else {
         return;
     };
-    let native = profile(stem, DevicePolicy::default())
-        .expect("profile")
-        .fields()
-        .leaf
-        .float8;
     let float8 = SpirvCapability::of(crate::spv::Capability::Float8EXT);
     let mut rng = Rng(0xf8e4);
     let mut nans = 0;
@@ -818,19 +789,11 @@ fn fp8_fused_sums((stem, widths): (&str, &[SubgroupSize])) {
         let (format, transposed, accumulates) = fp8_variant(v);
         let kernel = kernel(&bc, "tns_mm_fp8", v, stem);
         let artifact = &kernel.artifact;
-        assert_eq!(
-            artifact.requirements.spirv_capabilities.contains(&float8),
-            native,
+        assert!(
+            !artifact.requirements.spirv_capabilities.contains(&float8),
             "{}: {:?}",
             kernel.what,
             artifact.requirements.spirv_capabilities
-        );
-        assert_eq!(
-            artifact.precision.contains(&PrecisionNote::NativeFloat8),
-            native,
-            "{}: {:?}",
-            kernel.what,
-            artifact.precision
         );
         let a: Vec<u8> = (0..1024).map(|_| format.random(&mut rng)).collect();
         let b: Vec<u8> = (0..1024).map(|_| format.random(&mut rng)).collect();
@@ -842,13 +805,13 @@ fn fp8_fused_sums((stem, widths): (&str, &[SubgroupSize])) {
             for col in 0..32 {
                 let mut acc = if accumulates { c[row * 32 + col] } else { 0.0 };
                 for k in 0..32 {
-                    let x = format.widen(a[row * 32 + k], native);
+                    let x = format.widen(a[row * 32 + k]);
                     let at = if transposed {
                         col * 32 + k
                     } else {
                         k * 32 + col
                     };
-                    acc = x.mul_add(format.widen(b[at], native), acc);
+                    acc = x.mul_add(format.widen(b[at]), acc);
                 }
                 want[row * 32 + col] = acc.to_bits();
             }
@@ -883,8 +846,8 @@ fn fp8_fused_sums((stem, widths): (&str, &[SubgroupSize])) {
             );
         }
     }
-    // The device's e4m3 NaNs reach the sums only where the device has its own 8-bit floats.
-    assert_eq!(nans > 0, native, "{stem}: {nans} NaN sums");
+    // Metal's e4m3 has no NaN, and the finite inputs make none.
+    assert_eq!(nans, 0, "{stem}: {nans} NaN sums");
 }
 
 /// `fixture` with every spelling of a descriptor's fields `from` respelled `to`, for each pair (in
@@ -926,7 +889,7 @@ fn unmeasured_forms_are_refused_naming_them() {
         "i32 16, i32 64, i32 32",
         "16x64x32",
     )];
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     for (from, to, why) in cases {
         let Some(bc) = respelled("tns_mm_float", &[(from, to)]) else {
             return;

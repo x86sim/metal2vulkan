@@ -97,14 +97,11 @@ pub struct EntryPlan {
     pub stage: Stage,
     /// Each lowering strategy the plan selected: its uses, and the words it is estimated to emit.
     pub strategies: BTreeMap<String, StrategyUse>,
-    /// The size check's estimate of the module's words: a compile refuses above
-    /// `budget::SPIRV_WORDS` before it emits.
-    pub estimated_words: u64,
 }
 
 impl DeviceProfile {
     /// Compile entry `d` under `inputs` for this profile, and what the compile cost against
-    /// `budget`, whether it compiled or not: `Device::compile_function_with_report` of a bare
+    /// `budget`, whether it compiled or not: `Device::compile_function` of a bare
     /// module's entry. The result is as cacheable, and a pipeline takes it as
     /// `StageSource::Compiled`.
     pub fn compile_entry(
@@ -161,7 +158,7 @@ impl DeviceProfile {
         let mut m = Meter::new(budget);
         let variant = VariantKey::new();
         guarded(|| {
-            let r = d.request(InputsFrom::Vertex(vertex, &variant, 1, false, None));
+            let r = d.request(InputsFrom::Vertex(vertex, &variant, 1, false, false));
             let spec = specialize_one(&r, &mut m)?.spec;
             lower_inputs(&spec, r.inputs, self, &mut m)
         })
@@ -169,9 +166,8 @@ impl DeviceProfile {
 
     /// Everything [`DeviceProfile::compile_entry`] does before emission (decode, specialize,
     /// analyze, select), and what it cost against `budget`: its first plan, which a kernel whose
-    /// emitted module passes a bound its driver compiles within replaces
-    /// (`DriverWorkaround::SerializedStageWrapsLargeModules`,
-    /// `DriverWorkaround::CompilerMemoryGrowsWithStageSize`).
+    /// emulated module passes the compiled stage bound replaces with a plan keeping its pin
+    /// (`pipeline::compile`'s stage bound).
     pub fn plan_entry(
         &self,
         d: &EntryDescriptor<'_>,
@@ -185,7 +181,6 @@ impl DeviceProfile {
             plan_one(&r, self, widest, &mut m).map(|planned| EntryPlan {
                 stage: planned.plan.stage,
                 strategies: census(&planned.plan).entries,
-                estimated_words: planned.plan.estimate.words,
             })
         });
         (planned, CompileReport::of(&m))

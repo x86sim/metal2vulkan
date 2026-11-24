@@ -1,10 +1,7 @@
 //! Mesh draws behind a memory barrier: whether a reader draw sees the writer draw's words.
 //!
-//! Ported from the runtime lane `runtime_lane/mesh_barriers.rs`, whose expectation is a transcript
-//! of a Metal probe's printed lines (`PX`, `RESULT`, `CTL`). Metal's answer here is **run**, not
-//! copied: the lane's own documentation says its table is what an **M4** on macOS 27.0.1 printed,
-//! while the suite's oracle is this M3 Max, so porting the lane and recording it is also the first
-//! measurement of this probe on the chip the recording is keyed to.
+//! Metal's answer here is **run**, not copied: record mode measures it on the chip the recording is
+//! keyed to.
 //!
 //! Each row is one pass of one `RGBA32Uint` attachment, 8x8, cleared to zero and stored, and a
 //! control buffer of four words, `(1, 1, 1, 0)` from the host. A writer draw covers texel (7, 7)
@@ -15,18 +12,14 @@
 //! What a row observes is typed, not printed: the attachment's whole 8x8 as bytes under a layout
 //! that reads them as 32-bit words, the texels drawn as a count, the control buffer's four words
 //! after the pass as bytes of their own, every call of the pass by the Metal selector it makes,
-//! and the command buffer's status and error. The lane folded all of that into one list of
-//! formatted strings.
+//! and the command buffer's status and error.
 //!
 //! The row whose reader is an indirect draw of an object function is a case of its own, so that a
 //! refusal at its draw — a refused call stops a run — cannot cost the other six rows their sites.
-//! **It is not refused on any device we have:** the claim that an emulating device refuses it
-//! (`NotImplemented(MeshShading)`) was true until `bind::mesh_object_arguments_module` landed, and
-//! the lane that still said so has been corrected. On MoltenVK 1.4.2 it draws Metal's words.
+//! **It is not refused on any device we have:** on MoltenVK 1.4.2 it draws Metal's words.
 //!
 //! Nothing here can fault a GPU: every grid is one or two threadgroups.
 
-use crate::allowance::Allowance;
 use crate::case::{
     Abort, Case, Failure, Handle, Input, MeshFunctions, MeshStep, MetalSource, Side, SCOPE_BUFFERS,
     STAGE_FRAGMENT, STAGE_MESH, STAGE_OBJECT, TARGET_TEXEL,
@@ -111,7 +104,7 @@ struct Row {
     reader: Reader,
 }
 
-/// The rows both sides run to completion (the lane's `CASES` but for its last).
+/// The rows both sides run to completion.
 const ROWS: &[Row] = &[
     Row {
         name: "mesh-to-object",
@@ -151,8 +144,7 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The row the runtime refuses where a device emulates mesh draws: an indirect draw of an object
-/// function (the lane's `fragment-to-indirect-object`).
+/// The row whose reader is an indirect draw of an object function, a case of its own.
 const INDIRECT_OBJECT_ROW: &[Row] = &[Row {
     name: "fragment-to-indirect-object",
     writer: Writer::Fragment,
@@ -433,10 +425,6 @@ impl Case for MeshBarriers {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        super::mesh_draws::mesh_notice_allowances()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

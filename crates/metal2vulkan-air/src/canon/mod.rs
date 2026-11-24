@@ -51,8 +51,10 @@
 //!    decoded (`Callee::Unbound`: an internal function's parameter passed on to the intrinsic) is
 //!    bound where they now are, each inlined copy with its own call site's constants. A value use of an unsupplied
 //!    constant that survives is `Error::NeedsInput(FunctionConstant)`. **Unrolling**: a loop whose
-//!    trip count SCCP made constant, and whose counter decides a branch of its body, is unrolled
-//!    within fixed ceilings, and SCCP runs again over the copies; the result is kept where it is
+//!    trip count SCCP made constant, and whose counter decides a texel offset of its body, is
+//!    unrolled where it runs at most 25 times with the loops nested in it, and kept, so the
+//!    offset is a constant; then one whose counter decides a branch of its body is unrolled
+//!    within fixed ceilings, and SCCP runs again over the copies; that result is kept where it is
 //!    no larger than the loops it replaces (`unroll`). **Private reach**: then each private array
 //!    of nested arrays whose every index the constants bound (constants, and the counters of loops
 //!    whose trip count they decide), and whose address reaches only element accesses, is allocated
@@ -81,14 +83,13 @@
 //!    row, the origin and the constant transpose flag (`legacy_matrix`). **Aggregate accesses**: a
 //!    load or store of a whole array or struct in buffer or threadgroup memory becomes its scalar
 //!    and vector members' accesses, joined by `insertvalue` or split by `extractvalue`
-//!    (`aggregates`). **Global built-in
+//!    (`aggregates`). **Program-scope buffer bindings**: each load of the pointer a bound buffer's
+//!    global holds becomes a read of the entry's parameter of that buffer, its own or one appended
+//!    (`global_binding`). **Global built-in
 //!    variables**: each `air.get_*` read of a program-scope built-in becomes a read of a built-in
 //!    parameter appended to the entry (`global_builtin`); in OpenCL mode, first, the entry takes
 //!    the three hidden buffers, each OpenCL C work-item read becomes a read of its built-in or of
 //!    the first buffer, and each image format query a read of the third ([`opencl`]).
-//!    **Program-scope bindings** (MSL 3.2's
-//!    `!air.global_bindings`) became parameters before SCCP the same way: each load of a bound
-//!    global reads a parameter of the binding's role appended to the entry (`global_binding`).
 //! 10. **ABI resolution and pruning**: predicate-gated parameters and outputs that are off
 //!     disappear from the entry point, a read of an absent argument takes its absent value (the
 //!     null reference of a resource argument) or is refused, global-valued ABI integers become
@@ -203,6 +204,12 @@ pub struct SpecRequest {
     /// sits 3 past its index, and OpenCL C's work-item functions read the dispatch's values
     /// ([`opencl`]). Any other entry than a kernel specializes as without it.
     pub open_cl_mode: bool,
+    /// With [`open_cl_mode`](Self::open_cl_mode), the texture indices of the kernel's 1D images
+    /// (`texture1d` and `texture1d_array` arguments) that a 1D texture is bound for, where Apple's
+    /// OpenCL binds a 2D texture of height 1: each keeps its 1D type and its 1D operations, which
+    /// read the 1D texture. Every other 1D image of the kernel is read as the 2D texture
+    /// ([`Entry::open_cl_1d_images`]).
+    pub open_cl_lines: BTreeSet<u32>,
 }
 
 /// The constexpr samplers of one linked function that a pipeline state numbers
@@ -294,6 +301,11 @@ pub struct Entry {
     /// no measurement says whether it speculates them (an arm of an instruction, size or shape no
     /// probe covers). Such a branch keeps the AIR's lanes; Metal's may be the block's.
     pub unmeasured_speculation: bool,
+    /// In a kernel of OpenCL mode ([`SpecRequest::open_cl_mode`]), the texture indices of its 1D
+    /// images (`texture1d` and `texture1d_array` arguments): each is read as the 2D texture of
+    /// height 1 Apple's OpenCL binds for it, or as a 1D texture where
+    /// [`SpecRequest::open_cl_lines`] names it. Empty elsewhere.
+    pub open_cl_1d_images: BTreeSet<u32>,
 }
 
 /// An entry's explicit call stack: what its recursion through visible functions runs on. Its stacks
@@ -318,15 +330,9 @@ pub struct Lockstep {
     /// Some inserted simdgroup barrier stands where the lanes of a subgroup are not known to
     /// reach it together, so it orders its pair only on emulated simdgroups, whose predicated
     /// walk takes every thread of the workgroup through it: the kernel takes the `Emulated` tier.
-    /// Never set for a device whose lockstep orders those pairs (`device`), nor where a subgroup
-    /// barrier in divergent flow orders the threads that run it together (maximal reconvergence on
-    /// 32-lane subgroups).
+    /// Never set where a subgroup barrier in divergent flow orders the threads that run it together
+    /// (maximal reconvergence on 32-lane subgroups).
     pub emulated: bool,
-    /// On a device that runs a simdgroup's 32 threads in lockstep
-    /// (`VkProperty::SimdgroupLockstep`): the barrier positions that only emulated simdgroups would
-    /// make exact, left out because the device's lockstep orders their pairs as Apple's does. The
-    /// module then requires the property. 0 elsewhere.
-    pub device: u32,
     /// Every inserted simdgroup barrier orders only pairs whose threads meet where a simdgroup
     /// spans two rows of its threadgroup (two of its threads then share their position's `x`, or
     /// hold different `y`s or `z`s): in a threadgroup whose simdgroups each lie within one row (a
@@ -336,14 +342,18 @@ pub struct Lockstep {
     /// simdgroup barrier at its place would, and needs no subgroup size, so a pipeline for such
     /// threadgroups keeps them and leaves out only the simdgroup barriers, and with them the
     /// subgroup size they pinned: an exact removal. Decided where a subgroup barrier keeps a
-    /// 32-lane tier (maximal reconvergence on 32-lane subgroups, without the device's own
-    /// lockstep); `false` elsewhere and where no barrier is inserted.
+    /// 32-lane tier (maximal reconvergence on 32-lane subgroups); `false` elsewhere and where no
+    /// barrier is inserted.
     pub rows: bool,
     /// The inserted threadgroup barriers that order only pairs whose threads meet where a
     /// simdgroup spans two rows of its threadgroup, sorted: each runs only in a threadgroup whose
     /// simdgroups may span two rows (more than one row, of a width not a multiple of 32), and in
     /// any other no pair it orders meets.
     pub across_rows: Vec<crate::ir::InstId>,
+    /// The kernel holds such a pair and no barrier was inserted for it: under a profile that
+    /// orders none (the identity domains), its pairs are found and left as the program wrote
+    /// them, and the kernel records that its answer there is the device's order's.
+    pub unordered: bool,
 }
 
 impl Lockstep {
@@ -657,16 +667,13 @@ pub fn specialize_dynamic(
     let body = block_read::expand(body, &mut parts, ep.func, m)?;
     // OpenCL C's vector data loads and stores are their element accesses.
     let body = vector_data::expand(body, &mut parts, ep.func, m)?;
-    // OpenCL mode: a 1D image's operations are the 2D texture's that Apple's OpenCL binds for it.
+    // OpenCL mode: a 1D image's operations are the 2D texture's that Apple's OpenCL binds for it,
+    // but those of an image a 1D texture is bound for.
     let body = if req.open_cl_mode && matches!(ep.stage, Stage::Kernel { .. }) {
-        opencl_1d::expand(body, &mut parts, ep.func, m)?
+        opencl_1d::expand(body, &mut parts, (ep, &req.open_cl_lines), m)?
     } else {
         body
     };
-    // MSL 3.2 program-scope bindings: each load of a bound global becomes a read of a parameter
-    // added to the entry, before SCCP sees the global's `undef` initializer.
-    let (body, global_bindings) =
-        global_binding::expand(body, &mut parts, func, abi, &ep.stage, m)?;
 
     // SCCP. The body it read is freed as soon as it has run.
     let solved = solve(&body, &mut parts, &fcs, &name, m)?;
@@ -719,14 +726,29 @@ pub fn specialize_dynamic(
     } else {
         resolved
     };
+    // Loops whose trip count the constants decided, unrolled where their counters decide a texel
+    // offset of their body, in nests of at most `unroll::OFFSET_TRIPS` runs, and kept: every
+    // offset is then a constant. SCCP after each round folds the copies' offsets.
+    let mut grown = 0;
+    for _ in 0..unroll::ROUNDS {
+        let offsets = (&mut grown, unroll::Decides::Offset);
+        let Some(unrolled) = unroll::round(&body, &mut parts, offsets, m)? else {
+            break;
+        };
+        let solved = solve(&unrolled, &mut parts, &fcs, &name, m)?;
+        unrolled.release(m);
+        body.release(m);
+        body = solved.body;
+        undefined_reads.extend(solved.reads);
+    }
     // Loops whose trip count the constants decided, unrolled where their counters decide a branch
     // of their body; SCCP after each round folds what the copies decide. The unrolled body is
     // kept only where it comes out no larger than the loops it replaces (`unroll::live_size`).
-    let mut grown = 0;
     let mut trial: Option<(Body, BTreeSet<u32>)> = None;
     for _ in 0..unroll::ROUNDS {
         let current = trial.as_ref().map_or(&body, |(b, _)| b);
-        let Some(unrolled) = unroll::round(current, &mut parts, &mut grown, m)? else {
+        let branches = (&mut grown, unroll::Decides::Branch);
+        let Some(unrolled) = unroll::round(current, &mut parts, branches, m)? else {
             break;
         };
         let solved = solve(&unrolled, &mut parts, &fcs, &name, m)?;
@@ -794,6 +816,9 @@ pub fn specialize_dynamic(
     } else {
         (body, None)
     };
+    // Program-scope buffer bindings: each load of a bound buffer's pointer becomes a read of the
+    // entry's own parameter of that buffer, or of one added to it.
+    let (body, bound) = global_binding::expand(body, &mut parts, ep, &abi.global_bindings, m)?;
     // Global built-in variables: each read becomes a read of a built-in parameter added to the
     // entry, but one Metal refuses in the entry's stage.
     let (body, global_builtins) = global_builtin::expand(body, &mut parts, func, &ep.stage, m)?;
@@ -820,13 +845,16 @@ pub fn specialize_dynamic(
         ep.params.extend(lanes.bindings());
     }
     // OpenCL mode's indices and hidden buffers.
+    let mut open_cl_1d_images = BTreeSet::new();
     if let Some(first) = hidden {
-        ep = opencl::entry(ep, first)?;
+        (ep, open_cl_1d_images) = opencl::entry(ep, first, &req.open_cl_lines)?;
     }
+    // The buffer parameters the program-scope bindings' reads became, each at a slot no other
+    // parameter binds.
+    global_binding::shared_slot(&ep.name, &ep.params, &bound)?;
+    ep.params.extend(bound);
     // The built-in parameters the global built-ins' reads became.
     ep.params.extend(global_builtins);
-    // The parameters the program-scope bindings' reads became.
-    ep.params.extend(global_bindings);
     // A table whose every use devirtualization rewrote is read as a buffer of words.
     let mut function_tables = BTreeSet::new();
     for p in &mut ep.params {
@@ -853,6 +881,11 @@ pub fn specialize_dynamic(
     // What nothing observes goes before pruning, so nothing it alone reaches is kept.
     interface::unobserved_code(&mut parts, func, &ep, m)?;
     let pruned = prune::prune(parts, func, m)?;
+    // A program-scope binding whose global the entry still reaches was read other than as a
+    // buffer parameter.
+    global_binding::left(&ep.name, &abi.global_bindings, |g| {
+        pruned.gmap.get(g.index()).copied().flatten().is_some()
+    })?;
     ep.func = pruned.func;
     remap_control_points(&mut ep, &pruned.fmap);
     // The module's constexpr samplers and those of the linked functions it imported.
@@ -918,6 +951,7 @@ pub fn specialize_dynamic(
         lockstep: Lockstep::default(),
         call_stack,
         unmeasured_speculation,
+        open_cl_1d_images,
         module,
     })
 }

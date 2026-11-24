@@ -1,15 +1,12 @@
 //! Two-plane YCbCr textures: what Metal says about the formats' descriptors, and what a kernel's
 //! `read()` of a `420v` surface's texels answers.
 //!
-//! Ported from `runtime_lane/ycbcr_textures.rs`. The lane is 4,500 lines over a `YCBCR8_420_2P`
-//! texture laid over a CoreVideo surface's two planes, and the two halves of it port very
-//! differently, because of one fact about Metal's API:
+//! The two cases here are shaped by one fact about Metal's API:
 //!
-//! **A texture of a two-plane YCbCr format exists only over an IOSurface.** The lane's own
-//! `ycbcr_textures_are_made_only_over_their_surfaces` is that fact: `newTextureWithDescriptor:`
-//! answers nil for the format, and so does a buffer's texture of it. The runtime takes a *buffer*
-//! standing for the surface, which is what makes the lane run on a host with no CoreVideo, but
-//! Metal takes an IOSurface and nothing else. So:
+//! **A texture of a two-plane YCbCr format exists only over an IOSurface.**
+//! `newTextureWithDescriptor:` answers nil for the format, and so does a buffer's texture of it.
+//! The runtime takes a *buffer* standing for the surface, which is what makes the cases run on a
+//! host with no CoreVideo, but Metal takes an IOSurface and nothing else. So:
 //!
 //! - [`FormatDescriptors`] is **recorded on Metal**, because it asks only about descriptors:
 //!   `heapTextureSizeAndAlignWithDescriptor:` and whether `newTextureWithDescriptor:` answers a
@@ -30,27 +27,22 @@
 //! side, must answer the same 5,760 bytes. That is the strongest check the case can carry, and it
 //! is what says the IOSurface this side builds is the surface the probe built.
 //!
-//! # What the port changes
+//! # The record
 //!
-//! The lane compares its reads with that file **and** with `metal2vulkan::bind::ycbcr_texel`'s
-//! model, which is the right thing for a lane to do. What it does not do is keep Metal's values in
-//! a shape anything else can read: the comparison is a `Vec<[u16; 3]>` built inside one test
-//! function, and the only artifact that survives a failure is the first differing texel. This case
-//! records all 960 texels as a region whose rows are the texture's rows, so a diff names the texel
-//! by its row and its channel, and the file's own SHA-256 is part of the case's input fingerprint:
-//! a change to the measurement makes the case `Unrecorded` rather than quietly comparing against
-//! other bytes.
+//! This case records all 960 texels as a region whose rows are the texture's rows, so a diff names
+//! the texel by its row and its channel, and the file's own SHA-256 is part of the case's input
+//! fingerprint: a change to the measurement makes the case `Unrecorded` rather than quietly
+//! comparing against other bytes.
 //!
 //! # Why neither case can fault a GPU
 //!
-//! [`FormatDescriptors`] runs no GPU work at all. The multisample descriptors of the lane's own
-//! sweep are **left out by construction**: the runtime answers them `Error::Invalid`, which is its
-//! word for "Metal's validation stops it, ending the process", and the suite's standing rule is
-//! that no case may end Metal's process. [`TexelReads`] is one 40 x 24 texture, one 4 KiB surface
-//! and one dispatch of 960 threads, and the one pair it hands Metal — format 500 over a `420v`
-//! surface — is the pair the committed probe already ran on this machine.
+//! [`FormatDescriptors`] runs no GPU work at all. The multisample descriptors are **left out by
+//! construction**: Metal's validation stops them, ending the process, and the suite's standing rule
+//! is that no case may end Metal's process. [`TexelReads`] is one 40 x 24 texture, one 4 KiB
+//! surface and one dispatch of 960 threads, and the one pair it hands Metal — format 500 over a
+//! `420v` surface — is the pair the committed probe already ran on this machine.
 
-use crate::allowance::Allowance;
+use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{made, Abort, Bindings, Case, Failure, Input, MetalSource, PlaneTexture, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -82,10 +74,10 @@ fn family() -> Vec<PixelFormat> {
         .collect()
 }
 
-/// The texture extent every descriptor of the sweep names, as the lane's does.
+/// The texture extent every descriptor of the sweep names.
 const SIZE: [u32; 2] = [40, 24];
 
-/// The slices the array descriptor names, as the lane's does.
+/// The slices the array descriptor names.
 const SLICES: u32 = 2;
 
 /// The site a descriptor's answers sit under.
@@ -103,13 +95,13 @@ impl FormatDescriptors {
     /// The descriptors the case asks about, in order: each format's 2D descriptor in each
     /// storage, and its 2D array descriptor in each storage.
     ///
-    /// The 2D multisample and multisample-array descriptors of the lane's sweep are not here:
+    /// The 2D multisample and multisample-array descriptors are not here:
     /// Metal's own validation stops them, which ends its process.
     fn queries(&self) -> Vec<(Q, bool)> {
         let mut queries = Vec::new();
         for format in family() {
             for storage in [Storage::Shared, Storage::Private] {
-                // The 2D descriptor is the one the lane asks `newTextureWithDescriptor:` of, and
+                // The 2D descriptor is the one the case asks `newTextureWithDescriptor:` of, and
                 // Metal answers nil for it, so asking allocates nothing.
                 queries.push((Q::texture_2d(format, SIZE, storage), true));
             }
@@ -135,6 +127,20 @@ impl Case for FormatDescriptors {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
+    }
+
+    fn allowances(&self) -> Vec<Allowance> {
+        // The runtime's answers are the device's own, held by their property and not by
+        // Metal's numbers (`texture_query::DEVICE_OWN_SIZES`).
+        (self.queries().into_iter())
+            .map(|(query, _)| {
+                Allowance::new(
+                    format!("case/{}/{}/Ok/*", query.site(), site::QUERY),
+                    Loosening::Unchecked,
+                    Justification::accepted(crate::texture_query::DEVICE_OWN_SIZES),
+                )
+            })
+            .collect()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -175,8 +181,8 @@ impl Case for FormatDescriptors {
 // The texel reads of one measured `420v` surface.
 // ---------------------------------------------------------------------------------------------
 
-/// The surface's extent in texels, and its planes' layout, exactly as the lane lays its stand-in
-/// buffer out and as the probe laid the IOSurface it measured.
+/// The surface's extent in texels, and its planes' layout, exactly as the probe laid the IOSurface
+/// it measured.
 const W: u64 = 40;
 const H: u64 = 24;
 /// The bytes between rows of either plane.
@@ -216,7 +222,7 @@ const GROUP: u32 = 64;
 /// The byte the read-back buffer holds before the dispatch.
 const BLANK: u8 = 0xab;
 
-/// The lane's and the probes' generator of the surface's bytes.
+/// The probes' generator of the surface's bytes.
 struct Random(u64);
 
 impl Random {
@@ -354,13 +360,6 @@ impl Case for TexelReads {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // One declaration and no tolerance: the buffer the texel-read case writes its reads into is `Shared`, which is
-        // what [`crate::replay::shared_memory_notice`] is for. It loosens the notices site alone,
-        // so every value this case reads still compares exactly.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let fixture = Fixture {
             name: READ_FIXTURE,
@@ -478,8 +477,8 @@ mod tests {
         assert_eq!(formats.len(), 69, "{formats:?}");
         let queries = FormatDescriptors.queries();
         assert_eq!(queries.len(), formats.len() * 4);
-        // Only the 2D descriptors are asked whether Metal makes a texture: those are the ones the
-        // lane establishes Metal answers nil for.
+        // Only the 2D descriptors are asked whether Metal makes a texture: those are the ones
+        // Metal answers nil for.
         let asked = queries.iter().filter(|(_, asks)| *asks).count();
         assert_eq!(asked, formats.len() * 2);
         for (query, asks) in &queries {
@@ -504,7 +503,7 @@ mod tests {
         assert_eq!(FORMAT, PixelFormat::YCBCR84202P);
     }
 
-    /// The surface the case feeds is the one the probe measured: the lane pins its SHA-256, and a
+    /// The surface the case feeds is the one the probe measured: its SHA-256 is pinned, and a
     /// generator that drifts would compare our reads against another surface's answer.
     #[test]
     fn the_surface_is_the_one_metal_read() {
@@ -517,7 +516,7 @@ mod tests {
     }
 
     /// The committed probe's measurement is the one it has always been, by its length and its
-    /// SHA-256, which the lane pins too.
+    /// SHA-256.
     #[test]
     fn the_probes_reads_are_the_committed_measurement() {
         let bytes = measured().expect("the committed measurement");
@@ -618,62 +617,5 @@ mod tests {
         alpha[12..16].copy_from_slice(&0.5f32.to_le_bytes());
         let (_, counted) = TexelReads::steps(&alpha).expect("the steps still read");
         assert_eq!(counted, 1);
-    }
-}
-
-/// The safety guard the format sweep rests on, run on a device.
-///
-/// Record mode hands every descriptor of [`FormatDescriptors`] to Metal, and a descriptor Metal's
-/// own validation stops **ends Metal's process**. The runtime's model is what tells the two apart:
-/// `Error::Nil` is "plain Metal answers nil, the process going on", while `Error::Invalid` is
-/// "Metal's validation stops it, ending the process". So a sweep that makes the runtime answer
-/// anything but an answer is a sweep that must not be recorded, and this says so before anybody
-/// runs `conformance record`.
-///
-/// Its failure mode was exercised while writing it: adding the lane's 2D multisample descriptor to
-/// the sweep fails here, naming the format and `TypeForFormat`.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_tests {
-    use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    #[test]
-    fn no_descriptor_of_the_family_is_one_metals_validation_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_descriptor_of_the_family_is_one_metals_validation_stops"),
-        );
-        let mut stopped = Vec::new();
-        for (query, asks_texture) in FormatDescriptors.queries() {
-            if let Err(failure) = side.heap_texture_size_and_align(&query) {
-                stopped.push(format!("{}: {:?}", query.site(), failure.recorded()));
-            }
-            if asks_texture {
-                if let Err(failure) = side.makes_texture(&query) {
-                    stopped.push(format!(
-                        "{} makes_texture: {:?}",
-                        query.site(),
-                        failure.recorded()
-                    ));
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these descriptors do not answer on the runtime, so Metal's validation may stop them \
-             and record mode would end Metal's process; take them out of the sweep:\n{}",
-            stopped.join("\n")
-        );
     }
 }

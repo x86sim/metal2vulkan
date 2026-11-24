@@ -23,8 +23,9 @@
 //! The data are small integers (or 8-bit floats that are multiples of 1/4 no larger than 4), so
 //! every product and sum is exact and the expectations do not depend on the accumulation's
 //! rounding. On every committed profile each kernel compiles, links, and passes L3 exactly where a
-//! cross-lane shuffle class has a compute tier. 16x16x16 products are refused as
-//! `SimdgroupMatrix`. No GPU is used.
+//! cross-lane shuffle class has a compute tier. The owned fixture `engine/simd_matrix16`'s 16x16x16
+//! products, which Metal makes only on an Apple10 GPU and later, are refused as
+//! `SimdgroupMatrix16x16x16` on every committed profile. No GPU is used.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +40,7 @@ use crate::lower::arith::narrow::Fp8Layout;
 use crate::lower::select::Plan;
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::interface::{AccessSet, Window};
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, fixtures_dir, link_and_validate, llvm_assemble, metal_assemble, profile,
     typed_module, AssembleError,
@@ -73,29 +74,30 @@ fn owned() -> Option<Vec<u8>> {
 }
 
 fn moltenvk() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 /// A wave64-only compute device: the committed RDNA3 description with its subgroup size range
 /// narrowed to 64 (the `Cluster32` tier).
 fn wave64() -> DeviceProfile {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/amd-rdna3-radv.json");
+        .join("../metal2vulkan-validation/profiles/amd-780m-radv.json");
     let text = std::fs::read_to_string(&path).expect("read the RDNA3 description");
     let narrowed = text.replace("\"minSubgroupSize\": 32", "\"minSubgroupSize\": 64");
     assert_ne!(narrowed, text, "the description names minSubgroupSize");
     let desc = DeviceDescription::from_khronos_json(&narrowed, None).expect("description");
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
 }
 
-/// The tiers: (profile, tier, subgroup size, threadgroup sizes). `lavapipe` and `swiftshader`,
-/// which cannot pin 32 lanes, emulate their simdgroups through workgroup memory, here on 8- and
-/// 16-lane subgroups.
+/// The tiers: (profile, tier, subgroup size, threadgroup sizes). `lavapipe` and `runtime-floor`
+/// without `shaderInt64` (below the runtime's floor, its buffers bound, as the interpreter runs
+/// them), which cannot pin 32 lanes, emulate their simdgroups through workgroup memory, here on 8-
+/// and 16-lane subgroups.
 fn tiers() -> [(DeviceProfile, Tier, SubgroupSize, &'static [u32]); 4] {
-    let committed = |stem| profile(stem, DevicePolicy::default()).expect("profile");
+    let committed = |stem| profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
     [
         (moltenvk(), Tier::Direct, SubgroupSize::W32, &[32, 64]),
         (wave64(), Tier::Cluster32, SubgroupSize::W64, &[64]),
@@ -105,13 +107,19 @@ fn tiers() -> [(DeviceProfile, Tier, SubgroupSize, &'static [u32]); 4] {
             SubgroupSize::W8,
             &[32, 64],
         ),
-        (
-            committed("swiftshader"),
-            Tier::Emulated,
-            SubgroupSize::W16,
-            &[32],
-        ),
+        (floor_words(), Tier::Emulated, SubgroupSize::W16, &[32]),
     ]
+}
+
+/// `runtime-floor` without `shaderInt64` (below the runtime's floor): its buffers are bound, not
+/// addressed.
+fn floor_words() -> DeviceProfile {
+    crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[VkFeature::ShaderInt64],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("below the runtime's floor")
 }
 
 /// The committed `moltenvk-m3` description without `shaderInt64`: 64-bit integers are held as
@@ -122,7 +130,7 @@ fn moltenvk_words() -> DeviceProfile {
     let text = std::fs::read_to_string(&path).expect("read the MoltenVK description");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     assert!(desc.features.remove(&VkFeature::ShaderInt64));
-    let p = Device::new(desc, DevicePolicy::default())
+    let p = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone();
@@ -166,10 +174,7 @@ fn run_all(
     bufs: &[Vec<u8>],
 ) -> Vec<Vec<u8>> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([local, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(local));
+    spec.extend(crate::pipeline::threadgroup_constants([local, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     let res = Resources {
         buffers: bufs
@@ -340,7 +345,9 @@ fn thread_elements_are_the_distributed_cells() {
     }
 }
 
-/// Products in every `half`/`float` mix and of `bfloat` factors, from and to device blocks.
+/// Products in every `half`/`float` mix and of `bfloat` factors, from and to device blocks. The
+/// kernel's five buffers pass the floor's four storage buffers a stage where it binds them (no
+/// device addresses, below the runtime's floor), which refuses it (`DescriptorCount`).
 #[test]
 fn mixed_products_compute_the_matrix_product() {
     let Some(bc) = owned() else { return };
@@ -353,7 +360,14 @@ fn mixed_products_compute_the_matrix_product() {
     let mut want_h = flat(&mad(&h, &h, &h));
     want_h.extend(flat(&mad(&f, &h, &h)));
     for (p, tier, lanes, locals) in tiers() {
-        let (plan, m) = typed_module(&bc, entry, &p).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        let limit = p.fields().limits.max_per_stage_descriptor_storage_buffers;
+        let (plan, m) = match typed_module(&bc, entry, &p) {
+            Ok(module) => module,
+            Err(Error::Unsupported(u)) if u.feature == Feature::DescriptorCount && limit < 5 => {
+                continue
+            }
+            Err(e) => panic!("{entry}: {e}"),
+        };
         check_plan(&plan, tier, entry);
         for &n in locals {
             let out = run_all(
@@ -461,14 +475,12 @@ fn public_block_fixture_matches_the_msl_formulas() {
         // The copy loop's stores at `tid + 32 i` may meet between threads of a simdgroup that
         // share `thread_position_in_threadgroup` (a threadgroup narrower than 32 threads), where
         // no barrier every thread of the simdgroup reaches orders them: the kernel takes the
-        // `Emulated` tier, but on moltenvk-m3 (the `Direct` row), whose device runs a simdgroup's
-        // 32 threads in lockstep itself and keeps the kernel's tier, and on the 64-lane RDNA3 row
-        // (`Cluster32`), whose entry reconverges maximally: a subgroup barrier where the threads
+        // `Emulated` tier, but on moltenvk-m3's 32-lane row (`Direct`) and the 64-lane RDNA3 row
+        // (`Cluster32`), whose entries reconverge maximally: a subgroup barrier where the threads
         // diverge orders the threads that run it together, the lanes Apple's simdgroup runs it for,
         // so the kernel keeps its tier. The cells below are Metal's on every row.
         let (tier, key) = match tier {
-            Tier::Direct => (tier, "barrier.lockstep.device"),
-            Tier::Cluster32 => {
+            Tier::Direct | Tier::Cluster32 => {
                 assert!(p.fields().subgroup.maximal_reconvergence, "{stem}");
                 (tier, "barrier.lockstep.simdgroup")
             }
@@ -626,10 +638,8 @@ fn fp8_bytes(l: Fp8Layout, seed: u32) -> Vec<u8> {
 }
 
 /// 8-bit float factors decode exactly and multiply as the logical matrices their
-/// `thread_elements()` place: by the integer decode, and on a device with its own 8-bit floats
-/// (`shaderFloat8`: the RTX 50 profile) through the device's type where it has the format's
-/// encoding (`f8e4m3fn`, `f8e5m2`: the module declares `Float8EXT`), not for the IEEE-like
-/// `f8e4m3`.
+/// `thread_elements()` place: by the integer decode on every profile, one that lists
+/// `shaderFloat8` (the RTX 50 profile) included, so no module declares `Float8EXT`.
 #[test]
 fn fp8_factors_multiply_exactly() {
     for (fmt, f) in FP8 {
@@ -651,7 +661,7 @@ fn fp8_factors_multiply_exactly() {
         let want = mad(&a, &b, &[[0.0; 8]; 8]);
         let mut input = ab.clone();
         input.extend(&bb);
-        let rtx50 = profile("nvidia-rtx50-linux", DevicePolicy::default()).expect("profile");
+        let rtx50 = profile("nvidia-rtx50-linux", DevicePolicy::RESIDENT_TABLES).expect("profile");
         let one: &'static [u32] = &[32];
         let runs = tiers()
             .into_iter()
@@ -659,7 +669,6 @@ fn fp8_factors_multiply_exactly() {
             .chain([(rtx50, None, SubgroupSize::W32, one)]);
         let float8 =
             crate::device::requirements::SpirvCapability::of(crate::spv::Capability::Float8EXT);
-        let mut native = 0;
         for (p, tier, lanes, locals) in runs {
             let (plan, m) = typed_module(&bc, &name, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
             if let Some(tier) = tier {
@@ -667,14 +676,11 @@ fn fp8_factors_multiply_exactly() {
             }
             let a = compile(&bc, &name, &p).unwrap_or_else(|e| panic!("{name}: {e}"));
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{name}: L3: {e}"));
-            let declared = a.requirements.spirv_capabilities.contains(&float8);
-            assert_eq!(
-                declared,
-                p.fields().leaf.float8 && f != Fp8::E4M3,
+            assert!(
+                !a.requirements.spirv_capabilities.contains(&float8),
                 "{name}: {:?}",
                 a.requirements.spirv_capabilities
             );
-            native += usize::from(declared);
             for &n in locals {
                 let out = run_all(&plan, &m, n, lanes, &[input.clone(), vec![0xFF; 256]]);
                 let got = read_f32(&out[1]);
@@ -689,20 +695,11 @@ fn fp8_factors_multiply_exactly() {
                 }
             }
         }
-        assert_eq!(native, usize::from(f != Fp8::E4M3), "{name}");
     }
 }
 
-/// A 16x16x16 product.
+/// An AIR 2.7 block load whose transpose flag is no constant, which stays in that form.
 fn refused_kernels() -> Vec<(&'static str, String)> {
-    let op16 = "air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f32.v8f32.v8f32";
-    let body16 = format!(
-        "  %r = tail call <8 x float> @{op16}(<8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer)\n  \
-         %e = extractelement <8 x float> %r, i64 0\n  store float %e, ptr addrspace(1) %b0, align 4\n"
-    );
-    let decl16 =
-        format!("declare <8 x float> @{op16}(<8 x float>, i1, <8 x float>, i1, <8 x float>)\n");
-    // An AIR 2.7 block load whose transpose flag is no constant stays in that form.
     let legacy = format!(
         "  %w = load i32, ptr addrspace(1) %b0, align 4\n  %f = icmp ne i32 %w, 0\n  \
          %a = tail call <64 x float> @{LOAD1}(ptr addrspace(1) %b0, i64 8, <2 x i64> zeroinitializer, i1 %f)\n  \
@@ -710,17 +707,44 @@ fn refused_kernels() -> Vec<(&'static str, String)> {
     );
     let legacy_decl =
         format!("declare <64 x float> @{LOAD1}(ptr addrspace(1), i64, <2 x i64>, i1)\n");
-    vec![
-        ("mac16", kernel("mac16", 1, &body16, &decl16)),
-        (
-            "legacy_runtime_transpose",
-            kernel("legacy_runtime_transpose", 1, &legacy, &legacy_decl),
-        ),
-    ]
+    vec![(
+        "legacy_runtime_transpose",
+        kernel("legacy_runtime_transpose", 1, &legacy, &legacy_decl),
+    )]
 }
 
-/// The unmeasured 16x16x16 fragment layout is refused as `Unsupported{SimdgroupMatrix,
-/// NotImplemented}`, and so is an AIR 2.7 block load whose transpose flag is no constant.
+/// Every kernel of the owned fixture `engine/simd_matrix16` (`float`, `half` and widening signed
+/// 8-bit products, each with the four transpose-flag pairs) is refused as
+/// `Unsupported{SimdgroupMatrix16x16x16, NotImplemented}` on every committed profile: Metal makes
+/// these products only on an Apple10 GPU and later, so their fragment layout is not measured.
+#[test]
+fn products_of_16x16x16_are_refused_as_their_own_feature() {
+    let Some(bc) = assembled(
+        llvm_assemble(&engine_dir().join("simd_matrix16.ll")),
+        "simd_matrix16",
+    ) else {
+        return;
+    };
+    let names: Vec<String> = ["f32_f32", "f16_f16", "s_s"]
+        .iter()
+        .flat_map(|form| ["00", "01", "10", "11"].map(|tt| format!("m16_{form}_{tt}")))
+        .collect();
+    for (stem, p) in committed_profiles().expect("profiles") {
+        for name in &names {
+            match compile(&bc, name, &p) {
+                Err(Error::Unsupported(u)) => assert_eq!(
+                    (u.feature, u.needs),
+                    (Feature::SimdgroupMatrix16x16x16, Needs::NotImplemented),
+                    "{stem} {name}"
+                ),
+                other => panic!("{stem} {name}: {:?}", other.err()),
+            }
+        }
+    }
+}
+
+/// An AIR 2.7 block load whose transpose flag is no constant is refused as
+/// `Unsupported{SimdgroupMatrix, NotImplemented}`.
 #[test]
 fn unmeasured_forms_are_refused() {
     let p = moltenvk();
@@ -913,8 +937,7 @@ fn products_record_their_precision() {
 /// Every matrix kernel compiles, links, relocates, and passes L3 on every committed profile
 /// exactly where its cross-lane class (a shuffle with a product, the lane alone for blocks) has
 /// a compute tier, and elsewhere is refused as that tier is (`matrix_mixed`'s five buffers fit
-/// `vk12-floor`'s four storage buffers per stage through a uniform view). The plan's size estimate
-/// bounds the emitted words.
+/// the runtime floor's four storage buffers per stage through a uniform view).
 #[test]
 fn matrix_kernels_compile_or_refuse_with_the_tier() {
     // Each kernel with its operations' class: a product shuffles, the blocks alone read the lane.
@@ -958,17 +981,22 @@ fn matrix_kernels_compile_or_refuse_with_the_tier() {
                 Ok(a) => {
                     link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {name}: {e}"));
                     assert!(tier.is_ok(), "{stem} {name}");
-                    let (plan, _) = typed_module(bc, name, &p).expect("plan");
-                    let words = a.module.words.len() as u64;
-                    assert!(
-                        plan.estimate.words >= words,
-                        "{stem} {name}: estimate {} < emitted {words}",
-                        plan.estimate.words
-                    );
                     ok += 1;
                 }
+                // Threadgroup memory Metal zeroes, on a device that does not zero it.
+                Err(Error::Unsupported(u)) if u.feature == Feature::ZeroedThreadgroupMemory => {
+                    assert!(
+                        !(p.fields().enabled.features)
+                            .contains(&VkFeature::ShaderZeroInitializeWorkgroupMemory),
+                        "{stem} {name}"
+                    );
+                    refused += 1;
+                }
                 Err(Error::Unsupported(u)) => {
-                    let want = tier.clone().expect_err("a refused tier");
+                    let want = match tier.clone() {
+                        Err(want) => want,
+                        Ok(t) => panic!("{stem} {name}: refused on tier {t:?}: {u}"),
+                    };
                     assert_eq!(u.feature, want.feature, "{stem} {name}");
                     refused += 1;
                 }
@@ -1388,7 +1416,7 @@ fn a_shuffle_into_a_fragment_moves_only_its_two_elements() {
 /// fragments (2 KiB); held whole it is 64 KiB, refused.
 #[test]
 fn matrices_held_as_fragments_count_their_two_elements() {
-    let p = profile("nvidia-rtx5080-laptop", DevicePolicy::default()).expect("profile");
+    let p = profile("nvidia-rtx5080-laptop", DevicePolicy::RESIDENT_TABLES).expect("profile");
     for spoil in [false, true] {
         let name = if spoil {
             "matrices_whole"

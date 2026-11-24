@@ -2,9 +2,11 @@
 //!
 //! The owned fixture `engine/gsm2_quad_ops` (Apple's compiler's AIR of our own MSL) goes
 //! through the whole pipeline and its kernels run on the CPU interpreter in every kernel tier: the
-//! `Direct` tier at 32 lanes on `moltenvk-m3`, the `Cluster32` tier at 64 lanes on a wave64-only
-//! device, and the `Emulated` tier on `lavapipe` at 8, 16, 32 and 64 lanes, in both scheduling
-//! orders. Every word is checked against Metal's answers as measured on the M3 Max and the M4:
+//! `Direct` tier at 32 lanes on `moltenvk-m3`, the `Direct` tier with no pinned size at the sizes
+//! the device gives on `lavapipe` (8 lanes) and an Intel profile (8, 16 and 32 lanes), the
+//! `Cluster32` tier at 64 lanes on a wave64-only device, and the emulated-simdgroups variant on
+//! `lavapipe` at 8, 16, 32 and 64 lanes, in both scheduling orders. Every word is checked against
+//! Metal's answers as measured on the M3 Max and the M4:
 //! - a quad is four aligned lanes; quad lane `q` of thread `t` is `t & 3`;
 //! - a quad fill is the simdgroup fill within the quad for a modulo of 2 or 4, the only moduli
 //!   the cases use (the others: `tests::engine_fill_moduli`); rotate up by `d` reads quad lane
@@ -31,9 +33,11 @@ use crate::device::subgroup::Tier;
 use crate::device::{DevicePolicy, DeviceProfile};
 use crate::lower::arith::legal::f64_to_f16;
 use crate::lower::select::Plan;
-use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
-use crate::pipeline::testing::{engine_dir, llvm_assemble, profile, typed_module, AssembleError};
-use crate::pipeline::PrecisionNote;
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
+use crate::pipeline::testing::{
+    engine_dir, llvm_assemble, profile, typed_module_with, AssembleError,
+};
+use crate::pipeline::{LoweringInputs, PrecisionNote};
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
 
@@ -280,10 +284,7 @@ fn run_buffers(
     bytes: [Vec<u8>; 3],
 ) -> Vec<u8> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([local, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(local));
+    spec.extend(crate::pipeline::threadgroup_constants([local, 1, 1]));
     let res = Resources {
         buffers: bytes
             .into_iter()
@@ -342,16 +343,51 @@ fn fixture() -> Option<Vec<u8>> {
     }
 }
 
-/// Every kernel of the fixture under `p`, planned in `tier`, at each of `widths`, and
-/// [`reductions_in_metal_s_order`].
-fn run_kernels(p: &DeviceProfile, tier: Tier, widths: &[SubgroupSize]) {
+/// Whether `plan` holds a barrier the lockstep pass inserted for emulated simdgroups: a kernel whose
+/// lockstep order the profile keeps only on emulated simdgroups, whatever tier its class takes.
+fn lockstep_emulated(plan: &Plan) -> bool {
+    use crate::lower::strategy::Strategy;
+    use crate::lower::sync::barrier::{BarrierStrategy, Origin};
+    plan.strategy.iter().flatten().any(|s| {
+        matches!(
+            s,
+            Strategy::Barrier(BarrierStrategy::Barrier(b)) if b.origin == Origin::LockstepEmulated
+        )
+    })
+}
+
+/// Every kernel of the fixture under `p` and lowering inputs `inputs`, planned in `tier` (one whose
+/// lockstep order needs emulated simdgroups, [`lockstep_emulated`], in the `Emulated` tier), at
+/// each of `widths` (a module that pins 32 lanes at 32 alone), and
+/// [`reductions_in_metal_s_order`]. Returns how many kernels took their quads from the subgroup at
+/// the size the device gives (a varying size).
+fn run_kernels(
+    p: &DeviceProfile,
+    inputs: &LoweringInputs,
+    tier: Tier,
+    widths: &[SubgroupSize],
+) -> usize {
     let Some(bc) = fixture() else {
-        return;
+        return 0;
     };
-    reductions_in_metal_s_order(&bc, p, tier, widths);
+    reductions_in_metal_s_order(&bc, p, inputs, tier, widths);
+    let mut varying = 0;
     for (entry, locals, pairs) in KERNELS {
-        let (plan, m) = typed_module(&bc, entry, p).unwrap_or_else(|e| panic!("{entry}: {e}"));
-        assert_eq!(plan.simd.1, tier, "{entry}");
+        let (plan, m) =
+            typed_module_with(&bc, entry, p, inputs).unwrap_or_else(|e| panic!("{entry}: {e}"));
+        let want = if lockstep_emulated(&plan) {
+            Tier::Emulated
+        } else {
+            tier
+        };
+        assert_eq!(plan.simd.1, want, "{entry}");
+        varying += usize::from(plan.subgroup.varying);
+        let pinned = [SubgroupSize::W32];
+        let widths = if plan.subgroup.size == Some(32) {
+            &pinned[..]
+        } else {
+            widths
+        };
         for &lanes in widths {
             for &local in locals {
                 for dm in pairs {
@@ -365,6 +401,7 @@ fn run_kernels(p: &DeviceProfile, tier: Tier, widths: &[SubgroupSize]) {
             }
         }
     }
+    varying
 }
 
 /// Thread `t`'s input of [`reductions_in_metal_s_order`]: each quad holds `1, 2^24, 1, -2^24`,
@@ -388,9 +425,16 @@ fn tree(xs: [Option<f32>; 4], op: fn(f32, f32) -> f32) -> f32 {
 /// [`ordered`] inputs, over full quads and a threadgroup of 42 whose last quad holds two threads:
 /// Metal's `(x0 + x1) + (x2 + x3)` (measured), bit for bit; so the module records no
 /// `ReductionOrder`.
-fn reductions_in_metal_s_order(bc: &[u8], p: &DeviceProfile, tier: Tier, widths: &[SubgroupSize]) {
+fn reductions_in_metal_s_order(
+    bc: &[u8],
+    p: &DeviceProfile,
+    inputs: &LoweringInputs,
+    tier: Tier,
+    widths: &[SubgroupSize],
+) {
     let entry = "quad_float_scans";
-    let (plan, m) = typed_module(bc, entry, p).unwrap_or_else(|e| panic!("{entry}: {e}"));
+    let (plan, m) =
+        typed_module_with(bc, entry, p, inputs).unwrap_or_else(|e| panic!("{entry}: {e}"));
     assert_eq!(plan.simd.1, tier, "{entry}");
     assert!(
         !plan.precision.contains(&PrecisionNote::ReductionOrder),
@@ -426,8 +470,13 @@ fn reductions_in_metal_s_order(bc: &[u8], p: &DeviceProfile, tier: Tier, widths:
 
 #[test]
 fn quad_operations_run_direct_at_32_lanes() {
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
-    run_kernels(&p, Tier::Direct, &[SubgroupSize::W32]);
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
+    run_kernels(
+        &p,
+        &LoweringInputs::new(),
+        Tier::Direct,
+        &[SubgroupSize::W32],
+    );
 }
 
 /// Each 64-lane subgroup holds two Metal simdgroups; a quad is four aligned lanes in either.
@@ -435,17 +484,45 @@ fn quad_operations_run_direct_at_32_lanes() {
 fn quad_operations_run_cluster32_at_64_lanes() {
     run_kernels(
         &super::engine_simd::wave64(),
+        &LoweringInputs::new(),
         Tier::Cluster32,
         &[SubgroupSize::W64],
     );
 }
 
-/// `lavapipe` cannot pin 32 lanes: the quads are emulated through workgroup memory.
+/// Every kernel of the fixture is quad-only: where the kernel stage's narrowest subgroup is below
+/// 32 lanes (`lavapipe`'s 8; the Intel profiles' 8 to 32) it takes its quads from the subgroup at
+/// the size the device gives, the `Direct` tier with no pinned size, and one module computes
+/// Metal's answers at every size the device may run. A kernel whose lockstep order the profile
+/// keeps only on emulated simdgroups stays emulated, and one the lockstep pass gave a simdgroup
+/// barrier keeps its pin to 32 (run at 32 alone).
+#[test]
+fn quad_operations_run_direct_at_the_size_the_device_gives() {
+    use SubgroupSize::{W16, W32, W8};
+    for (stem, widths) in [
+        ("lavapipe", &[W8][..]),
+        ("intel-irisxe-rplp-anv", &[W8, W16, W32][..]),
+    ] {
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
+        let varying = run_kernels(&p, &LoweringInputs::new(), Tier::Direct, widths);
+        println!(
+            "{stem}: {varying} of {} kernels at the size the device gives",
+            KERNELS.len()
+        );
+        assert!(varying > 0, "{stem}");
+    }
+}
+
+/// A threadgroup that is not a multiple of `lavapipe`'s 8 lanes runs the emulated-simdgroups
+/// variant: the quads are emulated through workgroup memory.
 #[test]
 fn quad_operations_run_emulated_at_every_width() {
-    let p = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let p = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
+    let mut inputs = LoweringInputs::new();
+    inputs.emulated_simdgroups = true;
     run_kernels(
         &p,
+        &inputs,
         Tier::Emulated,
         &[
             SubgroupSize::W8,

@@ -1,14 +1,12 @@
-//! The Vulkan graphics pipeline of an engine `RenderPipeline`: one builder that L4 driver
-//! acceptance ([`super::acceptance`]) and the render executor ([`super::render`]) share, so a
-//! pipeline the sweep creates is the pipeline the executor draws with.
+//! The Vulkan graphics pipeline of an engine `RenderPipeline`, as L4 driver acceptance
+//! ([`super::acceptance`]) creates it.
 //!
 //! Everything comes from the artifact's graphics state and vertex input: the render pass
 //! ([`create_render_pass`]: every color attachment at its Metal index, each framebuffer-fetch
 //! input as an input attachment of its color attachment with the by-region self-dependency the
-//! contract names, rasterization-order color access where the artifact states it, and the
-//! depth/stencil attachment), the vertex input (static strides, and zero for a stride the pipeline
-//! makes dynamic state; instance divisors through the divisor state), the multisample, blend
-//! (rasterization-order access with the subpass's), and dynamic states. The caller supplies what the artifact leaves to the
+//! contract names, and the depth/stencil attachment), the vertex input (static strides, and zero
+//! for a stride the pipeline makes dynamic state; instance divisors through the divisor state),
+//! the multisample, blend and dynamic states. The caller supplies what the artifact leaves to the
 //! consumer: each stage's specialization, the draw's topology within the compiled class with the
 //! primitive restart Metal applies to it, and the depth-stencil state and front face (Metal's
 //! `MTLDepthStencilState` and front-facing winding, which are encoder state, not pipeline state).
@@ -16,13 +14,9 @@
 
 use crate::executor_contract::DrawDepthStencil;
 use ash::vk;
-use metal2vulkan::device::DriverFact;
 use metal2vulkan::pipeline::{GraphicsState, RenderPipeline, VertexStride};
-use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::time::Duration;
-
-use super::METAL_DEFAULT_FRONT_FACE;
 
 /// Why no graphics pipeline (or render pass) was created.
 #[derive(Debug)]
@@ -138,13 +132,9 @@ pub(super) fn has_depth(format: vk::Format) -> bool {
 /// (`VK_ATTACHMENT_UNUSED` for an absent one), in `COLOR_ATTACHMENT_OPTIMAL` (`GENERAL` for an
 /// attachment a framebuffer-fetch input also reads, as the input attachment of the same index,
 /// with the by-region self-dependency of [`FETCH_SELF_DEPENDENCY`]), then the depth/stencil
-/// attachment ([`depth_stencil_format`]) in `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`.
-/// The subpass has rasterization-order color access when the artifact states it
-/// (`GraphicsState::rasterization_order_attachment_access`), so each fetch sees the earlier
-/// fragments of the draw that cover its pixel, as in Metal; where it does not, each draw records
-/// after a barrier of that dependency ([`fetch_between_draws`]). Every attachment is loaded before and
-/// stored after the subpass. The framebuffer's views are the present color attachments in index
-/// order, then the depth/stencil one.
+/// attachment ([`depth_stencil_format`]) in `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`. Every attachment
+/// is loaded before and stored after the subpass. The framebuffer's views are the present color
+/// attachments in index order, then the depth/stencil one.
 pub(super) fn create_render_pass(
     device: &ash::Device,
     graphics: &GraphicsState,
@@ -254,7 +244,6 @@ pub(super) fn create_render_pass(
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
     });
     let mut subpass = vk::SubpassDescription::default()
-        .flags(subpass_flags(graphics))
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .color_attachments(&colors)
         .input_attachments(&inputs);
@@ -302,63 +291,6 @@ pub(super) const FETCH_SELF_DEPENDENCY: (vk::PipelineStageFlags, vk::AccessFlags
     ),
 );
 
-/// Whether `graphics` reads input attachments ordered between draws alone: on a device with
-/// neither rasterization-order color attachment access nor the pixel interlock, which states no
-/// rasterization-order access (`GraphicsState::rasterization_order_attachment_access`). The
-/// contract has the consumer order each draw of it after the color writes of the draws before,
-/// and each draw that writes a color after their reads, by a barrier of the subpass's dependency
-/// on itself; the executor records one before each of its draws ([`fetch_between_draws`]), after
-/// the load operations too, as the runtime does.
-pub(super) fn fetches_between_draws(graphics: &GraphicsState) -> bool {
-    !graphics.input_attachments.is_empty() && !graphics.rasterization_order_attachment_access
-}
-
-/// Record, into `command`, inside a render pass of [`create_render_pass`] whose subpass reads
-/// input attachments, the barrier of its [`FETCH_SELF_DEPENDENCY`]: the draws after it read and
-/// write the colors after the draws before it wrote and read them.
-///
-/// # Safety
-///
-/// `command` is recording inside such a render pass instance, on `device`.
-pub(super) unsafe fn fetch_between_draws(device: &ash::Device, command: vk::CommandBuffer) {
-    let (stages, src, dst) = FETCH_SELF_DEPENDENCY;
-    let barrier = vk::MemoryBarrier::default()
-        .src_access_mask(src)
-        .dst_access_mask(dst);
-    // SAFETY: the caller's contract; the subpass depends on itself by region with these scopes.
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command,
-            stages,
-            stages,
-            vk::DependencyFlags::BY_REGION,
-            &[barrier],
-            &[],
-            &[],
-        );
-    }
-}
-
-/// The subpass flags of `graphics`: rasterization-order color access where it states it.
-pub(super) fn subpass_flags(graphics: &GraphicsState) -> vk::SubpassDescriptionFlags {
-    if graphics.rasterization_order_attachment_access {
-        vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_EXT
-    } else {
-        vk::SubpassDescriptionFlags::empty()
-    }
-}
-
-/// The color blend state flags of `graphics`, matching its subpass's ([`subpass_flags`]).
-pub(super) fn color_blend_flags(
-    graphics: &GraphicsState,
-) -> vk::PipelineColorBlendStateCreateFlags {
-    if graphics.rasterization_order_attachment_access {
-        vk::PipelineColorBlendStateCreateFlags::RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXT
-    } else {
-        vk::PipelineColorBlendStateCreateFlags::empty()
-    }
-}
-
 /// One stage's specialization: its map entries and packed data.
 pub(super) type Specialization = (Vec<vk::SpecializationMapEntry>, Vec<u8>);
 
@@ -379,7 +311,8 @@ pub(super) struct Consumer<'a> {
     pub depth_stencil: vk::PipelineDepthStencilStateCreateInfo<'a>,
     /// The encoder's cull mode.
     pub cull_mode: vk::CullModeFlags,
-    /// The encoder's front-facing winding ([`front_face`]).
+    /// The encoder's front-facing winding: Metal's clockwise default is
+    /// [`super::METAL_DEFAULT_FRONT_FACE`] under a flipped viewport.
     pub front_face: vk::FrontFace,
 }
 
@@ -415,26 +348,13 @@ pub(super) fn metal_depth_stencil(
         .back(face(mapped.back, state.back_reference))
 }
 
-/// The front face of `state`'s front-facing winding: Metal's clockwise default is
-/// [`METAL_DEFAULT_FRONT_FACE`] under the executor's flipped viewport, and its counter-clockwise
-/// winding the other face.
-pub(super) fn front_face(state: &DrawDepthStencil) -> vk::FrontFace {
-    if state.winding == metal2vulkan::metal::Winding::CounterClockwise {
-        vk::FrontFace::COUNTER_CLOCKWISE
-    } else {
-        METAL_DEFAULT_FRONT_FACE
-    }
-}
-
 /// Create the graphics pipeline of `pipeline` as `consumer` decides it: the pipeline and the
 /// duration of the `vkCreateGraphicsPipelines` call alone. The caller owns (and destroys) the
-/// pipeline. The diagnostics the executing driver's `facts` measure it to report as it makes
-/// the pipeline (`DriverFact::pipeline_creation_diagnostics`) fail no row from inside that call;
-/// those of its color attachments the driver cannot blend fail none anywhere
-/// (`MessageSink::making`).
+/// pipeline. On MoltenVK (`moltenvk`) the warning it reports inside that call of a pipeline whose
+/// primitive restart is dynamic fails no row (`device::restart_warning`).
 pub(super) fn create_graphics_pipeline(
     device: &ash::Device,
-    facts: &BTreeSet<DriverFact>,
+    moltenvk: bool,
     pipeline: &RenderPipeline,
     consumer: &Consumer<'_>,
 ) -> Result<(vk::Pipeline, Duration), GraphicsError> {
@@ -520,18 +440,13 @@ pub(super) fn create_graphics_pipeline(
         .collect();
     let mut stages = Vec::with_capacity(pipeline.stages.len());
     let topology = metal2vulkan::vk::PrimitiveTopology::from_raw(consumer.topology.as_raw());
-    // Of a pipeline's barycentric geometry stages, only the draw's class's runs.
-    for (at, (((stage, module), (entry, spec)), subgroup)) in pipeline
+    for (((stage, module), (entry, spec)), subgroup) in pipeline
         .stages
         .iter()
         .zip(consumer.modules)
         .zip(entries.iter().zip(&spec_infos))
         .zip(subgroups.iter_mut())
-        .enumerate()
     {
-        if !pipeline.runs_stage(at, topology) {
-            continue;
-        }
         let mut info = vk::PipelineShaderStageCreateInfo::default()
             .stage(stage.stage.into())
             .module(*module)
@@ -567,10 +482,6 @@ pub(super) fn create_graphics_pipeline(
         .line_width(1.0);
     let mut multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(graphics.rasterization_samples.into())
-        // Metal's once-per-covered-sample invocations of a function that writes memory; the minimum
-        // is ignored without sample shading, and stays Vulkan's default there.
-        .sample_shading_enable(graphics.sample_shading)
-        .min_sample_shading(if graphics.sample_shading { 1.0 } else { 0.0 })
         .alpha_to_coverage_enable(graphics.alpha_to_coverage)
         .alpha_to_one_enable(graphics.alpha_to_one);
     // The descriptor's private sample mask, one word.
@@ -599,9 +510,7 @@ pub(super) fn create_graphics_pipeline(
             }
         })
         .collect();
-    let blend = vk::PipelineColorBlendStateCreateInfo::default()
-        .flags(color_blend_flags(graphics))
-        .attachments(&blends);
+    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
     let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
     // A tessellation pipeline's patches are its control points.
     let tessellation = graphics.tessellation.map(|t| {
@@ -624,11 +533,9 @@ pub(super) fn create_graphics_pipeline(
     if let Some(tessellation) = &tessellation {
         info = info.tessellation_state(tessellation);
     }
-    let expected = facts
-        .iter()
-        .flat_map(|fact| {
-            fact.pipeline_creation_diagnostics(&graphics.dynamic_states, topology, &[])
-        })
+    let expected = (super::device::restart_warning(&graphics.dynamic_states, topology))
+        .filter(|_| moltenvk)
+        .into_iter()
         .collect();
     let clock = crate::budgets::CreationClock::start();
     let created = super::device::expecting_diagnostics(expected, || {
@@ -725,7 +632,6 @@ mod tests {
         );
         assert_eq!(face(state.front), replace);
         assert_eq!(face(state.back), replace);
-        assert!(front_face(&both) == METAL_DEFAULT_FRONT_FACE);
         assert_eq!(
             tests(&metal_depth_stencil(&derived(
                 Some(DepthCompare::Always),
@@ -799,6 +705,5 @@ mod tests {
                 0xC0
             )
         );
-        assert!(front_face(&authored) == vk::FrontFace::COUNTER_CLOCKWISE);
     }
 }

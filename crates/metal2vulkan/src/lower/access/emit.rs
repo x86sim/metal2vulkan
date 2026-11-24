@@ -4,9 +4,9 @@ use std::collections::BTreeSet;
 
 use crate::air::ir::InstId;
 use crate::lower::emit::EmitCx;
-use crate::memory::contain::{self, Check};
+use crate::memory::contain;
 use crate::memory::leaf::{self, k32, u32_op, Leaf, Units, WordMem, WordOps};
-use crate::memory::views::{self, UnitViews, View, ViewKind};
+use crate::memory::views::{self, UnitViews, View};
 use crate::pipeline::sym::PushField;
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
 use crate::spirv::builder::FunctionBuilder;
@@ -22,8 +22,7 @@ use super::{
 };
 
 /// The word memory of one descriptor view, loaded and stored with memory operands (a coherence,
-/// and `Volatile`; a uniform view's read-only words stay plain: no agent writes them while the
-/// dispatch runs). Sub-word stores are two relaxed device-scope word atomics, except where the
+/// and `Volatile`). Sub-word stores are two relaxed device-scope word atomics, except where the
 /// slot's narrow views hold the leaf's units; a 16-byte (8-byte) leaf at an offset proven a
 /// multiple of its size is one `uvec4` (`uvec2`) where the slot has that view.
 #[derive(Clone, Copy, Debug)]
@@ -55,11 +54,7 @@ impl WordMem for ViewMem {
         index: SValue,
     ) -> BResult<SValue> {
         let view = self.vec(lanes)?;
-        // A uniform view's read-only vectors are read plainly, as its words are.
-        let access = match view.class {
-            crate::spirv::ir::StorageClass::Uniform => MemAccess::default(),
-            _ => self.1.access(fb, MemAccess::default(), false)?,
-        };
+        let access = self.1.access(fb, MemAccess::default(), false)?;
         views::read_vec(fb, view, index, access)
     }
 
@@ -103,16 +98,16 @@ impl WordMem for ViewMem {
     }
 
     fn read(&mut self, fb: &mut FunctionBuilder<'_>, word: SValue) -> BResult<SValue> {
-        if self.1 == WordOps::default() || self.0.kind != ViewKind::Storage {
+        if self.1 == WordOps::default() {
             return views::read_word(fb, self.0, word);
         }
-        let p = storage_ptr(fb, self.0, word)?;
+        let p = views::word_ptr(fb, self.0, word)?;
         let access = self.1.access(fb, MemAccess::default(), false)?;
         fb.load(p, access)
     }
 
     fn write(&mut self, fb: &mut FunctionBuilder<'_>, word: SValue, value: SValue) -> BResult<()> {
-        let p = storage_ptr(fb, self.0, word)?;
+        let p = views::word_ptr(fb, self.0, word)?;
         let access = self.1.access(fb, MemAccess::default(), true)?;
         fb.store(p, value, access)
     }
@@ -124,23 +119,12 @@ impl WordMem for ViewMem {
         mask: SValue,
         bits: SValue,
     ) -> BResult<()> {
-        let p = storage_ptr(fb, self.0, word)?;
+        let p = views::word_ptr(fb, self.0, word)?;
         let keep = fb.unary(UnOp::Not, mask)?;
         let clear = fb.binary(BinOp::BitwiseOr, keep, bits)?;
         fb.atomic(AtomicOp::And, p, Scope::Device, Semantics::RELAXED, clear)?;
         fb.atomic(AtomicOp::Or, p, Scope::Device, Semantics::RELAXED, bits)?;
         Ok(())
-    }
-}
-
-/// A word pointer of a storage view. Stores through a uniform view are refused by selection, so a
-/// missing pointer is an internal invariant failure.
-fn storage_ptr(fb: &mut FunctionBuilder<'_>, view: View, word: SValue) -> BResult<SValue> {
-    match views::word_ptr(fb, view, word)? {
-        Some(p) => Ok(p),
-        None => Err(crate::spirv::error::BuildError::Dangling(
-            crate::spirv::error::Dangling::Global(view.global),
-        )),
     }
 }
 
@@ -245,6 +229,41 @@ impl WordMem for Mem {
             Mem::Psb(m) => m.write_unit(fb, bytes, index, value),
         }
     }
+
+    fn whole(&self) -> bool {
+        match self {
+            Mem::View(m) => m.whole(),
+            Mem::Psb(m) => m.whole(),
+        }
+    }
+
+    fn read_whole(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        off: SValue,
+        at: u32,
+        ty: TypeId,
+        align: u32,
+    ) -> BResult<SValue> {
+        match self {
+            Mem::View(m) => m.read_whole(fb, off, at, ty, align),
+            Mem::Psb(m) => m.read_whole(fb, off, at, ty, align),
+        }
+    }
+
+    fn write_whole(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        off: SValue,
+        at: u32,
+        value: SValue,
+        align: u32,
+    ) -> BResult<()> {
+        match self {
+            Mem::View(m) => m.write_whole(fb, off, at, value, align),
+            Mem::Psb(m) => m.write_whole(fb, off, at, value, align),
+        }
+    }
 }
 
 /// One candidate slot, ready to access: its word memory, the byte offset in it, and the
@@ -255,17 +274,33 @@ pub(super) struct Prepared {
     pub(super) off: SValue,
     pub(super) inb: Option<SValue>,
     /// A store needs `if_(inb)`: a view's out-of-bounds offset is not redirected (a PSB access
-    /// already points at the sink).
+    /// already points at the sink), nor is a store's under the identity domains.
     pub(super) guard_store: bool,
+    /// A load out of bounds already reads zeros: its units' places select the zero range
+    /// (`PsbMem::outside`), so its value takes no select.
+    pub(super) reads_zero: bool,
 }
 
-/// Prepare `t` for an access of `n` bytes at Metal offset `m`.
+/// Prepare `t` for an access of `n` bytes at Metal offset `m`, a load or a copy's read where
+/// `read`.
+///
+/// Under the identity domains a slot an access may reach at an offset that is not a
+/// translation-time constant (`AccessPlan::variable`) is checked where `m` is not a constant,
+/// against its buffer (`psb::in_buffer`): `m`, read as signed, plus the bytes before the bind
+/// offset, under the slot's limit for `n` bytes (`psb::limit`), both from the slot's `SlotBounds`
+/// and made once per function (`EmitCx::slot_limit`), the normative check (`contain::in_bounds`)
+/// in `u32`. So an offset before the bind offset is inside where the
+/// buffer holds it, as Metal reads it, and outside before the buffer's start. A load outside reads
+/// each unit at `ZeroAddress`, 16 bytes of zeros, with one select of the unit's address and none
+/// of its value; a store or atomic outside is in the closed `if_(inb)` and runs nothing. Nil and a
+/// slot shorter than one access push a length the check fails for every offset, so neither reads
+/// nor writes there.
 pub(super) fn prepare(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     t: &Target,
     m: SValue,
-    n: u32,
+    (n, read): (u32, bool),
 ) -> BResult<Prepared> {
     let Some(choice) = cx.plan.slots.get(t.slot).copied().flatten() else {
         return Err(cx.fail("an access names an unplanned slot"));
@@ -273,56 +308,65 @@ pub(super) fn prepare(
     let lowering = cx.plan.families.access.slots.get(t.slot).copied().flatten();
     let ops = WordOps::of(crate::lower::sync::memory_model::coherence(cx.plan));
     if let Some(SlotLowering::Psb { start }) = lowering {
-        let table = cx.push_field(fb, PushField::RootTableAddress)?;
-        let contained = cx.plan.families.access.psb_contained;
-        let a = psb::prepare(fb, table, t.root, m, start, n, contained)?;
+        // Under the identity domains a slot whose address the binder holds to its argument's
+        // alignment is reached from that address as it is (its biased word), a leaf at an offset
+        // proven a multiple of 8 or 16 accessed at that alignment; any other from the word below
+        // each access.
+        let aligned = cx.plan.families.access.aligned.contains(&t.slot);
+        let a = if cx.plan.families.access.identity {
+            match aligned {
+                true => {
+                    let base = super::pointer::biased_slot_address(cx, fb, choice.slot)?;
+                    psb::prepare_direct(base, m)
+                }
+                false => {
+                    let address = super::pointer::slot_address(cx, fb, choice.slot)?;
+                    psb::prepare_at(fb, address, m)?
+                }
+            }
+        } else {
+            let table = cx.push_field(fb, PushField::RootTableAddress)?;
+            let contained = cx.plan.families.access.psb_contained;
+            psb::prepare(fb, table, t.root, m, start, n, contained)?
+        };
         let units = cx.plan.families.access.psb_units;
+        let read_only = cx.plan.families.access.unwritten.contains(&t.slot);
+        let mut mem = a.mem.with(ops).with_units(units).read_only(read_only);
+        let checked = cx.plan.families.access.variable.contains(&choice.slot)
+            && leaf::known(fb, m)?.is_none();
+        if checked {
+            let limit = cx.slot_limit(fb, choice.slot, n)?;
+            let inb = psb::in_buffer(fb, m, limit)?;
+            if read {
+                let zero = cx.push_field(fb, PushField::ZeroAddress)?;
+                mem = mem.outside(inb, zero);
+            }
+            return Ok(Prepared {
+                mem: Mem::Psb(mem),
+                off: a.off,
+                inb: Some(inb),
+                guard_store: true,
+                reads_zero: read,
+            });
+        }
         return Ok(Prepared {
-            mem: Mem::Psb(a.mem.with(ops).with_units(units)),
+            mem: Mem::Psb(mem),
             off: a.off,
             inb: a.inb,
             guard_store: false,
+            reads_zero: false,
         });
     }
     let Some(view) = cx.decl.families.access.views.get(t.slot).copied().flatten() else {
         return Err(cx.fail("an access names an undeclared slot view"));
     };
     let residual = cx.push_field(fb, PushField::SlotBindOffset(choice.slot))?;
-    let shifted = u32_op(fb, BinOp::IAdd, residual, m)?;
-    // Where the binder starts a uniform view's range at the bind offset (`RangeAtBindOffset`), the
-    // residual is 0: the offset alone, a constant for a constant member, which a driver can push.
-    let off = match cx
-        .decl
-        .families
-        .access
-        .at_bind
-        .get(t.slot)
-        .copied()
-        .flatten()
-    {
-        Some(at_bind) => fb.select(at_bind, m, shifted)?,
-        None => shifted,
-    };
-    let inb = match (t.check, view.kind) {
-        (Check::None, _) => None,
-        (Check::InShader, ViewKind::Storage) => match views::storage_bytes(fb, view)? {
-            Some(size) => Some(contain::in_bounds(fb, off, size, u64::from(n))?),
-            None => return Err(cx.fail("a storage view without a size")),
-        },
-        (Check::InShader, ViewKind::UniformWords { .. } | ViewKind::UniformVec4 { .. }) => {
-            // Selection gives a uniform view only to an encoding without checks: the range bound
-            // behind it may be shorter than its declared size.
-            return Err(cx.fail("an in-shader check of a uniform view"));
-        }
-    };
-    let (off, guard_store) = match inb {
-        // Read at a clamped offset (word 0 exists: a bound range is never empty).
-        Some(inb) => {
-            let zero = k32(fb, 0)?;
-            (fb.select(inb, off, zero)?, true)
-        }
-        None => (off, false),
-    };
+    let off = u32_op(fb, BinOp::IAdd, residual, m)?;
+    let size = views::storage_bytes(fb, view)?;
+    let inb = contain::in_bounds(fb, off, size, u64::from(n))?;
+    // Read at a clamped offset (word 0 exists: a bound range is never empty).
+    let zero = k32(fb, 0)?;
+    let off = fb.select(inb, off, zero)?;
     let units = cx
         .decl
         .families
@@ -334,8 +378,9 @@ pub(super) fn prepare(
     Ok(Prepared {
         mem: Mem::View(ViewMem(view, ops, units)),
         off,
-        inb,
-        guard_store,
+        inb: Some(inb),
+        guard_store: true,
+        reads_zero: false,
     })
 }
 
@@ -345,10 +390,8 @@ fn load_one(fb: &mut FunctionBuilder<'_>, leaf: &Leaf, p: Prepared) -> BResult<S
     let v = leaf::load(fb, &mut mem, leaf, p.off)?;
     match p.inb {
         None => Ok(v),
-        Some(inb) => {
-            let z = leaf::zero(fb, leaf)?;
-            fb.select(inb, v, z)
-        }
+        Some(_) if p.reads_zero => Ok(v),
+        Some(inb) => leaf::contained(fb, leaf, inb, v),
     }
 }
 
@@ -434,40 +477,41 @@ pub(super) fn access_at(
     };
     let mut prepared = Vec::with_capacity(a.targets.len());
     for t in &a.targets {
-        let mut p = prepare(cx, fb, t, m, a.leaf.bytes)?;
+        let mut p = prepare(cx, fb, t, m, (a.leaf.bytes, stored.is_none()))?;
         p.mem = p.mem.with(ops);
         prepared.push((t.root, t.slot, p));
     }
     let leaf = a.leaf;
     // A pointer that may point into the blob reads it under `BLOB_ROOT` (never stored).
     let blob = match a.blob {
-        Some(check) => match cx.decl.families.access.blob {
-            Some(view) => Some((view, check == Check::InShader)),
+        true => match cx.decl.families.access.blob {
+            Some(decl) => Some(decl),
             None => return Err(cx.fail("the constant blob is not declared")),
         },
-        None => None,
+        false => None,
     };
-    if let Some((view, checked)) = blob {
+    if let Some(decl) = blob {
         if stored.is_some() {
             return Err(cx.fail("a store through a pointer into the constant blob"));
         }
         let root = fat_part(fb, p, 0)?;
         let mut cases: Vec<(Vec<u32>, ArmFn<'_, ()>)> = Vec::with_capacity(prepared.len() + 1);
         for (r, _, prep) in prepared.iter().copied() {
-            let arm: ArmFn<'_, ()> =
-                Box::new(move |fb, _| Ok(ArmEnd::FallThrough(vec![load_one(fb, &leaf, prep)?])));
+            let arm: ArmFn<'_, ()> = Box::new(move |fb, _| {
+                let v = load_one(fb, &leaf, prep)?;
+                Ok(ArmEnd::FallThrough(leaf::carried(fb, &leaf, Some(v))?))
+            });
             cases.push((vec![r], arm));
         }
         let arm: ArmFn<'_, ()> = Box::new(move |fb, _| {
-            Ok(ArmEnd::FallThrough(vec![super::blob::load_view(
-                fb, view, &leaf, m, checked,
-            )?]))
+            let v = super::blob::load_decl(fb, decl, &leaf, m)?;
+            Ok(ArmEnd::FallThrough(leaf::carried(fb, &leaf, Some(v))?))
         });
         cases.push((vec![BLOB_ROOT], arm));
         let default: ArmFn<'_, ()> =
-            Box::new(move |fb, _| Ok(ArmEnd::FallThrough(vec![leaf::zero(fb, &leaf)?])));
+            Box::new(move |fb, _| Ok(ArmEnd::FallThrough(leaf::carried(fb, &leaf, None)?)));
         let merged = fb.switch_at_use(&mut (), root, cases, default)?;
-        return Ok(merged.0.first().copied());
+        return leaf::merged(fb, &leaf, &merged.0).map(Some);
     }
     match (prepared.as_slice(), stored) {
         // No candidate slot: only null, whose dereference Metal leaves undefined.
@@ -489,7 +533,10 @@ pub(super) fn access_at(
             let mut cases: Vec<(Vec<u32>, ArmFn<'_, Slots>)> = Vec::with_capacity(many.len());
             for (r, slot, prep) in many.iter().copied() {
                 let arm: ArmFn<'_, Slots> = Box::new(move |fb, merged| match stored {
-                    None => Ok(ArmEnd::FallThrough(vec![load_one(fb, &leaf, prep)?])),
+                    None => {
+                        let v = load_one(fb, &leaf, prep)?;
+                        Ok(ArmEnd::FallThrough(leaf::carried(fb, &leaf, Some(v))?))
+                    }
                     Some(v) => {
                         if store_one(fb, &leaf, prep, v)? {
                             merged.insert(slot);
@@ -500,13 +547,16 @@ pub(super) fn access_at(
                 cases.push((vec![r], arm));
             }
             let default: ArmFn<'_, Slots> = Box::new(move |fb, _| match stored {
-                None => Ok(ArmEnd::FallThrough(vec![leaf::zero(fb, &leaf)?])),
+                None => Ok(ArmEnd::FallThrough(leaf::carried(fb, &leaf, None)?)),
                 Some(_) => Ok(ArmEnd::FallThrough(Vec::new())),
             });
             let mut merged = Slots::new();
             let out = fb.switch_at_use(&mut merged, root, cases, default)?;
             cx.merged.extend(merged);
-            Ok(out.0.first().copied())
+            match stored {
+                None => leaf::merged(fb, &leaf, &out.0).map(Some),
+                Some(_) => Ok(None),
+            }
         }
     }
 }
@@ -636,7 +686,8 @@ pub fn emit(
         AccessStrategy::Value(p) => super::pointer::emit(cx, fb, vid, p),
         AccessStrategy::Cell(c) => super::cell::emit(cx, fb, vid, c),
         AccessStrategy::Imageblock(i) => super::imageblock::emit(cx, fb, vid, i),
-        AccessStrategy::Encode(e) => super::encode::emit(cx, fb, vid, e),
+        AccessStrategy::Object(o) => super::object::emit(cx, fb, vid, o),
+        AccessStrategy::Commands(c) => super::icb::emit(cx, fb, c),
         AccessStrategy::FunctionTable(t) => super::function_table::emit(cx, fb, vid, t),
         AccessStrategy::AbsentRead(a) => super::absent::emit(cx, fb, vid, a),
     }

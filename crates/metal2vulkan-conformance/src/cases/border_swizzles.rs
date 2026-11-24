@@ -1,36 +1,33 @@
-//! Border texels through a swizzled texture, ported from `runtime_lane::border_swizzles`.
+//! Border texels through a swizzled texture.
 //!
-//! Metal's answer, as the lane fitted it over 1,056 border values on an **Apple M4**: a border texel
-//! is the border colour in the format's channels — a missing red, green or blue read as 0 and a
-//! missing alpha as 1 — and then the texture's swizzle, exactly as for any texel. `A8Unorm`'s one
+//! Metal's answer, as a rule fitted over 1,056 border values on an **Apple M4** states it: a border
+//! texel is the border colour in the format's channels — a missing red, green or blue read as 0 and
+//! a missing alpha as 1 — and then the texture's swizzle, exactly as for any texel. `A8Unorm`'s one
 //! channel takes the border colour's *red*, so its opaque-black border reads alpha 0 just as its
 //! transparent one does. And a **runtime** sampler of clamp-to-zero reads its own border colour,
 //! which is what clamp-to-border does, rather than reading zero; the fixture's two **constexpr**
 //! `address::clamp_to_zero` samplers carry no border colour and do read zero, in the format's
 //! channels and through the swizzle.
 //!
-//! **The port re-measures it on this M3 Max**, which matters more here than in most of the batch:
-//! the rule was fitted on another chip, and the one thing the lane cannot tell us is whether this
-//! chip agrees. Record mode runs the case, each recording holds Metal's own words, and the rule is a
-//! committed cross-check (the test `every_recorded_texel_is_the_lanes_rule`).
+//! **Measured again on an Apple M3 Max**, as the rule was fitted on another chip: record mode runs
+//! the case, each recording holds Metal's own words, and the rule is a committed cross-check (the
+//! test `every_recorded_texel_is_the_border_rule`).
 //!
 //! **One case per format**, eight of them, each sweeping the six swizzles against the ten samplers
 //! and the three coordinates — one inside at a texel centre, and one a texel past each edge, where
 //! nearest and linear filtering read only border texels. A venue that holds no texture of a format,
 //! or no sampler of a border colour, answers its typed refusal there and counts as lacking the
-//! feature instead of leaving the sweep green with nothing compared, which is what the lane does
-//! when it prints `BORDER-REFUSED` and moves on.
+//! feature instead of leaving the sweep green with nothing compared.
 //!
 //! The owned fixture `a2_clamp_to_zero` samples a float texture through two constexpr
 //! clamp-to-zero samplers (nearest and linear) and through the runtime sampler at `[[sampler(0)]]`,
 //! and also samples a uint and an int texture, five `uint4`s a lane. The case keeps all five, so
 //! the integer textures' reads are recorded beside the float texture's rather than dropped.
 //!
-//! **One difference from the lane, stated rather than hidden:** the lane sets the runtime sampler's
-//! `r` address mode beside `t`. A 2D sample reads no `r` coordinate, so that mode cannot change any
-//! texel here, and [`crate::case::SamplerSpec`] — a core type other streams share — states `s` and
-//! `t` alone. The case therefore states `s` and `t`, and a case that ever samples a 3D or cube
-//! texture through such a sampler is what should grow the field.
+//! **The `r` address mode is not stated.** A 2D sample reads no `r` coordinate, so that mode cannot
+//! change any texel here, and [`crate::case::SamplerSpec`] — a core type other streams share —
+//! states `s` and `t` alone. The case therefore states `s` and `t`, and a case that ever samples a
+//! 3D or cube texture through such a sampler is what should grow the field.
 //!
 //! Nothing here can fault a GPU: one compute pass a sampler, three read-only textures, three
 //! threads, no loop.
@@ -71,7 +68,7 @@ const BLANK: u8 = 0xab;
 /// of the border colour each of them takes on Metal, and the bytes of its one texel value.
 ///
 /// The table is public because it is the family's description, and what reads `present` and
-/// `border_source` is the cross-check that holds the recordings against the lane's rule: the case
+/// `border_source` is the cross-check that holds the recordings against the rule: the case
 /// itself needs only the format and its texel.
 pub struct Format {
     pub name: &'static str,
@@ -96,7 +93,7 @@ const R16: &[u8] = &[0x00, 0x34];
 const RG16: &[u8] = &[0x00, 0x34, 0x00, 0x38];
 const RGBA16: &[u8] = &[0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x30];
 
-/// The lane's eight formats, with its texel bytes.
+/// The eight formats, with their texel bytes.
 pub const FORMATS: [Format; 8] = [
     Format {
         name: "border-swizzles-r8unorm",
@@ -201,7 +198,7 @@ const SAMPLERS: [(&str, [SamplerAddressMode; 2], SamplerBorderColor); 10] = {
     ]
 };
 
-/// The sampler state the row `(_, [s, t], border)` names: the lane's, which filters nearest and
+/// The sampler state the row `(_, [s, t], border)` names, which filters nearest and
 /// samples in normalized coordinates.
 fn sampler_spec(modes: [SamplerAddressMode; 2], border: SamplerBorderColor) -> SamplerSpec {
     let mut spec = SamplerSpec::filtered(SamplerMinMagFilter::Nearest);
@@ -240,7 +237,7 @@ impl BorderSwizzles {
     }
 
     /// The uint and int textures every dispatch binds at textures 1 and 2: 4 by 4, every texel 1
-    /// and -1, with the default swizzle, as the lane makes them.
+    /// and -1, with the default swizzle.
     fn integer_texels() -> [(PixelFormat, [u8; 4]); 2] {
         [
             (PixelFormat::R32Uint, 1u32.to_le_bytes()),
@@ -295,22 +292,31 @@ impl Case for BorderSwizzles {
     fn allowances(&self) -> Vec<Allowance> {
         // The sample goes to the device's own sampler and the texel's `float` value is the
         // device's conversion of its codes, which the runtime announces as `device-sampling` and
-        // `device-texel-conversion` off Metal's own texture unit: native notes the suite declares
+        // `device-texel-conversion`: native notes the suite declares
         // for every case, which loosen no word. A word the device's conversion moves is a
-        // `known-gaps.tsv` row of the venue.
+        // `known-gaps-rt.tsv` row of the venue.
         //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
+        // The fixture's float texture is sampled through the runtime sampler at `[[sampler(0)]]`,
+        // which the runtime's pipelines note as scaled
+        // (`crate::replay::pixel_sampler_scaling_notice` holds why). Measured through the rt side
+        // on lavapipe, the Radeon 780M and the RX 550: it fired for all 8 rows.
         //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 8 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
+        // Every row sweeps samplers that read an opaque-black border, which the runtime's
+        // sampler states note on every device (`crate::replay::swizzled_border_notice`).
+        //
+        // And the kernel's SIMD-group access pairs, which the runtime's pipelines note on every
+        // device (`crate::replay::simdgroup_access_order_notice`).
+        let mut named = vec![
+            crate::replay::pixel_sampler_scaling_notice(),
+            crate::replay::simdgroup_access_order_notice(),
+        ];
+        let black = (SAMPLERS.iter()).any(|&(_, modes, border)| {
+            crate::replay::reads_opaque_black_border(&sampler_spec(modes, border))
+        });
+        if black {
+            named.push(crate::replay::swizzled_border_notice());
+        }
+        named
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -547,15 +553,15 @@ mod tests {
         );
     }
 
-    /// Every border texel of every committed recording is the lane's rule's, and so is every texel
+    /// Every border texel of every committed recording is the rule's, and so is every texel
     /// a sample inside reads, within one part in a million (a format conversion's rounding, which
     /// this case is not about).
     ///
-    /// This is the cross-check the port exists for: the recordings hold what Metal answered on this
-    /// M3 Max, and the rule was fitted on an Apple M4. A difference means the chips disagree or the
+    /// The recordings hold what Metal answered on an Apple M3 Max, and the rule was fitted on an
+    /// Apple M4. A difference means the chips disagree or the
     /// rule was never Metal's, and either is a finding rather than something to edit away.
     #[test]
-    fn every_recorded_texel_is_the_lanes_rule() {
+    fn every_recorded_texel_is_the_border_rule() {
         let mut unrecorded = Vec::new();
         let mut differ = Vec::new();
         let mut checked = 0usize;
@@ -591,7 +597,7 @@ mod tests {
                             // the shader: they carry no border colour and read zero in the
                             // format's channels. Only the runtime sampler reads the border colour
                             // the case set, and Metal reads it under clamp-to-zero as under
-                            // clamp-to-border, which is the lane's finding.
+                            // clamp-to-border.
                             let want_zero = rule(format, [0.0; 4], true, swizzle);
                             let want_border = rule(format, border_rgba(border), true, swizzle);
                             for lane in 0..COORDS.len() {
@@ -632,8 +638,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{checked} channels checked; Metal's recorded texels differ from the lane's \
-             rule:\n{}",
+            "{checked} channels checked; Metal's recorded texels differ from the rule:\n{}",
             differ.join("\n")
         );
         assert!(

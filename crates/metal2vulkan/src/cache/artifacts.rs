@@ -143,7 +143,7 @@ impl RenderPipeline {
     /// The pipeline's content digest: [`ComputePipeline::content_digest`]'s definition over a
     /// render pipeline. It covers every field but `key` and `profile`: each stage's module, the
     /// layout, the vertex input, the fixed-function state, the runtime dependencies, the interface,
-    /// the requirements, the variant bits and a mesh pipeline's answers. It is equal across builds whose pipelines for an
+    /// the requirements and the variant bits. It is equal across builds whose pipelines for an
     /// input say the same thing, changes whenever covered content changes, and authenticates
     /// nothing, as the compute pipeline's.
     pub fn content_digest(&self) -> Hash256 {
@@ -158,7 +158,6 @@ impl RenderPipeline {
             interface,
             requirements,
             variant_bits,
-            mesh_info,
         } = self;
         Node::fields(&mut [
             ("stages", stages.digest()),
@@ -169,7 +168,6 @@ impl RenderPipeline {
             ("interface", interface.digest()),
             ("requirements", requirements.digest()),
             ("variant_bits", variant_bits.digest()),
-            ("mesh_info", mesh_info.digest()),
         ])
         .root("render pipeline")
     }
@@ -272,8 +270,8 @@ fn open_answer<T: Codec>(
 
 impl crate::reflection::LinkedUseAnswers {
     /// The versioned, self-checking encoding of the answers of the render descriptor of `key`
-    /// ([`Device::render_descriptor_key`]) on `device`: the frame of an artifact, its key the
-    /// descriptor's and its profile `device`'s.
+    /// ([`Device::queried_render_descriptor_key`]) on `device`: the frame of an artifact, its key
+    /// the descriptor's and its profile `device`'s.
     pub fn to_bytes(&self, key: &PipelineKey, device: &Device) -> Vec<u8> {
         seal_answer(Kind::LinkedUseAnswers, self, key, device)
     }
@@ -292,7 +290,7 @@ impl crate::reflection::LinkedUseAnswers {
 
 impl crate::reflection::RenderPipelineReflection {
     /// The versioned, self-checking encoding of the reflection of the render descriptor of `key`
-    /// ([`Device::render_descriptor_key`]) on `device`, as
+    /// ([`Device::queried_render_descriptor_key`]) on `device`, as
     /// [`LinkedUseAnswers::to_bytes`](crate::reflection::LinkedUseAnswers::to_bytes) frames its
     /// answers.
     pub fn to_bytes(&self, key: &PipelineKey, device: &Device) -> Vec<u8> {

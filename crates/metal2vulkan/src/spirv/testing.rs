@@ -28,7 +28,7 @@ use crate::pipeline::sym::Symbol;
 use crate::spirv::ir::TypedModule;
 use crate::spirv::serialize::RelocatableModule;
 #[cfg(test)]
-use crate::spirv::serialize::{relocate, serialize_for};
+use crate::spirv::serialize::{relocate, serialize};
 
 /// A `spirv-val --target-env` value. Every profile emits SPIR-V 1.5, which both accept.
 #[non_exhaustive]
@@ -80,8 +80,6 @@ pub struct ValOptions {
     pub scalar_block_layout: bool,
     /// `--uniform-buffer-standard-layout` (`uniformBufferStandardLayout`).
     pub uniform_buffer_standard_layout: bool,
-    /// `--workgroup-scalar-block-layout` (`workgroupMemoryExplicitLayoutScalarBlockLayout`).
-    pub workgroup_scalar_block_layout: bool,
     /// `--allow-localsizeid` (`maintenance4`, needed for `LocalSizeId` under Vulkan 1.2).
     pub allow_localsizeid: bool,
     /// `--allow-offset-texture-operand` (`maintenance8`, needed for `Offset` outside a gather,
@@ -101,9 +99,6 @@ impl ValOptions {
         ValOptions {
             scalar_block_layout: has(VkFeature::ScalarBlockLayout),
             uniform_buffer_standard_layout: has(VkFeature::UniformBufferStandardLayout),
-            workgroup_scalar_block_layout: has(
-                VkFeature::WorkgroupMemoryExplicitLayoutScalarBlockLayout,
-            ),
             allow_localsizeid: has(VkFeature::Maintenance4),
             allow_offset_texture_operand: has(VkFeature::Maintenance8),
         }
@@ -117,10 +112,6 @@ impl ValOptions {
             (
                 self.uniform_buffer_standard_layout,
                 "--uniform-buffer-standard-layout",
-            ),
-            (
-                self.workgroup_scalar_block_layout,
-                "--workgroup-scalar-block-layout",
             ),
             (self.allow_localsizeid, "--allow-localsizeid"),
             (
@@ -177,7 +168,7 @@ pub fn link_dense(r: &RelocatableModule) -> BTreeMap<Symbol, u32> {
 }
 
 /// L3 for a finished module on `profile`: the owned verifier (every rule, requirements ⊆ profile),
-/// serialization for the profile (`serialize_for`), a dense link ([`link_dense`]), and `spirv-val`
+/// serialization (`serialize`), a dense link ([`link_dense`]), and `spirv-val`
 /// under Vulkan 1.2 and the profile's environment with the profile's layout relaxations. Returns
 /// the linked words, or the first failure with a disassembly.
 #[cfg(test)]
@@ -185,10 +176,16 @@ pub fn check_valid(m: TypedModule, profile: &DeviceProfile) -> Result<Vec<u32>, 
     let mut meter = Meter::new(&Budget::default());
     crate::spirv::verify::check(&m, profile, &mut meter)
         .map_err(|e| format!("owned verifier: {e}"))?;
-    let r = serialize_for(m, profile).map_err(|e| format!("serialize: {e}"))?;
+    let r = serialize(m).map_err(|e| format!("serialize: {e}"))?;
     let words = relocate(&r, &link_dense(&r)).map_err(|e| format!("relocate: {e}"))?;
     check_words_valid(&words, &r.requirements, profile)?;
     Ok(words)
+}
+
+/// A finished module's derived device requirements.
+#[cfg(test)]
+pub fn requirements(m: &TypedModule) -> &Requirements {
+    &m.requirements
 }
 
 /// [`check_valid`] for already linked words: requirements ⊆ profile, then `spirv-val` under
@@ -235,20 +232,46 @@ pub fn assert_valid(m: TypedModule, profile: &DeviceProfile) -> Vec<u32> {
 }
 
 /// Every committed device profile (`validation/profiles/*.json`, read-only), derived through
-/// `Device::new` with the default policy, sorted by file stem.
+/// `Device::from_queries` with the resident-table domains, sorted by file stem.
 pub fn committed_profiles() -> Result<Vec<(String, DeviceProfile)>, String> {
-    committed_profiles_under(DevicePolicy::default())
+    committed_profiles_under(DevicePolicy::RESIDENT_TABLES)
 }
 
-/// [`committed_profiles`] under `policy` (the tests of Metal's NaN and `half` rounding take
-/// [`crate::pipeline::testing::exact_maths`]).
+/// [`committed_profiles`] that take threadgroup memory: those with
+/// `shaderZeroInitializeWorkgroupMemory`, since a function's threadgroup memory starts at zero and
+/// a profile without it refuses every function that uses threadgroup memory
+/// (`Unsupported{ZeroedThreadgroupMemory}`, `tests::engine_zeroed_threadgroup`).
+#[cfg(test)]
+pub fn threadgroup_profiles() -> Result<Vec<(String, DeviceProfile)>, String> {
+    let mut out = committed_profiles()?;
+    out.retain(|(_, p)| zeroes_threadgroup_memory(p));
+    Ok(out)
+}
+
+/// Whether `p` takes threadgroup memory ([`threadgroup_profiles`]).
+#[cfg(test)]
+pub fn zeroes_threadgroup_memory(p: &DeviceProfile) -> bool {
+    (p.fields().enabled.features).contains(&VkFeature::ShaderZeroInitializeWorkgroupMemory)
+}
+
+/// Whether `e` is `p`'s refusal of threadgroup memory: `Unsupported{ZeroedThreadgroupMemory}` on a
+/// profile that does not take it ([`zeroes_threadgroup_memory`]).
+#[cfg(test)]
+pub fn refuses_threadgroup_memory(e: &crate::error::Error, p: &DeviceProfile) -> bool {
+    let zeroed = crate::error::Feature::ZeroedThreadgroupMemory;
+    matches!(e, crate::error::Error::Unsupported(u) if u.feature == zeroed)
+        && !zeroes_threadgroup_memory(p)
+}
+
+/// [`committed_profiles`] under `policy`.
 pub fn committed_profiles_with(
     policy: DevicePolicy,
 ) -> Result<Vec<(String, DeviceProfile)>, String> {
     committed_profiles_under(policy)
 }
 
-/// Every committed device profile, derived through `Device::new` with `policy`, sorted by stem:
+/// Every committed device profile, derived through `Device::from_queries` with `policy`, sorted by
+/// stem:
 /// derived once per policy per test process, since deriving a device computes its fingerprint
 /// and a test may ask for the profiles once per case it checks (a sixth of such a test's time).
 fn committed_profiles_under(policy: DevicePolicy) -> Result<Vec<(String, DeviceProfile)>, String> {
@@ -260,7 +283,7 @@ fn committed_profiles_under(policy: DevicePolicy) -> Result<Vec<(String, DeviceP
     }
     let mut out = Vec::new();
     for (stem, desc) in committed_descriptions()? {
-        let dev = Device::new(desc.clone(), policy).map_err(|e| format!("{stem}: {e}"))?;
+        let dev = Device::from_queries(desc.clone(), policy).map_err(|e| format!("{stem}: {e}"))?;
         out.push((stem.clone(), dev.profile().clone()));
     }
     lock().push((policy, out.clone()));
@@ -308,98 +331,4 @@ pub const MOLTENVK_CAPTURES: [&str; 1] = ["moltenvk-m3"];
 /// Whether the committed profile `stem` is one of [`MOLTENVK_CAPTURES`].
 pub fn is_moltenvk_capture(stem: &str) -> bool {
     MOLTENVK_CAPTURES.contains(&stem)
-}
-
-/// One long check as several tests, so nextest runs them side by side: a suite's wall-clock is
-/// at least its longest test's, and an exhaustive table run as one test was the longest.
-///
-/// `sharded_tests!(group = run(shard_0 => 0, shard_1 => 1, ...))` declares module `group` with
-/// test `shard_k` calling `run(k, n)` (`run` in the module that invokes this), `n` the number of
-/// shards listed; `run` checks the cases whose index is `k` modulo `n`. The shards must be
-/// numbered `0, 1, ..., n - 1` in order, or the module does not compile: every case runs in
-/// exactly one shard.
-macro_rules! sharded_tests {
-    ($group:ident = $run:ident($($test:ident => $k:literal),+ $(,)?)) => {
-        mod $group {
-            /// The number of shards.
-            const SHARDS: usize = [$($k),+].len();
-            // The shards are numbered 0, 1, ..., SHARDS - 1, in order.
-            const _: () = {
-                let shards: [usize; SHARDS] = [$($k),+];
-                let mut i = 0;
-                while i < SHARDS {
-                    assert!(shards[i] == i, "shards are numbered 0, 1, ... in order");
-                    i += 1;
-                }
-            };
-            $(
-                #[test]
-                fn $test() {
-                    super::$run($k, SHARDS);
-                }
-            )+
-        }
-    };
-}
-pub(crate) use sharded_tests;
-
-/// The constants of SPIR-V `words` by id: `(width, value)` of each 32- or 64-bit integer
-/// `OpConstant`.
-pub fn int_constants(words: &[u32]) -> std::collections::BTreeMap<u32, (u32, u64)> {
-    let mut widths = std::collections::BTreeMap::new();
-    let mut out = std::collections::BTreeMap::new();
-    let mut i = 5;
-    while let Some(&w) = words.get(i) {
-        let (len, op) = ((w >> 16) as usize, w & 0xFFFF);
-        let at = |k: usize| words.get(i + k).copied().unwrap_or(0);
-        match op {
-            // OpTypeInt result, width.
-            21 => {
-                widths.insert(at(1), at(2));
-            }
-            // OpConstant type, result, value words.
-            43 => match widths.get(&at(1)) {
-                Some(&32) => {
-                    out.insert(at(2), (32, u64::from(at(3))));
-                }
-                Some(&64) => {
-                    out.insert(at(2), (64, u64::from(at(3)) | (u64::from(at(4)) << 32)));
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        if len == 0 {
-            break;
-        }
-        i += len;
-    }
-    out
-}
-
-/// How many `OpUDiv`s of SPIR-V `words` divide the all-ones integer of their width (`2^32 - 1`
-/// or `2^64 - 1`), the form of an overflow test (`b <= (2^32 - 1) / a`) NVIDIA's compiler
-/// refuses in some modules (`bind::replay::checked_mul`).
-pub fn all_ones_divisions(words: &[u32]) -> usize {
-    const UDIV: u32 = 134;
-    let consts = int_constants(words);
-    let all_ones = |id: u32| match consts.get(&id) {
-        Some(&(32, v)) => v == u64::from(u32::MAX),
-        Some(&(64, v)) => v == u64::MAX,
-        _ => false,
-    };
-    let mut n = 0;
-    let mut i = 5;
-    while let Some(&w) = words.get(i) {
-        let (len, op) = ((w >> 16) as usize, w & 0xFFFF);
-        // OpUDiv type, result, dividend, divisor.
-        if op == UDIV && words.get(i + 3).is_some_and(|&id| all_ones(id)) {
-            n += 1;
-        }
-        if len == 0 {
-            break;
-        }
-        i += len;
-    }
-    n
 }

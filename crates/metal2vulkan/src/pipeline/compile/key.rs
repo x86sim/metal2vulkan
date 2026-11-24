@@ -10,9 +10,9 @@
 //!   links functions, each linked function's list, name, specialized name, specialization, AIR
 //!   hash, and constant values. A stage without linked functions keeps the key it had before
 //!   linking existed, and one
-//!   compiled without `emulated_simdgroups`, `one_row`, `dropped_vertex_layer`, `storage_view_slots`,
-//!   `signed_color_attachments`, `multisampled`, `replay_bindings`, or `framebuffer_fetch` the key
-//!   it had before those inputs existed. A stage that links dynamic libraries records each library
+//!   compiled without `emulated_simdgroups`, `one_row`,
+//!   `signed_color_attachments`, `multisampled` or `replay_bindings` the key it had before those
+//!   inputs existed. A stage that links dynamic libraries records each library
 //!   its imports are searched in, in order (install name and content hash), and the install name
 //!   not loaded; one that links none keeps its key.
 //! - [`pipeline_key`] (`PipelineKey`): the profile fingerprint, each stage's `FunctionCompileKey`
@@ -25,8 +25,9 @@ use crate::cache::{Hash256, PipelineKey, SEMANTICS_VERSION};
 use crate::library::{FunctionCompileKey, FunctionConstantValues};
 use crate::lower::select::LowerInputs;
 use crate::pipeline::descriptor::{
-    LinkedList, MeshPipelineDescriptor, PrivateRenderState, RenderPipelineDescriptor,
-    StageInputDescriptor, StageSource, TessellationDescriptor,
+    ColorAttachmentDescriptor, LinkedList, PrivateRenderState, RenderPipelineDescriptor,
+    StageInputDescriptor, StageSource, TessellationDescriptor, VertexAttributeDescriptor,
+    VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 
 /// What a compile key records of one linked function: the list it is in, its name, the
@@ -136,10 +137,6 @@ pub fn canonical_inputs(inputs: &LowerInputs) -> LowerInputs {
         .map(StageInputDescriptor::canonical);
     // A depth of 0 is taken as 1, Metal's default, which is no depth at all.
     out.max_call_stack_depth = inputs.max_call_stack_depth.filter(|&k| k > 1);
-    // Metal's default tessellation state is no state at all.
-    out.tessellation = inputs
-        .tessellation
-        .filter(|d| *d != TessellationDescriptor::default());
     // Only a tile function's threadgroup is the tile.
     out.threadgroup_size_matches_tile_size =
         inputs.threadgroup_size_matches_tile_size && inputs.tile_attachments.is_some();
@@ -199,18 +196,10 @@ pub fn function_key(
     if inputs.one_row {
         h.bytes(b"one-row");
     }
-    if inputs.dropped_vertex_layer {
-        h.bytes(b"dropped-vertex-layer");
-    }
     // Appended only when set, canonical, in its derived `Debug` form (ordered maps of plain enums
     // and integers, a total encoding as `inputs_encoding`'s).
     if let Some(d) = &inputs.stage_input {
         h.bytes(b"stage-input").bytes(format!("{d:?}").as_bytes());
-    }
-    // Appended only when set, as above.
-    if !inputs.storage_view_slots.is_empty() {
-        h.bytes(b"storage-view-slots")
-            .bytes(format!("{:?}", inputs.storage_view_slots).as_bytes());
     }
     // Appended only when set, as above.
     if !inputs.signed_color_attachments.is_empty() {
@@ -234,73 +223,52 @@ pub fn function_key(
     if inputs.merged_draws {
         h.bytes(b"merged-draws");
     }
-    // Appended only when set, in its derived `Debug` form (ordered maps of plain enums, flags, and
-    // booleans, a total encoding as `inputs_encoding`'s).
-    if let Some(f) = &inputs.framebuffer_fetch {
-        h.bytes(b"framebuffer-fetch")
-            .bytes(format!("{f:?}").as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.srgb_textures.is_empty() {
         h.bytes(b"srgb-textures")
             .bytes(format!("{:?}", inputs.srgb_textures).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.snapshot_textures.is_empty() {
-        h.bytes(b"snapshot-textures")
-            .bytes(format!("{:?}", inputs.snapshot_textures).as_bytes());
+    // Appended only when set, as `signed_color_attachments`.
+    if !inputs.texel_buffer_parts.is_empty() {
+        h.bytes(b"texel-buffer-parts")
+            .bytes(format!("{:?}", inputs.texel_buffer_parts).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.ycbcr_in_place.is_empty() {
-        h.bytes(b"ycbcr-in-place")
-            .bytes(format!("{:?}", inputs.ycbcr_in_place).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.ycbcr_planes_sampled.is_empty() {
-        h.bytes(b"ycbcr-planes-sampled")
-            .bytes(format!("{:?}", inputs.ycbcr_planes_sampled).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
-    if !inputs.texel_rows.is_empty() {
-        h.bytes(b"texel-rows")
-            .bytes(format!("{:?}", inputs.texel_rows).as_bytes());
-    }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.extended_range.is_empty() {
         h.bytes(b"extended-range")
             .bytes(format!("{:?}", inputs.extended_range).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.extended_range_colors.is_empty() {
         h.bytes(b"extended-range-colors")
             .bytes(format!("{:?}", inputs.extended_range_colors).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.word_colors.is_empty() {
         h.bytes(b"word-colors")
             .bytes(format!("{:?}", inputs.word_colors).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.rotated_colors.is_empty() {
         h.bytes(b"rotated-colors")
             .bytes(format!("{:?}", inputs.rotated_colors).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.alpha_in_red_colors.is_empty() {
         h.bytes(b"alpha-in-red-colors")
             .bytes(format!("{:?}", inputs.alpha_in_red_colors).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.rotated_factors.is_empty() {
         h.bytes(b"rotated-factors")
             .bytes(format!("{:?}", inputs.rotated_factors).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.rotated_blends.is_empty() {
         h.bytes(b"rotated-blends")
             .bytes(format!("{:?}", inputs.rotated_blends).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.swizzled_storage.is_empty() {
         h.bytes(b"swizzled-storage")
             .bytes(format!("{:?}", inputs.swizzled_storage).as_bytes());
@@ -308,10 +276,6 @@ pub fn function_key(
     // Appended only when set.
     if inputs.viewport_index_varying {
         h.bytes(b"viewport-index-varying");
-    }
-    // Appended only when set: canonical, so never Metal's default state.
-    if let Some(d) = inputs.tessellation {
-        h.bytes(b"tessellation").bytes(format!("{d:?}").as_bytes());
     }
     // Appended only when set: canonical, so never 1, Metal's default.
     if let Some(k) = inputs.max_call_stack_depth {
@@ -350,6 +314,10 @@ pub fn function_key(
         h.bytes(b"private-list");
     }
     // Appended only when set.
+    if inputs.indirect_range {
+        h.bytes(b"indirect-range");
+    }
+    // Appended only when set.
     if let Some(d) = inputs.amplification_draws {
         h.bytes(b"amplification-draws")
             .u64(u64::from(d.layered))
@@ -371,22 +339,6 @@ pub fn function_key(
     if !inputs.absent_varyings.is_empty() {
         h.bytes(b"absent-varyings")
             .bytes(format!("{:?}", inputs.absent_varyings).as_bytes());
-    }
-    // Appended only when set.
-    if let Some(c) = inputs.viewport_compensation {
-        h.bytes(b"viewport-compensation").u64(u64::from(c.depth));
-        // Appended only when set.
-        if c.point_guard {
-            h.bytes(b"point-guard");
-        }
-        // Appended only when set.
-        if c.mirrors {
-            h.bytes(b"viewport-mirrors");
-        }
-        // Appended only when set.
-        if c.vertex_clamp {
-            h.bytes(b"viewport-vertex-clamp");
-        }
     }
     // Appended only when set.
     if inputs.folded_groups {
@@ -447,67 +399,45 @@ pub fn function_key(
             .bytes(&function.as_raw().to_le_bytes());
     }
     // Appended only when set.
-    if let Some(op) = inputs.logic_operation {
-        h.bytes(b"logic-operation")
-            .bytes(&op.as_raw().to_le_bytes());
-    }
-    // Appended only when set.
     if inputs.depth_compare_clamp_mask != 0 {
         h.bytes(b"depth-compare-clamp")
             .bytes(&inputs.depth_compare_clamp_mask.to_le_bytes());
     }
     // Appended only when set.
-    if inputs.read_only_tests {
-        h.bytes(b"read-only-tests");
-    }
-    // Appended only when set.
-    if inputs.shader_tests {
-        h.bytes(b"shader-tests");
-    }
-    // Appended only when set.
-    if inputs.shader_stencil {
-        h.bytes(b"shader-stencil");
-    }
-    // Appended only when set.
-    if inputs.window_depth_varying {
-        h.bytes(b"window-depth-varying");
-    }
-    // Appended only when set.
     if inputs.threadgroup_size_matches_tile_size {
         h.bytes(b"threadgroup-size-matches-tile-size");
     }
-    // Appended only when set, as `storage_view_slots`: a texture whose map is the identity keeps
+    // Appended only when set, as `signed_color_attachments`: a texture whose map is the identity keeps
     // every key.
     if !inputs.address_maps.is_empty() {
         h.bytes(b"address-maps")
             .bytes(format!("{:?}", inputs.address_maps).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.cubic_samplers.is_empty() {
         h.bytes(b"cubic-samplers")
             .bytes(format!("{:?}", inputs.cubic_samplers).as_bytes());
-    }
-    // Appended only when set, in its derived `Debug` form, as `dropped_colors` is: the shadowed
-    // variant of a function whose fetch inputs already hold the color (a blend's) is otherwise the
-    // unshadowed one's key, and a cache would hand it the unshadowed artifact.
-    if !inputs.extended_shadows.is_empty() {
-        h.bytes(b"extended-shadows")
-            .bytes(format!("{:?}", inputs.extended_shadows).as_bytes());
     }
     // Appended only when set: the default mode keeps every key.
     if inputs.texture_write_rounding != crate::metal::TextureWriteRoundingMode::TowardZero {
         h.bytes(b"texture-write-rounding-nearest-even");
     }
-    // Appended only when set, as `storage_view_slots`.
+    // Appended only when set, as `signed_color_attachments`.
     if !inputs.cross_class.is_empty() {
         h.bytes(b"cross-class")
             .bytes(format!("{:?}", inputs.cross_class).as_bytes());
     }
-    // Appended only when set, as `storage_view_slots`: a function bound to no anisotropic
+    // Appended only when set, as `signed_color_attachments`: a function bound to no anisotropic
     // sampler keeps every key.
     if !inputs.anisotropic_samplers.is_empty() {
         h.bytes(b"anisotropic-samplers")
             .bytes(format!("{:?}", inputs.anisotropic_samplers).as_bytes());
+    }
+    // Appended only when set, as `signed_color_attachments`: a kernel whose 1D images are bound as Apple's
+    // OpenCL binds them keeps its key.
+    if !inputs.open_cl_lines.is_empty() {
+        h.bytes(b"open-cl-lines")
+            .bytes(format!("{:?}", inputs.open_cl_lines).as_bytes());
     }
     // Appended only when set, in its derived `Debug` form (an ordered set of byte keys): a
     // fragment function whose vertex function writes no varying it interpolates the same at
@@ -522,11 +452,6 @@ pub fn function_key(
         h.bytes(b"instanced-attributes")
             .bytes(format!("{:?}", inputs.instanced_attributes).as_bytes());
     }
-    // Appended only when set, in its derived `Debug` form (integers), as `dropped_colors` is.
-    if let Some(group) = &inputs.color_group {
-        h.bytes(b"color-group")
-            .bytes(format!("{group:?}").as_bytes());
-    }
     // Appended only when set: a mesh function whose own payload arena holds its object
     // function's keeps its key.
     if let Some(bytes) = inputs.object_payload {
@@ -537,12 +462,12 @@ pub fn function_key(
         h.bytes(b"region-viewports");
     }
     // Appended only when set.
-    if inputs.region_copies {
-        h.bytes(b"region-copies");
-    }
-    // Appended only when set.
     if inputs.unit_axes != 0 {
         h.bytes(b"unit-axes").u64(u64::from(inputs.unit_axes));
+    }
+    // Appended only when set.
+    if inputs.push_base != 0 {
+        h.bytes(b"push-base").u64(u64::from(inputs.push_base));
     }
     // Appended only when present, so a stage that links nothing keeps its key: the tag's length
     // prefix keeps the encoding unambiguous.
@@ -596,86 +521,14 @@ pub fn pipeline_key(
     PipelineKey::new(h.finish())
 }
 
-/// The key of mesh render pipeline descriptor `d` for the profile of fingerprint `profile`
-/// (`Device::mesh_descriptor_key`): each stage by `stage`'s kind and digest, then every other
-/// field of `d`, as [`render_descriptor_key`] writes a render descriptor's, and each named here
-/// so that a field added to the descriptor does not compile until the key reads it.
-pub(crate) fn mesh_descriptor_key(
-    profile: &Hash256,
-    d: &MeshPipelineDescriptor,
-    stage: impl Fn(&StageSource) -> (u64, Hash256),
-) -> PipelineKey {
-    let MeshPipelineDescriptor {
-        object,
-        mesh,
-        fragment,
-        color_attachments,
-        depth_format,
-        stencil_format,
-        raster_sample_count,
-        rasterization_enabled,
-        alpha_to_coverage,
-        alpha_to_one,
-        support_indirect_command_buffers,
-        texture_write_rounding_mode,
-        max_total_threads_per_object_threadgroup,
-        max_total_threads_per_mesh_threadgroup,
-        max_total_threadgroups_per_mesh_grid,
-        object_threadgroup_size_is_multiple_of_thread_execution_width,
-        mesh_threadgroup_size_is_multiple_of_thread_execution_width,
-        payload_memory_length,
-        max_vertex_amplification_count,
-        required_threads_per_object_threadgroup,
-        required_threads_per_mesh_threadgroup,
-    } = d;
-    let mut h = KeyHasher::new(b"metal2vulkan/mesh-descriptor-key/v1");
-    h.bytes(profile);
-    for source in [object.as_ref(), Some(mesh), fragment.as_ref()] {
-        match source {
-            Some(source) => {
-                let (kind, digest) = stage(source);
-                h.u64(kind).bytes(&digest);
-            }
-            // As `render_descriptor_key` writes a descriptor without a fragment stage: a stage a
-            // descriptor does not have is told apart from every stage it could have.
-            None => {
-                h.u64(u64::MAX);
-            }
-        }
-    }
-    let fields = [
-        format!("{color_attachments:?}"),
-        format!("{depth_format:?} {stencil_format:?}"),
-        format!("{raster_sample_count} {alpha_to_coverage} {alpha_to_one}"),
-        format!("{rasterization_enabled} {support_indirect_command_buffers}"),
-        format!("{texture_write_rounding_mode:?}"),
-        format!(
-            "{max_total_threads_per_object_threadgroup:?} {max_total_threads_per_mesh_threadgroup:?} \
-             {max_total_threadgroups_per_mesh_grid:?}"
-        ),
-        format!(
-            "{object_threadgroup_size_is_multiple_of_thread_execution_width} \
-             {mesh_threadgroup_size_is_multiple_of_thread_execution_width}"
-        ),
-        format!("{payload_memory_length:?} {max_vertex_amplification_count}"),
-        format!(
-            "{required_threads_per_object_threadgroup:?} {required_threads_per_mesh_threadgroup:?}"
-        ),
-    ];
-    h.u64(fields.len() as u64);
-    for field in &fields {
-        h.bytes(field.as_bytes());
-    }
-    PipelineKey::new(h.finish())
-}
-
-/// The key of render pipeline descriptor `d` for the profile of fingerprint `profile`
-/// (`Device::render_descriptor_key`): each stage by `stage`'s kind and digest, then every other
-/// field of `d`, each named here so that a field added to the descriptor does not compile until
-/// the key reads it. A field is written in its derived `Debug` form, which no float of these
-/// types takes (the private state's one float is written by its bits, so `-0.0` and each NaN
-/// payload are told apart).
-pub(crate) fn render_descriptor_key(
+/// The key of render pipeline descriptor `d` for the profile of fingerprint `profile`, on
+/// `Device::from_queries`' path (`Device::queried_render_descriptor_key`): each stage by `stage`'s
+/// kind and digest, then every other field of `d` as fixed-width little-endian words in a fixed
+/// order, each optional or repeated part after its tag or count, so no two descriptors write the
+/// same words. Every field of `d` and of each struct it holds is named here, so that a field added
+/// to any of them does not compile until the key writes it. The private state's one float is
+/// written by its bits, so `-0.0` and each NaN payload are told apart.
+pub(crate) fn queried_render_descriptor_key(
     profile: &Hash256,
     d: &RenderPipelineDescriptor,
     stage: impl Fn(&StageSource) -> (u64, Hash256),
@@ -725,7 +578,7 @@ pub(crate) fn render_descriptor_key(
         explicit_visibility_group_id,
         open_gl_mode_enabled,
     } = private;
-    let mut h = KeyHasher::new(b"metal2vulkan/render-descriptor-key/v1");
+    let mut h = KeyHasher::new(b"metal2vulkan/queried-render-descriptor-key/v1");
     h.bytes(profile);
     let (kind, digest) = stage(vertex);
     h.u64(kind).bytes(&digest);
@@ -738,42 +591,171 @@ pub(crate) fn render_descriptor_key(
             h.u64(u64::MAX);
         }
     }
-    let fields = [
-        format!("{vertex_descriptor:?}"),
-        format!("{color_attachments:?}"),
-        format!("{depth_format:?} {stencil_format:?}"),
-        format!("{raster_sample_count} {alpha_to_coverage} {alpha_to_one}"),
-        format!("{rasterization_enabled} {input_primitive_topology:?}"),
-        format!("{max_vertex_amplification_count} {tessellation:?}"),
-        format!("{support_indirect_command_buffers}"),
-        format!("{max_vertex_call_stack_depth} {max_fragment_call_stack_depth}"),
-        format!(
-            "{support_adding_vertex_binary_functions} {support_adding_fragment_binary_functions}"
-        ),
-        format!("{vertex_buffers:?} {fragment_buffers:?}"),
-        format!("{texture_write_rounding_mode:?}"),
-        format!(
-            "{sample_mask} {} {sample_coverage_invert} {alpha_test_enabled} \
-             {alpha_test_function} {logic_operation_enabled} {logic_operation} \
-             {clip_distance_enable_mask} {point_smooth_enabled} {point_coord_lower_left} \
-             {point_size_output_vs} {two_side_enabled} {vertex_depth_compare_clamp_mask} \
-             {fragment_depth_compare_clamp_mask} {depth_stencil_write_disabled} \
-             {needs_custom_border_color_samplers}{}{}",
-            sample_coverage.to_bits(),
-            // Appended only past Metal's defaults, so every other descriptor keeps its key.
-            match (*vertex_amplification_mode, *explicit_visibility_group_id) {
-                (0, u32::MAX) => String::new(),
-                (mode, group) => format!(" {mode} {group}"),
-            },
-            match open_gl_mode_enabled {
-                true => " opengl",
-                false => "",
+    // The fields' words, hashed as one field.
+    let mut w = Words(Vec::with_capacity(384));
+    match vertex_descriptor {
+        None => {
+            w.u32(0);
+        }
+        Some(VertexDescriptor {
+            layouts,
+            attributes,
+        }) => {
+            w.u32(1).count(layouts.len());
+            for (
+                &buffer,
+                VertexBufferLayoutDescriptor {
+                    stride,
+                    step_function,
+                    step_rate,
+                },
+            ) in layouts
+            {
+                // The dynamic stride (`None`) apart from every stride.
+                w.u32(buffer)
+                    .u64(stride.map_or(u64::MAX, u64::from))
+                    .u32(step_function.as_raw())
+                    .u32(*step_rate);
             }
-        ),
-    ];
-    h.u64(fields.len() as u64);
-    for field in &fields {
-        h.bytes(field.as_bytes());
+            w.count(attributes.len());
+            for (
+                &index,
+                VertexAttributeDescriptor {
+                    format,
+                    offset,
+                    buffer_index,
+                },
+            ) in attributes
+            {
+                w.u32(index)
+                    .u32(format.as_raw())
+                    .u32(*offset)
+                    .u32(*buffer_index);
+            }
+        }
     }
+    for color in color_attachments {
+        match color {
+            None => {
+                w.u32(0);
+            }
+            Some(ColorAttachmentDescriptor {
+                pixel_format,
+                blending_enabled,
+                source_rgb_blend_factor,
+                destination_rgb_blend_factor,
+                rgb_blend_operation,
+                source_alpha_blend_factor,
+                destination_alpha_blend_factor,
+                alpha_blend_operation,
+                write_mask,
+            }) => {
+                w.u32(1)
+                    .u32(pixel_format.as_raw())
+                    .flag(*blending_enabled)
+                    .u32(source_rgb_blend_factor.as_raw())
+                    .u32(destination_rgb_blend_factor.as_raw())
+                    .u32(rgb_blend_operation.as_raw())
+                    .u32(source_alpha_blend_factor.as_raw())
+                    .u32(destination_alpha_blend_factor.as_raw())
+                    .u32(alpha_blend_operation.as_raw())
+                    .u32(write_mask.as_raw());
+            }
+        }
+    }
+    // An absent format apart from every format, `Invalid` included.
+    let format = |f: &Option<crate::metal::PixelFormat>| f.map_or(u64::MAX, |f| f.as_raw().into());
+    w.u64(format(depth_format))
+        .u64(format(stencil_format))
+        .u32(*raster_sample_count)
+        .flag(*alpha_to_coverage)
+        .flag(*alpha_to_one)
+        .flag(*rasterization_enabled)
+        .u32(input_primitive_topology.as_raw())
+        .u32(*max_vertex_amplification_count);
+    match tessellation {
+        None => {
+            w.u32(0);
+        }
+        Some(TessellationDescriptor {
+            max_tessellation_factor,
+            partition_mode,
+            factor_format,
+            factor_step_function,
+            output_winding_order,
+            control_point_index_type,
+            factor_scale_enabled,
+        }) => {
+            w.u32(1)
+                .u32(*max_tessellation_factor)
+                .u32(partition_mode.as_raw())
+                .u32(factor_format.as_raw())
+                .u32(factor_step_function.as_raw())
+                .u32(output_winding_order.as_raw())
+                .u32(control_point_index_type.as_raw())
+                .flag(*factor_scale_enabled);
+        }
+    }
+    w.flag(*support_indirect_command_buffers)
+        .u32(*max_vertex_call_stack_depth)
+        .u32(*max_fragment_call_stack_depth)
+        .flag(*support_adding_vertex_binary_functions)
+        .flag(*support_adding_fragment_binary_functions);
+    for buffers in [vertex_buffers, fragment_buffers] {
+        w.count(buffers.len());
+        for (&index, mutability) in buffers {
+            w.u32(index).u32(mutability.as_raw());
+        }
+    }
+    // Metal's raw value of each mode.
+    let rounding = match texture_write_rounding_mode {
+        crate::metal::TextureWriteRoundingMode::TowardZero => 0,
+        crate::metal::TextureWriteRoundingMode::NearestEven => 2,
+    };
+    w.u32(rounding)
+        .u64(*sample_mask)
+        .u32(sample_coverage.to_bits())
+        .flag(*sample_coverage_invert)
+        .flag(*alpha_test_enabled)
+        .u64(*alpha_test_function)
+        .flag(*logic_operation_enabled)
+        .u64(*logic_operation)
+        .u32((*clip_distance_enable_mask).into())
+        .flag(*point_smooth_enabled)
+        .flag(*point_coord_lower_left)
+        .flag(*point_size_output_vs)
+        .flag(*two_side_enabled)
+        .u32(*vertex_depth_compare_clamp_mask)
+        .u32(*fragment_depth_compare_clamp_mask)
+        .flag(*depth_stencil_write_disabled)
+        .flag(*needs_custom_border_color_samplers)
+        .u64(*vertex_amplification_mode)
+        .u32(*explicit_visibility_group_id)
+        .flag(*open_gl_mode_enabled);
+    h.bytes(&w.0);
     PipelineKey::new(h.finish())
+}
+
+/// Fixed-width little-endian words, gathered to be hashed as one field.
+struct Words(Vec<u8>);
+
+impl Words {
+    fn u32(&mut self, v: u32) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    fn u64(&mut self, v: u64) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    fn flag(&mut self, v: bool) -> &mut Self {
+        self.u32(v.into())
+    }
+
+    /// A count, before the parts it counts.
+    fn count(&mut self, n: usize) -> &mut Self {
+        self.u64(n as u64)
+    }
 }

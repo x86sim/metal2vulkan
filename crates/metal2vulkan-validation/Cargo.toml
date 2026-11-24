@@ -32,12 +32,14 @@ metal2vulkan = { path = "../metal2vulkan", features = ["serde", "ash", "cli"] }
 metal2vulkan-air = { path = "../metal2vulkan-air" }
 metal2vulkan-runtime = { path = "../metal2vulkan-runtime" }
 metal2vulkan-devtools = { path = "../metal2vulkan-devtools" }
+ash = { workspace = true, features = ["loaded"] }
 base64 = "0.22"
 libc.workspace = true
 memchr = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 wait-timeout = "0.2"
 
@@ -46,17 +48,12 @@ block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
-ash = { workspace = true, features = ["loaded"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ash = { workspace = true, features = ["loaded"] }
 
 # Device-executing tests are gated on non-default cfgs rather than features, because the ordinary
 # gate builds with `--all-features`: `--cfg m2v_gpu` (a real GPU) and `--cfg m2v_cpu_icd` (a CPU
-# Vulkan ICD such as lavapipe). See docs/VALIDATION.md. `--cfg m2v_system_alloc` keeps the system
-# allocator in the lib test binary for the runtime lanes' cost measurements (worker/alloc.rs).
+# Vulkan ICD such as lavapipe). See docs/VALIDATION.md.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(m2v_gpu)", "cfg(m2v_cpu_icd)", "cfg(m2v_gpu_hazards)", "cfg(m2v_system_alloc)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(m2v_gpu)", "cfg(m2v_cpu_icd)", "cfg(m2v_gpu_hazards)"] }
 
 [build-dependencies]
 sha2.workspace = true
@@ -70,10 +67,6 @@ proc-macro2 = "1"
 # then build no test harness of it (one compile and one link of the whole translator, runtime and
 # validation saved per binary on every test build). The integration test `bins.rs` fails when such a
 # binary's sources hold a `#[test]`; a binary that gains unit tests drops the line.
-[[bin]]
-name = "corpus-draw-ab"
-path = "src/bin/corpus-draw-ab.rs"
-
 [[bin]]
 name = "command-replay"
 path = "src/bin/command-replay.rs"
@@ -104,11 +97,6 @@ path = "src/bin/corpus-metal.rs"
 test = false
 
 [[bin]]
-name = "corpus-moltenvk"
-path = "src/bin/corpus-moltenvk.rs"
-test = false
-
-[[bin]]
 name = "corpus-vulkan"
 path = "src/bin/corpus-vulkan.rs"
 test = false
@@ -120,9 +108,4 @@ path = "src/bin/corpus-pipeline.rs"
 [[bin]]
 name = "corpus-triage"
 path = "src/bin/corpus-triage.rs"
-
-[[bin]]
-name = "format-scout"
-path = "src/bin/format-scout.rs"
-test = false
 

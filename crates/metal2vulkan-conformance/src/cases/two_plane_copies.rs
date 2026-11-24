@@ -1,5 +1,4 @@
-//! Copies of Apple's two-plane extended-range textures, ported from
-//! `runtime_lane::two_plane_copies`.
+//! Copies of Apple's two-plane extended-range textures.
 //!
 //! Two cases, both from the halves of that lane whose Metal values were measured on **this** chip
 //! under **this** release:
@@ -25,29 +24,24 @@
 //! answer because two of its twenty-two blits fill first, and `two-plane-pad-fills` because every
 //! case of it is a fill.
 //!
-//! **Not ported, and why.** The lane's other three families stay the lane's:
+//! **Not cases, and why:**
 //!
-//! - its `METAL` table of 66 digests (`get`, `t2b`, `rep`, `b2t`, `t2t`) was measured on **an Apple
-//!   M4** under macOS 27.0.1. A recording is keyed by chip, and this round records this M3 Max
-//!   alone, so carrying an M4's digests into an `apple-m3-max` answer would key a measurement to a
-//!   chip it was not taken on. The right fix is a carried answer that names the chip it was
-//!   measured on, which the recording format does not hold today.
-//! - its byte model (`bind::plane_copy`) is a check against our own model, not against Metal, so
-//!   there is nothing for a Metal side to answer.
-//! - its chained-blit case asserts a notice fired on the second copy and not the first, which is a
-//!   per-device once rule rather than a Metal observation.
+//! - the copies `get`, `t2b`, `rep`, `b2t` and `t2t`, whose 66 digests were measured on **an Apple
+//!   M4** under macOS 27.0.1. No case carries them; one that did would name that chip
+//!   ([`MetalSource::measured_on`](crate::case::MetalSource::measured_on)).
+//! - a byte model of the plane copy is a check against our own model, not against Metal, so there
+//!   is nothing for a Metal side to answer.
+//! - whether a notice fires on a chained blit's second copy and not its first is a per-device once
+//!   rule rather than a Metal observation.
 
-use crate::allowance::Allowance;
 use crate::case::{answered, call, Abort, Case, Input, MetalSource, Side};
 use crate::measured::hex_bytes;
-use crate::replay::{notice_allowance, NOTICES_SITE};
+use crate::replay::NOTICES_SITE;
 use crate::transcript::{Digest, DigestKind, Node, Observed, Sites, Transcript, Value};
 use crate::work::{Plane, Rect, Resource, Step, Storage, TextureSpec, Work};
 
 /// Where the carried values were measured.
-const MEASURED_IN: &str =
-    "runtime_lane::two_plane_copies, from the probes bp.m and pad.m (an Apple M3 Max, \
-     macOS 27.0.1)";
+const MEASURED_IN: &str = "the probes bp.m and pad.m (an Apple M3 Max, macOS 27.0.1)";
 
 /// Why record mode must not run a case that fills on Metal.
 ///
@@ -426,31 +420,6 @@ impl Case for RowBlits {
         ])
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every case declares the notice the venue's own memory model provokes: the buffer it
-        // reads the copied planes back through is `Shared`, which a device with no unified memory
-        // keeps in system memory because that is the only memory both sides can reach.
-        let shared = crate::replay::shared_memory_notice();
-        if !self.announced {
-            // Three of the blits place their texture in a placement heap, where this device keeps
-            // the two-plane texture's texels in the heap's bytes and announces it. Metal announces
-            // nothing, so the notices site differs and that notice is what justifies it. Every
-            // word still compares exactly.
-            return vec![
-                notice_allowance(metal2vulkan_runtime::Degradation::ShadowedTexture.code()),
-                shared,
-            ];
-        }
-        // Into the texture, where rows meet and Metal's own order varies from run to run, the
-        // device says which row's bytes it kept. Metal announces nothing, so the notices site
-        // differs; the two notices are what justify it. The words still compare exactly.
-        vec![
-            notice_allowance(metal2vulkan_runtime::Degradation::TwoPlaneBufferBlit.code()),
-            notice_allowance(metal2vulkan_runtime::Degradation::TwoPlaneBufferBlitOrder.code()),
-            shared,
-        ]
-    }
-
     fn carried_transcript(&self) -> Result<Option<(u32, Transcript)>, String> {
         if self.announced {
             // Record mode runs this one on Metal. Its probe's table stays as the cross-check
@@ -650,7 +619,7 @@ pub struct PadFills {
     name: &'static str,
 }
 
-/// The ported case.
+/// The case.
 pub fn pad_fills() -> PadFills {
     PadFills {
         name: "two-plane-pad-fills",
@@ -670,19 +639,6 @@ impl Case for PadFills {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::carried_only(MEASURED_IN, PRIVATE_FILL)
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // A fill into a two-plane texture's planes goes through the device's two-plane buffer
-        // blit, which it announces. Metal announces nothing, so the notices site differs and that
-        // notice is what justifies it; every digest still compares exactly. The sibling row blits
-        // name this notice for the same reason, and the order notice besides, which a fill of
-        // whole rows never meets.
-        vec![
-            notice_allowance(metal2vulkan_runtime::Degradation::TwoPlaneBufferBlit.code()),
-            // The venue's own, for the `Shared` read-back buffer, as the row blits state.
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {

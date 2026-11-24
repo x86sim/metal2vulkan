@@ -27,13 +27,13 @@
 //! output alone does not interlock the function, so a function whose groups hold nothing else
 //! compiles on every device, the ones without an interlock included.
 //!
-//! **Color inputs without an ordered fetch form**. On a device with neither rasterization-order
-//! color attachment access nor the pixel interlock (`fetch::fetch_unordered`), a color input reads
-//! its input attachment ordered between draws alone, by the consumer's barriers. A group on such
-//! an input, or on a color output of an attachment the function reads, asks for the order of that
-//! read, which is the read's own there: it does not interlock the function, and the read's
-//! fragments of one draw stay unordered (`PrecisionNote::UnorderedFetchWithinDraw`, which the read
-//! records). A group on anything else still needs the interlock.
+//! **Color inputs**. A color input reads its input attachment ordered between draws alone, by the
+//! consumer's barriers (under the identity domains, the attachment's pushed texture; `fetch`). A group on such an input, or on a color output of an attachment the
+//! function reads, asks for the order of that read, which is the read's own there: it does not
+//! interlock the function, since the interlock cannot order the attachment's own write, which
+//! happens after the function, and the read's fragments of one draw stay unordered
+//! (`PrecisionNote::UnorderedFetchWithinDraw`, which the read records). A group on anything else,
+//! memory the function reads and writes, still needs the interlock.
 //!
 //! **Unused inputs**. A group on a parameter the body never uses, such as an input whose reads the
 //! function's constants fold away, orders no access, and neither does a member of a layout only
@@ -44,12 +44,8 @@
 //!
 //! **Mode** ([`mode`]). `PixelInterlockOrderedEXT` where the profile has
 //! `fragmentShaderPixelInterlock`: it orders every invocation covering the pixel, which covers
-//! Metal's pixel- and sample-rate ordering. `SampleInterlockOrderedEXT` orders only invocations
-//! covering the same sample, which equals Metal's ordering only when the module itself runs at
-//! sample rate (it reads `SampleId` or has a sample-interpolated input); a pixel-rate module on a
-//! multisampled target would leave two fragments covering disjoint samples of one pixel unordered,
-//! so there it is not used. Otherwise the function is refused
-//! `Unsupported{RasterOrderGroups, AnyOf[[FragmentShaderPixelInterlock], ...]}`.
+//! Metal's pixel- and sample-rate ordering. Otherwise the function is refused
+//! `Unsupported{RasterOrderGroups, AnyOf[[FragmentShaderPixelInterlock]]}`.
 
 use std::collections::BTreeSet;
 
@@ -57,9 +53,8 @@ use crate::air::abi::{MemberKind, OutputRole, ParamRole, StructRef};
 use crate::device::requirements::VkFeature;
 use crate::error::{Capability, Error, Feature, Unsupported};
 use crate::lower::select::SelectCx;
-use crate::lower::stage_io::IoObject;
 use crate::pipeline::sym::Stage;
-use crate::spirv::ir::{ExecMode, IoDir, Sampling};
+use crate::spirv::ir::ExecMode;
 
 /// The raster order group a parameter role names, if any.
 fn role_group(role: &ParamRole) -> Option<u32> {
@@ -92,33 +87,16 @@ fn role_layouts(role: &ParamRole) -> [Option<StructRef>; 2] {
 /// attachment), or an argument-buffer or imageblock member of a layout its used parameters and its
 /// outputs reach. `e.structs` holds every layout of the module, so a layout only another function
 /// names does not count. A group's color output the function does not read needs none, and neither
-/// does a group on a parameter the body never uses, nor, on a device with neither ordered fetch
-/// form, a group on a color input or on a color output of an attachment the function reads
-/// ([module docs](self)).
+/// does a group on a parameter the body never uses, nor a group on a color input or on a color
+/// output of an attachment the function reads ([module docs](self)).
 pub(super) fn declared(cx: &SelectCx<'_>) -> bool {
     let e = cx.entry;
     let used = &crate::lower::users::params_used(cx.body);
     let params = || e.ep.params.iter().filter(move |b| used.contains(&b.param));
-    let read = |attachment| {
-        params()
-            .any(|b| matches!(b.role, ParamRole::ColorInput { index, .. } if index == attachment))
-    };
-    // Whether a group on a color read interlocks: not where the read is ordered between draws
-    // alone.
-    let colors = !super::fetch::fetch_unordered(cx.profile);
-    let named = params().any(|b| {
-        role_group(&b.role).is_some() && (colors || !matches!(b.role, ParamRole::ColorInput { .. }))
-    });
-    let outputs = colors
-        && e.ep.outputs.iter().any(|o| match o.role {
-            OutputRole::RenderTarget {
-                attachment,
-                raster_order_group: Some(_),
-                ..
-            } => read(attachment),
-            _ => false,
-        });
-    if named || outputs {
+    // A group on a color read does not interlock: the read is ordered between draws alone.
+    let named = params()
+        .any(|b| role_group(&b.role).is_some() && !matches!(b.role, ParamRole::ColorInput { .. }));
+    if named {
         return true;
     }
     let mut stack: Vec<StructRef> = params()
@@ -153,19 +131,6 @@ pub(super) fn declared(cx: &SelectCx<'_>) -> bool {
     false
 }
 
-/// Whether the planned stage interface makes the module run at sample rate: it reads `SampleId`
-/// or declares a sample-interpolated input.
-fn sample_rate(objects: &[IoObject]) -> bool {
-    objects.iter().any(|o| match o {
-        IoObject::Builtin { builtin, dir, .. } => {
-            *builtin == crate::spv::BuiltIn::SampleId && *dir == IoDir::Input
-        }
-        IoObject::User { dir, deco, .. } => {
-            *dir == IoDir::Input && deco.sampling == Sampling::Sample
-        }
-    })
-}
-
 /// The interlock mode of a function in a raster order group, or its refusal. Called once the
 /// stage interface is planned (`fragment::finish`).
 pub(super) fn mode(cx: &SelectCx<'_>) -> Result<ExecMode, Error> {
@@ -173,24 +138,14 @@ pub(super) fn mode(cx: &SelectCx<'_>) -> Result<ExecMode, Error> {
         // Metal orders raster order groups between fragments only.
         return Err(Unsupported::not_implemented(Feature::RasterOrderGroups).into());
     }
-    let f = cx.profile.fields().fragment;
-    let per_sample = sample_rate(&cx.families.stage_io.objects);
-    if f.pixel_interlock {
+    if cx.profile.fields().fragment.pixel_interlock {
         return Ok(ExecMode::PixelInterlockOrdered);
     }
-    if f.sample_interlock && per_sample {
-        return Ok(ExecMode::SampleInterlockOrdered);
-    }
-    let pixel = vec![Capability::Feature(VkFeature::FragmentShaderPixelInterlock)];
-    let alternatives = if per_sample {
-        vec![
-            pixel,
-            vec![Capability::Feature(
-                VkFeature::FragmentShaderSampleInterlock,
-            )],
-        ]
-    } else {
-        vec![pixel]
-    };
-    Err(Unsupported::needs_any_of(Feature::RasterOrderGroups, alternatives).into())
+    Err(Unsupported::needs_any_of(
+        Feature::RasterOrderGroups,
+        vec![vec![Capability::Feature(
+            VkFeature::FragmentShaderPixelInterlock,
+        )]],
+    )
+    .into())
 }

@@ -42,7 +42,7 @@
 //!   `x4..`) `L = 9576 ((Y << u) - 64)`, full range (`420f`, `xf..`)
 //!   `L = 256 ⌊(32768 Y + ⌊m / 2⌋) / m⌋` with `m = 2^b - 1`. Red, green and blue are each
 //!   `v / 2048`, where `v = clamp((L + kb Cb' + kr Cr' + 2048) >> 12, 0, 2048)` (an arithmetic
-//!   shift) with the channel's `(kb, kr)` of the range and matrix ([`ycbcr_read`]); alpha is 1.
+//!   shift) with the channel's `(kb, kr)` of the range and matrix; alpha is 1.
 //!   Every value lies on the grid of `1 / 2048`, which a half float holds exactly.
 //! - **sRGB** ([`YCbCrOutput::Srgb`], the `_sRGB` twins `YCBCR8_420_2P_sRGB` over `420v` and `420f`
 //!   and `YCBCR10_420_2P_sRGB` over `x420`, `xf20`, `x422` and `xf44`, as textures and as views of
@@ -53,51 +53,18 @@
 //!   12.92` up to `0.04045`, `((c + 0.055) / 1.055)^2.4` above), joined by straight lines: with `i
 //!   = min(q >> 4, 511)` and `f = q - 16 i`, the step `(16 K[i] + (K[i + 1] - K[i]) f) / 16`
 //!   rounded to nearest even, each channel that step `/ 8192`; alpha is 1. A half float does not
-//!   hold every step (above `1/4`), so the image is `R32G32B32A32_SFLOAT`.
+//!   hold every step (above `1/4`).
 //!
-//! **The module** (one per device and conversion: the layout of the codes, their range and their
-//! matrix, [`YCbCrConversion`], which the module resolves as it is built, so no invocation
-//! branches on them). One `GLCompute` entry `main` with local size
-//! ([`YCbCrConvertModule::LOCAL_SIZE`], [`YCbCrConvertModule::LOCAL_SIZE`], 1), no push constants,
-//! and in set 0:
-//!
-//! | Binding | Resource |
-//! |---|---|
-//! | [`YCbCrConvertModule::IMAGE_BINDING`] | the texture's image, a 2D storage image, written: `Rgba16f` of the converted texels, `Rgba32f` of the sRGB ones, or `R32ui` of the codes packed as `A2B10G10R10_UNORM_PACK32` (10 bits) or `R8G8B8A8_UNORM` (8 bits) packs them (a view of that image); `Rgba32f` of any texels, as floats, from [`ycbcr_convert_floats_module`] |
-//! | [`YCbCrConvertModule::SHAPE_BINDING`] | the texture's size and its planes' first bytes and rows ([`YCbCrConvertModule::shape`]), a storage buffer |
-//! | [`YCbCrConvertModule::BYTES_BINDING`] | the surface's bytes, 4 to a word, a storage buffer |
-//!
-//! Invocation `(x, y)` inside the texture writes texel `(x, y)` as above, from the bytes
-//! binding's luma and chroma codes at the shape's offsets and rows. One outside it writes
-//! nothing. The consumer dispatches `⌈w / 8⌉ x ⌈h / 8⌉` workgroups and keeps the bytes binding
-//! within `maxStorageBufferRange`.
-//!
-//! **Synchronization** (consumer): the writes of the bytes and the shape (`TRANSFER_WRITE`) →
-//! `SHADER_STORAGE_READ` in `COMPUTE_SHADER` before the dispatch; its image writes
-//! (`SHADER_STORAGE_WRITE`) → whatever reads the texture after.
+//! A consumer that holds such a texture as its texels computes them from the planes' bytes by
+//! these rules.
 
-use std::sync::Arc;
-
-use crate::budget::{Budget, Meter};
-use crate::device::requirements::Requirements;
-use crate::device::Device;
-use crate::error::{Error, InternalError, InternalKind};
 use crate::metal::format::ChromaSubsampling;
-use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage, Symbol};
-use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
-use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
-use crate::spirv::error::BResult;
-use crate::spirv::ids::{GlobalId, TypeId, Value};
-use crate::spirv::ir::{
-    natural_layout, BinOp, ConstBits, Constant, ConvOp, Dim, ExecMode, ExecModel, GlslOp,
-    ImageOperands, ImageType, ImageUsage, IoDir, LayoutRule, MemAccess, StorageClass, TexelMemory,
-    Type, TypedModule,
-};
 
 /// The range of a YCbCr surface's codes, which its pixel format names.
+#[cfg(test)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum YCbCrRange {
+pub(crate) enum YCbCrRange {
     /// Video range: luma codes 16 to 235 span black to white (CoreVideo's `420v`).
     Video,
     /// Full range: luma codes 0 to 255 (CoreVideo's `420f`).
@@ -106,9 +73,10 @@ pub enum YCbCrRange {
 
 /// The YCbCr matrix of a conversion: the surface's `IOSurfaceYCbCrMatrix` as Metal reads it when
 /// it makes the texture (none reads as BT.601).
+#[cfg(test)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum YCbCrMatrix {
+pub(crate) enum YCbCrMatrix {
     /// ITU-R BT.601 (`ITU_R_601_4`, or no matrix).
     Bt601,
     /// ITU-R BT.709 (`ITU_R_709_2`).
@@ -117,25 +85,21 @@ pub enum YCbCrMatrix {
     Bt2020,
 }
 
-/// What a YCbCr texture's texels read of its codes (the module docs), which picks the module's
-/// image.
+/// What a YCbCr texture's texels read of its codes (the module docs).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum YCbCrOutput {
     /// The color converted by the surface's range and matrix, each channel a multiple of
-    /// `1 / 2048`: an `R16G16B16A16_SFLOAT` image, written through an `Rgba16f` view.
+    /// `1 / 2048`.
     Converted,
-    /// The codes themselves, red Cr, green Y and blue Cb: an `A2B10G10R10_UNORM_PACK32` image of
-    /// 10-bit codes, an `R8G8B8A8_UNORM` one of 8-bit codes, written packed through an `R32ui`
-    /// view of it.
+    /// The codes themselves, red Cr, green Y and blue Cb, each `code / (2^b - 1)`.
     Codes,
-    /// The converted color through the sRGB curve, each channel a multiple of `1 / 8192`: an
-    /// `R32G32B32A32_SFLOAT` image, written through an `Rgba32f` view.
+    /// The converted color through the sRGB curve, each channel a multiple of `1 / 8192`.
     Srgb,
 }
 
 /// How a two-plane format's planes hold its codes, and what its texels read of them: the layouts
-/// the module converts (the module docs).
+/// Metal's conversion is modelled for (the module docs).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct YCbCrCodes {
@@ -156,8 +120,8 @@ pub struct YCbCrCodes {
 }
 
 impl YCbCrCodes {
-    /// The codes of a two-plane format of `format`'s layout, `None` for a layout the module does
-    /// not convert: the 4:2:0, 4:2:2 and 4:4:4 formats of unpacked codes, 8- and 10-bit ones read
+    /// The codes of a two-plane format of `format`'s layout, `None` for a layout the conversion
+    /// does not model: the 4:2:0, 4:2:2 and 4:4:4 formats of unpacked codes, 8- and 10-bit ones read
     /// converted (`YCBCR8_420_2P`, `YCBCR10_444_2P`, ...), through the sRGB curve (their
     /// `_sRGB` twins) or as codes (`RGB8_420_2P`, `RGB10_422_2P`, ...), and the packed 10-bit ones
     /// read converted or through the sRGB curve (`YCBCR10_420_2P_PACKED`,
@@ -184,12 +148,8 @@ impl YCbCrCodes {
         })
     }
 
-    /// The largest code, `2^bits - 1`.
-    fn max(&self) -> u32 {
-        (1 << self.bits) - 1
-    }
-
     /// The codes a unit holds: 3 packed, 1 otherwise.
+    #[cfg(test)]
     fn per_unit(&self) -> u32 {
         match self.packed {
             true => 3,
@@ -199,32 +159,31 @@ impl YCbCrCodes {
 
     /// The units that hold `n` codes from a row's start: `⌈n / 3⌉` packed, `n` otherwise. A
     /// plane's row of `n` codes is that many units of [`bytes`](Self::bytes) bytes.
-    pub fn units(&self, n: u64) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn units(&self, n: u64) -> u64 {
         n.div_ceil(u64::from(self.per_unit()))
-    }
-
-    /// The shift that takes a unit to its first code: `8 * bytes - bits` (the high bits of a
-    /// byte or a 16-bit word), and 0 packed.
-    fn first_shift(&self) -> u32 {
-        match self.packed {
-            true => 0,
-            false => 8 * self.bytes - self.bits,
-        }
-    }
-
-    /// The bits from one code of a unit to the next: [`bits`](Self::bits) packed, 0 otherwise.
-    fn step(&self) -> u32 {
-        match self.packed {
-            true => self.bits,
-            false => 0,
-        }
     }
 }
 
-/// Where a texture's two planes lie in the bytes the module reads, and how they convert.
+/// The `(kb, kr)` of red, green and blue for `range` and `matrix`, in the units of the module
+/// docs' conversion (measured, the module docs).
+#[cfg(test)]
+pub(crate) fn coefficients(range: YCbCrRange, matrix: YCbCrMatrix) -> [(i32, i32); 3] {
+    match (range, matrix) {
+        (YCbCrRange::Video, YCbCrMatrix::Bt601) => [(-9, 13123), (-3218, -6686), (16591, 9)],
+        (YCbCrRange::Video, YCbCrMatrix::Bt709) => [(-1, 14743), (-1753, -4383), (17373, 1)],
+        (YCbCrRange::Full, YCbCrMatrix::Bt601) => [(-8, 11483), (-2816, -5850), (14518, 8)],
+        (YCbCrRange::Full, YCbCrMatrix::Bt709) => [(-1, 12900), (-1534, -3835), (15201, 1)],
+        (YCbCrRange::Video, YCbCrMatrix::Bt2020) => [(0, 13806), (-1540, -5349), (17614, -1)],
+        (YCbCrRange::Full, YCbCrMatrix::Bt2020) => [(0, 12080), (-1348, -4680), (15412, -1)],
+    }
+}
+
+/// Where a texture's two planes lie in its surface's bytes, and how they convert.
+#[cfg(test)]
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct YCbCrPlanes {
+pub(crate) struct YCbCrPlanes {
     /// The texture's width and height, in luma texels.
     pub size: [u32; 2],
     /// The luma plane's first byte, and the bytes from one of its rows to the next.
@@ -237,11 +196,12 @@ pub struct YCbCrPlanes {
     pub codes: YCbCrCodes,
 }
 
+#[cfg(test)]
 impl YCbCrPlanes {
     /// The planes of a texture of `size` texels whose luma plane starts at byte `luma[0]` with
     /// rows `luma[1]` bytes apart, and whose chroma plane at `chroma[0]` with rows `chroma[1]`
     /// apart, holding `codes`.
-    pub fn new(
+    pub(crate) fn new(
         size: [u32; 2],
         luma: [u32; 2],
         chroma: [u32; 2],
@@ -260,95 +220,17 @@ impl YCbCrPlanes {
 
     /// The chroma plane's texels across and down: `⌈w / 2⌉ x ⌈h / 2⌉` for 4:2:0 codes,
     /// `⌈w / 2⌉ x h` for 4:2:2 ones and `w x h` for 4:4:4 ones.
-    pub fn chroma_size(&self) -> [u32; 2] {
+    pub(crate) fn chroma_size(&self) -> [u32; 2] {
         let halved = self.codes.subsampling.halved();
         [0, 1].map(|axis| match halved[axis] {
             true => self.size[axis].div_ceil(2),
             false => self.size[axis],
         })
     }
-
-    /// The conversion the planes read ([`YCbCrConversion::of`]): the module built for it converts
-    /// them.
-    pub fn conversion(&self) -> YCbCrConversion {
-        YCbCrConversion::of(self.codes, (self.range, self.matrix))
-    }
-}
-
-/// What a conversion module is built for: everything of a texture's planes that the module
-/// resolves as it is built, which is all of them but the texture's size and its planes' first
-/// bytes and rows ([`YCbCrConvertModule::shape`] still states those).
-///
-/// A texture's planes name theirs ([`YCbCrPlanes::conversion`]), and two textures of one
-/// conversion read through one module. [`of`](Self::of) is the only way to one: a conversion read
-/// as codes ([`YCbCrOutput::Codes`]) reads neither range nor matrix, so every range and matrix of
-/// one such layout names the same conversion and is converted by the same module.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct YCbCrConversion {
-    /// How the planes hold the codes, and what a texel reads.
-    pub codes: YCbCrCodes,
-    /// The codes' range, [`YCbCrRange::Video`] of a layout read as codes.
-    pub range: YCbCrRange,
-    /// The codes' matrix, [`YCbCrMatrix::Bt601`] of a layout read as codes.
-    pub matrix: YCbCrMatrix,
-}
-
-impl YCbCrConversion {
-    /// The conversion of `codes` under `range` and `matrix`: a layout read as codes
-    /// ([`YCbCrOutput::Codes`]) reads neither, so it names [`YCbCrRange::Video`] and
-    /// [`YCbCrMatrix::Bt601`] whatever the surface's own.
-    pub fn of(codes: YCbCrCodes, (range, matrix): (YCbCrRange, YCbCrMatrix)) -> YCbCrConversion {
-        let (range, matrix) = match codes.output {
-            YCbCrOutput::Codes => (YCbCrRange::Video, YCbCrMatrix::Bt601),
-            YCbCrOutput::Converted | YCbCrOutput::Srgb => (range, matrix),
-        };
-        YCbCrConversion {
-            codes,
-            range,
-            matrix,
-        }
-    }
-}
-
-/// Every conversion a two-plane YCbCr texture can name ([`YCbCrPlanes::conversion`]): each
-/// layout the module converts ([`YCbCrCodes::of`] over every pixel format) under each range and
-/// matrix its texels read, a layout read as codes under one ([`YCbCrConversion::of`]). These and
-/// their floats twins are every conversion module a device can be asked for, so twice this many
-/// bound what one holds.
-#[cfg(test)]
-pub(crate) fn conversions() -> Vec<YCbCrConversion> {
-    let mut out: Vec<YCbCrConversion> = Vec::new();
-    for pf in crate::metal::PixelFormat::ALL.iter().copied() {
-        let Some(codes) = crate::metal::format::ycbcr_format(pf).and_then(YCbCrCodes::of) else {
-            continue;
-        };
-        for range in [YCbCrRange::Video, YCbCrRange::Full] {
-            for matrix in [YCbCrMatrix::Bt601, YCbCrMatrix::Bt709, YCbCrMatrix::Bt2020] {
-                let conversion = YCbCrConversion::of(codes, (range, matrix));
-                if !out.contains(&conversion) {
-                    out.push(conversion);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// The `(kb, kr)` of red, green and blue for `range` and `matrix`, in the units of the module
-/// docs' conversion (measured, the module docs).
-pub(crate) fn coefficients(range: YCbCrRange, matrix: YCbCrMatrix) -> [(i32, i32); 3] {
-    match (range, matrix) {
-        (YCbCrRange::Video, YCbCrMatrix::Bt601) => [(-9, 13123), (-3218, -6686), (16591, 9)],
-        (YCbCrRange::Video, YCbCrMatrix::Bt709) => [(-1, 14743), (-1753, -4383), (17373, 1)],
-        (YCbCrRange::Full, YCbCrMatrix::Bt601) => [(-8, 11483), (-2816, -5850), (14518, 8)],
-        (YCbCrRange::Full, YCbCrMatrix::Bt709) => [(-1, 12900), (-1534, -3835), (15201, 1)],
-        (YCbCrRange::Video, YCbCrMatrix::Bt2020) => [(0, 13806), (-1540, -5349), (17614, -1)],
-        (YCbCrRange::Full, YCbCrMatrix::Bt2020) => [(0, 12080), (-1348, -4680), (15412, -1)],
-    }
 }
 
 /// The luma term of the conversion for the code `y` of `bits` bits (the module docs).
+#[cfg(test)]
 fn luma_term(range: YCbCrRange, bits: u32, y: u32) -> i32 {
     let max = (1u32 << bits) - 1;
     match range {
@@ -359,6 +241,7 @@ fn luma_term(range: YCbCrRange, bits: u32, y: u32) -> i32 {
 
 /// The sRGB curve's knots on the grid of `1 / 8192` (the module docs): `K[j]`, the step nearest
 /// `8192 · srgb(16 j / 8192)`, for `j` from 0 to 512 (`the_srgb_knots_are_the_curves`).
+#[cfg(test)]
 const SRGB_KNOTS: [u16; 513] = [
     0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22, 24, 25, 26, 27, 29, 30, 31,
     33, 34, 36, 37, 39, 41, 42, 44, 46, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65, 68, 70, 72, 74, 77,
@@ -394,6 +277,7 @@ const SRGB_KNOTS: [u16; 513] = [
 
 /// The step of `1 / 8192` Metal reads for the converted sum's step `q` (at most 8192) of an sRGB
 /// format (the module docs): the knots joined by straight lines, rounded to nearest even.
+#[cfg(test)]
 fn srgb_step(q: u32) -> u16 {
     let i = (q >> 4).min(511) as usize;
     let f = q - 16 * i as u32;
@@ -405,7 +289,14 @@ fn srgb_step(q: u32) -> u16 {
 /// Metal's red, green and blue of a texel of luma code `y` whose chroma rounded to the 8-bit
 /// codes `cb` and `cr` (the module docs), each `v` of the value `v / 2048`: [`ycbcr_read`] of
 /// 8-bit codes read converted.
-pub fn ycbcr_texel(range: YCbCrRange, matrix: YCbCrMatrix, y: u8, cb: u8, cr: u8) -> [u16; 3] {
+#[cfg(test)]
+pub(crate) fn ycbcr_texel(
+    range: YCbCrRange,
+    matrix: YCbCrMatrix,
+    y: u8,
+    cb: u8,
+    cr: u8,
+) -> [u16; 3] {
     let codes = YCbCrCodes {
         bits: 8,
         bytes: 1,
@@ -420,7 +311,8 @@ pub fn ycbcr_texel(range: YCbCrRange, matrix: YCbCrMatrix, y: u8, cb: u8, cr: u8
 /// rounded to the codes `cb` and `cr` (the module docs): each `v` of the value `v / 2048` for
 /// codes read converted, by `range` and `matrix`, and of `v / 8192` for codes read through the
 /// sRGB curve; the codes `cr`, `y` and `cb` of `code / (2^bits - 1)` for codes read as codes.
-pub fn ycbcr_read(
+#[cfg(test)]
+pub(crate) fn ycbcr_read(
     codes: YCbCrCodes,
     (range, matrix): (YCbCrRange, YCbCrMatrix),
     [y, cb, cr]: [u16; 3],
@@ -440,697 +332,19 @@ pub fn ycbcr_read(
     }
 }
 
-/// The crate-owned YCbCr conversion module of one device, validated like any output.
+/// The device's own sampler Y′CbCr conversion of a two-plane YCbCr texture's planes held as an
+/// image of the multi-planar 4:2:0 format over their bytes: the codes' bits, the surface's range
+/// and matrix, Metal's reconstruction (the chroma at the midpoint through a linear chroma filter)
+/// and a linear filter. A slot that samples such a texture through it is a combined image sampler
+/// whose immutable sampler is the device's conversion of this (`ResourceKind::YCbCrPlanes`,
+/// `vk::SamplerDesc::ycbcr`); the consumer makes the image's view with the same conversion.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct YCbCrConvertModule {
-    /// SPIR-V 1.5 words, entry point `main`, bindings numbered as below in set 0.
-    pub spirv: Arc<[u32]>,
-    /// What the module needs from the device (within every Vulkan 1.2 device).
-    pub requirements: Requirements,
-}
-
-impl YCbCrConvertModule {
-    /// Descriptor set of every binding.
-    pub const SET: u32 = 0;
-    /// The texture's image: a 2D storage image, written (`Rgba16f` of the converted texels,
-    /// `Rgba32f` of the sRGB ones, `R32ui` of the packed codes of either width; the module
-    /// docs).
-    pub const IMAGE_BINDING: u32 = 0;
-    /// The planes' shape: a storage buffer of [`SHAPE_WORDS`](Self::SHAPE_WORDS) words.
-    pub const SHAPE_BINDING: u32 = 1;
-    /// The surface's bytes, 4 to a word: a storage buffer.
-    pub const BYTES_BINDING: u32 = 2;
-    /// The words of a shape.
-    pub const SHAPE_WORDS: u32 = 6;
-    /// Invocations of one workgroup along x, and along y: one texel each.
-    pub const LOCAL_SIZE: u32 = 8;
-
-    /// The shape's bytes of `planes`: the texture's size and its planes' first bytes and rows
-    /// alone. The rest of the planes is their conversion ([`YCbCrPlanes::conversion`]), which the
-    /// module holds.
-    pub fn shape(planes: &YCbCrPlanes) -> [u8; Self::SHAPE_WORDS as usize * 4] {
-        let words = [
-            planes.size[0],
-            planes.size[1],
-            planes.luma[0],
-            planes.luma[1],
-            planes.chroma[0],
-            planes.chroma[1],
-        ];
-        let mut bytes = [0; Self::SHAPE_WORDS as usize * 4];
-        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-            chunk.copy_from_slice(&word.to_le_bytes());
-        }
-        bytes
-    }
-}
-
-/// The shape's words, in order (written by [`YCbCrConvertModule::shape`]).
-mod word {
-    pub(super) const WIDTH: u32 = 0;
-    pub(super) const HEIGHT: u32 = 1;
-    pub(super) const LUMA_OFFSET: u32 = 2;
-    pub(super) const LUMA_ROW: u32 = 3;
-    pub(super) const CHROMA_OFFSET: u32 = 4;
-    pub(super) const CHROMA_ROW: u32 = 5;
-}
-
-/// The binding symbol of the image in the typed module.
-const IMAGE: ResourceSlot = ResourceSlot {
-    stage: Stage::Kernel,
-    kind: ResourceKind::Texture,
-    index: 0,
-};
-/// The binding symbol of the shape in the typed module.
-const SHAPE: ResourceSlot = ResourceSlot {
-    stage: Stage::Kernel,
-    kind: ResourceKind::Buffer,
-    index: 0,
-};
-/// The binding symbol of the surface's bytes in the typed module.
-const BYTES: ResourceSlot = ResourceSlot {
-    stage: Stage::Kernel,
-    kind: ResourceKind::Buffer,
-    index: 1,
-};
-
-/// A `Block { u32 words[]; }` storage buffer bound at `sym`.
-pub(super) fn words_buffer(
-    b: &mut ModuleBuilder,
-    sym: ResourceSlot,
-    u32_: TypeId,
-) -> BResult<GlobalId> {
-    let rta = b.ty(Type::RuntimeArray {
-        elem: u32_,
-        stride: Some(4),
-    })?;
-    let layout = natural_layout(b.types(), LayoutRule::Std430, true, &[rta])?;
-    let block = b.ty(Type::Struct {
-        members: [rta].into(),
-        layout: Some(layout),
-    })?;
-    b.resource(sym, StorageClass::StorageBuffer, block)
-}
-
-/// The sRGB knots ([`SRGB_KNOTS`]) as a `Private` `u32[513]` initialized to them.
-fn knots_table(b: &mut ModuleBuilder, u32_: TypeId) -> BResult<GlobalId> {
-    let len = b.constant(Constant::Scalar {
-        ty: u32_,
-        bits: ConstBits(SRGB_KNOTS.len() as u64),
-    })?;
-    let arr = b.ty(Type::Array {
-        elem: u32_,
-        len,
-        stride: None,
-    })?;
-    let mut parts = Vec::with_capacity(SRGB_KNOTS.len());
-    for k in SRGB_KNOTS {
-        parts.push(b.constant(Constant::Scalar {
-            ty: u32_,
-            bits: ConstBits(u64::from(k)),
-        })?);
-    }
-    let init = b.constant(Constant::Composite {
-        ty: arr,
-        parts: parts.into(),
-    })?;
-    b.plain_global(StorageClass::Private, arr, Some(init))
-}
-
-/// A scalar constant of `ty` with `bits`, as a value.
-pub(super) fn scalar(f: &mut FunctionBuilder<'_>, ty: TypeId, bits: u64) -> BResult<Value> {
-    let c = f.module().constant(Constant::Scalar {
-        ty,
-        bits: ConstBits(bits),
-    })?;
-    f.module().const_value(c)
-}
-
-/// The values the conversion of one texel reads, and the layout the module was built for: what
-/// [`YCbCrCodes`] states of a code's place is a constant of the module, not a word it loads.
-#[derive(Clone, Copy)]
-struct Cx {
-    u32_: TypeId,
-    zero: Value,
-    one: Value,
-    bytes: Value,
-    /// How the planes hold their codes, which the module was built for.
-    codes: YCbCrCodes,
-}
-
-impl Cx {
-    fn uint(&self, f: &mut FunctionBuilder<'_>, v: u32) -> BResult<Value> {
-        scalar(f, self.u32_, u64::from(v))
-    }
-
-    /// The word of the bytes binding that holds the byte at `at`.
-    fn word(&self, f: &mut FunctionBuilder<'_>, at: Value) -> BResult<Value> {
-        let two = self.uint(f, 2)?;
-        let index = f.binary(BinOp::ShiftRightLogical, at, two)?;
-        let p = f.access_chain(self.bytes, &[self.zero, index])?;
-        f.load(p, MemAccess::default())
-    }
-
-    /// `v` shifted left by `by`, which is `v` itself where `by` is 0.
-    fn shift_up(&self, f: &mut FunctionBuilder<'_>, v: Value, by: u32) -> BResult<Value> {
-        match by {
-            0 => Ok(v),
-            _ => {
-                let by = self.uint(f, by)?;
-                f.binary(BinOp::ShiftLeftLogical, v, by)
-            }
-        }
-    }
-
-    /// `v` shifted right by `by`, which is `v` itself where `by` is 0.
-    fn shift_down(&self, f: &mut FunctionBuilder<'_>, v: Value, by: u32) -> BResult<Value> {
-        match by {
-            0 => Ok(v),
-            _ => {
-                let by = self.uint(f, by)?;
-                f.binary(BinOp::ShiftRightLogical, v, by)
-            }
-        }
-    }
-
-    /// `v` times `by`: `v` itself where `by` is 1, a shift where it is another power of two.
-    fn scale(&self, f: &mut FunctionBuilder<'_>, v: Value, by: u32) -> BResult<Value> {
-        match by.is_power_of_two() {
-            true => self.shift_up(f, v, by.ilog2()),
-            false => {
-                let by = self.uint(f, by)?;
-                f.binary(BinOp::IMul, v, by)
-            }
-        }
-    }
-
-    /// The `span` bytes of the bytes binding from byte `at` (4 at most) as a word's low bytes:
-    /// the word holding `at` from its byte `at mod 4` on, and, where the span passes that word,
-    /// above them the next word's first bytes, shifted by `32 - lane` in two steps so a lane of 0
-    /// takes none of them. Only the words holding the span's first and last byte are read, so no
-    /// read passes the span.
-    fn window(&self, f: &mut FunctionBuilder<'_>, at: Value, span: u32) -> BResult<Value> {
-        let three = self.uint(f, 3)?;
-        let lane = f.binary(BinOp::BitwiseAnd, at, three)?;
-        let lane = f.binary(BinOp::ShiftLeftLogical, lane, three)?;
-        let low = self.word(f, at)?;
-        let low = f.binary(BinOp::ShiftRightLogical, low, lane)?;
-        match span {
-            // One byte lies in one word.
-            1 => Ok(low),
-            _ => {
-                let last = self.uint(f, span - 1)?;
-                let last = f.binary(BinOp::IAdd, at, last)?;
-                let high = self.word(f, last)?;
-                let thirty_one = self.uint(f, 31)?;
-                let up = f.binary(BinOp::ISub, thirty_one, lane)?;
-                let high = f.binary(BinOp::ShiftLeftLogical, high, up)?;
-                let high = f.binary(BinOp::ShiftLeftLogical, high, self.one)?;
-                f.binary(BinOp::BitwiseOr, low, high)
-            }
-        }
-    }
-
-    /// Code `index` of the row whose first byte is at `row`: in unit `⌊index / per⌋`, its
-    /// `index mod per`-th code, `bits` bits from `shift + step · (index mod per)` of the unit's
-    /// little-endian bytes (a byte, a 16-bit word's high bits, or a packed word's codes at bits
-    /// 0, 10 and 20), where `per`, `shift`, `step` and `bits` are the layout's own.
-    fn code(&self, f: &mut FunctionBuilder<'_>, row: Value, index: Value) -> BResult<Value> {
-        let codes = self.codes;
-        // The unit's first byte, and the shift that takes its bytes to the code: a packed unit's
-        // `index mod 3`-th code is `bits` bits above the one before it, and an unpacked unit
-        // holds its one code in its high bits.
-        let (at, shift) = match codes.packed {
-            true => {
-                let per = self.uint(f, codes.per_unit())?;
-                let unit_index = f.binary(BinOp::UDiv, index, per)?;
-                let first = f.binary(BinOp::IMul, unit_index, per)?;
-                let k = f.binary(BinOp::ISub, index, first)?;
-                let offset = self.scale(f, unit_index, codes.bytes)?;
-                let at = f.binary(BinOp::IAdd, row, offset)?;
-                let step = self.uint(f, codes.step())?;
-                let shift = f.binary(BinOp::IMul, k, step)?;
-                (at, Some(shift))
-            }
-            false => {
-                let offset = self.scale(f, index, codes.bytes)?;
-                let at = f.binary(BinOp::IAdd, row, offset)?;
-                (at, None)
-            }
-        };
-        let bytes = self.window(f, at, codes.bytes)?;
-        let code = match shift {
-            Some(step) => {
-                let shift = match codes.first_shift() {
-                    0 => step,
-                    first => {
-                        let first = self.uint(f, first)?;
-                        f.binary(BinOp::IAdd, first, step)?
-                    }
-                };
-                f.binary(BinOp::ShiftRightLogical, bytes, shift)?
-            }
-            None => self.shift_down(f, bytes, codes.first_shift())?,
-        };
-        let max = self.uint(f, codes.max())?;
-        f.binary(BinOp::BitwiseAnd, code, max)
-    }
-
-    /// Whether a pair of codes read through one window ([`code_pair`](Self::code_pair)) reads
-    /// fewer of the bytes binding's words than one window each: an unpacked layout whose unit of
-    /// two bytes already spans the words holding its first and last byte, whose pair spans the
-    /// same two. A unit of one byte lies in one word, so two of them read two words either way,
-    /// and a packed layout's two codes may lie in two units, at bits their own index names.
-    fn pairs_in_a_window(&self) -> bool {
-        !self.codes.packed && self.codes.bytes > 1 && 2 * self.codes.bytes <= 4
-    }
-
-    /// Codes `index` and `index + 1` of the row whose first byte is at `row`, where
-    /// [`pairs_in_a_window`](Self::pairs_in_a_window) holds: the two units lie in `2 bytes` bytes
-    /// from the first's, so one window holds both codes, each in its unit's high bits.
-    fn code_pair(
-        &self,
-        f: &mut FunctionBuilder<'_>,
-        row: Value,
-        index: Value,
-    ) -> BResult<[Value; 2]> {
-        let codes = self.codes;
-        let offset = self.scale(f, index, codes.bytes)?;
-        let at = f.binary(BinOp::IAdd, row, offset)?;
-        let bytes = self.window(f, at, 2 * codes.bytes)?;
-        let max = self.uint(f, codes.max())?;
-        let mut out = [self.zero; 2];
-        for (k, code) in out.iter_mut().enumerate() {
-            let shift = codes.first_shift() + 8 * codes.bytes * k as u32;
-            let shifted = self.shift_down(f, bytes, shift)?;
-            *code = f.binary(BinOp::BitwiseAnd, shifted, max)?;
-        }
-        Ok(out)
-    }
-
-    /// The step of `1 / 8192` an sRGB format reads for the converted sum's step `q` (at most
-    /// 8192), by the knots of `table` ([`srgb_step`]): `i = min(q >> 4, 511)`, `f = q - 16 i`,
-    /// and `n = 16 K[i] + (K[i + 1] - K[i]) f` divided by 16 to nearest even.
-    fn srgb_step(&self, f: &mut FunctionBuilder<'_>, table: GlobalId, q: Value) -> BResult<Value> {
-        let four = self.uint(f, 4)?;
-        let last = self.uint(f, 511)?;
-        let i = f.binary(BinOp::ShiftRightLogical, q, four)?;
-        let i = f.glsl(GlslOp::UMin, &[i, last])?;
-        let start = f.binary(BinOp::ShiftLeftLogical, i, four)?;
-        let fraction = f.binary(BinOp::ISub, q, start)?;
-        let table = f.module().global_value(table)?;
-        let p = f.access_chain(table, &[i])?;
-        let a = f.load(p, MemAccess::default())?;
-        let next = f.binary(BinOp::IAdd, i, self.one)?;
-        let p = f.access_chain(table, &[next])?;
-        let b = f.load(p, MemAccess::default())?;
-        let rise = f.binary(BinOp::ISub, b, a)?;
-        let rise = f.binary(BinOp::IMul, rise, fraction)?;
-        let base = f.binary(BinOp::ShiftLeftLogical, a, four)?;
-        let n = f.binary(BinOp::IAdd, base, rise)?;
-        // `(n + 7 + ((n >> 4) & 1)) >> 4`: a remainder of 8 carries where the quotient is odd.
-        let quotient = f.binary(BinOp::ShiftRightLogical, n, four)?;
-        let odd = f.binary(BinOp::BitwiseAnd, quotient, self.one)?;
-        let seven = self.uint(f, 7)?;
-        let n = f.binary(BinOp::IAdd, n, seven)?;
-        let n = f.binary(BinOp::IAdd, n, odd)?;
-        f.binary(BinOp::ShiftRightLogical, n, four)
-    }
-
-    /// The two chroma texels of luma column (or row) `p` of a halved axis (a chroma texel for
-    /// each two luma ones) of a plane `n` texels across, and the first one's weight (the second's
-    /// is 4 less it): `⌊p / 2⌋` and the next for an odd `p`, weighted 3 and 1; the one before and
-    /// `⌊p / 2⌋` for an even `p`, weighted 1 and 3; each clamped to the plane. An axis the plane
-    /// does not halve reads texel `p` alone, weighted 4, which the module reads as its one tap.
-    fn taps(&self, f: &mut FunctionBuilder<'_>, p: Value, n: Value) -> BResult<[Value; 3]> {
-        let c = f.binary(BinOp::ShiftRightLogical, p, self.one)?;
-        let odd = f.binary(BinOp::BitwiseAnd, p, self.one)?;
-        let a = f.binary(BinOp::IAdd, c, odd)?;
-        let last = f.binary(BinOp::ISub, n, self.one)?;
-        // `a` is at most `n`: the farther or nearer texel past the plane is its last.
-        let past = f.binary(BinOp::UGreaterThan, a, last)?;
-        let second = f.select(past, last, a)?;
-        let at_start = f.binary(BinOp::IEqual, a, self.zero)?;
-        let before = f.binary(BinOp::ISub, a, self.one)?;
-        let first = f.select(at_start, self.zero, before)?;
-        let is_odd = f.binary(BinOp::IEqual, odd, self.one)?;
-        let three = self.uint(f, 3)?;
-        let weight = f.select(is_odd, three, self.one)?;
-        Ok([first, second, weight])
-    }
-}
-
-/// The pair of chroma codes texel `(x, y)` reads, filtered by the layout's subsampling (the
-/// module docs): the four nearest chroma texels weighted 9 / 3 / 3 / 1 where the chroma plane
-/// halves both axes, the two nearest weighted 3 and 1 where it halves one, and the texel's own
-/// pair where it halves neither.
-///
-/// A halved axis's weights sum to 4 and a direct axis's one tap weighs 4, so the sum of the taps
-/// carries `2 h` bits of the `h` halved axes and `C = (S + 8) >> 4` of both axes' weights is
-/// `(S + 2) >> 2` of one halved axis's alone, and the texel's own code where neither axis halves.
-/// The module leaves a direct axis's weight of 4 out of each term and rounds by `2 h` instead.
-fn chroma_codes(
-    f: &mut FunctionBuilder<'_>,
-    cx: Cx,
-    [x, y]: [Value; 2],
-    [width, height]: [Value; 2],
-    [chroma_offset, chroma_row]: [Value; 2],
-) -> BResult<[Value; 2]> {
-    let halved = cx.codes.subsampling.halved();
-    // The taps along one axis: a halved axis's two, the first weighted `w` and the second
-    // `4 - w`; a direct axis's own, whose weight of 4 the rounding below carries. The chroma
-    // plane is `⌈w / 2⌉` texels along a halved axis and `w` along a direct one.
-    let axis = |f: &mut FunctionBuilder<'_>,
-                p: Value,
-                size: Value,
-                halved: bool|
-     -> BResult<Vec<(Value, Option<Value>)>> {
-        match halved {
-            false => Ok(vec![(p, None)]),
-            true => {
-                let wide = f.binary(BinOp::IAdd, size, cx.one)?;
-                let n = f.binary(BinOp::ShiftRightLogical, wide, cx.one)?;
-                let [first, second, w] = cx.taps(f, p, n)?;
-                let four = cx.uint(f, 4)?;
-                let w1 = f.binary(BinOp::ISub, four, w)?;
-                Ok(vec![(first, Some(w)), (second, Some(w1))])
-            }
-        }
-    };
-    let xs = axis(f, x, width, halved[0])?;
-    let ys = axis(f, y, height, halved[1])?;
-    let mut sums: [Option<Value>; 2] = [None, None];
-    for &(cy, wy) in &ys {
-        let row = f.binary(BinOp::IMul, cy, chroma_row)?;
-        let row = f.binary(BinOp::IAdd, chroma_offset, row)?;
-        for &(cx_, wx) in &xs {
-            let weight = match (wx, wy) {
-                (Some(a), Some(b)) => Some(f.binary(BinOp::IMul, a, b)?),
-                (Some(w), None) | (None, Some(w)) => Some(w),
-                (None, None) => None,
-            };
-            // The pair's Cb, code `2 x` of the row, and its Cr after it.
-            let cb = f.binary(BinOp::ShiftLeftLogical, cx_, cx.one)?;
-            let pair = match cx.pairs_in_a_window() {
-                true => cx.code_pair(f, row, cb)?,
-                false => {
-                    let cr = f.binary(BinOp::IAdd, cb, cx.one)?;
-                    [cx.code(f, row, cb)?, cx.code(f, row, cr)?]
-                }
-            };
-            for (sum, code) in sums.iter_mut().zip(pair) {
-                let term = match weight {
-                    Some(w) => f.binary(BinOp::IMul, w, code)?,
-                    None => code,
-                };
-                *sum = match *sum {
-                    None => Some(term),
-                    Some(s) => Some(f.binary(BinOp::IAdd, s, term)?),
-                };
-            }
-        }
-    }
-    // `C = (S + 2^(2 h - 1)) >> 2 h`, and the code itself where no axis halves.
-    let bits = 2 * halved.iter().filter(|halved| **halved).count() as u32;
-    let mut out = [cx.zero; 2];
-    for (c, sum) in out.iter_mut().zip(sums) {
-        let sum = sum.expect("every component has a tap");
-        *c = match bits {
-            0 => sum,
-            _ => {
-                let bias = cx.uint(f, 1 << (bits - 1))?;
-                let rounded = f.binary(BinOp::IAdd, sum, bias)?;
-                cx.shift_down(f, rounded, bits)?
-            }
-        };
-    }
-    Ok(out)
-}
-
-/// The module of `conversion` as a typed module, before serialization: the module
-/// [`ycbcr_convert_module`] serializes (or, `floats`, [`ycbcr_convert_floats_module`]), which
-/// the CPU interpreter runs. Its bindings are the symbols `IMAGE`, `SHAPE` and `BYTES` (the module
-/// docs).
-///
-/// Everything the conversion states — the codes' bits, their unit's bytes and shifts, the chroma
-/// subsampling, the output, the range and the matrix — is a constant of the module, so its
-/// invocations load the texture's size and its planes' first bytes and rows alone and branch on
-/// nothing the conversion settles.
-fn typed_module(conversion: YCbCrConversion, floats: bool) -> BResult<TypedModule> {
-    let codes = conversion.codes;
-    let output = codes.output;
-    let mut b = ModuleBuilder::new();
-    let u32_ = b.ty(Type::Int {
-        width: 32,
-        signed: false,
-    })?;
-    let f32_ = b.ty(Type::Float { width: 32 })?;
-    let uvec2 = b.ty(Type::Vector { elem: u32_, len: 2 })?;
-    let uvec3 = b.ty(Type::Vector { elem: u32_, len: 3 })?;
-    let (sampled_type, format) = match output {
-        _ if floats => (f32_, crate::spv::ImageFormat::Rgba32f),
-        YCbCrOutput::Converted => (f32_, crate::spv::ImageFormat::Rgba16f),
-        YCbCrOutput::Srgb => (f32_, crate::spv::ImageFormat::Rgba32f),
-        YCbCrOutput::Codes => (u32_, crate::spv::ImageFormat::R32ui),
-    };
-    let texel_ty = b.ty(Type::Vector {
-        elem: sampled_type,
-        len: 4,
-    })?;
-    let image_ty = b.ty(Type::Image(ImageType {
-        sampled_type,
-        dim: Dim::D2,
-        depth: false,
-        arrayed: false,
-        multisampled: false,
-        usage: ImageUsage::Storage,
-        format,
-    }))?;
-    let image = b.resource(IMAGE, StorageClass::UniformConstant, image_ty)?;
-    let knots = match output {
-        YCbCrOutput::Srgb => Some(knots_table(&mut b, u32_)?),
-        YCbCrOutput::Converted | YCbCrOutput::Codes => None,
-    };
-    let shape = words_buffer(&mut b, SHAPE, u32_)?;
-    let bytes = words_buffer(&mut b, BYTES, u32_)?;
-    let invocation = b.builtin(crate::spv::BuiltIn::GlobalInvocationId, IoDir::Input, uvec3)?;
-    let void = b.ty(Type::Void)?;
-    let mut f = b.function(void)?;
-    let zero = scalar(&mut f, u32_, 0)?;
-    let one = scalar(&mut f, u32_, 1)?;
-    let bytes = f.module().global_value(bytes)?;
-    let cx = Cx {
-        u32_,
-        zero,
-        one,
-        bytes,
-        codes,
-    };
-    let invocation = f.module().global_value(invocation)?;
-    let invocation = f.load(invocation, MemAccess::default())?;
-    let x = f.composite_extract(invocation, &[0])?;
-    let y = f.composite_extract(invocation, &[1])?;
-    let shape = f.module().global_value(shape)?;
-    let field = |f: &mut FunctionBuilder<'_>, index: u32| -> BResult<Value> {
-        let index = cx.uint(f, index)?;
-        let p = f.access_chain(shape, &[zero, index])?;
-        f.load(p, MemAccess::default())
-    };
-    let width = field(&mut f, word::WIDTH)?;
-    let height = field(&mut f, word::HEIGHT)?;
-    let in_x = f.binary(BinOp::ULessThan, x, width)?;
-    let in_y = f.binary(BinOp::ULessThan, y, height)?;
-    let inside = f.binary(BinOp::LogicalAnd, in_x, in_y)?;
-    let luma_offset = field(&mut f, word::LUMA_OFFSET)?;
-    let luma_row = field(&mut f, word::LUMA_ROW)?;
-    let chroma_offset = field(&mut f, word::CHROMA_OFFSET)?;
-    let chroma_row = field(&mut f, word::CHROMA_ROW)?;
-    // The conversion's own numbers: the channels' `(kb, kr)`, the shift that counts a code as a
-    // 10-bit code, and the largest code.
-    let k = coefficients(conversion.range, conversion.matrix);
-    let up = 10 - codes.bits;
-    let max = codes.max();
-    let image = f.module().global_value(image)?;
-    let converted: ArmFn<'_, ()> = Box::new(move |f, _| {
-        // The luma code.
-        let row = f.binary(BinOp::IMul, y, luma_row)?;
-        let row = f.binary(BinOp::IAdd, luma_offset, row)?;
-        let luma = cx.code(f, row, x)?;
-        // The chroma codes, filtered by the layout's subsampling.
-        let mut chroma = chroma_codes(f, cx, [x, y], [width, height], [chroma_offset, chroma_row])?;
-        let coord = f.composite_construct(uvec2, &[x, y])?;
-        let texel = match output {
-            YCbCrOutput::Codes if floats => {
-                // Each code over the largest, red Cr, green Y and blue Cb, and alpha 1.
-                let largest = scalar(f, f32_, u64::from((max as f32).to_bits()))?;
-                let mut channels = Vec::with_capacity(4);
-                for code in [chroma[1], luma, chroma[0]] {
-                    let code = f.convert(ConvOp::ConvertUToF, code, f32_)?;
-                    channels.push(f.binary(BinOp::FDiv, code, largest)?);
-                }
-                channels.push(scalar(f, f32_, u64::from(1.0f32.to_bits()))?);
-                f.composite_construct(texel_ty, &channels)?
-            }
-            YCbCrOutput::Codes => {
-                // `A2B10G10R10_UNORM_PACK32`'s or `R8G8B8A8_UNORM`'s bits, `b` each: red Cr,
-                // green Y, blue Cb, and alpha every bit above (3 of 10-bit codes, 255 of 8-bit).
-                let green = cx.shift_up(f, luma, codes.bits)?;
-                let blue = cx.shift_up(f, chroma[0], 2 * codes.bits)?;
-                let packed = f.binary(BinOp::BitwiseOr, chroma[1], green)?;
-                let packed = f.binary(BinOp::BitwiseOr, packed, blue)?;
-                let alpha = cx.uint(f, u32::MAX << (3 * codes.bits))?;
-                let packed = f.binary(BinOp::BitwiseOr, packed, alpha)?;
-                f.composite_construct(texel_ty, &[packed, zero, zero, zero])?
-            }
-            YCbCrOutput::Converted | YCbCrOutput::Srgb => {
-                // Counted as 10-bit codes, less 512.
-                let offset = cx.uint(f, 512)?;
-                for c in chroma.iter_mut() {
-                    let ten = cx.shift_up(f, *c, up)?;
-                    *c = f.binary(BinOp::ISub, ten, offset)?;
-                }
-                // The luma term of the conversion's range: video range
-                // `9576 ((Y << u) - 64)`, full range `256 ⌊(32768 Y + ⌊m / 2⌋) / m⌋` (two's
-                // complement words, read as signed below).
-                let l = match conversion.range {
-                    YCbCrRange::Video => {
-                        let y10 = cx.shift_up(f, luma, up)?;
-                        let sixty_four = cx.uint(f, 64)?;
-                        let above = f.binary(BinOp::ISub, y10, sixty_four)?;
-                        let scale = cx.uint(f, 9576)?;
-                        f.binary(BinOp::IMul, above, scale)?
-                    }
-                    YCbCrRange::Full => {
-                        let wide = cx.shift_up(f, luma, 15)?;
-                        let half = cx.uint(f, max / 2)?;
-                        let wide = f.binary(BinOp::IAdd, wide, half)?;
-                        let largest = cx.uint(f, max)?;
-                        let quotient = f.binary(BinOp::UDiv, wide, largest)?;
-                        cx.shift_up(f, quotient, 8)?
-                    }
-                };
-                // Each channel's sum `T = L + kb Cb' + kr Cr'` onto its grid `D`:
-                // `clamp((T + D') >> s, 0, D)` with `(D', s, D)` `(2048, 12, 2048)` converted and
-                // `(512, 10, 8192)` through the sRGB curve, whose knots then decode the step.
-                let (bias, dropped, grid) = match knots {
-                    Some(_) => (512, 10, 8192),
-                    None => (2048, 12, 2048),
-                };
-                let round = cx.uint(f, bias)?;
-                let shift = cx.uint(f, dropped)?;
-                let top = cx.uint(f, grid)?;
-                let step = 1.0f32 / grid as f32;
-                let step = scalar(f, f32_, u64::from(step.to_bits()))?;
-                let mut channels = Vec::with_capacity(4);
-                for (kb, kr) in k {
-                    let kb = cx.uint(f, kb as u32)?;
-                    let kr = cx.uint(f, kr as u32)?;
-                    let b_term = f.binary(BinOp::IMul, kb, chroma[0])?;
-                    let r_term = f.binary(BinOp::IMul, kr, chroma[1])?;
-                    let t = f.binary(BinOp::IAdd, l, b_term)?;
-                    let t = f.binary(BinOp::IAdd, t, r_term)?;
-                    let t = f.binary(BinOp::IAdd, t, round)?;
-                    let v = f.binary(BinOp::ShiftRightArithmetic, t, shift)?;
-                    let below = f.binary(BinOp::SLessThan, v, zero)?;
-                    let v = f.select(below, zero, v)?;
-                    let over = f.binary(BinOp::SGreaterThan, v, top)?;
-                    let v = f.select(over, top, v)?;
-                    let v = match knots {
-                        Some(table) => cx.srgb_step(f, table, v)?,
-                        None => v,
-                    };
-                    let v = f.convert(ConvOp::ConvertUToF, v, f32_)?;
-                    channels.push(f.binary(BinOp::FMul, v, step)?);
-                }
-                channels.push(scalar(f, f32_, u64::from(1.0f32.to_bits()))?);
-                f.composite_construct(texel_ty, &channels)?
-            }
-        };
-        let image = f.load(image, MemAccess::default())?;
-        f.write(
-            image,
-            coord,
-            texel,
-            &ImageOperands::default(),
-            TexelMemory::PRIVATE,
-        )?;
-        Ok(ArmEnd::FallThrough(Vec::new()))
-    });
-    f.if_(&mut (), inside, converted, None)?;
-    f.ret(None)?;
-    let id = f.finish()?;
-    b.entry(
-        ExecModel::GLCompute,
-        id,
-        vec![ExecMode::LocalSize {
-            x: YCbCrConvertModule::LOCAL_SIZE,
-            y: YCbCrConvertModule::LOCAL_SIZE,
-            z: 1,
-        }],
-    )?;
-    b.finalize()
-}
-
-/// The fixed binding numbers of the module's symbols.
-fn binding_of(sym: &Symbol) -> Option<u32> {
-    match sym {
-        Symbol::DescriptorSet(_) => Some(YCbCrConvertModule::SET),
-        Symbol::Binding(s) if *s == IMAGE => Some(YCbCrConvertModule::IMAGE_BINDING),
-        Symbol::Binding(s) if *s == SHAPE => Some(YCbCrConvertModule::SHAPE_BINDING),
-        Symbol::Binding(s) if *s == BYTES => Some(YCbCrConvertModule::BYTES_BINDING),
-        _ => None,
-    }
-}
-
-/// The YCbCr conversion module of `device` that converts `conversion`'s planes
-/// ([`YCbCrPlanes::conversion`]), writing texels of its output: built with the typed builder,
-/// checked by the owned verifier against the device's profile (requirements included),
-/// serialized, and numbered with the fixed bindings of [`YCbCrConvertModule`]. The conversion is
-/// the module's, so a consumer holds one module for each conversion of its textures; equal
-/// conversions name equal modules.
-pub fn ycbcr_convert_module(
-    device: &Device,
-    conversion: YCbCrConversion,
-) -> Result<YCbCrConvertModule, Error> {
-    module_of(device, conversion, false)
-}
-
-/// The YCbCr conversion module of `device` that converts `conversion`'s planes and writes their
-/// texels as floats into an `Rgba32f` image, whatever the output's own image: a converted texel's
-/// `v / 2048` and an sRGB one's `v / 8192`, as [`ycbcr_convert_module`] writes them, and codes
-/// read as codes each `code / (2^b - 1)` (red Cr, green Y, blue Cb), alpha 1. A render pass that
-/// loads a two-plane YCbCr color attachment loads its render shadow, an `R32G32B32A32_SFLOAT`
-/// image, through it. Built and checked as [`ycbcr_convert_module`] is.
-pub fn ycbcr_convert_floats_module(
-    device: &Device,
-    conversion: YCbCrConversion,
-) -> Result<YCbCrConvertModule, Error> {
-    module_of(device, conversion, true)
-}
-
-/// [`ycbcr_convert_module`], or, `floats`, [`ycbcr_convert_floats_module`].
-fn module_of(
-    device: &Device,
-    conversion: YCbCrConversion,
-    floats: bool,
-) -> Result<YCbCrConvertModule, Error> {
-    let profile = device.profile();
-    let m = typed_module(conversion, floats)?;
-    let mut meter = Meter::new(&Budget::default());
-    crate::spirv::verify::verify(&m, profile, &mut meter)?;
-    let r = crate::spirv::serialize::serialize(m)?;
-    profile.check(&r.requirements).map_err(|c| {
-        Error::Internal(InternalError::new(
-            InternalKind::RequirementsExceedProfile,
-            format!("the YCbCr conversion module needs {c:?}"),
-        ))
-    })?;
-    let words = crate::spirv::serialize::relocate(&r, &binding_of)?;
-    Ok(YCbCrConvertModule {
-        spirv: words.into(),
-        requirements: r.requirements,
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct YCbCrPlanesSampler {
+    /// The conversion: the codes' bits in bits 0 to 7, full range in bit 8, and the matrix in bits
+    /// 9 and 10 (0 BT.601, 1 BT.709, 2 BT.2020).
+    pub(crate) conversion: u32,
 }
 
 #[cfg(test)]

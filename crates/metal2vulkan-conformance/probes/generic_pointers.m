@@ -19,9 +19,6 @@
 //
 // Each case compiles the source as MSL 4.1, runs its kernel over 8 threads in one threadgroup
 // with `in[i] = i` (16 words), and prints the words.
-//
-// WHAT IT MEASURED (Apple M3 Max, macOS 27.0.1): see the runtime lane's
-// `runtime_lane::generic_pointers` module docs.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>

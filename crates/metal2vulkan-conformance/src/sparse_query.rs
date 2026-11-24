@@ -7,20 +7,15 @@
 //! is safe on every venue and comparable on every venue — including one with no sparse binding at
 //! all, which is what makes this the first sparse family the suite can carry end to end.
 //!
-//! The runtime answers them from a model of Metal's rule (`sparse::tile_texels`), the same on every
-//! device, whose comment says it was measured on an Apple M4 and whose only possible oracle is
-//! Metal. `runtime_lane::sparse_textures` asserts exactly three of its answers —
-//! `(Type2D, R32Float, 1)`, `(Cube, R32Float, 1)` and `(Type2DMultisample, RGBA8Unorm, 2 and 4)` —
-//! so the rule's two interesting claims, that the answer does not depend on the texture type and
-//! that it halves the tile's sides as the block's bytes double, have never been checked against
-//! Metal over a sweep. A case over this type checks them.
+//! Metal's rule makes two claims a case over this type checks over a sweep: that the answer does
+//! not depend on the texture type, and that it halves the tile's sides as the block's bytes double.
 //!
 //! The vocabulary is Metal's own enumerations as the translator's public API names them, so a value
 //! a case writes reaches `MTLTextureType`, `MTLPixelFormat` and `MTLSparsePageSize` by its raw
 //! ordinal and reaches the runtime's call unchanged.
 
+use crate::values::SparsePageSize;
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use metal2vulkan_runtime::SparsePageSize;
 
 /// The page a query asks in: one of Metal's three, or none, which is the getter without a page
 /// argument (whose answer Metal documents as the 16-KiB page's).
@@ -37,14 +32,6 @@ pub fn page_word(page: QueryPage) -> &'static str {
         Some(SparsePageSize::Size16) => "page-16",
         Some(SparsePageSize::Size64) => "page-64",
         Some(SparsePageSize::Size256) => "page-256",
-        // `SparsePageSize` is `#[non_exhaustive]`: a page Metal gains is named by its raw value
-        // rather than silently sharing a site with one of these.
-        Some(page) => match page.raw() {
-            101 => "page-16",
-            102 => "page-64",
-            103 => "page-256",
-            _ => "page-unknown",
-        },
     }
 }
 
@@ -145,8 +132,7 @@ pub struct SparseHeapSpec {
 }
 
 impl SparseHeapSpec {
-    /// A heap of `size` bytes in 16-KiB pages, which is the descriptor's default and the one the
-    /// lane uses.
+    /// A heap of `size` bytes in 16-KiB pages, which is the descriptor's default.
     pub const fn new(size: u64) -> Self {
         Self {
             size,

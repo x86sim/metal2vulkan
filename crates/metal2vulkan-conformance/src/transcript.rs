@@ -2,7 +2,7 @@
 //!
 //! A site holds one [`Observed`]: a [`Value`] in the portable vocabulary, the [`Shape`] that says
 //! how to read and compare it, and an optional [`Digest`], a projection of the value a recording
-//! may carry in its place. One record type serves every fidelity, so a case ported digest-first
+//! may carry in its place. One record type serves every fidelity, so a case recorded digest-first
 //! gains raw values without being rewritten.
 //!
 //! The tree, rather than a list, is what lets a failure descend: a case whose answer is a digest of
@@ -323,8 +323,8 @@ impl Digest {
 
     /// The first sixteen hexadecimal digits of the SHA-256 of `bytes`.
     ///
-    /// This is the projection the probes printed and the runtime lanes keep, so a case ported
-    /// from such a lane records Metal's own value rather than a digest nobody measured.
+    /// This is the projection the probes printed, so a case whose probe printed one records
+    /// Metal's own value rather than a digest nobody measured.
     pub fn sha256_prefix16(bytes: &[u8]) -> Self {
         let mut hex = crate::sha256_hex(bytes);
         hex.truncate(16);
@@ -355,7 +355,7 @@ impl Digest {
 pub enum DigestKind {
     Sha256,
     /// The SHA-256's first sixteen hexadecimal digits: what our probes printed, and so the widest
-    /// projection a case ported from a lane that kept one can honestly record.
+    /// projection a case whose probe kept one can honestly record.
     Sha256Prefix16,
 }
 
@@ -542,7 +542,7 @@ impl Element {
 pub struct Transcript {
     pub root: Node,
     /// The sites where the **venue honestly lacks** what the call needed, by their paths from the
-    /// root, each with what it lacks ([`crate::verdict::device_gap`]). A refused call's site, and
+    /// root, each with what it lacks ([`crate::verdict::device_gap_of`]). A refused call's site, and
     /// a getter's whose answer is a limit the device holds below Metal's, where the device refused
     /// the work of Metal's size as its gap (a tile state's `maxTotalThreadsPerThreadgroup`,
     /// [`crate::cases::tile_threadgroups`]): either differs from Metal's as the venue's gap.
@@ -583,10 +583,6 @@ impl Transcript {
     /// Every degrade notice the transcript records, by code, with how many times it was
     /// announced: the `counts` child of each site [`Sites::notices`] emitted, wherever it sits in
     /// the tree.
-    ///
-    /// The closed-vocabulary notice census (`runtime_lane::degrade_notices`) stays a lane and
-    /// reads the suite's runs through this, rather than becoming a case: its subject is the
-    /// vocabulary across every lane, which has no Metal counterpart to compare against.
     pub fn announced_notices(&self) -> BTreeMap<String, u64> {
         let mut found = BTreeMap::new();
         for announced in self.announced_at() {

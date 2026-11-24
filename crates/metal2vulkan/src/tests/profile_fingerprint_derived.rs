@@ -16,8 +16,8 @@
 //! twice, and nothing counted it: the SPIR-V, the keys and the artifacts all came out identical,
 //! so no golden table, no artifact check and no existing count could see the work.
 //!
-//! The derivation now happens where the profile is built (`DeviceProfile::of`), which is the only
-//! place a profile comes from, and `fingerprint()` is a read.
+//! The derivation now happens where the profile is built (`DeviceProfile::of`), which is the
+//! only place a profile comes from, and `fingerprint()` is a read.
 //!
 //! # Why this is a count
 //!
@@ -37,8 +37,7 @@
 
 use crate::budget::{Budget, Meter};
 use crate::device::profile::fingerprints_derived;
-use crate::device::profile::GuestIsolation;
-use crate::device::{ContainmentPolicy, Device, DeviceDescription, DevicePolicy};
+use crate::device::{Device, DeviceDescription, DevicePolicy, HandleDomain, PointerDomain};
 use crate::library::FunctionConstantValues;
 use crate::library::Library;
 use crate::pipeline::compile::{compile_stage, InputsFrom};
@@ -82,7 +81,8 @@ fn library() -> Option<Library> {
 fn a_run_of_compiles_derives_no_profile_fingerprint() {
     let Some(library) = library() else { return };
     let start = fingerprints_derived();
-    let device = Device::new(description("moltenvk-m3"), DevicePolicy::default()).expect("device");
+    let device = Device::from_queries(description("moltenvk-m3"), DevicePolicy::RESIDENT_TABLES)
+        .expect("device");
     let made = fingerprints_derived() - start;
     // The fingerprint every compile takes, read as often as anything reads it.
     for _ in 0..RUN {
@@ -130,8 +130,10 @@ fn a_run_of_compiles_derives_no_profile_fingerprint() {
 /// fingerprints, and an edited profile carries the edit's.
 #[test]
 fn profiles_that_differ_carry_their_own_fingerprints() {
-    let m3 = Device::new(description("moltenvk-m3"), DevicePolicy::default()).expect("device");
-    let pipe = Device::new(description("lavapipe"), DevicePolicy::default()).expect("device");
+    let m3 = Device::from_queries(description("moltenvk-m3"), DevicePolicy::RESIDENT_TABLES)
+        .expect("device");
+    let pipe = Device::from_queries(description("lavapipe"), DevicePolicy::RESIDENT_TABLES)
+        .expect("device");
     assert_ne!(
         m3.profile_fingerprint(),
         pipe.profile_fingerprint(),
@@ -139,16 +141,15 @@ fn profiles_that_differ_carry_their_own_fingerprints() {
          each read the other's cache entries"
     );
     // The derivation is of the fields the profile holds, whatever built them.
-    let uncontained = DevicePolicy {
-        containment: ContainmentPolicy::UnsafeOff,
-        isolation: GuestIsolation::Off,
-        ..DevicePolicy::default()
+    let identity = DevicePolicy {
+        pointer_domain: PointerDomain::Identity,
+        handle_domain: HandleDomain::Identity,
     };
-    let uncontained = Device::new(description("moltenvk-m3"), uncontained)
-        .expect("device under the uncontained policy");
+    let identity = Device::from_queries(description("moltenvk-m3"), identity)
+        .expect("device under the identity domains");
     assert_ne!(
         m3.profile_fingerprint(),
-        uncontained.profile_fingerprint(),
+        identity.profile_fingerprint(),
         "the policy is part of the profile's fields, so it is part of the fingerprint"
     );
     let mut edited = m3.profile().clone();

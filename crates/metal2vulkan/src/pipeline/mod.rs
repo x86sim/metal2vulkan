@@ -19,8 +19,7 @@
 //! - one [`PipelineLayout`]: dense descriptor set layouts and push-constant ranges, to create as
 //!   they are (no renumbering);
 //! - a render pipeline's [`VertexInputState`] and [`GraphicsState`] (with a
-//!   [`TessellationState`] when it tessellates, and a mesh render pipeline's answers to Metal's
-//!   mesh queries, [`MeshPipelineMetalInfo`]), or a compute pipeline's answers to Metal's
+//!   [`TessellationState`] when it tessellates), or a compute pipeline's answers to Metal's
 //!   per-pipeline queries ([`ComputePipelineMetalInfo`]);
 //! - the [`PipelineInterface`]: every statically used Metal argument slot ([`SlotRef`]), how the
 //!   shader accesses it, and each buffer's proven byte window;
@@ -35,10 +34,9 @@
 //! decoding; `Device::render_pipeline_key` decodes (but does not lower) the vertex function to
 //! learn the attributes it reads, and returns [`RenderPipelineKeys`]: the pipeline's key, each
 //! stage's function key, and the [`LoweringInputs`] each function stage compiles under (see
-//! [`cache`](crate::cache)). A binding plan can ask for another variant of the pipeline, named by
-//! a [`VariantKey`](crate::cache::VariantKey) (`BindingPlan::variant`,
-//! `BindError::NeedsVariant`). A render pipeline compiles its variant with
-//! `Device::compile_render_variant`; a compute pipeline compiles its kernel with
+//! [`cache`](crate::cache)). Another variant of the pipeline is named by a
+//! [`VariantKey`](crate::cache::VariantKey). A render pipeline's keys under a variant are
+//! `Device::render_variant_key`'s; a compute pipeline compiles its kernel with
 //! `Device::compile_function` under `VariantKey::lowering_inputs(Stage::Kernel)` and links it as
 //! `StageSource::Compiled`.
 //!
@@ -47,7 +45,7 @@
 //! kernel compiled on its own for such a pipeline compiles under the same descriptor
 //! (`LoweringInputs::stage_input`). A dispatch of a kernel that steps an attribute by thread
 //! position, or reads `[[grid_origin]]` or `[[grid_size]]`, needs the encoder's stage-in region
-//! (`BindState::stage_in_region`). A render pipeline whose vertex function is a post-tessellation
+//! (`setStageInRegion:`). A render pipeline whose vertex function is a post-tessellation
 //! vertex function is a tessellation pipeline, under the descriptor's `tessellation`
 //! ([`TessellationDescriptor`], or Metal's defaults): a synthesized vertex and tessellation
 //! control stage, the function's evaluation stage, and the fragment stage when rasterization is
@@ -56,17 +54,17 @@
 //! **Tile pipelines.** `Device::compile_tile_pipeline` compiles a [`TileRenderPipelineDescriptor`]
 //! into a [`ComputePipeline`]: its tile function compiled under the descriptor's color attachment
 //! formats (`LoweringInputs::tile_attachments`), which the consumer dispatches over the render
-//! area's tiles in place of `dispatchThreadsPerTile:`, with the pass's tile size
-//! (`BindState::imageblock_size`) and render area (`BindState::render_area`), and the pass's
-//! attachments bound as storage images in the plan's formats (`WriteSource::TileAttachment`: a
+//! area's tiles in place of `dispatchThreadsPerTile:`, with the pass's tile size and render area,
+//! and the pass's attachments bound as storage images in the interface's formats
+//! (`WriteSource::TileAttachment`: a
 //! float attachment through the unsigned-integer format of its channels, so its bits move).
 //!
 //! **Mesh pipelines.** `Device::compile_mesh_pipeline` compiles a [`MeshPipelineDescriptor`]
 //! into a [`RenderPipeline`] whose stages are its object (`TASK_EXT`), mesh (`MESH_EXT`) and
 //! fragment stages, with no vertex input; its fragment function reads the mesh function's primitive
-//! outputs per primitive (`LoweringInputs::primitive_varyings`). Its plan draws mesh draws
+//! outputs per primitive (`LoweringInputs::primitive_varyings`). It draws mesh draws
 //! (`DrawCall::MeshThreadgroups` and its siblings), each with the specialization of its mesh
-//! threadgroup's size (`DrawCommands::specialization`).
+//! threadgroup's size.
 //!
 //! **Not implemented yet.** The plan of a mesh pipeline with an object function, an object
 //! function's payload, and a patch draw with a patch index buffer are refused, each as
@@ -86,10 +84,12 @@ pub(crate) mod compile;
 pub(crate) mod descriptor;
 pub(crate) mod facts;
 pub(crate) mod graphics;
+mod indirect_draws;
 pub(crate) mod interface;
 pub(crate) mod layout;
 pub(crate) mod link;
 pub(crate) mod lower_inputs;
+mod own;
 pub(crate) mod private_state;
 pub(crate) mod relocate;
 pub(crate) mod rotated_blend;
@@ -105,9 +105,9 @@ pub(crate) mod tile_map;
 pub(crate) mod vertex;
 
 pub use artifact::{
-    ComputePipeline, ComputePipelineMetalInfo, EntryMath, MeshPipelineMetalInfo, ModuleStats,
-    PrecisionNote, Reconvergence, RenderPipeline, RuntimeDependency, SpecClause, SpecConstant,
-    SpecTest, SpecializationLayout, SpecializedNote, StageModule, StrategyCensus, StrategyUse,
+    ComputePipeline, ComputePipelineMetalInfo, ModuleStats, PrecisionNote, Reconvergence,
+    RenderPipeline, RuntimeDependency, SpecClause, SpecConstant, SpecTest, SpecializationLayout,
+    SpecializedNote, StageModule, StrategyCensus, StrategyUse,
 };
 pub use descriptor::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, DynamicLibraries, FunctionDescriptor,
@@ -117,28 +117,25 @@ pub use descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 pub use graphics::{
-    BandPrimitive, BlendState, ColorAttachmentState, EmulatedTessellation, FanOutState,
-    FragmentImageblock, GraphicsState, ImageblockMechanism, InputAttachmentUse, LineBandState,
-    RegionFanOut, ShaderTestsUse, ShadowStencilUse, StandInUse, StandInView, StorageAttachmentUse,
-    StorageAttachmentView, TessellationState,
+    BandPrimitive, BlendState, ColorAttachmentState, GraphicsState, InputAttachmentUse,
+    LineBandState, TessellationState,
 };
+pub use indirect_draws::IndirectDrawLayout;
 pub use interface::{
-    AccessSet, AttributeFetch, BufferForm, BufferKind, BufferSlot, CommandWrites, DescriptorView,
-    LevelReads, MeshRecords, NumberedSampler, PatchDomain, PipelineInterface, PlacedField, PushLoc,
-    PushPlacement, RecordField, RecordValue, SampledLevels, SamplerArray, SamplerLevels,
-    SamplerSlot, SlotInterface, SnapshotRefusal, TextureAccess, TextureSlot, ThreadgroupArgument,
-    Window,
+    AccessSet, AttributeFetch, BufferForm, BufferKind, BufferSlot, CommandWrites, LevelReads,
+    NumberedSampler, PatchDomain, PipelineInterface, PlacedField, PushLoc, PushPlacement,
+    SampledLevels, SamplerArray, SamplerLevels, SamplerSlot, SlotInterface, TextureAccess,
+    TextureSlot, ThreadgroupArgument, Window,
 };
 pub use layout::{
     BindingSource, DescriptorBinding, DescriptorSetLayout, PipelineLayout, PushConstantRange,
 };
 pub use link::{heap_sampler_capacity, heap_unused_while_pending};
 pub use lower_inputs::{
-    AliasView, AmplificationDraws, BlendEquation, ChannelWrite, ColorGroup, ExtendedRangeColor,
-    FactorLane, FetchedAttachment, FramebufferFetchInputs, LoweringInputs, RotatedBlendForm,
-    StorageImageChoice, StorageImageClass, VertexFetch, VertexFetchProjection,
-    ViewportCompensation,
+    AliasView, AmplificationDraws, ChannelWrite, ExtendedRangeColor, FactorLane, KernelVariant,
+    LoweringInputs, StorageImageChoice, StorageImageClass, VertexFetch, VertexFetchProjection,
 };
+pub use own::{own_kernel, ExecutionCounts, OwnKernel};
 pub use table::FunctionHandle;
 // The vocabulary the pipeline surface reaches: render-pipeline keys, runtime facts and their
 // mechanisms, and the link symbols artifacts, layouts, and plans name.
@@ -146,13 +143,24 @@ pub use compile::api::{CompileReport, RenderPipelineKeys};
 // Translating one entry of a bare module.
 pub use compile::{
     EntryDescriptor, EntryPlan, EntryRef, LinkedSource, StageEntries, StandaloneModule,
+    COMPILED_STAGE_WEIGHT,
 };
-pub use facts::{Mechanism, RuntimeFact, UniformViewChoice};
+pub use facts::{Mechanism, RuntimeFact};
+// The `DispatchRegion` push field's bytes, which a consumer of the identity domains pushes with
+// each dispatch, the tile a kernel's grid tiles cover a grid with (`RuntimeFact::GridTiles`), the
+// depth past which a threadgroup runs as one row (`SpecKey::DeepThreadgroup`), and every
+// specialization constant a kernel's threadgroup size decides.
+pub use crate::lower::dispatch::{
+    grid_tile, nonuniform_region_bytes, region_bytes, threadgroup_constants, DEEP_THREADGROUP,
+    GRID_TILE_THREADS, NONUNIFORM,
+};
+// The threadgroup memory of an emulated-simdgroup module's arena (`RuntimeFact::SimdgroupEmulation`),
+// which a consumer of the identity domains counts with each dispatch's scratch.
+pub use crate::lower::simd::workgroup::arena_bytes;
 pub use sym::{
     AccelerationStructureLevel, AirUserKey, Axis, CombinedSampler, HandleClass, ImageAccess,
     ImageDim, ImageHandleClass, PushField, ResourceKind, ResourceSlot, SampledType, SamplerRef,
-    SlotClass, SlotRef, SnapshotForm, SpecKey, Stage, StorageFormatClass, Symbol, SyntheticBinding,
-    VaryingKey,
+    SlotClass, SlotRef, SpecKey, Stage, StorageFormatClass, Symbol, SyntheticBinding, VaryingKey,
 };
 pub use vertex::{PulledAttribute, VertexAttribute, VertexBinding, VertexInputState, VertexStride};
 

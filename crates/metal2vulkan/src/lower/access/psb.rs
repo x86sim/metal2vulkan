@@ -19,7 +19,10 @@
 //! **Containment** is mandatory for PSB (robust buffer access does not apply to device addresses):
 //! the normative check in `u64` against `size`, the access at `select(inb, address, sink)`, and a
 //! load's value `select(inb, v, 0)`. A contained store lands in the sink, which no shader reads
-//! observably. Only `Containment::UnsafeOff` omits it.
+//! observably. Under the identity domains no table is
+//! read: an access whose offset is not a translation-time constant is checked against the slot's
+//! buffer ([`in_buffer`], `emit::prepare`), a load outside reading the zero range
+//! ([`PsbMem::outside`]).
 //!
 //! The leaf itself (`memory::leaf`) sees a word memory based at the 4-aligned address below the
 //! access, and the access's byte offset within that word (0 to 3).
@@ -30,14 +33,21 @@
 //! `storageBuffer8BitAccess` and `storageBuffer16BitAccess` cover the `PhysicalStorageBuffer`
 //! storage class as they cover `StorageBuffer`. A sub-word store there is one narrow store; without
 //! the access it stays the two word atomics ([`PsbMem`]'s `write_bits`).
+//!
+//! **Whole words.** A leaf of whole words is one access of up to 16 bytes at the device address of
+//! its first word (`memory::leaf`'s whole words; [`PsbMem`]'s `whole_place`), not one per word:
+//! from the word below the access, that word; from a slot's own address, the slot's address plus
+//! the offset, which a leaf proven a multiple of 8 or 16 takes as it is, with that `Aligned`
+//! operand, and any other rounds down to a multiple of 4.
 
+use super::SLOT_ADDRESS_BIAS;
 use crate::device::DeviceProfile;
-use crate::memory::leaf::{Units, WordMem, WordOps};
+use crate::memory::leaf::{k32, u32_op, Units, WordMem, WordOps};
 use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{TypeId, Value};
 use crate::spirv::ir::{
-    AtomicOp, BinOp, ConstBits, Constant, ConvOp, MemAccess, Scope, Semantics, Type, UnOp,
+    AtomicOp, BinOp, ConstBits, Constant, ConvOp, GlslOp, MemAccess, Scope, Semantics, Type, UnOp,
 };
 
 /// Bytes of one root-table entry.
@@ -92,6 +102,21 @@ fn entry_field(
     )
 }
 
+/// `x` (a `u64`) rounded down to a multiple of 4, and its remainder (0 to 3) as a `u32`: the word
+/// below a byte and the byte's offset in it. A leaf of whole words reads only the word, and the
+/// remainder's instructions are then removed as dead.
+pub fn split_word(fb: &mut FunctionBuilder<'_>, x: Value) -> BResult<(Value, Value)> {
+    let mask = k64(fb, !3)?;
+    let word = fb.binary(BinOp::BitwiseAnd, x, mask)?;
+    let three = k64(fb, 3)?;
+    let low = fb.binary(BinOp::BitwiseAnd, x, three)?;
+    let u32_ = fb.module().ty(Type::Int {
+        width: 32,
+        signed: false,
+    })?;
+    Ok((word, fb.convert(ConvOp::UConvert, low, u32_)?))
+}
+
 /// The 64-bit displacement from the bind offset (a `u64`) that the `u32` offset `m` of a
 /// static-root fat pointer stands for, in a slot whose window starts at `start` (module doc:
 /// `start + zext((m − start) mod 2³²)`, wrapping).
@@ -135,15 +160,8 @@ pub fn prepare(
     let bind = entry_field(fb, table, root, BIND_OFFSET)?;
     let disp = displacement(fb, m, start)?;
     let off = fb.binary(BinOp::IAdd, bind, disp)?;
-    let three = k64(fb, 3)?;
-    let low = fb.binary(BinOp::BitwiseAnd, off, three)?;
-    let aligned = fb.binary(BinOp::ISub, off, low)?;
+    let (aligned, low) = split_word(fb, off)?;
     let base = fb.binary(BinOp::IAdd, host, aligned)?;
-    let u32_ = fb.module().ty(Type::Int {
-        width: 32,
-        signed: false,
-    })?;
-    let low = fb.convert(ConvOp::UConvert, low, u32_)?;
     if !contained {
         return Ok(PsbAccess {
             mem: PsbMem::at(base),
@@ -164,6 +182,104 @@ pub fn prepare(
     })
 }
 
+/// How a device-address memory reaches its units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// From the 4-aligned device address below one access ([`prepare`]): each unit at that
+    /// address plus its index times its size, in 64 bits.
+    Rounded,
+    /// From the 4-aligned device address below one access of a slot under the identity domains
+    /// ([`prepare_at`]): each unit at that address plus its index times its size, the product in
+    /// 32 bits and zero-extended. A unit lies within 2^31 bytes of that address, the runtime
+    /// making no buffer longer than 2 GiB (`metal2vulkan_runtime::MAX_BUFFER_LENGTH`), so the product is
+    /// exact, and no 64-bit shift or multiply scales an index.
+    Below,
+    /// From a slot's own device address under the identity domains ([`prepare_direct`]), held
+    /// as that address less [`SLOT_ADDRESS_BIAS`] (2^31): each unit at that base plus its 32-bit
+    /// byte offset plus 2^31, modulo 2^32, zero-extended, in 64-bit integers, then one
+    /// `OpConvertUToPtr` to the unit's block (`NonWritable` for a load of an unwritten slot).
+    /// Every byte of a buffer lies within 2^31 bytes of each bind address in it, the runtime
+    /// making no buffer longer than 2 GiB (`metal2vulkan_runtime::MAX_BUFFER_LENGTH`), so the offset
+    /// read as signed is in `[-2^31, 2^31)`, the biased one is that offset plus 2^31 exactly, and
+    /// the sum is the address plus the offset. A unit index `x + c` with a constant `c` folds
+    /// `c`'s bytes into the bias: `(x + c) * s + 2^31` is `x * s + (c * s + 2^31)` modulo 2^32.
+    /// The bias is one 32-bit add, which a device fuses with the index's shift; the offset is
+    /// zero-extended, which a device splits into a scalar base and a vector offset; no shift of
+    /// the offset in 64 bits and no pointer bitcast.
+    Direct,
+}
+
+/// Prepare an access of a static slot at the `u32` displacement `m` from its bind offset, read as
+/// signed, under the identity domains: `address` (a `u64`) is the slot's own device address, the
+/// buffer's plus the bind offset, so no table is read, and the access is at `address` plus `m`
+/// sign-extended, below the bind address for a negative `m`, as [`prepare_direct`]'s is. Every
+/// byte of a buffer lies within 2^31 bytes of each bind address in it, the runtime making no buffer
+/// longer than 2 GiB, so the offset is exact whatever the slot's window. The address need not be
+/// 4-aligned: the word below the access and the byte offset in it come from the sum. The check,
+/// where the access takes one, is `emit::prepare`'s ([`in_buffer`]).
+pub fn prepare_at(fb: &mut FunctionBuilder<'_>, address: Value, m: Value) -> BResult<PsbAccess> {
+    let u64_ = u64_ty(fb)?;
+    let disp = fb.convert(ConvOp::SConvert, m, u64_)?;
+    let at = fb.binary(BinOp::IAdd, address, disp)?;
+    let (base, low) = split_word(fb, at)?;
+    Ok(PsbAccess {
+        mem: PsbMem {
+            reach: Reach::Below,
+            ..PsbMem::at(base)
+        },
+        off: low,
+        inb: None,
+    })
+}
+
+/// Prepare an access of a static slot at the `u32` displacement `m` from its bind offset, under
+/// the identity domains, from `base` (a `u64`), the slot's own device address less
+/// [`SLOT_ADDRESS_BIAS`], an address the binder holds to a multiple of the argument's alignment
+/// (`RuntimeFact::AddressAlignment`): the access is the byte offset `m`, read as signed, from that
+/// address, as a descriptor view's is `m` from its base ([`Reach::Direct`]). Every byte of a
+/// buffer lies within 2^31 bytes of each bind address in it, the runtime making no buffer longer
+/// than 2 GiB (`metal2vulkan_runtime::MAX_BUFFER_LENGTH`), so the offset is exact whatever the slot's
+/// window. Nothing is rounded. The check, where the access takes one, is `emit::prepare`'s.
+pub fn prepare_direct(base: Value, m: Value) -> PsbAccess {
+    PsbAccess {
+        mem: PsbMem {
+            reach: Reach::Direct,
+            ..PsbMem::at(base)
+        },
+        off: m,
+        inb: None,
+    }
+}
+
+/// The limit of an `n`-byte access (`n` at least 1) of a buffer of `length` bytes, an unsigned
+/// integer: `length - min(length, n - 1)`, so the access at byte `at` of the buffer lies in it
+/// exactly where `at < limit`, the normative check `(length >= n) && (at <= length - n)`
+/// (`contain::in_bounds`): where `length >= n` the limit is `length - n + 1`, and below that it is
+/// 0, which no offset is under. Nothing wraps. `length` itself for a 1-byte access.
+pub fn limit(fb: &mut FunctionBuilder<'_>, length: Value, n: u32) -> BResult<Value> {
+    if n <= 1 {
+        return Ok(length);
+    }
+    let k = crate::memory::contain::int_like(fb, length, u64::from(n - 1))?;
+    let low = fb.glsl(GlslOp::UMin, &[length, k])?;
+    fb.binary(BinOp::ISub, length, low)
+}
+
+/// Whether an access at the `u32` byte offset `m` from a slot's bind offset, read as signed, lies
+/// in the slot's buffer: `m` plus `before`, the buffer's bytes before the bind offset (from the
+/// slot's pushed bounds, `PushField::SlotBounds`), under the slot's [`limit`] for the access's
+/// size, both made once per function by `EmitCx::slot_limit`. One add and one compare per access,
+/// in `u32`. Exact as the runtime makes no buffer longer than 2 GiB: an offset that reaches
+/// before the buffer's start wraps to at least 2^31, past every limit.
+pub fn in_buffer(
+    fb: &mut FunctionBuilder<'_>,
+    m: Value,
+    (before, limit): (Value, Value),
+) -> BResult<Value> {
+    let at = fb.binary(BinOp::IAdd, m, before)?;
+    fb.binary(BinOp::ULessThan, at, limit)
+}
+
 /// The narrow units a device-address memory loads and stores directly on profile `p`: the 1- and
 /// 2-byte units of [`Units::storage_on`] (the width's storage access and integer type). No `uvec2`
 /// or `uvec4` unit: a device address below an access is only 4-byte aligned.
@@ -177,12 +293,18 @@ pub fn narrow_units(p: &DeviceProfile) -> Units {
 
 /// Words at a 4-aligned device address (a `u64`), loaded and stored with memory operands (a
 /// coherence and `Volatile`), and the narrow units ([`narrow_units`]) it also loads and stores
-/// directly.
+/// directly. Memory nothing writes while the module runs is loaded through `NonWritable` places
+/// ([`PsbMem::read_only`]).
 #[derive(Clone, Copy, Debug)]
 pub struct PsbMem {
     base: Value,
     ops: WordOps,
     units: Units,
+    read_only: bool,
+    reach: Reach,
+    /// Where a load's units read when a check fails ([`PsbMem::outside`]): the check and the
+    /// zero range's address.
+    outside: Option<(Value, Value)>,
 }
 
 impl PsbMem {
@@ -193,7 +315,29 @@ impl PsbMem {
             base,
             ops: WordOps::default(),
             units: Units::NONE,
+            read_only: false,
+            reach: Reach::Rounded,
+            outside: None,
         }
+    }
+
+    /// The same words, each unit a load reads at `zero` (a `u64`, the identity domains' zero
+    /// range: 16 bytes of zeros at a multiple of 16 that nothing writes) where `inb` fails: one
+    /// select of the unit's address, so a load outside reads zero, touches nothing of the slot,
+    /// and takes no select of its value. Stores and atomics are not redirected: they run only
+    /// where `inb` holds.
+    pub fn outside(self, inb: Value, zero: Value) -> PsbMem {
+        PsbMem {
+            outside: Some((inb, zero)),
+            ..self
+        }
+    }
+
+    /// The same words, loaded through `NonWritable` places where `read_only`: memory nothing
+    /// writes while the module runs (`AccessPlan`'s unwritten slots), so the device may read it as
+    /// read-only memory.
+    pub fn read_only(self, read_only: bool) -> PsbMem {
+        PsbMem { read_only, ..self }
     }
 
     /// The same words, loaded and stored with `ops`.
@@ -215,59 +359,155 @@ impl PsbMem {
     }
 
     /// A `PhysicalStorageBuffer` place of the `bytes`-byte unit `index` (a `u32` index of such
-    /// units) of the memory, and the unit's type.
+    /// units, `bytes` 1, 2, 4, 8 or 16) of type `ty`, to load from where `load`.
+    fn place_of(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        bytes: u32,
+        index: Value,
+        ty: TypeId,
+        load: bool,
+    ) -> BResult<Value> {
+        match self.reach {
+            Reach::Rounded => {
+                let u64_ = u64_ty(fb)?;
+                let i = fb.convert(ConvOp::UConvert, index, u64_)?;
+                let d = match bytes {
+                    1 => i,
+                    _ => {
+                        let size = k64(fb, u64::from(bytes))?;
+                        fb.binary(BinOp::IMul, i, size)?
+                    }
+                };
+                let addr = fb.binary(BinOp::IAdd, self.base, d)?;
+                self.place(fb, addr, ty, load)
+            }
+            Reach::Below => {
+                let shift = k32(fb, bytes.trailing_zeros())?;
+                let at = u32_op(fb, BinOp::ShiftLeftLogical, index, shift)?;
+                let u64_ = u64_ty(fb)?;
+                let d = fb.convert(ConvOp::UConvert, at, u64_)?;
+                let addr = fb.binary(BinOp::IAdd, self.base, d)?;
+                self.place(fb, addr, ty, load)
+            }
+            Reach::Direct => {
+                let shift = bytes.trailing_zeros();
+                let (x, c) = fb.sum_of(index).unwrap_or((index, 0));
+                let s = k32(fb, shift)?;
+                let at = u32_op(fb, BinOp::ShiftLeftLogical, x, s)?;
+                let bias = (c << shift).wrapping_add(SLOT_ADDRESS_BIAS as u32);
+                let bias = k32(fb, bias)?;
+                let at = u32_op(fb, BinOp::IAdd, at, bias)?;
+                let u64_ = u64_ty(fb)?;
+                let d = fb.convert(ConvOp::UConvert, at, u64_)?;
+                let addr = fb.binary(BinOp::IAdd, self.base, d)?;
+                self.place(fb, addr, ty, load)
+            }
+        }
+    }
+
+    /// A `PhysicalStorageBuffer` place of the `bytes`-byte unit `index` (a `u32` index of such
+    /// units) of the memory, to load from where `load`, and the unit's type.
     fn unit_ptr(
         &self,
         fb: &mut FunctionBuilder<'_>,
         bytes: u32,
         index: Value,
+        load: bool,
     ) -> BResult<(Value, TypeId)> {
-        let u64_ = u64_ty(fb)?;
-        let i = fb.convert(ConvOp::UConvert, index, u64_)?;
-        let d = match bytes {
-            1 => i,
-            _ => {
-                let size = k64(fb, u64::from(bytes))?;
-                fb.binary(BinOp::IMul, i, size)?
-            }
-        };
-        let addr = fb.binary(BinOp::IAdd, self.base, d)?;
         let ty = fb.module().ty(Type::Int {
             width: if bytes == 1 { 8 } else { 16 },
             signed: false,
         })?;
-        Ok((fb.device_place(addr, ty)?, ty))
+        Ok((self.place_of(fb, bytes, index, ty, load)?, ty))
     }
 
-    /// A `PhysicalStorageBuffer` place of word `word` (a `u32` index) of the memory.
-    pub fn word_ptr(&self, fb: &mut FunctionBuilder<'_>, word: Value) -> BResult<Value> {
+    /// A `PhysicalStorageBuffer` place of word `word` (a `u32` index) of the memory, to load from
+    /// where `load`.
+    fn word_ptr(&self, fb: &mut FunctionBuilder<'_>, word: Value, load: bool) -> BResult<Value> {
         let u32_ = fb.module().ty(Type::Int {
             width: 32,
             signed: false,
         })?;
-        self.typed_ptr(fb, word, u32_)
+        self.place_of(fb, 4, word, u32_, load)
     }
 
-    /// A `PhysicalStorageBuffer` place of a `pointee` at word `word` (a `u32` index) of the
-    /// memory: a typed alias of the words, which only a device address gives (a descriptor view
-    /// is one `u32` array). Atomics take it.
-    pub fn typed_ptr(
+    /// The place of a `pointee` at `addr`: `NonWritable` for a load of read-only memory, and a
+    /// load's at the zero range where its check fails ([`PsbMem::outside`]).
+    fn place(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        addr: Value,
+        pointee: TypeId,
+        load: bool,
+    ) -> BResult<Value> {
+        let addr = match (load, self.outside) {
+            (true, Some((inb, zero))) => fb.select(inb, addr, zero)?,
+            _ => addr,
+        };
+        match load && self.read_only {
+            true => fb.device_place_read_only(addr, pointee),
+            false => fb.device_place(addr, pointee),
+        }
+    }
+
+    /// The `PhysicalStorageBuffer` place of a `pointee` (at most 16 bytes) at byte `at` past the
+    /// word holding byte `off` of the memory, to load from where `load`, and the `Aligned` operand
+    /// of an access through it: `align` where the memory's base is its Metal address and `off`
+    /// is proven a multiple of `align`, else 4.
+    ///
+    /// A memory based at the word below one access ([`Reach::Rounded`], [`Reach::Below`]) holds
+    /// that access's byte offset in the word, below 4: its first word is the base. A slot's own
+    /// address ([`Reach::Direct`]) is held to its argument's alignment, so a proven multiple of 8
+    /// or 16 is the address's own; any other offset is rounded down to a multiple of 4, as the
+    /// word path reads it.
+    fn whole_place(
+        &self,
+        fb: &mut FunctionBuilder<'_>,
+        (off, at): (Value, u32),
+        pointee: TypeId,
+        (load, align): (bool, u32),
+    ) -> BResult<(Value, u32)> {
+        match self.reach {
+            Reach::Rounded | Reach::Below => {
+                let addr = match at {
+                    0 => self.base,
+                    at => {
+                        let d = k64(fb, u64::from(at))?;
+                        fb.binary(BinOp::IAdd, self.base, d)?
+                    }
+                };
+                Ok((self.place(fb, addr, pointee, load)?, 4))
+            }
+            Reach::Direct => {
+                let (off, align) = match align {
+                    8 | 16 => (off, align),
+                    _ => {
+                        let mask = k32(fb, !3)?;
+                        (u32_op(fb, BinOp::BitwiseAnd, off, mask)?, 4)
+                    }
+                };
+                let (x, c) = fb.sum_of(off).unwrap_or((off, 0));
+                let bias = c.wrapping_add(at).wrapping_add(SLOT_ADDRESS_BIAS as u32);
+                let bias = k32(fb, bias)?;
+                let biased = u32_op(fb, BinOp::IAdd, x, bias)?;
+                let u64_ = u64_ty(fb)?;
+                let d = fb.convert(ConvOp::UConvert, biased, u64_)?;
+                let addr = fb.binary(BinOp::IAdd, self.base, d)?;
+                Ok((self.place(fb, addr, pointee, load)?, align))
+            }
+        }
+    }
+
+    /// The `PhysicalStorageBuffer` place of a `pointee` at word `word` (a `u32` index) of the
+    /// memory, for an atomic: never `NonWritable`.
+    pub fn word_place(
         &self,
         fb: &mut FunctionBuilder<'_>,
         word: Value,
         pointee: TypeId,
     ) -> BResult<Value> {
-        let addr = self.word_address(fb, word)?;
-        fb.device_place(addr, pointee)
-    }
-
-    /// The device address (a `u64`) of word `word` (a `u32` index) of the memory.
-    pub fn word_address(&self, fb: &mut FunctionBuilder<'_>, word: Value) -> BResult<Value> {
-        let u64_ = u64_ty(fb)?;
-        let w = fb.convert(ConvOp::UConvert, word, u64_)?;
-        let four = k64(fb, 4)?;
-        let d = fb.binary(BinOp::IMul, w, four)?;
-        fb.binary(BinOp::IAdd, self.base, d)
+        self.place_of(fb, 4, word, pointee, false)
     }
 }
 
@@ -282,13 +522,13 @@ const WORD: MemAccess = MemAccess {
 
 impl WordMem for PsbMem {
     fn read(&mut self, fb: &mut FunctionBuilder<'_>, word: Value) -> BResult<Value> {
-        let p = self.word_ptr(fb, word)?;
+        let p = self.word_ptr(fb, word, true)?;
         let access = self.ops.access(fb, WORD, false)?;
         fb.load(p, access)
     }
 
     fn write(&mut self, fb: &mut FunctionBuilder<'_>, word: Value, value: Value) -> BResult<()> {
-        let p = self.word_ptr(fb, word)?;
+        let p = self.word_ptr(fb, word, false)?;
         let access = self.ops.access(fb, WORD, true)?;
         fb.store(p, value, access)
     }
@@ -300,7 +540,7 @@ impl WordMem for PsbMem {
         mask: Value,
         bits: Value,
     ) -> BResult<()> {
-        let p = self.word_ptr(fb, word)?;
+        let p = self.word_ptr(fb, word, false)?;
         let keep = fb.unary(UnOp::Not, mask)?;
         let clear = fb.binary(BinOp::BitwiseOr, keep, bits)?;
         fb.atomic(AtomicOp::And, p, Scope::Device, Semantics::RELAXED, clear)?;
@@ -312,13 +552,44 @@ impl WordMem for PsbMem {
         self.units
     }
 
+    fn whole(&self) -> bool {
+        true
+    }
+
+    fn read_whole(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        off: Value,
+        at: u32,
+        ty: TypeId,
+        align: u32,
+    ) -> BResult<Value> {
+        let (p, align) = self.whole_place(fb, (off, at), ty, (true, align))?;
+        let access = self.ops.access(fb, unit_access(align), false)?;
+        fb.load(p, access)
+    }
+
+    fn write_whole(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        off: Value,
+        at: u32,
+        value: Value,
+        align: u32,
+    ) -> BResult<()> {
+        let ty = fb.value_ty(value)?;
+        let (p, align) = self.whole_place(fb, (off, at), ty, (false, align))?;
+        let access = self.ops.access(fb, unit_access(align), true)?;
+        fb.store(p, value, access)
+    }
+
     fn read_unit(
         &mut self,
         fb: &mut FunctionBuilder<'_>,
         bytes: u32,
         index: Value,
     ) -> BResult<Value> {
-        let (p, _) = self.unit_ptr(fb, bytes, index)?;
+        let (p, _) = self.unit_ptr(fb, bytes, index, true)?;
         let access = self.ops.access(fb, unit_access(bytes), false)?;
         let x = fb.load(p, access)?;
         let u32_ = fb.module().ty(Type::Int {
@@ -339,7 +610,7 @@ impl WordMem for PsbMem {
         index: Value,
         value: Value,
     ) -> BResult<()> {
-        let (p, ty) = self.unit_ptr(fb, bytes, index)?;
+        let (p, ty) = self.unit_ptr(fb, bytes, index, false)?;
         let x = fb.convert(ConvOp::UConvert, value, ty)?;
         let access = self.ops.access(fb, unit_access(bytes), true)?;
         fb.store(p, x, access)
@@ -351,5 +622,53 @@ fn unit_access(bytes: u32) -> MemAccess {
     MemAccess {
         aligned: Some(bytes),
         ..WORD
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
+    use crate::spirv::builder::FunctionBuilder;
+    use crate::spirv::error::BResult;
+    use crate::spirv::ids::Value;
+    use crate::spirv::interp::harness::{address, check_containment, AccessArgs};
+    use crate::spirv::ir::{BinOp, Constant, MemAccess};
+
+    use super::limit;
+
+    /// The identity domains' check with no bytes before the bind offset: the access at `offset`
+    /// of a buffer of `size` bytes, loaded inside `if_(offset < limit)`.
+    fn limited(fb: &mut FunctionBuilder<'_>, a: &AccessArgs) -> BResult<Value> {
+        let lim = limit(fb, a.size, a.n)?;
+        let inb = fb.binary(BinOp::ULessThan, a.offset, lim)?;
+        let null = fb.module().constant(Constant::Null { ty: a.elem })?;
+        let var = fb.local_var(a.elem, Some(null))?;
+        let result = fb.var_ptr(var)?;
+        let args = *a;
+        let then: ArmFn<'_, ()> = Box::new(move |fb, _| {
+            let p = address(fb, &args)?;
+            let v = fb.load(
+                p,
+                MemAccess {
+                    aligned: Some(1),
+                    ..MemAccess::default()
+                },
+            )?;
+            fb.store(result, v, MemAccess::default())?;
+            Ok(ArmEnd::FallThrough(Vec::new()))
+        });
+        fb.if_(&mut (), inb, then, None)?;
+        fb.load(result, MemAccess::default())
+    }
+
+    /// An offset under the limit is exactly one the normative check admits: at offsets around the
+    /// buffer's start and end and at `0xFFFF_FFF0..=0xFFFF_FFFF` (and the top of the 64-bit range),
+    /// for `n` in {1, 2, 4, 16} in both offset widths, over buffers shorter than one access (whose
+    /// limit is 0), as long as one, and longer.
+    #[test]
+    fn an_offset_under_the_limit_is_one_the_normative_check_admits() {
+        for size in [0u64, 1, 3, 4, 15, 16, 22, 64] {
+            check_containment(&limited, size).unwrap_or_else(|e| panic!("size {size}: {e}"));
+        }
     }
 }

@@ -24,7 +24,7 @@
 
 use crate::budget::{Budget, Meter};
 use crate::cache::VariantKey;
-use crate::device::requirements::{Requirements, VkExtension, VkFeature, VkLimit, VkProperty};
+use crate::device::requirements::{Requirements, VkExtension, VkFeature, VkLimit};
 use crate::device::{mechanism, Device, DeviceProfile};
 use crate::error::{
     ComputePipelineProblem, DescriptorError, Error, Feature, InternalError, InternalKind,
@@ -34,25 +34,21 @@ use crate::library::{CompiledFunction, FunctionArtifact, FunctionCompileKey};
 use crate::lower::select::LowerInputs;
 use crate::lower::simd::workgroup::arena_bytes;
 use crate::pipeline::artifact::{
-    ComputePipeline, ComputePipelineMetalInfo, MeshPipelineMetalInfo, PrecisionNote,
-    RenderPipeline, RuntimeDependency, StageModule,
+    ComputePipeline, ComputePipelineMetalInfo, PrecisionNote, RenderPipeline, RuntimeDependency,
+    StageModule,
 };
-use crate::pipeline::compile::key::{
-    function_key, mesh_descriptor_key, pipeline_key, render_descriptor_key,
-};
+use crate::pipeline::compile::key::{function_key, pipeline_key, queried_render_descriptor_key};
 use crate::pipeline::compile::{
-    color_group, compile_stage, compile_stage_from, dynamic_order, guarded, linked_keys,
-    primitive_id_carried_on, reads_primitive_id_varying, stage_inputs, FragmentPass, InputsFrom,
-    RawIndices, StageEntries, NO_PRIMITIVE_VARYINGS,
+    compile_stage, compile_stage_from, dynamic_order, guarded, kernel_observes_partition,
+    linked_keys, primitive_id_varying_on, reads_primitive_id_varying, stage_inputs,
+    vertex_push_end, FragmentPass, InputsFrom, RawIndices, StageEntries, NO_PRIMITIVE_VARYINGS,
 };
 use crate::pipeline::descriptor::{
     ComputePipelineDescriptor, FunctionDescriptor, MeshPipelineDescriptor,
     RenderPipelineDescriptor, StageSource, TileRenderPipelineDescriptor,
 };
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::graphics::{GraphicsState, StorageAttachmentView};
-use crate::pipeline::link::geometry;
-use crate::pipeline::link::mesh::synthesized_stage as mesh_vertex_stage;
+use crate::pipeline::graphics::GraphicsState;
 use crate::pipeline::link::tessellation::{note_evaluation_stage, synthesized_stages};
 use crate::pipeline::link::{link, LinkInputs, Linked, RenderLinkInputs};
 use crate::pipeline::lower_inputs::LoweringInputs;
@@ -61,7 +57,7 @@ use crate::pipeline::sym::{Stage, VaryingKey};
 use crate::spirv::serialize::ENTRY_NAME;
 use crate::vk;
 
-/// What one compile cost against its [`Budget`] ([`Device::compile_function_with_report`]): the
+/// What one compile cost against its [`Budget`] ([`DeviceProfile::compile_entry`]): the
 /// two bounds the budget sets besides its deadline, as the compile's meter counted them up to its
 /// end or its refusal.
 #[non_exhaustive]
@@ -101,9 +97,8 @@ pub struct RenderPipelineKeys {
     /// `Compiled` vertex stage.
     pub vertex_inputs: Option<LoweringInputs>,
     /// The inputs a `Function` fragment stage compiles under (`VariantKey::lowering_inputs` of
-    /// the fragment stage, the signed-integer color attachments it writes, whether the pipeline is
-    /// multisampled, and the state of the attachments it reads where the device orders framebuffer
-    /// fetch only through the pixel interlock). `None` for a `Compiled` fragment stage or none.
+    /// the fragment stage, the signed-integer color attachments it writes, and whether the
+    /// pipeline is multisampled). `None` for a `Compiled` fragment stage or none.
     pub fragment_inputs: Option<LoweringInputs>,
 }
 
@@ -128,40 +123,21 @@ impl Device {
         )
     }
 
-    /// The key of render pipeline descriptor `d` on this device, without decoding: a digest of
-    /// every field of `d`, each `Function` stage by its [`Device::function_compile_key`] under the
-    /// default lowering inputs (its AIR hash, entry name, constants, linked functions and dynamic
-    /// libraries), each `Compiled` stage by its key, with this device's profile fingerprint and
-    /// [`SEMANTICS_VERSION`](crate::cache::SEMANTICS_VERSION). Everything a creation asks of `d`
-    /// before its compile on this device ([`Device::render_variant_key`] under one variant, the
-    /// descriptor's linked-use answers, its reflection) is a function of this key: a consumer
-    /// may keep those answers under it. The crate keeps none.
-    pub fn render_descriptor_key(&self, d: &RenderPipelineDescriptor) -> crate::cache::PipelineKey {
-        let stage = |s: &StageSource| match s {
-            StageSource::Function(f) => (
-                0,
-                *self
-                    .function_compile_key(f, &LoweringInputs::default())
-                    .digest(),
-            ),
-            StageSource::Compiled(c) => (1, *c.key().digest()),
-        };
-        render_descriptor_key(&self.profile_fingerprint(), d, stage)
-    }
-
-    /// The key of mesh render pipeline descriptor `d` on this device, without decoding, as
-    /// [`Device::render_descriptor_key`] keys a render descriptor: a digest of every field of `d`,
-    /// each `Function` stage by its [`Device::function_compile_key`] under the default lowering
-    /// inputs, each `Compiled` stage by its key, with this device's profile fingerprint and
-    /// [`SEMANTICS_VERSION`](crate::cache::SEMANTICS_VERSION).
-    ///
-    /// The descriptor's [`reflection`](MeshPipelineDescriptor::reflection) and
-    /// [`slot_writes`](MeshPipelineDescriptor::slot_writes) are a function of this key, so a
-    /// consumer may keep either under it and ask for it once however many states it makes of the
-    /// descriptor. Both read the three stages alone, so the key is wider than they need; it is
-    /// every field so that it means this descriptor on this device, as the render form does. The
+    /// The key of render pipeline descriptor `d` on this device for the runtime on
+    /// [`Device::from_queries`], without decoding: every field of `d`, each `Function` stage by its
+    /// [`Device::function_compile_key`] under the default lowering inputs (its AIR hash, entry
+    /// name, constants, linked functions and dynamic libraries), each `Compiled` stage by its key,
+    /// with this device's profile fingerprint and
+    /// [`SEMANTICS_VERSION`](crate::cache::SEMANTICS_VERSION), the fields written as fixed-width
+    /// words rather than in their `Debug` form, so a seen descriptor's key costs no formatting.
+    /// Everything a creation asks of `d` before its compile on this device
+    /// ([`Device::render_variant_key`] under one variant, the descriptor's linked-use answers, its
+    /// reflection) is a function of this key: a consumer may keep those answers under it. The
     /// crate keeps no cache.
-    pub fn mesh_descriptor_key(&self, d: &MeshPipelineDescriptor) -> crate::cache::PipelineKey {
+    pub fn queried_render_descriptor_key(
+        &self,
+        d: &RenderPipelineDescriptor,
+    ) -> crate::cache::PipelineKey {
         let stage = |s: &StageSource| match s {
             StageSource::Function(f) => (
                 0,
@@ -171,7 +147,7 @@ impl Device {
             ),
             StageSource::Compiled(c) => (1, *c.key().digest()),
         };
-        mesh_descriptor_key(&self.profile_fingerprint(), d, stage)
+        queried_render_descriptor_key(&self.profile_fingerprint(), d, stage)
     }
 
     /// Compile `f` under `inp` for this device. The result is keyed by
@@ -182,19 +158,8 @@ impl Device {
         inp: &LoweringInputs,
         b: &Budget,
     ) -> Result<CompiledFunction, Error> {
-        self.compile_function_with_report(f, inp, b).0
-    }
-
-    /// [`Device::compile_function`], and what the compile cost against `b`
-    /// ([`CompileReport`]), whether it compiled or not.
-    pub fn compile_function_with_report(
-        &self,
-        f: &FunctionDescriptor,
-        inp: &LoweringInputs,
-        b: &Budget,
-    ) -> (Result<CompiledFunction, Error>, CompileReport) {
         let mut m = Meter::new(b);
-        let compiled = guarded(|| {
+        guarded(|| {
             compile_stage(
                 &f.function,
                 &f.constants,
@@ -203,8 +168,7 @@ impl Device {
                 InputsFrom::Given(inp),
                 &mut m,
             )
-        });
-        (compiled, CompileReport::of(&m))
+        })
     }
 
     /// [`Device::compile_function`], reading the stage's specialized entry from `entries`: the
@@ -264,10 +228,36 @@ impl Device {
         crate::pipeline::compile::kernel_inputs_read(f, inp, entries, &mut m)
     }
 
+    /// Whether the kernel `f` observes its threadgroup partition under `inp`: the answer
+    /// [`CompiledFunction::observes_threadgroup_partition`] gives for its compile under the same
+    /// inputs, without lowering it. A kernel that does not observe it computes the same in every
+    /// partition of its grid into threadgroups; on [`Device::from_queries`]' profile its
+    /// partial-threadgroups variant runs its grid in tiles (`RuntimeFact::GridTiles`), while one
+    /// that does runs a grid that is not a whole number of threadgroups on that variant at its own
+    /// threadgroup size. So a consumer that asks first lowers only the module a creation needs.
+    /// `true` for a function that is not a kernel.
+    ///
+    /// It decodes and specializes the kernel's AIR under `b`, reading the stage's specialized
+    /// entry from `entries` (the one a key or check of the same creation made, charged to `b`
+    /// what making it charged, else one made there now), and orders it for this device as the
+    /// compile does, whose inserted barriers observe the partition.
+    ///
+    /// Refused by the decode's and the specialization's own errors.
+    pub fn kernel_observes_partition(
+        &self,
+        f: &FunctionDescriptor,
+        inp: &LoweringInputs,
+        b: &Budget,
+        entries: &StageEntries,
+    ) -> Result<bool, Error> {
+        let mut m = Meter::new(b);
+        kernel_observes_partition(f, self.profile(), InputsFrom::Given(inp), entries, &mut m)
+    }
+
     /// The key of the compute pipeline `d` (no decode).
     pub fn compute_pipeline_key(&self, d: &ComputePipelineDescriptor) -> crate::cache::PipelineKey {
         let stage = match &d.kernel {
-            StageSource::Function(f) => self.function_compile_key(f, &kernel_inputs(d)),
+            StageSource::Function(f) => self.function_compile_key(f, &d.lowering_inputs()),
             StageSource::Compiled(c) => *c.key(),
         };
         pipeline_key(
@@ -289,31 +279,16 @@ impl Device {
         b: &Budget,
     ) -> Result<ComputePipeline, Error> {
         guarded(|| {
-            let inputs = kernel_inputs(d);
+            let inputs = d.lowering_inputs();
             self.compute_pipeline(d, &inputs, &mut Meter::new(b))
         })
-    }
-
-    /// The key of the tile render pipeline `d` (no decode).
-    pub fn tile_pipeline_key(&self, d: &TileRenderPipelineDescriptor) -> crate::cache::PipelineKey {
-        let stage = match &d.tile {
-            StageSource::Function(f) => self.function_compile_key(f, &tile_inputs(d)),
-            StageSource::Compiled(c) => *c.key(),
-        };
-        pipeline_key(
-            b"tile",
-            &self.profile_fingerprint(),
-            &[stage],
-            &tile_fields(d),
-        )
     }
 
     /// Compile the tile render pipeline `d` under budget `b`: its tile function, compiled under the
     /// descriptor's color attachment formats (`LoweringInputs::tile_attachments`, the color index
     /// of each attachment whose format is set), as a compute pipeline that runs one threadgroup per
     /// tile of the render area and stages the attachments it reaches (`lower::access::tile`). The
-    /// consumer dispatches it in place of `dispatchThreadsPerTile:` with
-    /// `BindState::imageblock_size` set to the pass's tile size and `BindState::render_area` to its
+    /// consumer dispatches it in place of `dispatchThreadsPerTile:` over the pass's tile size and
     /// render area, binding each attachment it reaches (`WriteSource::TileAttachment`). A
     /// `Compiled` tile function must have been compiled under the same formats: one compiled
     /// without tile inputs is `InvalidDescriptor(StageMismatch)`, and one that stages an attachment
@@ -333,10 +308,12 @@ impl Device {
         })
     }
 
-    /// The keys of the render pipeline `d`, with the lowering inputs of each `Function` stage. A
-    /// `Function` vertex stage is decoded and specialized under `b` (not lowered) to learn the
-    /// attributes it reads, and a `Function` fragment stage to learn the colors it writes and
-    /// reads.
+    /// The keys of the render pipeline `d`, with the lowering inputs of each `Function` stage: the
+    /// keys of [`Device::compile_render_pipeline`]'s compile. A `Function` vertex stage is decoded,
+    /// specialized and selected under `b` (not emitted) to learn the attributes it reads and where
+    /// its push fields end, from which the fragment function's start on the floor
+    /// (`CompiledFunction::fragment_push_base`); a `Compiled` one states that end. A `Function`
+    /// fragment stage is decoded and specialized to learn the colors it writes and reads.
     pub fn render_pipeline_key(
         &self,
         d: &RenderPipelineDescriptor,
@@ -345,10 +322,9 @@ impl Device {
         self.render_variant_key(d, &VariantKey::new(), b, &StageEntries::new())
     }
 
-    /// The keys of the render pipeline `d` compiled under variant `v`
-    /// ([`Device::compile_render_variant`]). Each `Function` stage's specialized entry is the one
-    /// `entries` holds, or one made there now: a creation that gave the same object to its
-    /// descriptor's checks specializes each stage once.
+    /// The keys of the render pipeline `d` compiled under variant `v`. Each `Function` stage's
+    /// specialized entry is the one `entries` holds, or one made there now: a creation that gave
+    /// the same object to its descriptor's checks specializes each stage once.
     pub fn render_variant_key(
         &self,
         d: &RenderPipelineDescriptor,
@@ -360,19 +336,13 @@ impl Device {
             crate::pipeline::private_state::check_render(d)?;
             let p = self.profile();
             // The attachments as the private logic operation draws them (`render_pipeline`).
-            let (operated, logic) = crate::pipeline::private_state::logic_operation(d, p)?;
-            let logic = crate::pipeline::private_state::LogicDraw::shader(logic);
+            let (operated, _) = crate::pipeline::private_state::logic_operation(d, p)?;
             let d = operated.as_ref();
-            // A color group's variant is the pipeline of its group's attachments
-            // (`render_pipeline`).
-            let group = color_group::group(d, v, p)?;
-            let grouped = group.as_ref().map(|g| color_group::descriptor(d, g));
-            let zeroed = with_zeroed_colors(grouped.as_ref().unwrap_or(d), v)?;
+            let zeroed = with_zeroed_colors(d, v)?;
             let d = zeroed.as_ref();
             // The vertex function writes the primitive ID a fragment function reads from its
-            // varying, on a device without a fragment `PrimitiveId` or behind an emulated
-            // post-tessellation vertex function.
-            let primitive_id = match primitive_id_carried_on(p) {
+            // varying, on a device without a fragment `PrimitiveId`.
+            let primitive_id = match primitive_id_varying_on(p) {
                 true => reads_primitive_id_varying(
                     d.fragment.as_ref(),
                     d.max_fragment_call_stack_depth,
@@ -381,23 +351,23 @@ impl Device {
                 )?,
                 false => false,
             };
-            let (vertex, vertex_inputs, written, varyings, uniform) = match &d.vertex {
+            let from = || {
+                InputsFrom::Vertex(
+                    d.vertex_descriptor.as_ref(),
+                    v,
+                    d.max_vertex_call_stack_depth,
+                    primitive_id,
+                    d.support_indirect_command_buffers,
+                )
+            };
+            let (vertex, vertex_inputs, written, varyings, uniform, push_end) = match &d.vertex {
                 StageSource::Function(f) => {
-                    let s = stage_inputs(
-                        f,
-                        p,
-                        InputsFrom::Vertex(
-                            d.vertex_descriptor.as_ref(),
-                            v,
-                            d.max_vertex_call_stack_depth,
-                            primitive_id,
-                            d.tessellation.as_ref(),
-                        ),
-                        entries,
-                        &mut Meter::new(b),
-                    )?;
+                    let s = stage_inputs(f, p, from(), entries, &mut Meter::new(b))?;
                     let key = self.function_compile_key(f, &s.inputs);
-                    (key, Some(s.inputs), s.writes, s.varyings, s.uniform)
+                    // The fragment function's push fields follow the vertex function's on the
+                    // floor, as `render_pipeline` compiles them.
+                    let end = vertex_push_end(f, p, from(), entries, &mut Meter::new(b))?;
+                    (key, Some(s.inputs), s.writes, s.varyings, s.uniform, end)
                 }
                 StageSource::Compiled(c) => (
                     *c.key(),
@@ -405,21 +375,20 @@ impl Device {
                     raw_indices_written(c.artifact()),
                     varyings_written(c.artifact()),
                     uniform_written(c.artifact()),
+                    c.fragment_push_base(),
                 ),
             };
             let (fragment, fragment_inputs) = match &d.fragment {
                 // Every fragment function is decoded, to learn which colors it writes that the
                 // pipeline has no attachment for, as `compile_render_pipeline` and a mesh
                 // pipeline's fragment learn them; and so which signed-integer attachments it
-                // writes, which attachments it reads on a device that orders framebuffer fetch only
-                // through the pixel interlock, and whether it reads the `[[viewport_array_index]]`
+                // writes, and whether it reads the `[[viewport_array_index]]`
                 // or `[[render_target_array_index]]` its vertex function writes.
                 Some(source @ StageSource::Function(f)) => {
                     // Whether the function applies the private masks itself shows only in its
                     // module, so a pipeline whose masks drop a sample lowers it once.
                     let mut pass: FragmentPass<'_> = d.into();
-                    pass.color_group = group.as_ref();
-                    pass.logic_operation = logic;
+                    pass.push_base = push_end;
                     if crate::pipeline::private_state::applied_masks(d).is_some() {
                         let inputs = InputsFrom::Fragment(
                             pass,
@@ -473,30 +442,16 @@ impl Device {
 
     /// Compile the render pipeline `d` under budget `b`. A vertex attribute whose buffer has no
     /// layout, read by the vertex function or not, is `InvalidDescriptor(VertexLayout)`, where
-    /// Metal stops at an assertion.
+    /// Metal stops at an assertion. Each stage's recursion is sized for `d`'s
+    /// `maxVertexCallStackDepth` or `maxFragmentCallStackDepth`, as a compute kernel's is for its
+    /// pipeline's; a `Compiled` stage sized for another depth is
+    /// `InvalidDescriptor(MaxCallStackDepth)`.
     pub fn compile_render_pipeline(
         &self,
         d: &RenderPipelineDescriptor,
         b: &Budget,
     ) -> Result<RenderPipeline, Error> {
-        self.compile_render_variant(d, &VariantKey::new(), b)
-    }
-
-    /// Compile the render pipeline `d` under the variant `v` a render plan asked for
-    /// (`BindingPlan::variant`) and budget `b`: each `Function` stage under
-    /// [`VariantKey::lowering_inputs`] of its stage (the vertex stage's projection pulls `v`'s
-    /// vertex buffers), linked with those layouts pulled. A `Compiled` stage must have been
-    /// compiled under the same inputs; link refuses a vertex stage compiled under another
-    /// projection. Each stage's recursion is sized for `d`'s `maxVertexCallStackDepth` or
-    /// `maxFragmentCallStackDepth`, as a compute kernel's is for its pipeline's; a `Compiled` stage
-    /// sized for another depth is `InvalidDescriptor(MaxCallStackDepth)`.
-    pub fn compile_render_variant(
-        &self,
-        d: &RenderPipelineDescriptor,
-        v: &VariantKey,
-        b: &Budget,
-    ) -> Result<RenderPipeline, Error> {
-        guarded(|| self.render_pipeline(d, v, &mut Meter::new(b)))
+        guarded(|| self.render_pipeline(d, &VariantKey::new(), &mut Meter::new(b)))
     }
 
     /// Compile the mesh render pipeline `d` under budget `b`: its object function (when it has one)
@@ -508,48 +463,28 @@ impl Device {
     /// result is a [`RenderPipeline`] whose stages are the object stage (`TASK_EXT`), the mesh
     /// stage (`MESH_EXT`) and the fragment stage: it has no vertex input and no input assembly (its
     /// `GraphicsState::topology` is unused), and Metal's draws of it are `drawMeshThreadgroups` and
-    /// `drawMeshThreads`. On a device without `VK_EXT_mesh_shader` the mesh stage is a `COMPUTE`
-    /// module that writes records, followed by a synthesized `VERTEX` stage that draws them as a
-    /// list of the mesh's topology (`GraphicsState::mesh_records`). A `Compiled` stage must have
-    /// been compiled under the same inputs and Metal's call stack depth of 1.
+    /// `drawMeshThreads`. A device without `VK_EXT_mesh_shader` and `meshShader` (and `taskShader`
+    /// for an object function) refuses it (`Unsupported{MeshShading}`). A `Compiled` stage must
+    /// have been compiled under the same inputs and Metal's call stack depth of 1.
     pub fn compile_mesh_pipeline(
         &self,
         d: &MeshPipelineDescriptor,
         b: &Budget,
     ) -> Result<RenderPipeline, Error> {
-        self.compile_mesh_variant(d, &VariantKey::new(), b)
+        guarded(|| self.mesh_pipeline(d, &VariantKey::new(), &mut Meter::new(b)))
     }
 
-    /// Compile the mesh render pipeline `d` under the variant `v` a plan of it asked for
-    /// (`BindingPlan::variant`) and budget `b`, as [`Device::compile_mesh_pipeline`] does: each
-    /// `Function` stage under [`VariantKey::lowering_inputs`] of its stage, the fragment function's
-    /// for the mesh function's outputs.
-    pub fn compile_mesh_variant(
-        &self,
-        d: &MeshPipelineDescriptor,
-        v: &VariantKey,
-        b: &Budget,
-    ) -> Result<RenderPipeline, Error> {
-        guarded(|| self.mesh_pipeline(d, v, &mut Meter::new(b)))
-    }
-
-    /// [`Device::compile_mesh_variant`] with the caller's meter.
+    /// [`Device::compile_mesh_pipeline`] of `d` under the variant `v` (`VariantKey::new()` there),
+    /// with the caller's meter.
     pub(crate) fn mesh_pipeline(
         &self,
         d: &MeshPipelineDescriptor,
         v: &VariantKey,
         m: &mut Meter,
     ) -> Result<RenderPipeline, Error> {
-        // A mesh draw's plan zeroes and drops no color, nor writes one through the interlock it
-        // does not fetch, nor shadows one.
-        if !v.zeroed_colors.is_empty()
-            || !v.dropped_colors.is_empty()
-            || !v.interlocked_colors.is_empty()
-            || !v.extended_shadows.is_empty()
-        {
-            return Err(invariant(
-                "a mesh variant zeroing, dropping, interlocking or shadowing colors",
-            ));
+        // A mesh draw's plan zeroes and drops no color.
+        if !v.zeroed_colors.is_empty() || !v.dropped_colors.is_empty() {
+            return Err(invariant("a mesh variant zeroing or dropping colors"));
         }
         check_mesh_fields(d)?;
         let p = self.profile();
@@ -621,6 +556,7 @@ impl Device {
             stages.push(stage_module(c, &linked, i)?);
         }
         note_sample_position(d.into(), &artifacts, &mut stages);
+        note_device_runs(d.into(), &artifacts, &mut stages);
         let keys: Vec<FunctionCompileKey> = artifacts.iter().map(|a| a.key).collect();
         let mut requirements = mesh.artifact().requirements.clone();
         for a in artifacts
@@ -629,35 +565,9 @@ impl Device {
         {
             requirements = p.union_requirements(&requirements, &a.requirements);
         }
-        // An emulated mesh function's records are drawn by a synthesized vertex stage, which
-        // follows the mesh stage's compute module, the last compute module (an object
-        // function's comes first).
-        let records = linked
-            .graphics
-            .as_ref()
-            .and_then(|g| g.mesh_records.as_ref());
-        let mut mesh_facts = Vec::new();
-        if let Some(records) = records {
-            // Drawn from each primitive's last index first: Apple's last provoking vertex on a
-            // device that takes flat inputs from the first (`VariantKey::mesh_last_first`).
-            let last_first = v.mesh_last_first && records.corners > 1;
-            let (module, r) = mesh_vertex_stage(records, last_first, &linked, p, m)?;
-            if last_first {
-                let fact = RuntimeFact::MeshLastFirst;
-                mesh_facts.push(RuntimeDependency::new(fact, mechanism(&fact, p)));
-            }
-            requirements = p.union_requirements(&requirements, &r);
-            let at = stages
-                .iter()
-                .rposition(|s| s.stage == vk::ShaderStage::COMPUTE)
-                .ok_or_else(|| invariant("an emulated mesh pipeline without its compute stage"))?;
-            stages.insert(at + 1, module);
-        }
-        let mut dependencies = dependencies(&artifacts, self);
-        dependencies.extend(mesh_facts);
+        let dependencies = dependencies(&artifacts, self);
         let (graphics, requirements) = graphics_requirements(requirements, &linked, &artifacts, p)?;
         let profile = self.profile_fingerprint();
-        let mesh_info = self.mesh_info(d, object.as_ref(), &mesh);
         Ok(RenderPipeline {
             key: pipeline_key(
                 b"mesh",
@@ -674,75 +584,7 @@ impl Device {
             interface: linked.interface,
             requirements,
             variant_bits: artifacts.iter().fold(0, |bits, a| bits | a.variant_bits),
-            mesh_info: Some(mesh_info),
         })
-    }
-
-    /// Answers to Metal's queries of the mesh render pipeline of descriptor `d`, of object function
-    /// `object` (where it has one) and mesh function `mesh` ([`MeshPipelineMetalInfo`]).
-    fn mesh_info(
-        &self,
-        d: &MeshPipelineDescriptor,
-        object: Option<&CompiledFunction>,
-        mesh: &CompiledFunction,
-    ) -> MeshPipelineMetalInfo {
-        let p = self.profile();
-        let limits = &p.fields().limits;
-        // Each stage's threadgroups run in the task and mesh stages, or as compute work.
-        let (object_limit, mesh_limit) = if crate::lower::mesh::emulates(p) {
-            let compute = limits.max_compute_work_group_invocations;
-            (compute, compute)
-        } else {
-            (
-                limits.mesh.max_task_work_group_invocations,
-                limits.mesh.max_mesh_work_group_invocations,
-            )
-        };
-        // Metal's on a first compile: the least of 1024, the function's own maximum, the
-        // descriptor's (Metal's 0 is none) and the threads of the stage's required size (Metal's
-        // all-zero size is none), within the device's.
-        let threads =
-            |f: &CompiledFunction, given: Option<u32>, required: Option<[u32; 3]>, device: u32| {
-                let required = required_size(required).map(|axes| {
-                    let threads: u64 = axes.iter().map(|&axis| u64::from(axis)).product();
-                    u32::try_from(threads).unwrap_or(u32::MAX)
-                });
-                [f.artifact().kernel.max_total_threads, given, required]
-                    .into_iter()
-                    .flatten()
-                    .filter(|&n| n > 0)
-                    .fold(METAL_MAX_THREADS.min(device), u32::min)
-            };
-        let width = self.metal_properties().thread_execution_width;
-        // The descriptor's, else Metal's: an object function's
-        // `[[max_total_threadgroups_per_mesh_grid(n)]]` changes nothing Metal answers.
-        let grid = d
-            .max_total_threadgroups_per_mesh_grid
-            .filter(|&n| n > 0)
-            .unwrap_or(METAL_MESH_GRID_THREADGROUPS);
-        let grid = match crate::lower::mesh::emulates(p) {
-            true => grid,
-            false => grid.min(limits.mesh.max_mesh_work_group_total_count),
-        };
-        MeshPipelineMetalInfo {
-            max_total_threads_per_object_threadgroup: object.map_or(0, |o| {
-                threads(
-                    o,
-                    d.max_total_threads_per_object_threadgroup,
-                    d.required_threads_per_object_threadgroup,
-                    object_limit,
-                )
-            }),
-            max_total_threads_per_mesh_threadgroup: threads(
-                mesh,
-                d.max_total_threads_per_mesh_threadgroup,
-                d.required_threads_per_mesh_threadgroup,
-                mesh_limit,
-            ),
-            object_thread_execution_width: object.map_or(0, |_| width),
-            mesh_thread_execution_width: width,
-            max_total_threadgroups_per_mesh_grid: grid,
-        }
     }
 
     /// A stage from its source: compiled now under `inputs`, or taken as compiled (link and
@@ -881,9 +723,20 @@ impl Device {
         })
     }
 
-    /// [`Device::compile_render_variant`] with the caller's meter. A variant of one of
-    /// the pipeline's color groups (`VariantKey::color_group`) compiles and links as the pipeline
-    /// of its group's attachments (`color_group`), its key's choices of colors naming the group's.
+    /// Compile the render pipeline `d` under the variant `v` and budget `b`: the crate's tests'
+    /// compile of a variant ([`Device::compile_render_pipeline`] compiles under `VariantKey::new()`).
+    #[cfg(test)]
+    pub(crate) fn compile_render_variant(
+        &self,
+        d: &RenderPipelineDescriptor,
+        v: &VariantKey,
+        b: &Budget,
+    ) -> Result<RenderPipeline, Error> {
+        guarded(|| self.render_pipeline(d, v, &mut Meter::new(b)))
+    }
+
+    /// The render pipeline `d` compiled under the variant `v` with the caller's meter
+    /// ([`Device::compile_render_pipeline`] under `VariantKey::new()`).
     pub(crate) fn render_pipeline(
         &self,
         d: &RenderPipelineDescriptor,
@@ -893,24 +746,17 @@ impl Device {
         crate::pipeline::private_state::check_render(d)?;
         let p = self.profile();
         // The attachments as the private logic operation draws them: its normalized and integer
-        // attachments unblended (unwritten under a no-op), and Vulkan's operation, or the fragment
-        // function's, where one is needed.
+        // attachments unblended (unwritten under a no-op), and Vulkan's operation where one is
+        // needed.
         let (operated, logic) = crate::pipeline::private_state::logic_operation(d, p)?;
         let d = operated.as_ref();
-        let group = color_group::group(d, v, p)?;
-        let grouped = group.as_ref().map(|g| color_group::descriptor(d, g));
-        let zeroed = with_zeroed_colors(grouped.as_ref().unwrap_or(d), v)?;
+        let zeroed = with_zeroed_colors(d, v)?;
         let d = zeroed.as_ref();
-        let pass = || {
-            let mut pass = FragmentPass::from(d);
-            pass.color_group = group.as_ref();
-            pass.logic_operation = crate::pipeline::private_state::LogicDraw::shader(logic);
-            pass
-        };
-        // On a device without a fragment `PrimitiveId` or without `tessellationShader`, whether
-        // the vertex function writes the primitive ID's varying: the fragment entry specialized
-        // for that is the one its compile reads.
-        let entries = primitive_id_carried_on(p).then(StageEntries::new);
+        let pass = || FragmentPass::from(d);
+        // On a device without a fragment `PrimitiveId`, whether the vertex function writes the
+        // primitive ID's varying: the fragment entry specialized for that is the one its compile
+        // reads.
+        let entries = primitive_id_varying_on(p).then(StageEntries::new);
         let primitive_id = match &entries {
             Some(e) => reads_primitive_id_varying(
                 d.fragment.as_ref(),
@@ -927,11 +773,17 @@ impl Device {
                 v,
                 d.max_vertex_call_stack_depth,
                 primitive_id,
-                d.tessellation.as_ref(),
+                d.support_indirect_command_buffers,
             ),
             m,
         )?;
         check_call_stack(vertex.artifact(), d.max_vertex_call_stack_depth)?;
+        // On the floor the fragment function's push fields follow the vertex function's.
+        let base = vertex.fragment_push_base();
+        let pass = || FragmentPass {
+            push_base: base,
+            ..pass()
+        };
         let written = raw_indices_written(vertex.artifact());
         let varyings = varyings_written(vertex.artifact());
         let uniform = uniform_written(vertex.artifact());
@@ -983,16 +835,13 @@ impl Device {
         }
         let compiled: Vec<&CompiledFunction> = std::iter::once(&vertex).chain(&fragment).collect();
         let artifacts: Vec<&FunctionArtifact> = compiled.iter().map(|c| c.artifact()).collect();
-        let linked = link(
-            &artifacts,
-            &LinkInputs::render_variant(d, v, group.clone()),
-            p,
-        )?;
+        let linked = link(&artifacts, &LinkInputs::render_variant(d, v), p)?;
         let mut stages = Vec::with_capacity(compiled.len());
         for (i, c) in compiled.iter().enumerate() {
             stages.push(stage_module(c, &linked, i)?);
         }
         note_sample_position(pass(), &artifacts, &mut stages);
+        note_device_runs(pass(), &artifacts, &mut stages);
         let keys: Vec<FunctionCompileKey> = artifacts.iter().map(|a| a.key).collect();
         let mut requirements = vertex.artifact().requirements.clone();
         for a in artifacts.iter().skip(1) {
@@ -1000,7 +849,7 @@ impl Device {
         }
         // A tessellation pipeline's synthesized vertex and control stages come first.
         if let Some(c) = &linked.control {
-            note_evaluation_stage(c, p, &mut stages);
+            note_evaluation_stage(c, &mut stages);
             let synthesized = synthesized_stages(c, &linked, p, m)?;
             let mut all = Vec::with_capacity(synthesized.len() + stages.len());
             for (module, r) in synthesized {
@@ -1009,22 +858,6 @@ impl Device {
             }
             all.extend(stages);
             stages = all;
-        }
-        // A fragment function that reads `[[barycentric_coord]]` as varyings, or a vertex function
-        // that selects its slice or viewport through them, or a fan-out variant: the geometry
-        // stages of the point, line and triangle classes, before the fragment stage, or last
-        // without one.
-        if let Some(g) = &linked.geometry {
-            let at = stages
-                .iter()
-                .position(|s| s.stage == vk::ShaderStage::FRAGMENT)
-                .unwrap_or(stages.len());
-            let mut added = Vec::with_capacity(geometry::CLASSES.len());
-            for (module, r) in g.stages(&linked, p, m)? {
-                requirements = p.union_requirements(&requirements, &r);
-                added.push(module);
-            }
-            stages.splice(at..at, added);
         }
         // A variant that draws its lines as bands: the band's control and evaluation stages,
         // right after the vertex stage.
@@ -1040,42 +873,23 @@ impl Device {
             }
             stages.splice(at..at, added);
         }
-        let mut dependencies = dependencies(&artifacts, self);
-        // A fan-out variant's stages are the consumer's choice of how to draw its rate-mapped
-        // pass, which its graphics state states (`GraphicsState::region_fan_out`).
-        if let Some(g) = linked.geometry.as_ref().filter(|g| g.fan_out.is_none()) {
-            let fact = RuntimeFact::SynthesizedGeometry {
-                weights: !g.forms.is_empty(),
-                layer: g.layer,
-                viewport: g.viewport,
-            };
-            dependencies.push(RuntimeDependency {
-                fact,
-                mechanism: mechanism(&fact, self.profile()),
-            });
-        }
+        let dependencies = dependencies(&artifacts, self);
         let (mut graphics, requirements) =
             graphics_requirements(requirements, &linked, &artifacts, p)?;
         graphics.sample_mask = crate::pipeline::private_state::sample_mask(
             d,
             fragment.as_ref().map(|f| f.artifact()),
-            &graphics,
         )?;
         crate::pipeline::private_state::alpha_tested(d, fragment.as_ref().map(|f| f.artifact()))?;
         crate::pipeline::private_state::depth_compares_clamped(
             d,
             fragment.as_ref().map(|f| f.artifact()),
         )?;
-        crate::pipeline::private_state::logic_operated(
-            logic,
-            fragment.as_ref().map(|f| f.artifact()),
-            &graphics,
-        )?;
-        let logic_op = crate::pipeline::private_state::LogicDraw::vulkan(logic);
-        graphics.logic_op = logic_op;
+        graphics.logic_op = logic;
         crate::pipeline::private_state::note_vulkan_codes(d, &graphics, &mut stages);
+        crate::pipeline::private_state::note_tile_store(d, &mut stages);
         let mut requirements = requirements;
-        if logic_op.is_some() {
+        if logic.is_some() {
             requirements.features.insert(VkFeature::LogicOp);
         }
         let profile = self.profile_fingerprint();
@@ -1095,7 +909,6 @@ impl Device {
             interface: linked.interface,
             requirements,
             variant_bits: artifacts.iter().fold(0, |bits, a| bits | a.variant_bits),
-            mesh_info: None,
         })
     }
 
@@ -1150,9 +963,8 @@ impl Device {
             metal = metal.min(cap);
         }
         // The static part of Metal's own layout, as Metal reports it: neither the emulated
-        // simdgroups' scratch nor a predicated walk's vote word, which are ours and which the
-        // planner counts in each dispatch's total (`bind::plan::compute`), refusing a threadgroup
-        // whose lengths fit beside this length and not beside them (`ThreadgroupMemorySize`).
+        // simdgroups' scratch nor a predicated walk's vote word, which are ours
+        // (`RuntimeFact::SimdgroupEmulation`, `RuntimeFact::PredicationVote`).
         // Metal reports it rounded up to 16 bytes, its threadgroup memory's granularity
         // (`threadgroup uint a[256]; threadgroup uint b;` answers 1040, not 1028, on the M3 Max,
         // macOS 27.0.1).
@@ -1183,13 +995,6 @@ fn graphics_requirements(
     requirements
         .features
         .extend(graphics.dynamic_state_features()?);
-    // A pipeline that reads through snapshots samples a color attachment of its subpass in the
-    // feedback loop layout, created with its flag (`GraphicsState::snapshot_reads`).
-    if graphics.snapshot_reads {
-        requirements
-            .features
-            .insert(VkFeature::AttachmentFeedbackLoopLayout);
-    }
     // Its color blend state: attachments that blend differently, dual-source blending.
     requirements
         .features
@@ -1202,14 +1007,6 @@ fn graphics_requirements(
     requirements
         .properties
         .extend(graphics.sample_count_properties(&p.fields().enabled.properties)?);
-    // The measured conversions its fixed-function vertex input relies on in place of a note.
-    requirements
-        .properties
-        .extend(linked.vertex_properties.iter().copied());
-    // The measured coverage its fixed-function alpha to coverage relies on in place of a note.
-    requirements
-        .properties
-        .extend(linked.fragment_properties.iter().copied());
     // The portability subset's features it relies on, named only where the device has them: where
     // the subset withholds one, link refused or pulled what it would allow (and the binder pulls a
     // per-bind stride that does not cover its attributes), and a device without the subset
@@ -1237,70 +1034,6 @@ fn graphics_requirements(
         requirements
             .features
             .insert(VkFeature::VertexAttributeAccessBeyondStride);
-    }
-    // Ordered framebuffer fetch: the subpass and pipeline flags need the feature.
-    if graphics.rasterization_order_attachment_access {
-        requirements
-            .features
-            .insert(VkFeature::RasterizationOrderColorAttachmentAccess);
-    }
-    // The interlocked form's storage views of the attachments; the module's own requirements name
-    // the interlock and the fragment stores.
-    for a in &graphics.storage_attachments {
-        requirements.formats.extend(a.format_usages());
-    }
-    // The shader-side stencil's shadow; the module's own requirements name the interlock, the
-    // fragment stores, and multisampled storage images. A multisampled shadow is copied by image
-    // copies (`maintenance8`), and it, or the neutral that stands in for it without a stencil
-    // attachment, is a storage image of the pipeline's samples.
-    if let Some(s) = &graphics.shadow_stencil {
-        requirements.formats.extend(s.format_usages());
-        if s.samples > 1 {
-            requirements.features.insert(VkFeature::Maintenance8);
-        }
-    }
-    // An in-shader depth test's stand-in; the module's own requirements name the interlock and
-    // the fragment stores. A multisampled stand-in has the pipeline's samples; planes are
-    // single-sample.
-    let mut multisampled_stand_in = false;
-    if let Some(t) = &graphics.shader_tests {
-        requirements.formats.extend(t.depth.format_usages());
-        multisampled_stand_in =
-            t.depth.view == crate::pipeline::graphics::StandInView::Image && t.depth.samples > 1;
-        // The stencil's stand-in, a multisampled image at more than one sample, copied to and
-        // from the stencil aspect by image copies there (`maintenance8`).
-        if let Some(s) = &t.stencil {
-            requirements.formats.extend(s.format_usages());
-            if s.samples > 1 {
-                requirements.features.insert(VkFeature::Maintenance8);
-                multisampled_stand_in = true;
-            }
-        }
-    }
-    let multisampled_shadow = artifacts.iter().any(|a| {
-        a.facts.iter().any(|f| {
-            matches!(
-                f,
-                RuntimeFact::ShadowStencil {
-                    multisampled: true,
-                    ..
-                }
-            )
-        })
-    });
-    // A per-sample framebuffer fetch's multisampled storage images have the pipeline's
-    // samples; planes are single-sample.
-    let multisampled_storage = graphics
-        .storage_attachments
-        .iter()
-        .any(|a| a.view == StorageAttachmentView::Attachment)
-        && graphics.rasterization_samples.as_raw() > 1;
-    if multisampled_shadow || multisampled_storage || multisampled_stand_in {
-        requirements
-            .properties
-            .insert(VkProperty::StorageImageSampleCount(
-                graphics.rasterization_samples.as_raw(),
-            ));
     }
     // A multiview pipeline needs `multiview` and its view count whether or not a stage reads the
     // view index; the binder draws more amplifications than the device has views one at a time, so
@@ -1372,15 +1105,6 @@ fn invariant(detail: &str) -> Error {
 /// The lowering inputs a `Function` kernel of compute pipeline `d` compiles under: its
 /// stage-input descriptor, its `maxCallStackDepth` when not Metal's default, 1, and its OpenCL
 /// mode.
-fn kernel_inputs(d: &ComputePipelineDescriptor) -> LoweringInputs {
-    LoweringInputs {
-        stage_input: d.stage_input.clone(),
-        max_call_stack_depth: (d.max_call_stack_depth > 1).then_some(d.max_call_stack_depth),
-        open_cl_mode: d.open_cl_mode_enabled,
-        ..LowerInputs::new()
-    }
-}
-
 /// The lowering inputs a `Function` tile function of tile pipeline `d` compiles under: its color
 /// attachments' pixel formats, and its `maxCallStackDepth` when not Metal's default, 1.
 fn tile_inputs(d: &TileRenderPipelineDescriptor) -> LoweringInputs {
@@ -1457,11 +1181,6 @@ fn check_tile_formats(a: &FunctionArtifact, d: &TileRenderPipelineDescriptor) ->
 const TILE_MAX_THREADS: u32 = TILE_MAX_SIDE * TILE_MAX_SIDE;
 /// Apple's GPUs' threads a threadgroup (a threadgroup of 2048 ran nothing on an M4).
 const METAL_MAX_THREADS: u32 = 1024;
-
-/// `maxTotalThreadgroupsPerMeshGrid` of a mesh render pipeline whose descriptor sets none, as an
-/// M3 Max under macOS 27.0.1 answers it, whatever its object function's
-/// `[[max_total_threadgroups_per_mesh_grid(n)]]`.
-const METAL_MESH_GRID_THREADGROUPS: u32 = 1 << 20;
 
 /// The most bytes of a mesh render pipeline's `payloadMemoryLength` Metal makes a pipeline of (an
 /// M3 Max under macOS 27.0.1).
@@ -1731,35 +1450,15 @@ fn compute_fields(d: &ComputePipelineDescriptor) -> String {
     }
 }
 
-/// The pipeline key's fields of variant `v` past its stages' keys: its color group past the first
-/// (`VariantKey::color_group`), whose variant of a pipeline without a fragment function has no
-/// stage of its own, its emulated mesh function's synthesized vertex stage, and a band variant's
-/// synthesized tessellation stages. Empty for every other variant, so a pipeline keeps its key.
+/// The pipeline key's fields of variant `v` past its stages' keys: a band variant's synthesized
+/// tessellation stages. Empty for every other variant, so a pipeline keeps its key.
 fn variant_fields(v: &VariantKey) -> String {
     let mut fields = String::new();
-    // The group a pipeline without a fragment function keeps in no stage's key.
-    if v.color_group != 0 {
-        fields.push_str(&format!(" color_group {}", v.color_group));
-    }
-    // The synthesized vertex stage of an emulated mesh function's pipeline, in no stage's key.
-    if v.mesh_last_first {
-        fields.push_str(" mesh_last_first");
-    }
     // The band's synthesized stages, in no stage's key.
     match v.line_band {
         None => {}
         Some(crate::pipeline::BandPrimitive::Lines) => fields.push_str(" line_band"),
         Some(crate::pipeline::BandPrimitive::Triangles) => fields.push_str(" line_band triangles"),
-    }
-    // The fan-out's synthesized geometry stages, in no stage's key.
-    match v.region_fan_out {
-        None => {}
-        Some(crate::pipeline::RegionFanOut::Draw) => fields.push_str(" region_fan_out"),
-        Some(crate::pipeline::RegionFanOut::Probe) => fields.push_str(" region_fan_out probe"),
-        Some(crate::pipeline::RegionFanOut::DrawFew) => fields.push_str(" region_fan_out few"),
-        Some(crate::pipeline::RegionFanOut::RegionCopies) => {
-            fields.push_str(" region_fan_out copies")
-        }
     }
     fields
 }
@@ -1773,9 +1472,7 @@ fn render_fields(d: &RenderPipelineDescriptor) -> String {
             RenderLinkInputs::from(d),
             d.support_indirect_command_buffers
         )
-    )
-    // A descriptor's inputs never fan out (`variant_fields` keys a variant that does).
-    .replace(", region_fan_out: None", "");
+    );
     // Appended only past Metal's defaults, so a default descriptor keeps its key.
     let fields = match (
         d.max_vertex_call_stack_depth,
@@ -1801,6 +1498,9 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
     let mut stage_flags = vk::PipelineShaderStageCreateFlags::empty();
     if a.subgroup.full_subgroups {
         stage_flags |= vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS;
+    }
+    if a.subgroup.varying {
+        stage_flags |= vk::PipelineShaderStageCreateFlags::ALLOW_VARYING_SUBGROUP_SIZE;
     }
     // A `half` output of a module without fast math keeps its note where its attachment blends.
     let colors = linked
@@ -1843,8 +1543,6 @@ fn stage_module(c: &CompiledFunction, linked: &Linked, i: usize) -> Result<Stage
         rounded_colors,
         specialized_notes: a.specialized.clone(),
         own_pixel_textures: a.interface.own_pixel_textures.clone(),
-        snapshot_textures: a.interface.snapshot_textures.clone(),
-        snapshot_refusals: a.interface.snapshot_refusals.clone(),
         level_reads: a.interface.level_reads.clone(),
         private_bytes: a.interface.private_bytes,
         // Link resolves the module's symbols and adds no instruction, so the function's own
@@ -1917,8 +1615,8 @@ fn primitive_varyings_written(a: &FunctionArtifact) -> std::collections::BTreeSe
         .collect()
 }
 
-/// The mesh descriptor fields the artifact depends on: its fixed-function state, as a render
-/// pipeline's ([`render_fields`]), and the limits its `mesh_info` answers within.
+/// The mesh descriptor fields the artifact's key holds: its fixed-function state, as a render
+/// pipeline's ([`render_fields`]), and its thread and grid maxima.
 fn mesh_fields(d: &MeshPipelineDescriptor) -> String {
     format!(
         "{:?} {:?} {:?} {:?}",
@@ -1981,6 +1679,31 @@ fn note_sample_position(
         // Unconditional on the stage: no specialization removes it.
         m.specialized_notes
             .retain(|s| s.note != PrecisionNote::MultisamplePosition);
+    }
+}
+
+/// Record `PrecisionNote::DeviceFragmentRuns` on the fragment stage of a pipeline of pass `d` that
+/// rasterizes more than one sample, where its function writes memory: it runs as many times per
+/// pixel as the device runs it.
+fn note_device_runs(
+    d: FragmentPass<'_>,
+    stages: &[&FunctionArtifact],
+    modules: &mut [StageModule],
+) {
+    if d.raster_sample_count <= 1 || !d.rasterization_enabled {
+        return;
+    }
+    for (a, m) in stages.iter().zip(modules) {
+        if a.interface.stage != Stage::Fragment || !a.interface.writes_memory {
+            continue;
+        }
+        if !m
+            .precision_notes
+            .contains(&PrecisionNote::DeviceFragmentRuns)
+        {
+            m.precision_notes.push(PrecisionNote::DeviceFragmentRuns);
+            m.precision_notes.sort_unstable();
+        }
     }
 }
 

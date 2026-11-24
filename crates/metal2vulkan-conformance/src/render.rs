@@ -58,16 +58,16 @@
 
 use crate::case::Failure;
 use crate::case::Handle;
+use crate::values::{
+    LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, SamplePosition,
+    StoreAction, StoreActionOptions, VisibilityResultMode, VisibilityResultType,
+};
 use metal2vulkan::metal::{
     BarrierScope, BlendFactor, BlendOperation, ColorWriteMask, CullMode, DepthClipMode, IndexType,
     PixelFormat, PrimitiveTopologyClass, PrimitiveType, RenderStages, ResourceUsage,
     TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction,
     TessellationPartitionMode, TextureType, TriangleFillMode, VertexFormat, VertexStepFunction,
     Winding,
-};
-use metal2vulkan_runtime::{
-    LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, SamplePosition,
-    StoreAction, StoreActionOptions, VisibilityResultMode, VisibilityResultType,
 };
 
 /// The `MTLBlitOption` a texture read takes, which the suite states in one place
@@ -92,6 +92,9 @@ pub struct TargetSpec {
     pub shader_read: bool,
     /// `MTLTextureUsageShaderWrite` beside `MTLTextureUsageRenderTarget`.
     pub shader_write: bool,
+    /// `MTLTextureUsageUnknown` in place of the usages the two fields above name: the target made
+    /// with usage 0, which Metal takes as every usage.
+    pub unknown_usage: bool,
     /// Whether the target is of shared storage rather than private.
     ///
     /// Private is the default and what an extended-range target is normally made with. A case says
@@ -387,6 +390,7 @@ impl TargetSpec {
             samples: 1,
             shader_read: true,
             shader_write: false,
+            unknown_usage: false,
             shared: false,
             surface: None,
             over_buffer: None,
@@ -407,6 +411,7 @@ impl TargetSpec {
             samples: 1,
             shader_read: false,
             shader_write: false,
+            unknown_usage: false,
             shared: false,
             surface: None,
             over_buffer: None,
@@ -462,6 +467,13 @@ impl TargetSpec {
         self
     }
 
+    /// The target made with `MTLTextureUsageUnknown`, usage 0, which Metal takes as every usage.
+    #[must_use]
+    pub const fn unknown_usage(mut self) -> Self {
+        self.unknown_usage = true;
+        self
+    }
+
     /// The words a case's input fingerprint covers: every field, so a target that moves is a
     /// change to the case's inputs rather than a quiet pass against another target's answer.
     pub fn words(&self) -> Vec<u8> {
@@ -473,6 +485,12 @@ impl TargetSpec {
         bytes.push(u8::from(self.shader_read));
         bytes.push(u8::from(self.shader_write));
         bytes.push(u8::from(self.shared));
+        // Written **only where the target states it**, keyed by its name, for the reasons the
+        // optional fields below are: every target of a stated usage fingerprints to exactly the
+        // bytes it always had, so every recording already committed still reads.
+        if self.unknown_usage {
+            bytes.extend(b"usage:unknown");
+        }
         // Written **only where the target has one**, as a pass writes its optional attachments:
         // a target of its own memory then fingerprints to exactly the bytes it always has, so
         // adding this field left every existing render case's recording valid. Writing a 0 here
@@ -960,8 +978,7 @@ pub struct RenderPipelineSpec<'a> {
     /// above an alpha of 1/2). Metal reads the alpha **before** the attachment's write mask, and
     /// ANDs the result with a sample mask the fragment writes; a first output with no alpha
     /// component leaves the coverage as rasterized. [`super::cases::alpha_coverage_pairs`] is
-    /// where each of those is measured, and the validation lane `runtime_lane::alpha_coverage`
-    /// the dither.
+    /// where each of those is measured.
     pub alpha_to_coverage: bool,
     /// `alphaToOneEnabled`: the fragment's alpha becomes 1 before the blend reads it and before it
     /// is stored, which the attachment's write mask can still stop from being stored.
@@ -2480,8 +2497,7 @@ pub const VISIBILITY_RESULT_TYPE: &str = "visibilityResultType";
 /// to hand Metal:
 ///
 /// - **More positions than the pass's samples.** Measured on an Apple M3 Max: plain Metal ends the
-///   process past the pass's samples
-///   (`metal2vulkan_runtime::RenderPassProblem::SamplePositionsSamples`). There is no safe way to
+///   process past the pass's samples. There is no safe way to
 ///   ask Metal this, so there is no answer to record and the shape may not be built.
 /// - **A coordinate outside `[0, 1)`.** Metal documents the range and its API validation asserts on
 ///   another coordinate; what plain Metal's driver programs for one is unmeasured, and the value

@@ -4,12 +4,10 @@ use super::profile::device;
 use super::*;
 use crate::device::requirements::VkProperty;
 use crate::device::subgroup::{
-    requirement, tier, OpBits, SimdClass, StageSubgroup, SubgroupModel, SubgroupRequirement,
-    SubgroupSizes, Tier,
+    quad_free, quad_requirement, requirement, tier, OpBits, SimdClass, StageSubgroup,
+    SubgroupModel, SubgroupRequirement, SubgroupSizes, Tier,
 };
 use crate::error::{Capability, Feature};
-use crate::metal::format::storage_image_choice;
-use crate::metal::PixelFormat;
 use crate::metal::{ArgumentBuffersTier, ReadWriteTextureTier};
 use crate::pipeline::sym::Stage;
 
@@ -53,7 +51,6 @@ const GOLDEN: &str = "\
 amd-780m-hawkpoint-radv: -,C,C,C,C,C,xW | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 amd-780m-radv: -,C,C,C,C,C,xW | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 amd-rdna2-apu-radv: -,C,C,C,C,C,xW | -,D,D,D,D,D,D | -,L,D,D,D,D,D
-amd-rdna3-radv: -,C,C,C,C,C,xW | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 gate-lavapipe: -,xO,xO,xO,xO,xO,xM | -,P,P,P,P,P,xW | -,L,E,E,E,E,E
 gate-lavapipe-x86_64: -,xO,xO,xO,xO,xO,xM | -,P,P,P,P,P,xW | -,L,E,E,E,E,E
 intel-arl-anv: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
@@ -61,14 +58,11 @@ intel-irisxe-anv: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 intel-irisxe-rplp-anv: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 intel-uhd770-rpls-anv: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 lavapipe: -,xO,xO,xO,xO,xO,xM | -,P,P,P,P,P,xW | -,L,E,E,E,E,E
-lunarg-desktop-baseline-2023: -,xO,xO,xO,xO,xO,xM | -,P,xQ,xO,xO,xO,xM | -,L,E,E,E,E,E
-moltenvk-m3: -,D,xO,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
+moltenvk-m3: -,xO,xO,xO,xO,xO,xM | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 nvidia-pascal-linux: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 nvidia-rtx50-linux: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
 nvidia-rtx5080-laptop: -,D,D,D,D,D,D | -,D,D,D,D,D,D | -,L,D,D,D,D,D
-roadmap-2022: -,xO,xO,xO,xO,xO,xM | -,P,P,P,P,P,xW | -,L,E,E,E,E,E
-swiftshader: -,P,xQ,P,P,P,xW | -,P,P,P,P,P,xW | -,L,E,E,E,E,E
-vk12-floor: -,xO,xO,xO,xO,xO,xM | -,xO,xQ,xO,xO,xO,xM | -,L,E,E,E,E,E
+runtime-floor: -,xO,xO,xO,xO,xO,xM | -,xO,xQ,xO,xO,xO,xM | -,L,E,E,E,E,E
 ";
 
 fn table() -> String {
@@ -163,7 +157,6 @@ fn model(stage: StageSubgroup) -> SubgroupModel {
             full_subgroups: true,
             ..stage
         },
-        quad_all_stages: true,
         maximal_reconvergence: false,
         uniform_control_flow: false,
         quad_control: false,
@@ -196,7 +189,7 @@ fn fixed_wave64_is_cluster32_without_a_pin() {
             size: None,
             full_subgroups: true,
             local_size_multiple: 64,
-            metal_vertex_simdgroups: false,
+            varying: false,
         }
     );
     assert_eq!(tier(&shuffle, Stage::Fragment, &m), Ok(Tier::Cluster32));
@@ -222,7 +215,7 @@ fn pinnable_ranges_prefer_32() {
             size: Some(32),
             full_subgroups: true,
             local_size_multiple: 32,
-            metal_vertex_simdgroups: false,
+            varying: false,
         }
     );
     assert_eq!(
@@ -231,7 +224,7 @@ fn pinnable_ranges_prefer_32() {
             size: Some(32),
             full_subgroups: false,
             local_size_multiple: 1,
-            metal_vertex_simdgroups: false,
+            varying: false,
         }
     );
     // A range above 32 pins the smallest cluster size.
@@ -260,7 +253,7 @@ fn a_subgroup_requirement_states_its_device_facts() {
         size: Some(32),
         full_subgroups: true,
         local_size_multiple: 32,
-        metal_vertex_simdgroups: false,
+        varying: false,
     };
     let r = facts(pinned, Stage::Kernel);
     assert_eq!(r.features, [VkFeature::SubgroupSizeControl].into());
@@ -362,6 +355,122 @@ fn narrow_subgroups_partial_in_graphics_emulated_in_compute() {
     );
 }
 
+/// A quad-only kernel takes its quads from the subgroup at the size the device gives where the
+/// kernel stage runs full subgroups of the class's operations and its narrowest size is below 32,
+/// read from the size range alone: 8 to 32 takes it; 32 to 32 and 32 to 64 keep today's pin to 32;
+/// a narrowest size below 4 is excluded by the guard, since a quad is four lanes of one subgroup.
+/// No other stage takes it. A stage that pins no size runs the API's alone, with no varying flag.
+#[test]
+fn a_quad_only_kernel_reads_the_size_range_alone() {
+    let quad = SimdClass::CrossLane(OpBits::QUAD);
+    let range = |min, max| {
+        let mut st = fixed(32);
+        st.pinnable = true;
+        st.sizes = SubgroupSizes { min, max };
+        model(st)
+    };
+    let m = range(8, 32);
+    assert!(quad_free(&quad, Stage::Kernel, &m));
+    assert!(quad_free(&SimdClass::Quad, Stage::Kernel, &m));
+    assert_eq!(
+        quad_requirement(Stage::Kernel, &m),
+        SubgroupRequirement {
+            size: None,
+            full_subgroups: true,
+            local_size_multiple: 32,
+            varying: true,
+        }
+    );
+    for stage in [Stage::Vertex, Stage::Fragment] {
+        assert!(!quad_free(&quad, stage, &m), "{stage:?}");
+    }
+    for (min, max) in [(4, 4), (8, 8), (16, 64)] {
+        assert!(
+            quad_free(&quad, Stage::Kernel, &range(min, max)),
+            "{min}..{max}"
+        );
+    }
+    // 32 is the narrowest size: the pin to 32 stays.
+    for (min, max) in [(32, 32), (32, 64), (64, 128)] {
+        assert!(
+            !quad_free(&quad, Stage::Kernel, &range(min, max)),
+            "{min}..{max}"
+        );
+    }
+    // The guard: a subgroup narrower than 4 lanes cannot hold a whole quad.
+    for (min, max) in [(1, 32), (2, 32), (1, 1), (2, 2)] {
+        assert!(
+            !quad_free(&quad, Stage::Kernel, &range(min, max)),
+            "{min}..{max}"
+        );
+    }
+    // Without full subgroups, or without the class's operations.
+    let mut m = range(8, 32);
+    m.kernel.full_subgroups = false;
+    assert!(!quad_free(&quad, Stage::Kernel, &m));
+    let mut m = range(8, 32);
+    m.kernel.ops = OpBits(0xff & !OpBits::QUAD.0);
+    assert!(!quad_free(&quad, Stage::Kernel, &m));
+    assert!(quad_free(
+        &SimdClass::CrossLane(OpBits::BALLOT.union(OpBits::SHUFFLE)),
+        Stage::Kernel,
+        &m
+    ));
+    // A stage that pins no size runs the API's.
+    let m = model(fixed(16));
+    assert!(quad_free(&quad, Stage::Kernel, &m));
+    assert_eq!(
+        quad_requirement(Stage::Kernel, &m),
+        SubgroupRequirement {
+            size: None,
+            full_subgroups: true,
+            local_size_multiple: 16,
+            varying: false,
+        }
+    );
+    assert!(!quad_free(&quad, Stage::Kernel, &model(fixed(32))));
+}
+
+/// The committed profiles a quad-only kernel takes its quads from the subgroup at the device's
+/// size on, with their kernel size ranges: none whose narrowest kernel size is 32 (NVIDIA, RDNA,
+/// and `moltenvk-m3`, whose kernel stage pins no size and so runs the API's 32 alone).
+#[test]
+fn quad_free_on_the_committed_profiles() {
+    let quad = SimdClass::CrossLane(OpBits::QUAD);
+    let mut free = Vec::new();
+    for (stem, _) in committed_profiles() {
+        let dev = device(&stem);
+        let model = &dev.profile().fields().subgroup;
+        if !quad_free(&quad, Stage::Kernel, model) {
+            continue;
+        }
+        let st = model.stage(Stage::Kernel);
+        assert_eq!(
+            quad_requirement(Stage::Kernel, model),
+            SubgroupRequirement {
+                size: None,
+                full_subgroups: true,
+                local_size_multiple: st.sizes.max,
+                varying: true,
+            },
+            "{stem}"
+        );
+        free.push(format!("{stem} {}..{}", st.sizes.min, st.sizes.max));
+    }
+    assert_eq!(
+        free,
+        [
+            "gate-lavapipe 4..4",
+            "gate-lavapipe-x86_64 8..8",
+            "intel-arl-anv 8..32",
+            "intel-irisxe-anv 8..32",
+            "intel-irisxe-rplp-anv 8..32",
+            "intel-uhd770-rpls-anv 8..32",
+            "lavapipe 8..8",
+        ]
+    );
+}
+
 #[test]
 fn missing_stage_or_operations_are_named() {
     let mut st = fixed(32);
@@ -377,39 +486,6 @@ fn missing_stage_or_operations_are_named() {
     );
     m.vertex.supported = false;
     assert!(tier(&SimdClass::LaneArithmetic, Stage::Vertex, &m).is_err());
-    // Vertex quads need quad operations in all stages.
-    let mut m = model(fixed(32));
-    m.quad_all_stages = false;
-    assert_eq!(
-        tier(&SimdClass::Quad, Stage::Vertex, &m)
-            .unwrap_err()
-            .feature,
-        Feature::QuadOperations
-    );
-    assert_eq!(
-        tier(&SimdClass::Quad, Stage::Fragment, &m),
-        Ok(Tier::Direct)
-    );
-}
-
-/// A vertex function's requirement of the subgroups its driver runs as Metal does without the
-/// stage listed states the measured fact in place of the stage its module's operations name, and
-/// adds nothing to a module of none.
-#[test]
-fn a_measured_vertex_stage_states_its_fact_in_place_of_the_stage() {
-    use crate::device::requirements::Requirements;
-    let measured = SubgroupRequirement {
-        metal_vertex_simdgroups: true,
-        ..SubgroupRequirement::NONE
-    };
-    let mut r = Requirements::default();
-    r.properties
-        .insert(VkProperty::SubgroupStage(Stage::Vertex));
-    measured.add_device_facts(Stage::Vertex, &mut r);
-    assert_eq!(r.properties, [VkProperty::MetalVertexSimdgroups].into());
-    let mut none = Requirements::default();
-    measured.add_device_facts(Stage::Vertex, &mut none);
-    assert_eq!(none, Requirements::default());
 }
 
 /// A class the device has (its compute stage's, which Vulkan always lists) but a stage lacks, as
@@ -442,48 +518,6 @@ fn a_class_measured_nowhere_in_a_stage_names_the_stage() {
     );
 }
 
-/// The committed MoltenVK captures, which take `DriverDeviation::MetalVertexSimdgroups` and do not
-/// list the vertex stage, have vertex subgroups of the classes measured exact there (basic, vote,
-/// arithmetic, ballot and shuffle), enable `VkProperty::MetalVertexSimdgroups` and not
-/// `SubgroupStage(Vertex)`, and so report a vertex stage whose sums and shuffles tier: the
-/// condition of Metal's `supports_simd_reduction` in both vertex and fragment functions.
-#[test]
-fn moltenvk_s_vertex_stage_has_the_measured_classes() {
-    use crate::error::DriverDeviation;
-    for stem in crate::spirv::testing::MOLTENVK_CAPTURES {
-        let dev = device(stem);
-        let p = dev.profile();
-        assert!(p.takes_driver_deviation(DriverDeviation::MetalVertexSimdgroups));
-        let f = p.fields();
-        let vertex = f.subgroup.vertex;
-        assert!(vertex.supported, "{stem}");
-        let measured = OpBits::BASIC
-            .union(OpBits::VOTE)
-            .union(OpBits::ARITHMETIC)
-            .union(OpBits::BALLOT)
-            .union(OpBits::SHUFFLE);
-        assert_eq!(vertex.ops, measured, "{stem}");
-        assert!(f.subgroup.kernel.ops.contains(measured), "{stem}");
-        let properties = &f.enabled.properties;
-        assert!(
-            properties.contains(&VkProperty::MetalVertexSimdgroups),
-            "{stem}"
-        );
-        assert!(
-            !properties.contains(&VkProperty::SubgroupStage(Stage::Vertex)),
-            "{stem}"
-        );
-        let simd = dev.metal_properties().simd;
-        for stage in [simd.vertex, simd.fragment] {
-            assert!(stage.cross_lane.contains(measured), "{stem}");
-        }
-        assert!(
-            !simd.vertex.cross_lane.contains(OpBits::SHUFFLE_RELATIVE),
-            "{stem}"
-        );
-    }
-}
-
 /// No device answers more than an Apple GPU: each answer a vendor's limit could raise past Apple's
 /// is the lower of the two. Every profile below has at least an Apple GPU's limits, and the
 /// profiles of other vendors' GPUs more of some, so each answers exactly the Apple GPU's: 1024
@@ -498,7 +532,6 @@ fn no_profile_answers_more_than_an_apple_gpu() {
         ("nvidia-pascal-linux", [1536, 49152, 8, 32768]),
         ("nvidia-rtx50-linux", [1024, 49152, 8, 32768]),
         ("nvidia-rtx5080-laptop", [1024, 49152, 8, 32768]),
-        ("amd-rdna3-radv", [1024, 65536, 8, 16384]),
         ("amd-rdna2-apu-radv", [1024, 65536, 8, 16384]),
         ("amd-780m-radv", [1024, 65536, 8, 16384]),
         ("intel-arl-anv", [1024, 49152, 16, 16384]),
@@ -535,7 +568,7 @@ fn no_profile_answers_more_than_an_apple_gpu() {
     let pascal = device("nvidia-pascal-linux");
     assert_eq!(
         pascal.metal_properties().max_threads_per_threadgroup,
-        [1024, 1024, 64]
+        [1024, 1024, 1024]
     );
     let lavapipe = device("lavapipe");
     assert_eq!(
@@ -554,13 +587,7 @@ fn metal_properties_report_d3_d4_values() {
         // Each the lower of the device's limit and an Apple GPU's answer.
         let threads = l.max_compute_work_group_invocations.min(1024);
         assert_eq!(m.max_total_threads_per_threadgroup, threads, "{stem}");
-        for axis in 0..3 {
-            assert_eq!(
-                m.max_threads_per_threadgroup[axis],
-                l.max_compute_work_group_size[axis].min(threads),
-                "{stem}"
-            );
-        }
+        assert_eq!(m.max_threads_per_threadgroup, [threads; 3], "{stem}");
         assert_eq!(
             m.max_threadgroup_memory_length,
             l.max_compute_shared_memory_size.min(32 * 1024),
@@ -582,27 +609,14 @@ fn metal_properties_report_d3_d4_values() {
         );
         assert!(m.max_buffer_length > 0, "{stem}");
     }
-    let floor = device("vk12-floor");
+    let floor = device("runtime-floor");
     let m = floor.metal_properties();
-    assert_eq!(m.max_threads_per_threadgroup, [128, 128, 64]);
-    assert_eq!(m.argument_buffers_tier, ArgumentBuffersTier::Tier1);
-    // Vulkan 1.2 requires R32 storage images: tier 1. Tier 2's 8- and 16-bit single-channel formats
-    // need shaderStorageImageExtendedFormats, which the floor lacks, so formatless reads and
-    // writes added to it do not make it tier 2.
-    assert_eq!(m.read_write_texture_tier, ReadWriteTextureTier::Tier1);
-    let mut formatless = profile("vk12-floor");
-    formatless
-        .features
-        .insert(VkFeature::ShaderStorageImageReadWithoutFormat);
-    formatless
-        .features
-        .insert(VkFeature::ShaderStorageImageWriteWithoutFormat);
-    let formatless = Device::new(formatless, DevicePolicy::default()).unwrap();
-    assert_eq!(
-        formatless.metal_properties().read_write_texture_tier,
-        ReadWriteTextureTier::Tier1
-    );
-    assert!(storage_image_choice(PixelFormat::R16Float, formatless.profile()).is_err());
+    assert_eq!(m.max_threads_per_threadgroup, [1024, 1024, 1024]);
+    // Device addresses and update-after-bind sampled and storage images: tier 2.
+    assert_eq!(m.argument_buffers_tier, ArgumentBuffersTier::Tier2);
+    // Tier 2's 8- and 16-bit single-channel storage formats come with
+    // shaderStorageImageExtendedFormats, which the floor requires.
+    assert_eq!(m.read_write_texture_tier, ReadWriteTextureTier::Tier2);
     // Typed storage images are enough: intel-irisxe-anv reads storage images only with a
     // declared format and still has every tier-2 format.
     let irisxe = device("intel-irisxe-anv");
@@ -611,7 +625,8 @@ fn metal_properties_report_d3_d4_values() {
         irisxe.metal_properties().read_write_texture_tier,
         ReadWriteTextureTier::Tier2
     );
-    assert_eq!(m.max_buffer_length, 1 << 27);
+    // Vulkan 1.3's maxBufferSize and maxMemoryAllocationSize guarantees.
+    assert_eq!(m.max_buffer_length, 1 << 30);
     // Without subgroup operations a kernel's simdgroups, matrices included, are emulated; a
     // fragment's are not.
     assert!(m.simd.kernel.matrix);
@@ -619,13 +634,11 @@ fn metal_properties_report_d3_d4_values() {
     let has = |f: &Feature| m.unsupported_features.iter().any(|u| u.feature == *f);
     // 64-bit integers are two words without `shaderInt64`, on every pipeline.
     assert!(!has(&Feature::Int64Arithmetic));
-    for f in [Feature::ArgumentBufferPointers, Feature::RasterOrderGroups] {
-        assert!(has(&f), "vk12-floor should report {f:?}");
-    }
-    // Neither rasterization-order access nor the pixel interlock: framebuffer fetch reads input
-    // attachments ordered between draws, a note, not a refusal.
-    let fragment = floor.profile().fields().fragment;
-    assert!(!fragment.rasterization_order_color_access && !fragment.pixel_interlock);
+    assert!(!has(&Feature::ArgumentBufferPointers));
+    assert!(has(&Feature::RasterOrderGroups));
+    // No pixel interlock: framebuffer fetch reads input attachments ordered between draws, a
+    // note, not a refusal.
+    assert!(!floor.profile().fields().fragment.pixel_interlock);
     assert!(!has(&Feature::FramebufferFetch));
     let nv = device("nvidia-rtx50-linux");
     let m = nv.metal_properties();

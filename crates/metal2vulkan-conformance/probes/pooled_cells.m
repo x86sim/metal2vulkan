@@ -9,9 +9,6 @@
 //   clang -fobjc-arc -O1 -fmodules -o pooled_cells pooled_cells.m \
 //     -framework Foundation -framework Metal
 // Run: ./pooled_cells, MTL_DEBUG_LAYER unset.
-//
-// WHAT IT MEASURED (Apple M3 Max, macOS 27.0.1): see the runtime lane's
-// `runtime_lane::pooled_cells` module docs.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>

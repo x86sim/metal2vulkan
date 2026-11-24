@@ -15,10 +15,12 @@
 //! `clamp_to_zero` reads the border color too). The level is always the base level (Metal's bicubic
 //! sampler has no mip filter, so the level, bias, gradients, and fragment derivatives select
 //! nothing), a 2D array's layer is clamped into the array, and what is done with the sum depends on
-//! the bound format: the [`SpecKey::BicubicTexels`] specialization of the texture slot selects the
-//! bilinear inner 2x2 instead (32-bit float channels), clamps the sum into `[0, 1]` or `[-1, 1]`
-//! (normalized channels), or rounds it to `half` (half and small-float channels). A 1D texture is
-//! filtered bilinearly over taps `i` and `i + 1` whatever its format, with the same fraction.
+//! the bound format: the [`SpecKey::BicubicTexels`] specialization of the texture slot (under the
+//! identity domains the same bits, read at run time from the slot's `PushField::BicubicTexels`)
+//! selects the bilinear inner 2x2 instead (32-bit float channels), clamps the sum into `[0, 1]` or
+//! `[-1, 1]` (normalized channels), or rounds it to `half` (half and small-float channels). A 1D
+//! texture is filtered bilinearly over taps `i` and `i + 1` whatever its format, with the same
+//! fraction.
 //!
 //! **Small levels and mirrored axes** (Apple M3 Max, macOS 26.7, the primary Metal reference; the
 //! probes probes, every lane of each run with and without Metal's validation layer,
@@ -28,8 +30,9 @@
 //!   linear filter under the sampler's address modes: its sample equals a linear sampler's with
 //!   the same modes on all 4,096 lanes of each run, under `clamp_to_edge`, `repeat`,
 //!   `mirrored_repeat`, `clamp_to_zero`, and one mirrored axis beside a clamped one. The
-//!   emulation takes the linear 2D sample there ([`routines::Quad`]) over the footprint's inner
-//!   taps, which are the linear filter's (the bicubic and linear footprints share `q`).
+//!   emulation takes the linear 2D sample there ([`routines::Plane`]'s `bilinear` form) over the
+//!   footprint's inner taps, which are the linear filter's (the bicubic and linear footprints
+//!   share `q`).
 //! - On a level of at least four texels each way, a mirrored axis of a format Metal filters
 //!   bicubically reads texel 1 at fraction 0 whatever the coordinate: with both axes mirrored
 //!   every lane is texel `(1, 1)` exactly, and with one the sample varies with the other axis
@@ -89,7 +92,8 @@ use crate::lower::texture::{OffsetBase, TexelConv};
 use crate::metal::bicubic::BicubicTexels;
 use crate::metal::sampler::SamplerWord;
 use crate::metal::{SamplerAddressMode, SamplerBorderColor};
-use crate::pipeline::sym::SamplerRef;
+use crate::pipeline::sym::{PushField, SamplerRef};
+use crate::spirv::builder::ops::arith::RemainderSign;
 use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::{BResult, BuildError, OperandRule};
 use crate::spirv::ids::{ConstId, TypeId, Value as SValue};
@@ -124,7 +128,8 @@ pub enum TapAddress {
 /// docs state.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Bicubic {
-    /// The texture slot whose `BicubicTexels` specialization states the bound format's treatment.
+    /// The texture slot whose `BicubicTexels` specialization (under the identity domains, push
+    /// field) states the bound format's treatment.
     pub texture: u32,
     /// The addressing of each plane axis (`s`, then `t` for a 2D texture).
     pub address: Vec<TapAddress>,
@@ -152,9 +157,7 @@ impl Bicubic {
     /// conversions; for a 2D texture the small level's test and linear sample ([`SMALL_WORDS`], its
     /// four taps' conversions on a raw sample) and each mirrored axis's pinned footprint
     /// ([`PINNED_WORDS`]), and Metal's offset rule on each axis a constant offset moves
-    /// (`position::OFFSET_RULE_WORDS`). The estimate bounds every public bicubic fixture
-    /// (`the_estimate_bounds_the_bicubic_fixtures`), every raw form
-    /// (`the_srgb_estimate_bounds_its_emission`), and the mirrored forms (`mirrored_axes`).
+    /// (`position::OFFSET_RULE_WORDS`).
     pub(super) fn words(&self) -> u32 {
         let (base, taps) = if self.linear_only() {
             (448, 2)
@@ -352,7 +355,6 @@ pub(super) struct Tys {
     pub(super) f32_: TypeId,
     i32_: TypeId,
     pub(super) u32_: TypeId,
-    pub(super) bool_: TypeId,
     pub(super) vec4: TypeId,
 }
 
@@ -368,13 +370,13 @@ impl Tys {
             width: 32,
             signed: false,
         })?;
-        let bool_ = m.ty(SType::Bool)?;
+        // Declared here, so the module keeps the order of its type declarations.
+        m.ty(SType::Bool)?;
         let vec4 = m.ty(SType::Vector { elem: f32_, len: 4 })?;
         Ok(Tys {
             f32_,
             i32_,
             u32_,
-            bool_,
             vec4,
         })
     }
@@ -402,7 +404,8 @@ fn i32_value(fb: &mut FunctionBuilder<'_>, t: &Tys, x: i32) -> BResult<SValue> {
 }
 
 /// Whether bit `bit` of the specialization `spec` is set: `0 < (spec & bit)`, computed in the
-/// function, since a function reads a texel format key's value as data.
+/// function, since a function reads the bound treatment's word as data
+/// (`PushField::BicubicTexels`).
 pub(super) fn flag(
     fb: &mut FunctionBuilder<'_>,
     t: &Tys,
@@ -475,8 +478,8 @@ struct Axis {
 ///   lets a device assume no float operand or result is an infinity or a NaN unless
 ///   `SignedZeroInfNanPreserve` is requested, which this lowering does not request. `NClamp`,
 ///   the comparisons, and `OpConvertFToS` of an unrepresentable value then give undefined
-///   values. Whatever `i32` `q` holds, each tap is clamped (`SClamp`) or wrapped (`SMod` by the
-///   positive extent) into the level, and integer adds wrap, so every fetch stays in bounds.
+///   values. Whatever `i32` `q` holds, each tap is clamped (`SClamp`) or wrapped (the remainder by
+///   the positive extent, with its sign) into the level, and integer adds wrap, so every fetch stays in bounds.
 /// - A normalized coordinate's `x` is Metal's position on an axis addressed by `address`
 ///   ([`super::position`]): `c` wrapped into one period first where the axis repeats or mirrors,
 ///   then times the extent, rounded to `f32` with ties away from zero. A repeating axis's `x` lies
@@ -656,11 +659,14 @@ fn tap(
             address: TapAddress::Edge,
             ..
         } => (fb.glsl(GlslOp::SClamp, &[i, zero, last])?, None),
-        // The extent is positive, so `SMod` lands in `[0, extent)`.
+        // The extent is positive, so the remainder with its sign lands in `[0, extent)`.
         AxisAddress::Mode {
             address: TapAddress::Repeat,
             ..
-        } => (fb.binary(BinOp::SMod, i, axis.extent)?, None),
+        } => (
+            fb.signed_remainder(i, axis.extent, RemainderSign::Divisor)?,
+            None,
+        ),
         AxisAddress::Mode {
             address: TapAddress::Border,
             ..
@@ -681,7 +687,7 @@ fn tap(
         // addresses each tap of a pixel or normalized sampler.
         AxisAddress::Word { mode, .. } => {
             let edge = fb.glsl(GlslOp::SClamp, &[i, zero, last])?;
-            let wrapped = fb.binary(BinOp::SMod, i, axis.extent)?;
+            let wrapped = fb.signed_remainder(i, axis.extent, RemainderSign::Divisor)?;
             let m = reflected_once(fb, t, i)?;
             let reflected = mirrored(fb, t, m, axis.extent)?;
             let once = fb.glsl(GlslOp::SMin, &[m, last])?;
@@ -726,12 +732,12 @@ fn reflected_once(fb: &mut FunctionBuilder<'_>, t: &Tys, i: SValue) -> BResult<S
 
 /// An index reflected once ([`reflected_once`]), `m` (a non-negative `int`), reflected into a
 /// level of `extent` texels (an `int`) as Metal's mirrored repeat reflects it: `r = m mod 2n`, then
-/// `r` or `2n - 1 - r`. The extent is positive and below `2^30`, so `2n` is too, and `SMod` of the
-/// non-negative `m` lands in `[0, 2n)`.
+/// `r` or `2n - 1 - r`. The extent is positive and below `2^30`, so `2n` is too, and the remainder
+/// of the non-negative `m` by it lands in `[0, 2n)`.
 fn mirrored(fb: &mut FunctionBuilder<'_>, t: &Tys, m: SValue, extent: SValue) -> BResult<SValue> {
     let one = i32_value(fb, t, 1)?;
     let two_n = fb.binary(BinOp::IAdd, extent, extent)?;
-    let r = fb.binary(BinOp::SMod, m, two_n)?;
+    let r = fb.signed_remainder(m, two_n, RemainderSign::Divisor)?;
     let low = fb.binary(BinOp::SLessThan, r, extent)?;
     let top = fb.binary(BinOp::ISub, two_n, one)?;
     let back = fb.binary(BinOp::ISub, top, r)?;
@@ -1092,25 +1098,6 @@ pub(super) fn footprint_of_image(
     footprint_at(fb, t, &at, (size, base, image), bits, taps)
 }
 
-/// [`footprint_of_image`] of an image whose base-level size `size` (a `uvec2`) the caller states:
-/// an in-place texture's (`super::in_place`), whose taps read the base level of its one level.
-pub(super) fn footprint_sized(
-    fb: &mut FunctionBuilder<'_>,
-    t: &Tys,
-    (coord, layer, offset): (SValue, Option<SValue>, Option<(SValue, u8)>),
-    (size, image): (SValue, CombinedImage),
-    bits: Bits,
-    (taps, parent): (&Taps<'_>, Option<OffsetBase>),
-) -> BResult<Footprint> {
-    let at = At {
-        coord,
-        layer,
-        parent,
-        offset,
-    };
-    footprint_at(fb, t, &at, (size, None, image), bits, taps)
-}
-
 /// The footprint of sample `s` over `taps` on an image of level-0 size `size` (image facts
 /// `image`), the border color seen through the channels of the bound format's treatment `bits`.
 pub(super) fn footprint_on(
@@ -1267,6 +1254,30 @@ pub(super) fn word_field(
     fb.binary(BinOp::BitwiseAnd, f, m)
 }
 
+/// The bound format's treatment of texture slot `texture` under the bicubic filter: the slot's
+/// `BicubicTexels` specialization, or under the identity domains its push field, which the
+/// consumer writes from the bound texture, read in the open block.
+pub(super) fn format_bits(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    texture: u32,
+) -> BResult<Bits> {
+    if let Some(&spec) = cx.decl.families.sampler.bicubic.get(&texture) {
+        return Ok(Bits::Spec(spec));
+    }
+    if !cx.plan.families.access.identity {
+        return Err(cx.fail(format!(
+            "texture slot {texture} has no bicubic specialization"
+        )));
+    }
+    let Some(slot) = cx.plan.families.texture.slots.get(&texture) else {
+        return Err(cx.fail(format!("texture slot {texture} is not planned")));
+    };
+    Ok(Bits::Value(
+        cx.push_field(fb, PushField::BicubicTexels(slot.slot))?,
+    ))
+}
+
 /// The `vec4` texel the bicubic sample `s` of sampled image `si` (image facts `image`) reads
 /// (module docs), its `half` result the device's narrowing of the `f32` sum.
 pub(super) fn emit(
@@ -1277,12 +1288,7 @@ pub(super) fn emit(
     image: CombinedImage,
     b: &Bicubic,
 ) -> BResult<SValue> {
-    let Some(&spec) = cx.decl.families.sampler.bicubic.get(&b.texture) else {
-        return Err(cx.fail(format!(
-            "texture slot {} has no bicubic specialization",
-            b.texture
-        )));
-    };
+    let bits = format_bits(cx, fb, b.texture)?;
     let half = half_result(cx, s)?;
     let t = Tys::new(fb)?;
     let span = b.span();
@@ -1291,7 +1297,6 @@ pub(super) fn emit(
     let zero_u = fb.u32_const(0)?;
     let zero_u = value(fb, zero_u)?;
     let size = fb.query(ImageQuery::SizeLod(zero_u), img)?;
-    let bits = Bits::Spec(spec);
     let fp = footprint_on(cx, fb, &t, s, (size, image), bits, &taps)?;
     let x = filter(cx, fb, (&t, &fp, size), b, bits, Texels::Own(img))?;
     narrowed(fb, x, half)

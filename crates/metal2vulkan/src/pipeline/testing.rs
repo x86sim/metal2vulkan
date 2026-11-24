@@ -104,8 +104,43 @@ pub fn description_at_1_2(stem: &str, flags2: bool) -> Result<DeviceDescription,
 
 /// Committed profile `stem` (`validation/profiles/<stem>.json`) derived under `policy`.
 pub fn profile(stem: &str, policy: DevicePolicy) -> Result<DeviceProfile, String> {
-    let dev = Device::new(description(stem)?, policy).map_err(|e| format!("{stem}: {e}"))?;
+    let dev =
+        Device::from_queries(description(stem)?, policy).map_err(|e| format!("{stem}: {e}"))?;
     Ok(dev.profile().clone())
+}
+
+/// Committed profile `stem` derived under `policy` without `features`. Without a feature the
+/// runtime's floor requires (`runtime-floor` states each), the device is below that floor: a test
+/// of a form only such a device takes builds it so.
+pub fn profile_without(
+    stem: &str,
+    features: &[crate::device::requirements::VkFeature],
+    policy: DevicePolicy,
+) -> Result<DeviceProfile, String> {
+    let mut desc = description(stem)?;
+    for feature in features {
+        desc.features.remove(feature);
+    }
+    let dev = Device::from_queries(desc, policy).map_err(|e| format!("{stem}: {e}"))?;
+    Ok(dev.profile().clone())
+}
+
+/// The name a test's messages give [`device_f`]'s device.
+pub const PROFILE_F: &str = "runtime-floor without bufferDeviceAddress";
+
+/// `runtime-floor` without `bufferDeviceAddress`: a device below the runtime's floor whose buffers
+/// take the floor form (`BufferAccess::Floor`, Profile F), which no committed profile takes. A
+/// test of that form builds it so.
+pub fn description_f() -> Result<DeviceDescription, String> {
+    let mut desc = description("runtime-floor")?;
+    desc.features
+        .remove(&crate::device::requirements::VkFeature::BufferDeviceAddress);
+    Ok(desc)
+}
+
+/// [`description_f`]'s device, derived under `policy`.
+pub fn device_f(policy: DevicePolicy) -> Result<Device, String> {
+    Device::from_queries(description_f()?, policy).map_err(|e| format!("{PROFILE_F}: {e}"))
 }
 
 /// Committed profile `stem` derived under `policy`, with `storage` storage buffers a stage
@@ -117,25 +152,25 @@ pub fn profile_with_storage_buffers(
 ) -> Result<DeviceProfile, String> {
     let mut desc = description(stem)?;
     desc.limits.max_per_stage_descriptor_storage_buffers = storage;
-    let dev = Device::new(desc, policy).map_err(|e| format!("{stem}: {e}"))?;
+    let dev = Device::from_queries(desc, policy).map_err(|e| format!("{stem}: {e}"))?;
     Ok(dev.profile().clone())
 }
 
 /// The name [`formatless_floor`]'s profile goes by in a test's messages.
-pub const FORMATLESS_FLOOR: &str = "vk12-floor+formatless";
+pub const FORMATLESS_FLOOR: &str = "Profile F+formatless";
 
-/// `vk12-floor` derived under `policy` with the two optional features that let a shader access a
-/// storage image without its format (`shaderStorageImageReadWithoutFormat` and
-/// `shaderStorageImageWriteWithoutFormat`): the floor, which states neither, beside a device that
-/// leaves a storage texture's format to the bound view.
+/// [`description_f`]'s device derived under `policy` with `shaderStorageImageReadWithoutFormat`,
+/// the optional feature that, beside the floor's `shaderStorageImageWriteWithoutFormat`, lets a
+/// shader access a storage image without its format: Profile F beside a device that leaves a
+/// storage texture's format to the bound view.
 pub fn formatless_floor(policy: DevicePolicy) -> Result<DeviceProfile, String> {
     use crate::device::requirements::VkFeature;
-    let mut desc = description("vk12-floor")?;
+    let mut desc = description_f()?;
     desc.features.extend([
         VkFeature::ShaderStorageImageReadWithoutFormat,
         VkFeature::ShaderStorageImageWriteWithoutFormat,
     ]);
-    let dev = Device::new(desc, policy).map_err(|e| format!("{FORMATLESS_FLOOR}: {e}"))?;
+    let dev = Device::from_queries(desc, policy).map_err(|e| format!("{FORMATLESS_FLOOR}: {e}"))?;
     Ok(dev.profile().clone())
 }
 
@@ -150,20 +185,10 @@ pub fn storage_buffers(a: &FunctionArtifact) -> u32 {
 }
 
 /// Whether artifact `a` leaves a NaN's bits to the device, which the interpreter does not model:
-/// it records `PrecisionNote::NativeNanEncoding`, or it requires `VkProperty::MetalNanMoves`, whose
-/// measured device answers Metal's bits where the interpreter's conversions answer their own.
+/// it records `PrecisionNote::NativeNanEncoding`.
 pub fn device_nan_bits(a: &FunctionArtifact) -> bool {
     a.precision
         .contains(&crate::pipeline::artifact::PrecisionNote::NativeNanEncoding)
-        || a.requirements
-            .properties
-            .contains(&crate::device::requirements::VkProperty::MetalNanMoves)
-}
-
-/// The default policy with Metal's answers wherever a choice still offers them
-/// ([`DevicePolicy::exact_answers`]).
-pub fn exact_maths() -> DevicePolicy {
-    DevicePolicy::default().exact_answers()
 }
 
 /// A fresh per-attempt meter with the standard caps and no deadline.
@@ -239,8 +264,7 @@ pub fn fragment_inputs(
     inputs
 }
 
-/// [`compile`] under lowering inputs `inputs` (a pipeline's state, such as its framebuffer
-/// fetch's).
+/// [`compile`] under lowering inputs `inputs` (a pipeline's state, such as its color writes').
 pub fn compile_with(
     bitcode: &[u8],
     entry: &str,
@@ -274,30 +298,7 @@ pub fn compile_kept(
         &mut meter(),
         SPIRV_WORDS,
     )
-    .map(|(compiled, plan, module)| {
-        let a = compiled.artifact();
-        assert_walk_estimate(entry, &plan, a.module.words.len());
-        (Arc::new(a.clone()), plan, module)
-    })
-}
-
-/// The plan's size estimate bounds the `emitted` words of a module of the emulated simdgroup tier
-/// or of the predicated walk: checked on every such module the engine tests build through
-/// [`compile_kept`] and [`typed_module_with`] (the estimate refuses before emission, so one under
-/// the emitted words would let a module past the cap only `check_emitted` catches, and one far
-/// over refuses a module that fits).
-fn assert_walk_estimate(entry: &str, plan: &Plan, emitted: usize) {
-    assert!(
-        !walked(plan) || plan.estimate.words >= emitted as u64,
-        "{entry}: estimate {} < emitted {emitted}",
-        plan.estimate.words
-    );
-}
-
-/// The plan is of the emulated simdgroup tier or walks its body predicated.
-fn walked(plan: &Plan) -> bool {
-    plan.simd.1 == crate::device::subgroup::Tier::Emulated
-        || plan.families.simd.predication.is_some()
+    .map(|(compiled, plan, module)| (Arc::new(compiled.artifact().clone()), plan, module))
 }
 
 /// The plan and the finished typed module of entry `entry` of `bitcode` for `p`, with no function
@@ -411,14 +412,9 @@ fn typed_module_of(
     let crate::lower::emit::Emitted { mut module, .. } =
         crate::lower::emit::emit_module(&spec, &plan, m)?;
     crate::spirv::roll::roll_entry(&mut module, m)?;
-    crate::spirv::hoist::hoist_uniform_loads(&mut module, p.containment(), m)?;
-    let (_, fences) = crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
-    fences.apply(&mut module)?;
+    crate::spirv::hoist::hoist_uniform_loads(&mut module, m)?;
+    crate::spirv::carry::end_dead_carries(&mut module, m)?;
     crate::spirv::verify::verify(&module, p, m)?;
-    if walked(&plan) {
-        let words = crate::spirv::serialize::serialize_for(module.clone(), p)?.words;
-        assert_walk_estimate(entry, &plan, words.len());
-    }
     Ok((plan, module))
 }
 
@@ -433,16 +429,11 @@ pub fn link_standalone(
 }
 
 /// Link `a` alone, relocate it, and run L3 (requirements ⊆ profile, `spirv-val` under the
-/// profile's environments and relaxations). Returns the table and the final words. A key the
-/// function reads as data left a specialization constant fails it: a read of the key's constant the
-/// entry hook did not reach, which would make a pipeline per bound value.
+/// profile's environments and relaxations). Returns the table and the final words.
 pub fn link_and_validate(
     a: &FunctionArtifact,
     p: &DeviceProfile,
 ) -> Result<(LinkTable, Vec<u32>), String> {
-    if let Some(c) = a.interface.spec.iter().find(|c| c.key.read_as_data()) {
-        return Err(format!("{:?} is still a specialization constant", c.key));
-    }
     let (table, words) = link_standalone(a, p).map_err(|e| format!("link: {e}"))?;
     check_words_valid(&words, &a.requirements, p)?;
     Ok((table, words))
@@ -1088,3 +1079,16 @@ pub fn status_reach_on(p: &DeviceProfile) -> StatusReach {
 }
 
 mod tests;
+
+/// The number of `op` instructions in module `words`.
+pub fn count_op(words: &[u32], op: crate::spv::Op) -> usize {
+    let mut i = 5;
+    let mut n = 0;
+    while i < words.len() {
+        let (len, opcode) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+        assert!(len > 0 && i + len <= words.len(), "malformed module");
+        n += usize::from(opcode == op as u32);
+        i += len;
+    }
+    n
+}

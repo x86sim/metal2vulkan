@@ -31,8 +31,7 @@
 //! A **completed** handler's `waitUntilScheduled` is the fourth combination, and the probe says
 //! Metal returns from it, scheduling having already happened. It is left out: running it on Metal
 //! would stake a record run on that prose, and the suite's standing rule against a shape that may
-//! not come back does not bend for a sentence. The runtime's `Ok(())` there stays a `runtime_lane`
-//! assertion.
+//! not come back does not bend for a sentence.
 //!
 //! The runtime's **bounded** wait (`wait_until_completed_for`) is left out too, for a different
 //! reason: Metal has no bounded wait, so its `TimedOut` is not a Metal fact and there is nothing
@@ -44,8 +43,8 @@ use crate::replay::NOTICES_SITE;
 use crate::transcript::{Node, Observed, Sites, Transcript};
 
 /// Where the probe that died is written down.
-const PROBED_IN: &str = "metal2vulkan-validation runtime_lane::handler_waits, \
-                         waits_from_a_command_buffer_s_own_handlers_answer_at_once";
+const PROBED_IN: &str = "a Metal probe of waits from a command buffer's own handlers, on an \
+                         Apple M4";
 
 /// The chip the probe died on, as the suite names it.
 ///
@@ -152,17 +151,6 @@ impl Case for OwnHandlerWait {
         MetalSource::did_not_return(PROBED_IN, self.wait.site(), self.says)
     }
 
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: every value of this family still compares against Metal's exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09), where it fired for all 3 rows of the family
-        // and each row was divergent on that field and nothing else (replay-nvidia.log).
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn inputs(&self) -> Result<Vec<Input>, String> {
         Ok(vec![
             Input::bytes("wait", &self.wait.words()),
@@ -208,7 +196,7 @@ mod tests {
             // measurements on a venue, taken by other legs, and a case states nothing about
             // either.
             assert_eq!(
-                committed.without_costs().without_times(),
+                committed.without_times(),
                 stated,
                 "{}: its committed recording is not the answer the case states",
                 case.name()

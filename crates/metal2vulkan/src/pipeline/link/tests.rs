@@ -2,8 +2,6 @@
 //! limits (the sweep over every committed profile), stage-interface locations and packing, vertex
 //! input, graphics state, and the property over random pipelines.
 
-mod fan_out;
-mod geometry;
 mod property;
 mod render;
 mod sweep;
@@ -15,6 +13,7 @@ use crate::device::derive::vk_stage;
 use crate::device::subgroup::SubgroupRequirement;
 use crate::device::DevicePolicy;
 use crate::library::FunctionCompileKey;
+use crate::lower::push::MOST_BYTES as MOST;
 use crate::pipeline::artifact::{Reconvergence, StrategyCensus};
 use crate::pipeline::interface::{StageDescriptor, StageSpec};
 use crate::pipeline::stage_io::{
@@ -32,7 +31,19 @@ use crate::spirv::serialize::serialize;
 // ---- Fixtures ----
 
 pub(super) fn profile(stem: &str) -> DeviceProfile {
+    crate::pipeline::testing::profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile")
+}
+
+/// Committed profile `stem` under the identity domains, the runtime's: the only domains where a
+/// vertex attribute is fetched in fixed function (outside them every attribute is pulled).
+pub(super) fn identity_profile(stem: &str) -> DeviceProfile {
     crate::pipeline::testing::profile(stem, DevicePolicy::default()).expect("profile")
+}
+
+/// Whether `r` is the identity domains' refusal of an attribute fixed-function input cannot
+/// fetch as laid out (`Feature::VertexInputLayout`).
+pub(super) fn layout_refused<T>(r: &Result<T, Error>) -> bool {
+    matches!(r, Err(Error::Unsupported(u)) if u.feature == crate::error::Feature::VertexInputLayout)
 }
 
 /// The key of user varying `name`.
@@ -121,7 +132,7 @@ pub(super) fn iface(
         stage,
         slots: BTreeMap::new(),
         threadgroup: Vec::new(),
-        push: crate::lower::push::place(stage, &BTreeSet::new()),
+        push: crate::lower::push::place(stage, 0, MOST, &BTreeSet::new()),
         descriptors,
         spec,
         needs_pointer_translation: false,
@@ -129,17 +140,15 @@ pub(super) fn iface(
         io: positioned(stage, StageIo::default()),
         tessellation: None,
         writes_memory: false,
-        mesh_records: None,
-        mesh_corners: None,
-        emulated_payload: None,
         payload: None,
         reaches_command_buffers: false,
         command_writes: Default::default(),
         writes_textures: false,
+        reads_unbound_resources: false,
+        writes_unbound_resources: false,
+        unbound_storage_textures: false,
         numbered_samplers: Vec::new(),
         own_pixel_textures: Vec::new(),
-        snapshot_textures: Vec::new(),
-        snapshot_refusals: Vec::new(),
         level_reads: Vec::new(),
         private_bytes: 0,
         sampler_arrays: Vec::new(),
@@ -585,7 +594,8 @@ fn bindings_and_spec_ids_are_dense_and_exact() {
     );
 }
 
-/// Push constant ranges are each stage's window, trimmed to its fields.
+/// Push constant ranges are each stage's placed fields: the vertex function's from 0, the fragment
+/// function's from the vertex function's end, where it was placed.
 #[test]
 fn push_ranges_are_the_stage_windows() {
     let p = profile("moltenvk-m3");
@@ -597,12 +607,18 @@ fn push_ranges_are_the_stage_windows() {
         })
     };
     let mut vs = iface(Stage::Vertex, Vec::new(), Vec::new());
-    vs.push = crate::lower::push::place(Stage::Vertex, &BTreeSet::from([sb(Stage::Vertex)]));
+    vs.push =
+        crate::lower::push::place(Stage::Vertex, 0, MOST, &BTreeSet::from([sb(Stage::Vertex)]));
+    assert_eq!(vs.push.push_range, Some((0, 4)));
     let mut fs = iface(Stage::Fragment, Vec::new(), Vec::new());
     fs.push = crate::lower::push::place(
         Stage::Fragment,
+        4,
+        MOST,
         &BTreeSet::from([PushField::RootTableAddress, sb(Stage::Fragment)]),
     );
+    let (start, size) = fs.push.push_range.expect("fragment fields");
+    assert!(start >= 4, "{start}");
     let (va, fa) = (artifact(vs, None), artifact(fs, None));
     let l = link(&[&va, &fa], &render(), &p).expect("link");
     let ranges: Vec<(vk::ShaderStageFlags, u32, u32)> = l
@@ -615,7 +631,7 @@ fn push_ranges_are_the_stage_windows() {
         ranges,
         vec![
             (vk::ShaderStageFlags::VERTEX, 0, 4),
-            (vk::ShaderStageFlags::FRAGMENT, 64, 12),
+            (vk::ShaderStageFlags::FRAGMENT, start, size),
         ]
     );
     assert_eq!(l.interface.push.len(), 2);
@@ -769,40 +785,6 @@ fn a_mesh_pipelines_fragment_reads_its_primitive_outputs_per_primitive() {
             Some(Unsupported::not_representable(Feature::UnmatchedVarying).into())
         );
     }
-}
-
-/// `push_descriptor_eligible` is set 0 fitting `maxPushDescriptors` on a profile with push
-/// descriptors; the layout never splits.
-#[test]
-fn push_descriptor_eligibility_follows_the_profile() {
-    let mut p = profile("moltenvk-m3");
-    let k = Stage::Kernel;
-    let descs = |n: u32| {
-        (0..n)
-            .map(|i| {
-                StageDescriptor::new(
-                    res(k, ResourceKind::Buffer, i),
-                    vk::DescriptorType::STORAGE_BUFFER,
-                    1,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    p.edit(|x| {
-        x.descriptors.push_descriptor = true;
-        x.limits.max_push_descriptors = 4;
-    });
-    for (n, eligible) in [(0, true), (4, true), (5, false)] {
-        let a = artifact(iface(k, descs(n), vec![]), None);
-        let l = link(&[&a], &LinkInputs::compute(), &p).expect("link");
-        assert_eq!(l.layout.push_descriptor_eligible, eligible, "{n}");
-        assert_eq!(l.layout.sets.len(), 1);
-        assert_eq!(l.layout.sets[0].bindings.len(), n as usize);
-    }
-    p.edit(|x| x.descriptors.push_descriptor = false);
-    let a = artifact(iface(k, descs(1), vec![]), None);
-    let l = link(&[&a], &LinkInputs::compute(), &p).expect("link");
-    assert!(!l.layout.push_descriptor_eligible);
 }
 
 /// An acceleration structure binding is an `ACCELERATION_STRUCTURE_KHR` descriptor fed by its
@@ -1136,7 +1118,8 @@ pub(super) fn io_stage(stage: Stage, io: StageIo) -> FunctionArtifact {
 /// function numbers its inputs in declaration order.
 #[test]
 fn locations_follow_the_stage_io_contract() {
-    let p = profile("moltenvk-m3");
+    // The identity domains, where the attributes are fixed function and so take locations.
+    let p = identity_profile("moltenvk-m3");
     let f4 = io_ty(IoNumeric::Float, 4);
     let u1 = io_ty(IoNumeric::Uint, 1);
     let vs = io_stage(

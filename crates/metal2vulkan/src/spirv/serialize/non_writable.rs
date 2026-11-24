@@ -175,7 +175,6 @@ fn memory_write(inst: &Inst) -> Option<Write> {
         | Inst::Select { .. }
         | Inst::BitFieldInsert { .. }
         | Inst::BitFieldExtract { .. }
-        | Inst::Fma { .. }
         | Inst::Convert { .. }
         | Inst::CompositeConstruct { .. }
         | Inst::CompositeExtract { .. }
@@ -208,9 +207,7 @@ fn memory_write(inst: &Inst) -> Option<Write> {
         | Inst::EndInterlock
         | Inst::DemoteToHelperInvocation
         | Inst::IsHelperInvocation
-        | Inst::SetMeshOutputs { .. }
-        | Inst::EmitVertex
-        | Inst::EndPrimitive => None,
+        | Inst::SetMeshOutputs { .. } => None,
     }
 }
 

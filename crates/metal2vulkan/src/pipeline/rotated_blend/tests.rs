@@ -152,16 +152,11 @@ fn texels(seed: u64) -> impl Iterator<Item = (Texel, Texel, Texel, Texel)> {
 }
 
 /// That Vulkan's blend `chosen` of `a` on the rotated image on `p` stores Metal's blend rotated,
-/// over pseudo-random texels: the function's first output rotated, its image alpha (Metal's
-/// blue) premultiplied by Metal's alpha where the form says so.
-fn check(a: &ColorAttachmentDescriptor, chosen: &RotatedBlend, p: &DeviceProfile) {
-    let premultiplied = rotated_form(a, p) == Some(RotatedBlendForm::Premultiplied);
+/// over pseudo-random texels: the function's first output rotated.
+fn check(a: &ColorAttachmentDescriptor, chosen: &RotatedBlend) {
     for v in texels(u64::from(a.source_rgb_blend_factor.as_raw())).take(16) {
         let (s, s1, d, c) = v;
-        let mut first = rotated(s);
-        if premultiplied {
-            first[3] = s[2] * s[3];
-        }
+        let first = rotated(s);
         let (state, second) = match *chosen {
             RotatedBlend::Direct(state) => (state, rotated(s1)),
             RotatedBlend::Synthesized(state, lanes) => (
@@ -194,7 +189,7 @@ fn attachment(
 }
 
 fn moltenvk() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 /// Every pair of Metal's color factors, under alpha factors that read nothing, the source's or
@@ -227,7 +222,7 @@ fn every_admitted_blend_stores_metals_rotated() {
                         let a = attachment((sr, dr, op), (sa, da, op));
                         match rotated_blend(&a, &p) {
                             Ok(Some(chosen)) => {
-                                check(&a, &chosen, &p);
+                                check(&a, &chosen);
                                 admitted += 1;
                                 synthesized +=
                                     usize::from(matches!(chosen, RotatedBlend::Synthesized(..)));
@@ -258,7 +253,7 @@ fn source_alpha_blends_read_a_second_output_of_the_source_alpha() {
     use vk::BlendFactor as B;
     use BlendFactor as F;
     use BlendOperation as O;
-    use FactorLane::{One, Output, Zero};
+    use FactorLane::{One, Output};
     let p = moltenvk();
     let state = |s, d, sa, da| BlendState {
         src_color: s,
@@ -270,8 +265,8 @@ fn source_alpha_blends_read_a_second_output_of_the_source_alpha() {
     };
     let add = |s, d| (s, d, O::Add);
     let cases = [
-        // Straight alpha, Metal's alpha alike: on MoltenVK the measured premultiplied form, the
-        // image's alpha (Metal's blue) by one over one minus the source alpha.
+        // Straight alpha, Metal's alpha alike: every lane of the image by a copy of the source's
+        // alpha in the second output.
         (
             attachment(
                 add(F::SourceAlpha, F::OneMinusSourceAlpha),
@@ -279,15 +274,16 @@ fn source_alpha_blends_read_a_second_output_of_the_source_alpha() {
             ),
             RotatedBlend::Synthesized(
                 state(
-                    B::SRC1_ALPHA,
-                    B::ONE_MINUS_SRC1_ALPHA,
-                    B::ONE,
-                    B::ONE_MINUS_SRC1_ALPHA,
+                    B::SRC1_COLOR,
+                    B::ONE_MINUS_SRC1_COLOR,
+                    B::SRC1_COLOR,
+                    B::ONE_MINUS_SRC1_COLOR,
                 ),
-                [Zero, Zero, Zero, Output(3)],
+                [Output(3); 4],
             ),
         ),
-        // Straight alpha, Metal's alpha accumulated: the image's red (Metal's alpha) takes one.
+        // Straight alpha, Metal's alpha accumulated: the image's red (Metal's alpha) takes one,
+        // and its alpha (Metal's blue) the source's alpha.
         (
             attachment(
                 add(F::SourceAlpha, F::OneMinusSourceAlpha),
@@ -297,8 +293,8 @@ fn source_alpha_blends_read_a_second_output_of_the_source_alpha() {
                 state(
                     B::SRC1_COLOR,
                     B::ONE_MINUS_SRC1_ALPHA,
-                    B::ONE,
-                    B::ONE_MINUS_SRC1_ALPHA,
+                    B::SRC1_COLOR,
+                    B::ONE_MINUS_SRC1_COLOR,
                 ),
                 [One, Output(3), Output(3), Output(3)],
             ),
@@ -347,7 +343,7 @@ fn source_alpha_blends_read_a_second_output_of_the_source_alpha() {
     ];
     for (a, want) in cases {
         assert_eq!(rotated_blend(&a, &p), Ok(Some(want)), "{a:?}");
-        check(&a, &want, &p);
+        check(&a, &want);
     }
 }
 
@@ -395,7 +391,7 @@ fn a_second_output_needs_dual_source_blending() {
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     assert!(desc.features.remove(&VkFeature::DualSrcBlend));
-    let p = Device::new(desc, DevicePolicy::default())
+    let p = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone();
@@ -418,55 +414,109 @@ fn a_second_output_needs_dual_source_blending() {
     ));
 }
 
-/// Every measured blend state is admitted on MoltenVK and on lavapipe and stores Metal's blend
-/// rotated; it takes the premultiplied form exactly where it lists one and the device's blend is
-/// Apple's (MoltenVK), and the search's form elsewhere, alike on both devices, unannounced.
+/// The rotated-targets lane's blended states, and one over zero and one over one: Metal's color
+/// source and destination factors, its alpha source and destination factors, and its one
+/// operation.
+const LANE: [([BlendFactor; 4], BlendOperation); 11] = {
+    use BlendFactor as F;
+    use BlendOperation as O;
+    [
+        ([F::One, F::Zero, F::One, F::Zero], O::Add),
+        ([F::One, F::One, F::One, F::One], O::Add),
+        (
+            [F::DestinationColor, F::Zero, F::DestinationAlpha, F::Zero],
+            O::Add,
+        ),
+        (
+            [
+                F::SourceColor,
+                F::OneMinusSourceColor,
+                F::SourceAlpha,
+                F::OneMinusSourceAlpha,
+            ],
+            O::Add,
+        ),
+        (
+            [
+                F::BlendAlpha,
+                F::OneMinusBlendAlpha,
+                F::BlendAlpha,
+                F::OneMinusBlendAlpha,
+            ],
+            O::Add,
+        ),
+        (
+            [
+                F::SourceAlpha,
+                F::OneMinusSourceAlpha,
+                F::SourceAlpha,
+                F::OneMinusSourceAlpha,
+            ],
+            O::Add,
+        ),
+        (
+            [
+                F::SourceAlpha,
+                F::OneMinusSourceAlpha,
+                F::One,
+                F::OneMinusSourceAlpha,
+            ],
+            O::Add,
+        ),
+        (
+            [
+                F::One,
+                F::OneMinusSourceAlpha,
+                F::One,
+                F::OneMinusSourceAlpha,
+            ],
+            O::Add,
+        ),
+        ([F::SourceAlpha, F::One, F::Zero, F::One], O::Add),
+        (
+            [F::SourceAlpha, F::One, F::SourceAlpha, F::One],
+            O::ReverseSubtract,
+        ),
+        (
+            [
+                F::One,
+                F::OneMinusSourceAlpha,
+                F::One,
+                F::OneMinusSourceAlpha,
+            ],
+            O::Subtract,
+        ),
+    ]
+};
+
+/// Every state of the rotated-targets lane is admitted on MoltenVK and on lavapipe and stores
+/// Metal's blend rotated, alike on both devices; all but one over zero and one over one, exact by
+/// construction, are announced, the straight-alpha pairs included.
 #[test]
-fn measured_blends_take_their_measured_forms() {
+fn the_lane_s_blends_store_metal_s_rotated() {
     let mvk = moltenvk();
-    let lvp = profile("lavapipe", DevicePolicy::default()).expect("profile");
-    let mut premultiplied = 0;
-    for m in &MEASURED {
-        let ([sr, dr, sa, da], op) = m.metal;
+    let lvp = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
+    for (i, &([sr, dr, sa, da], op)) in LANE.iter().enumerate() {
         let a = attachment((sr, dr, op), (sa, da, op));
         let on_mvk = rotated_blend(&a, &mvk).expect("admitted").expect("blended");
         let on_lvp = rotated_blend(&a, &lvp).expect("admitted").expect("blended");
-        check(&a, &on_mvk, &mvk);
-        check(&a, &on_lvp, &lvp);
-        assert_eq!(rotated_form(&a, &lvp), None, "{a:?}");
-        match m.premultiplied {
-            Some((_, lanes)) => {
-                premultiplied += 1;
-                assert_eq!(
-                    rotated_form(&a, &mvk),
-                    Some(RotatedBlendForm::Premultiplied),
-                    "{a:?}"
-                );
-                let RotatedBlend::Synthesized(_, chosen) = on_mvk else {
-                    panic!("{a:?}: {on_mvk:?}");
-                };
-                assert_eq!(chosen, lanes, "{a:?}");
-                assert_eq!(lanes[3], FactorLane::Output(3), "{a:?}");
-                assert_ne!(on_mvk, on_lvp, "{a:?}");
-            }
-            None => {
-                assert_eq!(rotated_form(&a, &mvk), None, "{a:?}");
-                assert_eq!(on_mvk, on_lvp, "{a:?}");
-            }
-        }
+        check(&a, &on_mvk);
+        check(&a, &on_lvp);
+        assert_eq!(inexact(&a, &lvp), i > 1, "{a:?}");
+        assert_eq!(inexact(&a, &mvk), i > 1, "{a:?}");
+        assert_eq!(on_mvk, on_lvp, "{a:?}");
     }
-    assert_eq!(premultiplied, 2);
 }
 
-/// A blend admitted in none of the measured forms is announced on every device; a minimum or
-/// maximum (which takes no factor), a blend that is off, and a blend no Vulkan state gives are
-/// not.
+/// A blend admitted that is not exact by construction is announced on every device; a minimum or
+/// maximum (which takes no factor), a blend by Vulkan factors of zero and one, a blend that is
+/// off, and a blend no Vulkan state gives are not.
 #[test]
-fn unmeasured_blends_are_announced() {
+fn inexact_blends_are_announced() {
     use BlendFactor as F;
     use BlendOperation as O;
     let mvk = moltenvk();
-    let lvp = profile("lavapipe", DevicePolicy::default()).expect("profile");
+    let lvp = profile("lavapipe", DevicePolicy::RESIDENT_TABLES).expect("profile");
     // Metal's color kept and its alpha replaced: in the 440-state sweep, 902 of 65,536 texels
     // apart on the M4.
     let kept = attachment((F::Zero, F::One, O::Add), (F::One, F::Zero, O::Add));
@@ -475,20 +525,25 @@ fn unmeasured_blends_are_announced() {
     off.blending_enabled = false;
     for p in [&mvk, &lvp] {
         assert!(matches!(rotated_blend(&kept, p), Ok(Some(_))));
-        assert_eq!(
-            rotated_form(&kept, p),
-            Some(RotatedBlendForm::Unmeasured),
-            "{p:?}"
-        );
+        assert!(inexact(&kept, p), "{p:?}");
         let max = attachment((F::One, F::One, O::Max), (F::One, F::One, O::Max));
         assert!(matches!(rotated_blend(&max, p), Ok(Some(_))));
-        assert_eq!(rotated_form(&max, p), None);
-        assert_eq!(rotated_form(&off, p), None);
+        assert!(!inexact(&max, p));
+        let difference = attachment(
+            (F::One, F::One, O::ReverseSubtract),
+            (F::One, F::One, O::ReverseSubtract),
+        );
+        let held = attachment((F::Zero, F::One, O::Add), (F::Zero, F::One, O::Add));
+        for exact in [difference, held] {
+            assert!(matches!(rotated_blend(&exact, p), Ok(Some(_))));
+            assert!(!inexact(&exact, p), "{exact:?}");
+        }
+        assert!(!inexact(&off, p));
         let refused = attachment(
             (F::DestinationAlpha, F::OneMinusDestinationAlpha, O::Add),
             (F::One, F::Zero, O::Add),
         );
-        assert_eq!(rotated_form(&refused, p), None);
+        assert!(!inexact(&refused, p));
     }
 }
 

@@ -26,8 +26,7 @@
 //!   (`arith::pack`, `PrecisionNote::DevicePackConversion`): every format's reads, stores and a
 //!   read after the function's own write, within the note's bound of the probes's model; and
 //!   through `half` members, of probe 12's. The interpreter models no `Pow` and leaves a pack of a
-//!   NaN undefined, so the sRGB formats and NaN stores are the device lane's
-//!   (`runtime_lane::tile_normalized`).
+//!   NaN undefined, so the sRGB formats and NaN stores are a device's to check.
 //! - The refusals are typed: no tile inputs, a converting format, an attachment without a format,
 //!   a multisampled pass, a threadgroup variable in a tile function; the binder specializes the
 //!   render area, refuses an empty one, and binds the attachments in their staging formats, and
@@ -37,14 +36,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::bind::{
-    BindState, BindingPlan, Dispatch, ImageblockSize, StageTable, WriteSource, SRGB_RESOLVE_LINEAR,
-    SRGB_RESOLVE_THRESHOLDS,
-};
 use crate::budget::Budget;
 use crate::device::profile::DeviceProfile;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
-use crate::error::{BindError, DescriptorError, Error, Feature, MetalAnswer, Needs, RuntimeInput};
+use crate::error::{DescriptorError, Error, Feature, MetalAnswer, Needs, RuntimeInput};
 use crate::library::Library;
 use crate::lower::select::{LowerInputs, Plan};
 use crate::lower::texture::TexelClass;
@@ -53,17 +48,15 @@ use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::layout::BindingSource;
 use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
+    PushField, ResourceKind, ResourceSlot, SpecKey, Stage, SyntheticBinding,
 };
 use crate::pipeline::testing::{engine_dir, llvm_assemble, typed_module_with, AssembleError};
 use crate::pipeline::{
-    ComputePipeline, FunctionDescriptor, StageSource, StorageAttachmentView,
-    TileRenderPipelineDescriptor,
+    ComputePipeline, FunctionDescriptor, StageSource, TileRenderPipelineDescriptor,
 };
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
-use crate::spirv::testing::committed_profiles;
-use crate::vk;
+use crate::spirv::testing::{committed_profiles, refuses_threadgroup_memory};
 
 fn assemble(stem: &str) -> Option<Vec<u8>> {
     let path = engine_dir().join(format!("{stem}.ll"));
@@ -90,7 +83,7 @@ fn tile_inputs(formats: &[PixelFormat]) -> LowerInputs {
 }
 
 /// The module of `entry` under `inputs` on `p`, or `None` when `p` lacks a capability its
-/// attachments' storage images need (`Feature::Format`).
+/// attachments' storage images need (`Feature::Format`) or takes no threadgroup memory.
 fn module(
     bc: &[u8],
     entry: &str,
@@ -101,6 +94,7 @@ fn module(
     match typed_module_with(bc, entry, p, inputs) {
         Ok(m) => Some(m),
         Err(Error::Unsupported(u)) if u.feature == Feature::Format => None,
+        Err(e) if refuses_threadgroup_memory(&e, p) => None,
         Err(e) => panic!("{stem}: {entry}: {e}"),
     }
 }
@@ -198,13 +192,11 @@ fn run_images(
 ) -> (Vec<u8>, Vec<Vec<[u32; 4]>>) {
     assert!(plan.facts.contains(&RuntimeFact::TileFunction));
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(d.threads[0]));
-    spec.insert(SpecKey::LocalSize(Axis::Y), u64::from(d.threads[1]));
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(
-        SpecKey::FlatLocalSize,
-        u64::from(d.threads[0] * d.threads[1]),
-    );
+    spec.extend(crate::pipeline::threadgroup_constants([
+        d.threads[0],
+        d.threads[1],
+        1,
+    ]));
     spec.insert(SpecKey::ImageblockWidth, u64::from(d.tile[0]));
     spec.insert(SpecKey::ImageblockHeight, u64::from(d.tile[1]));
     spec.insert(SpecKey::RenderAreaWidth, u64::from(d.area[0]));
@@ -501,68 +493,6 @@ fn an_aliased_layout_reads_each_attachment_at_its_member() {
     assert!(ran > 0);
 }
 
-/// A float attachment is bound through the unsigned-integer format of its channels and widths,
-/// so the dispatch moves its texels' bits: Vulkan would decode a float view's texel to a value,
-/// keeping neither a NaN's payload nor, in a shader that flushes its inputs, a denormal. The
-/// pipeline records its aliased layout's size, a tile state's `imageblockSampleLength`.
-#[test]
-fn a_float_attachment_is_bound_through_its_bits() {
-    let Some(bc) = assemble("k10ts_alias_probe") else {
-        return;
-    };
-    let formats = [
-        Some(PixelFormat::R16Float),
-        Some(PixelFormat::R32Float),
-        Some(PixelFormat::RGBA16Float),
-        Some(PixelFormat::R16Float),
-    ];
-    let views = [
-        vk::Format::R16_UINT,
-        vk::Format::R32_UINT,
-        vk::Format::R16G16B16A16_UINT,
-        vk::Format::R16_UINT,
-    ];
-    let mut planned = 0;
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"] {
-        let dev = device(stem);
-        let d = descriptor(&bc, "k10ts_alias_probe", &formats);
-        let pipe = match dev.compile_tile_pipeline(&d, &Budget::standard()) {
-            Ok(p) => p,
-            // A profile without the extended storage formats refuses the 16-bit views.
-            Err(Error::Unsupported(u)) if u.feature == Feature::Format => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        // The aliased layout's size, a tile state's sample length whatever the formats pack to
-        // (18 here), as Metal answers for this struct and these formats.
-        assert!(
-            pipe.dependencies
-                .iter()
-                .any(|x| x.fact == RuntimeFact::AliasedImageblock { data_size: 24 }),
-            "{stem}"
-        );
-        let mut s = BindState::default();
-        s.stages.insert(Stage::Kernel, StageTable::default());
-        s.imageblock_size = ImageblockSize::new(16, 16);
-        s.render_area = [16, 16];
-        let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-        for (c, view) in views.into_iter().enumerate() {
-            assert!(
-                plan.descriptors.iter().any(|w| w.source
-                    == WriteSource::TileAttachment {
-                        color_index: c as u32,
-                        format: view,
-                        view: StorageAttachmentView::Attachment,
-                        view_alias: None,
-                    }),
-                "{stem} {c}: {:?}",
-                plan.descriptors
-            );
-        }
-        planned += 1;
-    }
-    assert!(planned > 0);
-}
-
 /// A tile function's `[[threadgroup(n)]]` argument is its tile's threadgroup memory, which the
 /// render pass keeps: the function compiles, recording the argument's fact, where a tile function
 /// that declares a threadgroup variable is refused as Metal refuses its pipeline. The same kernels
@@ -570,8 +500,8 @@ fn a_float_attachment_is_bound_through_its_bits() {
 #[test]
 fn a_tile_functions_threadgroup_memory_is_its_tiles() {
     use crate::pipeline::testing::fixtures_dir;
-    let p =
-        crate::pipeline::testing::profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = crate::pipeline::testing::profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES)
+        .expect("profile");
     let dev = device("moltenvk-m3");
     let mut assembled = Vec::new();
     for (path, entry) in [
@@ -657,13 +587,11 @@ fn run_memory(
     out: usize,
 ) -> (Vec<u8>, Vec<u8>) {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(d.threads[0]));
-    spec.insert(SpecKey::LocalSize(Axis::Y), u64::from(d.threads[1]));
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(
-        SpecKey::FlatLocalSize,
-        u64::from(d.threads[0] * d.threads[1]),
-    );
+    spec.extend(crate::pipeline::threadgroup_constants([
+        d.threads[0],
+        d.threads[1],
+        1,
+    ]));
     spec.insert(SpecKey::TileThreadgroupLength, u64::from(d.tile_length));
     spec.insert(SpecKey::TileGridWidth, u64::from(d.grid[0]));
     for (index, &offset) in d.offsets.iter().enumerate() {
@@ -773,147 +701,13 @@ fn a_tiles_threadgroup_memory_persists_across_dispatches() {
     assert!(ran > 0);
 }
 
-/// The binder places a tile function's threadgroup arguments where the encoder set them: it
-/// specializes each offset, the tile's bytes (the pass's length rounded up to 16) and the tiles
-/// across the render area, and binds the pass's tile memory of every tile's bytes. An argument's
-/// length takes no part in the layout and bounds no access, as plain Metal's does not, so a length
-/// that is not a multiple of 16 and one that ends past the tile's memory are both planned at their
-/// offset (plain Metal on an M3 Max under macOS 27.0.1 takes every length, and reads zero from the
-/// tile's memory's end on, which the arena's containment gives). Every offset is planned too, where
-/// plain Metal begins the argument: at the offset floored to a multiple of 4, with no clamp, since
-/// the containment reads zero past the tile's memory and Metal's own arithmetic wraps at 2^32. An
-/// argument the encoder did not set is refused, and so is a tile memory past one storage-buffer
-/// descriptor's range.
-#[test]
-fn a_tile_pipeline_places_its_threadgroup_arguments() {
-    use crate::bind::{TileThreadgroupArgument, TileThreadgroupMemory};
-    let Some(bc) = assemble("cfit_tile_memory") else {
-        return;
-    };
-    let formats = [Some(PixelFormat::R32Uint)];
-    let d = descriptor(&bc, "cfit_tile_memory_shift", &formats);
-    let state = |length: u32, arguments: &[(u32, u32, u32)]| {
-        let mut s = BindState::default();
-        s.stages.insert(Stage::Kernel, StageTable::default());
-        s.imageblock_size = ImageblockSize::new(16, 16);
-        s.render_area = [40, 24];
-        let mut memory = TileThreadgroupMemory::new(length);
-        for &(index, length, offset) in arguments {
-            memory
-                .arguments
-                .insert(index, TileThreadgroupArgument::new(length, offset));
-        }
-        s.tile_threadgroup = memory;
-        s
-    };
-    for stem in ["moltenvk-m3", "lavapipe", "vk12-floor"] {
-        let dev = device(stem);
-        let pipe = dev
-            .compile_tile_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        for index in [0, 1] {
-            assert!(
-                pipe.dependencies
-                    .iter()
-                    .any(|x| x.fact == RuntimeFact::TileThreadgroupMemory { index }),
-                "{stem} {index}"
-            );
-        }
-        let plan = pipe
-            .plan(&dev, &state(72, &[(0, 64, 0), (1, 48, 16)]).shape())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(specialized(&pipe, &plan, SpecKey::TgOffset(0)), Some(0));
-        assert_eq!(specialized(&pipe, &plan, SpecKey::TgOffset(1)), Some(16));
-        assert_eq!(
-            specialized(&pipe, &plan, SpecKey::TileThreadgroupLength),
-            Some(80)
-        );
-        assert_eq!(specialized(&pipe, &plan, SpecKey::TileGridWidth), Some(3));
-        assert!(
-            plan.descriptors
-                .iter()
-                .any(|w| w.source == WriteSource::TileMemory { bytes: 6 * 80 }),
-            "{stem}"
-        );
-        let refused = |arguments: &[(u32, u32, u32)]| {
-            pipe.plan(&dev, &state(72, arguments).shape()).map(|_| ())
-        };
-        assert_eq!(
-            refused(&[(0, 64, 0)]),
-            Err(BindError::MissingThreadgroupMemory { index: 1 }),
-            "{stem}"
-        );
-        // A length that is not a multiple of 16, and an argument that ends past the tile's
-        // memory, are planned at their offset: plain Metal takes either.
-        for (length, offset) in [(56, 16), (64, 16), (1, 64), (0, 0), (u32::MAX, 32)] {
-            let plan = pipe
-                .plan(&dev, &state(72, &[(0, 64, 0), (1, length, offset)]).shape())
-                .unwrap_or_else(|e| panic!("{stem}: {length} at {offset}: {e}"));
-            assert_eq!(
-                specialized(&pipe, &plan, SpecKey::TgOffset(1)),
-                Some(offset),
-                "{stem} {length} at {offset}"
-            );
-            assert_eq!(
-                specialized(&pipe, &plan, SpecKey::TileThreadgroupLength),
-                Some(80),
-                "{stem} {length} at {offset}"
-            );
-        }
-        // Every offset is placed where plain Metal begins the argument: at the offset floored to
-        // a multiple of 4, and nothing is clamped, since an access from a base past the tile's
-        // memory is contained, reads zero and drops its store, and Metal's own arithmetic wraps at
-        // 2^32 rather than reading zero for ever. The offsets below are the ones the planner used
-        // to refuse; `(2, 0)`, `(20, 20)` and `(70, 68)` are what a floor to 16 would place
-        // differently from a floor to 4.
-        for (offset, at) in [
-            (8, 8),
-            (4, 4),
-            (2, 0),
-            (17, 16),
-            (20, 20),
-            (70, 68),
-            (72, 72),
-            (80, 80),
-            (1 << 20, 1 << 20),
-            (u32::MAX, u32::MAX - 3),
-        ] {
-            let plan = pipe
-                .plan(&dev, &state(72, &[(0, 64, 0), (1, 16, offset)]).shape())
-                .unwrap_or_else(|e| panic!("{stem}: 16 at {offset}: {e}"));
-            assert_eq!(
-                specialized(&pipe, &plan, SpecKey::TgOffset(1)),
-                Some(at),
-                "{stem} 16 at {offset}"
-            );
-        }
-    }
-    // Every tile's memory is one storage-buffer descriptor.
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/lavapipe.json");
-    let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.limits.max_storage_buffer_range = 256;
-    let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-    let pipe = dev
-        .compile_tile_pipeline(&d, &Budget::standard())
-        .expect("a tile pipeline");
-    match pipe.plan(&dev, &state(80, &[(0, 64, 0), (1, 64, 16)]).shape()) {
-        Err(BindError::Unsupported(u)) => assert_eq!(u.feature, Feature::TileShading),
-        other => panic!(
-            "a tile memory past the range planned: {:?}",
-            other.map(|_| ())
-        ),
-    }
-}
-
 fn device(stem: &str) -> Device {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 fn descriptor(
@@ -929,235 +723,6 @@ fn descriptor(
         d.color_attachment_formats[i] = *pf;
     }
     d
-}
-
-/// The value `plan` specializes `key` to.
-fn specialized(pipe: &ComputePipeline, plan: &BindingPlan, key: SpecKey) -> Option<u32> {
-    let id = pipe
-        .stage
-        .specialization
-        .constants
-        .iter()
-        .find(|c| c.key == key)?
-        .id;
-    let e = plan
-        .specialization
-        .entries
-        .iter()
-        .find(|e| e.constant_id == id)?;
-    let at = e.offset as usize;
-    Some(u32::from_le_bytes(
-        plan.specialization.data[at..at + 4]
-            .try_into()
-            .expect("u32"),
-    ))
-}
-
-/// `Device::compile_tile_pipeline` compiles the tile function under the descriptor's formats;
-/// its binding plan specializes the tile size and the render area, binds each attachment as
-/// `WriteSource::TileAttachment` in its staging format (a float attachment through the
-/// unsigned-integer format of its channels), refuses an empty render area and a layered pass,
-/// and answers `maxTotalThreadsPerThreadgroup` with Metal's 1024 where the device runs it, the
-/// largest tile threadgroup it runs, and records no aliased imageblock, so a tile state's `imageblockSampleLength` is its
-/// attachments' texels, packed. The key is the descriptor's.
-#[test]
-fn a_tile_pipeline_binds_its_attachments() {
-    let Some(bc) = assemble("k10ts_tile_grid") else {
-        return;
-    };
-    let formats = [
-        Some(PixelFormat::R32Float),
-        Some(PixelFormat::R32Uint),
-        Some(PixelFormat::R32Uint),
-    ];
-    for stem in ["moltenvk-m3", "lavapipe", "vk12-floor"] {
-        let dev = device(stem);
-        let d = descriptor(&bc, "k10ts_tile_grid", &formats);
-        let pipe = dev
-            .compile_tile_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        assert_eq!(pipe.key, dev.tile_pipeline_key(&d), "{stem}");
-        assert!(pipe
-            .dependencies
-            .iter()
-            .any(|x| x.fact == RuntimeFact::TileFunction));
-        let sources: Vec<BindingSource> = pipe
-            .layout
-            .sets
-            .iter()
-            .flat_map(|s| s.bindings.iter().map(|b| b.source))
-            .collect();
-        for c in 0..3 {
-            assert!(
-                sources.contains(&BindingSource::TileAttachment(c)),
-                "{stem} {c}"
-            );
-        }
-        let state = |layers: u32| {
-            let mut s = BindState::default();
-            s.stages.insert(Stage::Kernel, StageTable::default());
-            s.imageblock_size = ImageblockSize::new(16, 16);
-            s.render_area = [40, 24];
-            s.render_target_array_length = layers;
-            s
-        };
-        let plan = pipe.plan(&dev, &state(0).shape()).expect("plan");
-        assert_eq!(
-            specialized(&pipe, &plan, SpecKey::ImageblockWidth),
-            Some(16)
-        );
-        assert_eq!(
-            specialized(&pipe, &plan, SpecKey::RenderAreaWidth),
-            Some(40)
-        );
-        assert_eq!(
-            specialized(&pipe, &plan, SpecKey::RenderAreaHeight),
-            Some(24)
-        );
-        // The float attachment's bits move through its `uint` view; the others are `uint`.
-        for c in 0..3 {
-            assert!(
-                plan.descriptors.iter().any(|w| w.source
-                    == WriteSource::TileAttachment {
-                        color_index: c,
-                        format: vk::Format::R32_UINT,
-                        view: StorageAttachmentView::Attachment,
-                        view_alias: None,
-                    }),
-                "{stem} {c}"
-            );
-        }
-        match pipe.plan(&dev, &state(2).shape()) {
-            Err(BindError::Unsupported(u)) => assert_eq!(u.feature, Feature::TileShading),
-            other => panic!("{stem}: a layered pass planned: {:?}", other.map(|_| ())),
-        }
-        // A tile dispatch is one threadgroup per tile of a threadgroup whose layout is measured.
-        let tiles = |threads_per_group: [u32; 3]| Dispatch::Threadgroups {
-            groups: [3, 2, 1],
-            threads_per_group,
-        };
-        // A measured threadgroup runs where the device's local-size limits take it.
-        for [w, h] in [
-            [1, 1],
-            [2, 2],
-            [4, 4],
-            [8, 8],
-            [16, 16],
-            [32, 32],
-            [8, 4],
-            [4, 2],
-            [8, 2],
-            [2, 32],
-            [32, 4],
-            [16, 32],
-            [32, 16],
-            [16, 2],
-            [32, 2],
-            [6, 6],
-            [24, 24],
-            [30, 2],
-            [2, 14],
-        ] {
-            match plan.dispatch_variant(&tiles([w, h, 1])) {
-                Ok(_) => {}
-                Err(BindError::Unsupported(u)) => {
-                    assert!(
-                        matches!(u.feature, Feature::LocalSize { .. }),
-                        "{stem} {w}x{h}: {u:?}"
-                    )
-                }
-                Err(e) => panic!("{stem} {w}x{h}: {e}"),
-            }
-        }
-        // A threadgroup with an odd side leaves the lanes of its missing threads empty, which
-        // is not built, and a tile threadgroup is one deep.
-        for refused in [
-            tiles([16, 1, 1]),
-            tiles([8, 1, 1]),
-            tiles([1, 8, 1]),
-            tiles([3, 3, 1]),
-            tiles([5, 2, 1]),
-            tiles([2, 31, 1]),
-            tiles([8, 8, 2]),
-            tiles([64, 16, 1]),
-            Dispatch::Threads {
-                threads: [40, 24, 1],
-                threads_per_group: [8, 8, 1],
-            },
-        ] {
-            match plan.dispatch_variant(&refused) {
-                Err(BindError::Unsupported(u)) => {
-                    assert_eq!(
-                        (u.feature, u.needs),
-                        (Feature::TileShading, Needs::NotImplemented),
-                        "{stem} {refused:?}"
-                    )
-                }
-                other => panic!("{stem}: {refused:?} dispatched: {other:?}"),
-            }
-        }
-        // A tile dispatch outside a render pass (the encoder never set the area) has no tile.
-        for area in [[0, 0], [40, 0], [0, 24]] {
-            let mut s = state(0);
-            s.render_area = area;
-            assert_eq!(
-                pipe.plan(&dev, &s.shape()).map(|_| ()),
-                Err(BindError::InvalidRenderArea {
-                    width: area[0],
-                    height: area[1],
-                }),
-                "{stem} {area:?}"
-            );
-        }
-        // An implicit imageblock aliases no layout: a tile state's sample length is the
-        // attachments' texels, packed.
-        assert!(
-            !pipe
-                .dependencies
-                .iter()
-                .any(|x| matches!(x.fact, RuntimeFact::AliasedImageblock { .. })),
-            "{stem}"
-        );
-        // Metal's 1024, the 32x32 threadgroup the binder runs, where the
-        // device's limits take it.
-        let max = pipe.metal_info.max_total_threads_per_threadgroup;
-        assert!(max <= 1024, "{stem}: {max}");
-        if stem == "moltenvk-m3" {
-            assert_eq!(max, 1024);
-        }
-        // Metal's own answer, before the device's limits: 1024 on every profile.
-        assert_eq!(
-            pipe.metal_info.metal_max_total_threads_per_threadgroup, 1024,
-            "{stem}"
-        );
-        // The descriptor's limit lowers it, never raises it, and is part of the key; Metal's 0 is
-        // no limit. A limit answers the most threads of a threadgroup of even sides within it, as
-        // Metal's does (on an M3 Max and an M4: 1000 answers 960, 255 252, 3 none).
-        for (limit, metal) in [
-            (Some(64), 64),
-            (Some(1024), 1024),
-            (Some(0), 1024),
-            (Some(1000), 960),
-            (Some(255), 252),
-            (Some(3), 0),
-        ] {
-            let expected = metal.min(max);
-            let mut limited = d.clone();
-            limited.max_total_threads_per_threadgroup = limit;
-            let pipe = dev
-                .compile_tile_pipeline(&limited, &Budget::standard())
-                .unwrap_or_else(|e| panic!("{stem}: {e}"));
-            assert_eq!(
-                pipe.metal_info.max_total_threads_per_threadgroup, expected,
-                "{stem} {limit:?}"
-            );
-            assert_eq!(
-                pipe.metal_info.metal_max_total_threads_per_threadgroup, metal,
-                "{stem} {limit:?}: Metal's own"
-            );
-            assert_ne!(dev.tile_pipeline_key(&limited), dev.tile_pipeline_key(&d));
-        }
-    }
 }
 
 /// The refusals are typed: a tile function compiled without tile inputs needs them, a format
@@ -1533,165 +1098,52 @@ fn a_tile_sized_threadgroup_numbers_its_threads_by_simdgroup() {
     assert!(ran > 0);
 }
 
-/// A tile function's explicit imageblock that stands alone is the pass's imageblock storage: each
-/// function of `cfit_tile_imageblock` that reaches its cells compiles on every committed profile
-/// that compiles a tile function, records its size and alignment
-/// (`RuntimeFact::TileImageblock`), and plans the storage at `SyntheticBinding::Imageblock`
-/// (`WriteSource::Imageblock`) beside no staged attachment; the layout aliased onto the
-/// attachment records neither and stages the attachment.
-#[test]
-fn a_tile_functions_explicit_imageblock_alone_is_the_pass_storage() {
-    let Some(bc) = assemble("cfit_tile_imageblock") else {
-        return;
-    };
-    let formats = [Some(PixelFormat::R32Uint)];
-    let mut planned = 0;
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"] {
-        let dev = device(stem);
-        let mut s = BindState::default();
-        s.stages.insert(Stage::Kernel, StageTable::default());
-        s.imageblock_size = ImageblockSize::new(16, 16);
-        s.render_area = [40, 24];
-        for entry in [
-            "cfit_ib_tile_clear",
-            "cfit_ib_tile_add",
-            "cfit_ib_tile_resolve",
-            "cfit_ib_tile_resolve_halves",
-        ] {
-            let d = descriptor(&bc, entry, &formats);
-            let pipe = dev
-                .compile_tile_pipeline(&d, &Budget::standard())
-                .unwrap_or_else(|e| panic!("{stem} {entry}: {e}"));
-            assert!(
-                pipe.dependencies.iter().any(|x| x.fact
-                    == RuntimeFact::TileImageblock {
-                        data_size: 8,
-                        alignment: 4,
-                    }),
-                "{stem} {entry}"
-            );
-            assert!(
-                !pipe
-                    .dependencies
-                    .iter()
-                    .any(|x| matches!(x.fact, RuntimeFact::TileAttachmentFormat { .. })),
-                "{stem} {entry}"
-            );
-            let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-            let sources: Vec<_> = plan.descriptors.iter().map(|w| &w.source).collect();
-            assert!(
-                sources.contains(&&WriteSource::Imageblock),
-                "{stem} {entry}: {sources:?}"
-            );
-            assert!(
-                !sources
-                    .iter()
-                    .any(|w| matches!(w, WriteSource::TileAttachment { .. })),
-                "{stem} {entry}: {sources:?}"
-            );
-            planned += 1;
-        }
-        let d = descriptor(&bc, "cfit_ib_tile_aliased", &formats);
-        let pipe = dev
-            .compile_tile_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem} aliased: {e}"));
-        assert!(
-            !pipe
-                .dependencies
-                .iter()
-                .any(|x| matches!(x.fact, RuntimeFact::TileImageblock { .. })),
-            "{stem}"
-        );
-        let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-        assert!(
-            !plan
-                .descriptors
-                .iter()
-                .any(|w| w.source == WriteSource::Imageblock),
-            "{stem}"
-        );
-    }
-    assert_eq!(planned, 12);
-}
-
-/// A tile function's explicit imageblock standing alone in a pass that keeps fewer of its cells'
-/// bytes: the plan of a shape stating them (`BindShape::kept_imageblock_bytes`) asks for the
-/// variant that keeps them where they are fewer than the block's data, and none otherwise; the
-/// function compiles under them (`LoweringInputs::kept_imageblock_bytes`) with its plan's cells
-/// keeping them, and kept bytes that are not a cell's first whole words, or given to a function
-/// whose cells are not the pass's imageblock storage, are refused.
-#[test]
-fn a_pass_keeping_fewer_imageblock_bytes_asks_for_the_kept_variant() {
-    let Some(bc) = assemble("cfit_tile_imageblock") else {
-        return;
-    };
-    let formats = [Some(PixelFormat::R32Uint)];
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = device(stem);
-        let entry = "cfit_ib_tile_clear";
-        let d = descriptor(&bc, entry, &formats);
-        let pipe = dev
-            .compile_tile_pipeline(&d, &Budget::standard())
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let mut s = BindState::default();
-        s.stages.insert(Stage::Kernel, StageTable::default());
-        s.imageblock_size = ImageblockSize::new(16, 16);
-        s.render_area = [40, 24];
-        // The eight-byte cell: four bytes kept ask for the variant; eight, or none, do not.
-        for (kept, wanted) in [
-            (Some(4), Some(4)),
-            (Some(0), Some(0)),
-            (Some(8), None),
-            (None, None),
-        ] {
-            s.kept_imageblock_bytes = kept;
-            let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-            assert_eq!(
-                plan.variant.kept_imageblock_bytes, wanted,
-                "{stem} {kept:?}"
-            );
-        }
-        let mut inputs = tile_inputs(&[PixelFormat::R32Uint]);
-        inputs.kept_imageblock_bytes = Some(4);
-        let (plan, _) = typed_module_with(&bc, entry, dev.profile(), &inputs)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let tile = plan.families.access.tile.as_ref().expect("the tile plan");
-        assert_eq!(tile.kept_bytes, Some(4), "{stem}");
-        crate::pipeline::testing::compile_with(&bc, entry, dev.profile(), &inputs)
-            .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        // Not a cell's first whole words.
-        for kept in [2, 8] {
-            inputs.kept_imageblock_bytes = Some(kept);
-            assert!(
-                matches!(
-                    typed_module_with(&bc, entry, dev.profile(), &inputs),
-                    Err(Error::Internal(_))
-                ),
-                "{stem} {kept}"
-            );
-        }
-        // The layout aliased onto the attachment, and a kernel without tile inputs.
-        inputs.kept_imageblock_bytes = Some(4);
-        assert!(
-            matches!(
-                typed_module_with(&bc, "cfit_ib_tile_aliased", dev.profile(), &inputs),
-                Err(Error::Internal(_))
-            ),
-            "{stem} aliased"
-        );
-        let mut plain = LowerInputs::new();
-        plain.kept_imageblock_bytes = Some(4);
-        assert!(
-            matches!(
-                typed_module_with(&bc, entry, dev.profile(), &plain),
-                Err(Error::Internal(_))
-            ),
-            "{stem} without tile inputs"
-        );
-    }
-}
-
 /// A channel of a normalized format: an unsigned or signed normalized one of its width, or an
+/// Metal's 12-bit linear value of each 8-bit sRGB code, `round(decode(k) * 4095)` (probes, the M3
+/// Max and the M4 alike).
+const SRGB_RESOLVE_LINEAR: [u16; 256] = [
+    0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 18, 20, 21, 23, 25, 27, 29, 31, 33, 35, 37, 40,
+    42, 45, 48, 50, 53, 56, 59, 62, 66, 69, 72, 76, 79, 83, 87, 91, 95, 99, 103, 107, 112, 116,
+    121, 126, 131, 136, 141, 146, 151, 156, 162, 168, 173, 179, 185, 191, 197, 204, 210, 216, 223,
+    230, 237, 244, 251, 258, 265, 273, 280, 288, 296, 304, 312, 320, 329, 337, 346, 354, 363, 372,
+    381, 390, 400, 409, 419, 428, 438, 448, 458, 469, 479, 490, 500, 511, 522, 533, 544, 555, 567,
+    578, 590, 602, 614, 626, 639, 651, 664, 676, 689, 702, 715, 728, 742, 755, 769, 783, 797, 811,
+    825, 840, 854, 869, 884, 899, 914, 929, 945, 960, 976, 992, 1008, 1024, 1041, 1057, 1074, 1091,
+    1108, 1125, 1142, 1159, 1177, 1195, 1213, 1231, 1249, 1267, 1286, 1304, 1323, 1342, 1361, 1381,
+    1400, 1420, 1440, 1459, 1480, 1500, 1520, 1541, 1562, 1582, 1603, 1625, 1646, 1668, 1689, 1711,
+    1733, 1755, 1778, 1800, 1823, 1846, 1869, 1892, 1916, 1939, 1963, 1987, 2011, 2035, 2059, 2084,
+    2109, 2133, 2159, 2184, 2209, 2235, 2260, 2286, 2312, 2339, 2365, 2392, 2419, 2446, 2473, 2500,
+    2527, 2555, 2583, 2611, 2639, 2668, 2696, 2725, 2754, 2783, 2812, 2841, 2871, 2901, 2931, 2961,
+    2991, 3022, 3052, 3083, 3114, 3146, 3177, 3209, 3240, 3272, 3304, 3337, 3369, 3402, 3435, 3468,
+    3501, 3535, 3568, 3602, 3636, 3670, 3705, 3739, 3774, 3809, 3844, 3879, 3915, 3950, 3986, 4022,
+    4059, 4095,
+];
+
+/// Metal's encode of a 12-bit linear value: the 8-bit code `c` from
+/// `SRGB_RESOLVE_THRESHOLDS[c - 1]` on, code 0 below the first. Probes 1 to 3 observed each of
+/// the 3991 values a 2- or 4-sample average reaches. Of the 105 no such average reaches (3923 and
+/// above), 97 lie between two observed values of one code and take it; 4069 to 4076, between 254
+/// and 255 and reached only at 8 or more samples, take the exact encode rounded half up, 254. The
+/// table is the exact encode rounded half up but at 804, 1371, 2121 and 2569, each one code
+/// higher.
+const SRGB_RESOLVE_THRESHOLDS: [u16; 255] = [
+    1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 16, 18, 19, 21, 23, 24, 26, 28, 30, 32, 34, 37, 39,
+    42, 44, 47, 49, 52, 55, 58, 61, 64, 68, 71, 74, 78, 82, 85, 89, 93, 97, 102, 106, 110, 115,
+    119, 124, 129, 134, 139, 144, 149, 154, 160, 165, 171, 177, 183, 189, 195, 201, 207, 214, 220,
+    227, 234, 241, 248, 255, 262, 270, 277, 285, 293, 300, 308, 317, 325, 333, 342, 350, 359, 368,
+    377, 386, 395, 405, 414, 424, 434, 444, 454, 464, 474, 485, 495, 506, 517, 528, 539, 550, 562,
+    573, 585, 597, 609, 621, 633, 645, 658, 670, 683, 696, 709, 722, 736, 749, 763, 777, 790, 804,
+    819, 833, 848, 862, 877, 892, 907, 922, 938, 953, 969, 985, 1001, 1017, 1033, 1049, 1066, 1083,
+    1100, 1117, 1134, 1151, 1169, 1186, 1204, 1222, 1240, 1259, 1277, 1296, 1314, 1333, 1352, 1371,
+    1391, 1410, 1430, 1450, 1470, 1490, 1510, 1531, 1552, 1572, 1593, 1615, 1636, 1657, 1679, 1701,
+    1723, 1745, 1767, 1790, 1812, 1835, 1858, 1881, 1904, 1928, 1951, 1975, 1999, 2023, 2048, 2072,
+    2097, 2121, 2146, 2172, 2197, 2222, 2248, 2274, 2300, 2326, 2352, 2379, 2406, 2433, 2460, 2487,
+    2514, 2542, 2569, 2597, 2626, 2654, 2682, 2711, 2740, 2769, 2798, 2827, 2857, 2886, 2916, 2946,
+    2977, 3007, 3038, 3068, 3099, 3130, 3162, 3193, 3225, 3257, 3289, 3321, 3354, 3386, 3419, 3452,
+    3485, 3518, 3552, 3586, 3620, 3654, 3688, 3722, 3757, 3792, 3827, 3862, 3897, 3933, 3969, 4005,
+    4041, 4077,
+];
+
 /// sRGB colour channel of 8 bits.
 #[derive(Clone, Copy, Debug)]
 enum Channel {
@@ -2334,99 +1786,4 @@ fn a_normalized_attachment_stores_halves_as_metal_does() {
         }
     }
     assert!(ran > 0);
-}
-
-/// A normalized attachment is staged through the unsigned-integer view of its texel's bytes in
-/// 32-bit words (`R32Uint`, `RG32Uint`, or `R16Uint` for two bytes), through a `float` member or
-/// a `half` one, and a member of other lanes than its channels or four, or a format whose texel is
-/// one byte, is not implemented.
-#[test]
-fn a_normalized_attachment_is_bound_through_its_bits() {
-    let Some(bc) = assemble("cfb_tile_norm") else {
-        return;
-    };
-    let not_implemented = |r: Result<ComputePipeline, Error>| match r {
-        Err(Error::Unsupported(u)) => {
-            u.feature == Feature::TileShading && u.needs == Needs::NotImplemented
-        }
-        _ => false,
-    };
-    let cases = [
-        (
-            "cfb_tn_read4",
-            PixelFormat::RGBA8UnormSRGB,
-            vk::Format::R32_UINT,
-        ),
-        (
-            "cfb_tn_write4",
-            PixelFormat::BGR10A2Unorm,
-            vk::Format::R32_UINT,
-        ),
-        (
-            "cfb_tn_read4",
-            PixelFormat::RGBA16Snorm,
-            vk::Format::R32G32_UINT,
-        ),
-        ("cfb_tn_write2", PixelFormat::RG8Unorm, vk::Format::R16_UINT),
-        ("cfb_tn_read4", PixelFormat::R16Unorm, vk::Format::R16_UINT),
-        (
-            "cfb_tn_hread4",
-            PixelFormat::RGBA8Unorm,
-            vk::Format::R32_UINT,
-        ),
-        (
-            "cfb_tn_hwrite2",
-            PixelFormat::RG16Snorm,
-            vk::Format::R32_UINT,
-        ),
-        ("cfb_tn_hread1", PixelFormat::R16Unorm, vk::Format::R16_UINT),
-    ];
-    let mut planned = 0;
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"] {
-        let dev = device(stem);
-        let b = Budget::standard();
-        let mut s = BindState::default();
-        s.stages.insert(Stage::Kernel, StageTable::default());
-        s.imageblock_size = ImageblockSize::new(16, 16);
-        s.render_area = [16, 16];
-        for (entry, pf, view) in cases {
-            let pipe = match dev.compile_tile_pipeline(&descriptor(&bc, entry, &[Some(pf)]), &b) {
-                Ok(p) => p,
-                // A profile without the extended storage formats refuses the 16-bit views.
-                Err(Error::Unsupported(u)) if u.feature == Feature::Format => continue,
-                Err(e) => panic!("{stem} {entry} {pf:?}: {e}"),
-            };
-            let plan = pipe.plan(&dev, &s.shape()).expect("plan");
-            assert!(
-                plan.descriptors.iter().any(|w| w.source
-                    == WriteSource::TileAttachment {
-                        color_index: 0,
-                        format: view,
-                        view: StorageAttachmentView::Attachment,
-                        view_alias: None,
-                    }),
-                "{stem} {entry} {pf:?}: {:?}",
-                plan.descriptors
-            );
-            planned += 1;
-        }
-        for (entry, pf) in [
-            ("cfb_tn_read1", PixelFormat::RGBA8Unorm),
-            ("cfb_tn_read2", PixelFormat::R16Unorm),
-            ("cfb_tn_read2", PixelFormat::RGBA16Unorm),
-            ("cfb_tn_read4", PixelFormat::R8Unorm),
-            ("cfb_tn_read4", PixelFormat::RG8UnormSRGB),
-            ("cfb_tn_hread1", PixelFormat::RGBA8Unorm),
-            ("cfb_tn_hwrite2", PixelFormat::RGBA16Snorm),
-            ("cfb_tn_hread2", PixelFormat::R16Unorm),
-            ("cfb_tn_hread4", PixelFormat::R8Unorm),
-        ] {
-            let d = descriptor(&bc, entry, &[Some(pf)]);
-            assert!(
-                not_implemented(dev.compile_tile_pipeline(&d, &b)),
-                "{stem} {entry} {pf:?}"
-            );
-        }
-    }
-    assert!(planned > 0);
 }

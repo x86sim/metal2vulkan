@@ -6,8 +6,8 @@
 //! in words, so every site here records unsigned words and compares them exactly — a NaN's payload,
 //! a denormal's exact code and a signed zero are all lost the moment a site reads as a float.
 //!
-//! What `runtime_lane::half_read_nans` measured on plain Metal, and what these recordings hold the
-//! implementation to: with a `float` result, **every** NaN of a 16-bit float texel — whatever its
+//! What plain Metal answers, and what these recordings hold the implementation to: with a `float`
+//! result, **every** NaN of a 16-bit float texel — whatever its
 //! sign, its payload and its signalling bit — is `0x7fc00000`, and every other half its exact
 //! widening with denormals kept; a **32-bit** float texel's word is handed back as stored, a
 //! signalling NaN's and a negative NaN's included. So `0x7c01` in an `R16Float` texel reads
@@ -19,20 +19,17 @@
 //! in the others.
 //!
 //! **Two accesses, two sites, because they are two questions.** A device may fetch a texel one way
-//! and filter it another, which is exactly what the lane found elsewhere: ANV's nearest samples
-//! lose a denormal its fetches keep. The owned fixture `format_scout` holds both as kernels of one
+//! and filter it another: ANV's nearest samples lose a denormal its fetches keep. The owned
+//! fixture `format_scout` holds both as kernels of one
 //! library — `scout_read_f` reads texel `g` of a `texture2d<float, access::read>` into
 //! `out[16 g.y + g.x]`, and `scout_sample_f` takes a nearest sample at `(g + (0.25, 0.75)) / 16`
-//! of a `texture2d<float>` through the **runtime sampler at slot 0**, which is the lane's own
-//! `SampleSlot` access rather than a constexpr sampler folded into the shader. The texture is 16 by
+//! of a `texture2d<float>` through the **runtime sampler at slot 0**, a `SampleSlot` access rather
+//! than a constexpr sampler folded into the shader. The texture is 16 by
 //! 16, which the kernels' `16 g.y + g.x` and their division by 16 both fix.
 //!
-//! The lane's four other accesses — a `texture2d<float, access::read_write>`, a
-//! `texture_buffer<float, read>`, the texture an argument buffer holds, and a gather — ran on the
-//! lane's own generated AIR, and no committed fixture reads an arbitrary format through one of them
-//! with a single texture bound. They are not ported here; the module docs of
-//! `runtime_lane::half_read_nans` record that plain Metal answered the same words through all
-//! seven.
+//! No committed fixture reads an arbitrary format through a `texture2d<float, access::read_write>`,
+//! a `texture_buffer<float, read>`, the texture an argument buffer holds, or a gather with a single
+//! texture bound, so those four accesses are not cases here.
 //!
 //! Every word of both output buffers holds [`BLANK`] before its dispatch, so a word the kernel did
 //! not reach is a recorded value rather than whatever the allocator left.
@@ -72,7 +69,7 @@ const TEXELS: usize = (SIDE * SIDE) as usize;
 /// recorded value rather than whatever was there.
 pub const BLANK: u8 = 0xab;
 
-/// The halves a 16-bit float texel holds, in the lane's own order: quiet and signalling NaNs of
+/// The halves a 16-bit float texel holds, in order: quiet and signalling NaNs of
 /// both signs and both payload edges, then the infinities, the denormals, the zeros and two
 /// normals.
 ///
@@ -85,7 +82,7 @@ const V: [u16; 24] = [
     0x0000, 0x8000, 0x7bff, 0xfbff, 0x3555, 0xff00, // zeros, the largest halves, two more
 ];
 
-/// The 32-bit words a 32-bit float texel holds, in the lane's own order: NaNs of every class, then
+/// The 32-bit words a 32-bit float texel holds, in order: NaNs of every class, then
 /// the infinities, the denormals, the zeros and the normals.
 ///
 /// These are the words Metal hands back **as stored**, so each one is also its own expected value.
@@ -112,7 +109,7 @@ pub struct HalfReadNans {
     half: bool,
 }
 
-/// Every format the lane reads: the three 16-bit float widths and the three 32-bit float widths.
+/// Every format the case reads: the three 16-bit float widths and the three 32-bit float widths.
 pub fn all() -> Vec<HalfReadNans> {
     let case = |name, format, channels, half| HalfReadNans {
         name,
@@ -265,22 +262,15 @@ impl Case for HalfReadNans {
         // for every case (`crate::replay::NATIVE_NOTES`); every one of the 2,048 words still
         // compares exactly.
         //
-        // Nothing else is loosened. The lane names `device-nan-encoding` for a device whose own
-        // decode of a half NaN is not Metal's, and it is deliberately **not** named here: it fired
-        // on neither venue of this round, and an allowance no run justified is a claim without
-        // evidence. A venue that needs it adds it with the run that shows it.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
+        // Nothing else is loosened. `device-nan-encoding`, for a device whose own decode of a
+        // half NaN is not Metal's, is deliberately **not** named here: an allowance no run
+        // justified is a claim without evidence. A venue that needs it adds it with the run that
+        // shows it.
         //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
+        // Its samples are through a runtime sampler slot, which the runtime's pipelines note
+        // as scaled (`crate::replay::pixel_sampler_scaling_notice` holds why, and the run it
+        // rests on).
+        vec![crate::replay::pixel_sampler_scaling_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -336,7 +326,7 @@ impl Case for HalfReadNans {
             side.texture_2d_in_role(&self.spec(), &self.texels()),
         )?;
         // `MTLSamplerDescriptor`'s defaults, which are the nearest, clamp-to-edge, normalized
-        // state the lane sampled its runtime sampler slot through.
+        // state the runtime sampler slot is sampled through.
         let sampler = made(sites, "sampler", side.sampler(&SamplerSpec::new()))?;
 
         let mut words = Node::branch("words", Vec::new());
@@ -361,8 +351,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// The exact `f32` bits of half `bits`, denormals included: the widening the lane's model
-    /// takes, written here so the cross-check below has one.
+    /// The exact `f32` bits of half `bits`, denormals included: the widening the rule takes,
+    /// written here so the cross-check below has one.
     fn widened(bits: u16) -> u32 {
         let sign = u32::from(bits >> 15) << 31;
         let exponent = u32::from((bits >> 10) & 0x1f);
@@ -374,8 +364,8 @@ mod tests {
         }
     }
 
-    /// Metal's `float` lane for channel `channel` of texel `index`, as
-    /// `runtime_lane::half_read_nans` measured it: a 16-bit float texel's NaN is the canonical
+    /// Metal's `float` lane for channel `channel` of texel `index`: a 16-bit float texel's NaN is
+    /// the canonical
     /// `0x7fc00000` and every other half its exact widening; a 32-bit float texel's word is as
     /// stored; a missing green or blue reads 0 and a missing alpha 1.
     fn metal(case: &HalfReadNans, index: usize, channel: usize) -> u32 {
@@ -449,7 +439,7 @@ mod tests {
         }
     }
 
-    /// Each half format's texels hold every one of the lane's values, and a half case's texel is
+    /// Each half format's texels hold every one of the table's values, and a half case's texel is
     /// never the 32-bit table's word: the two tables must not be mixed up, because the whole
     /// family turns on telling a half texel from a 32-bit one.
     #[test]
@@ -467,20 +457,18 @@ mod tests {
         }
     }
 
-    /// Metal's recorded words are the rule the lane measured, word for word, for every format,
-    /// every texel, every lane and both accesses.
+    /// Metal's recorded words are the rule, word for word, for every format, every texel, every
+    /// lane and both accesses.
     ///
-    /// This is the cross-check the port exists for: the lane holds the rule in a function and
-    /// asserts a live device against it, which cannot say anything on a host with no Metal. Here
-    /// the rule is checked against Metal's own recorded answer, so a release that changes Metal's
-    /// widening shows as the texel that moved rather than as a lane that stops passing on one Mac.
+    /// The rule is checked against Metal's own recorded answer, so a release that changes Metal's
+    /// widening shows as the texel that moved.
     #[test]
-    fn metals_recorded_words_are_the_rule_the_lane_measured() {
+    fn metals_recorded_words_are_the_measured_rule() {
         for case in all() {
             let recording = match crate::recording::read(case.name()) {
                 Ok(recording) => recording,
-                // A case recorded in a later commit of this batch: the test says what it checked
-                // rather than failing on a file that is not there yet.
+                // A case with no recording: the test says what it checked rather than failing on
+                // a missing file.
                 Err(_) => continue,
             };
             let answer = recording
@@ -510,7 +498,7 @@ mod tests {
                         assert_eq!(
                             got, want,
                             "{} {access} texel {texel} lane {lane}: Metal recorded {got:#010x}, \
-                             the lane's rule is {want:#010x}",
+                             the rule is {want:#010x}",
                             case.name
                         );
                     }

@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::device::profile::{DeviceProfile, FloatFunctions};
+use crate::device::profile::DeviceProfile;
 use crate::device::DevicePolicy;
 use crate::error::{Error, Feature, Needs, Unsupported};
 use crate::lower::select::Plan;
@@ -29,11 +29,11 @@ use crate::metal::bicubic::{texels, BicubicTexels};
 use crate::metal::PixelFormat;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
+    PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
 };
 use crate::pipeline::testing::{
-    compile, compile_with, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
-    typed_module_with, AssembleError,
+    compile, compile_with, count_op, engine_dir, link_and_validate, llvm_assemble, profile,
+    typed_module, typed_module_with, AssembleError,
 };
 use crate::pipeline::PrecisionNote;
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
@@ -70,7 +70,7 @@ fn assemble_module(name: &str, text: &str) -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 /// The words of `constexpr sampler(filter::bicubic, ...)` with every axis addressed by `address`
@@ -287,17 +287,12 @@ const TEXTURE: SlotRef = SlotRef {
 /// the texture slot's `BicubicTexels` specialization `class`.
 fn resources(plan: &Plan, init: &[Vec<u8>], class: BicubicTexels) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     spec.insert(SpecKey::BicubicTexels(TEXTURE), u64::from(class.0));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -755,6 +750,17 @@ fn bicubic_samples_match_the_reference_filter() {
         assert!(
             a.precision
                 .contains(&PrecisionNote::BicubicFilterArithmetic),
+            "{name}"
+        );
+        // A repeating tap wraps by the builder's defined remainder: Vulkan makes `OpSMod` and
+        // `OpSRem` poison for a negative operand where the device does not enable `maintenance8`.
+        let words = &a.module.words;
+        assert_eq!(
+            (
+                count_op(words, crate::spv::Op::SMod),
+                count_op(words, crate::spv::Op::SRem)
+            ),
+            (0, 0),
             "{name}"
         );
         link_and_validate(&a, &p).expect("L3");
@@ -1261,11 +1267,9 @@ fn the_emulation_validates_on_every_committed_profile() {
 /// The ids the footprint's three `f32` operations produce in the entry point of a linked module
 /// `words`, and whether each is rounded on its own. The operations are the normalized coordinate
 /// times the extent (a product of an `OpConvertUToF` result), `y = 256 x` (a product by the
-/// constant 256), and `r = y - floor(y)` (an `OpFSub` of a GLSL `Floor` result). A product
-/// rounded on its own is `GLSL.std.450 Fma(a, b, -0.0)` where the profile's `float` functions are
-/// Metal's (`metal`), and an `OpFMul` elsewhere; it and the subtraction are rounded on their own
-/// when decorated `NoContraction`.
-fn footprint_ops(words: &[u32], metal: bool) -> [Vec<(u32, bool)>; 3] {
+/// constant 256), and `r = y - floor(y)` (an `OpFSub` of a GLSL `Floor` result). A product and
+/// the subtraction are rounded on their own when decorated `NoContraction`.
+fn footprint_ops(words: &[u32]) -> [Vec<(u32, bool)>; 3] {
     let insts: Vec<&[u32]> = {
         let (mut v, mut i) = (Vec::new(), 5);
         while i < words.len() {
@@ -1322,27 +1326,9 @@ fn footprint_ops(words: &[u32], metal: bool) -> [Vec<(u32, bool)>; 3] {
             && glsl.contains(&w[3])
             && w[4] == crate::spv::GlslStd450Op::Floor as u32
     });
-    let negative_zero = insts
-        .iter()
-        .filter(|w| {
-            op(w) == crate::spv::Op::Constant as u32
-                && floats.contains(&w[1])
-                && w[3] == 0x8000_0000
-        })
-        .map(|w| w[2])
-        .collect::<Vec<_>>();
-    // The product of `a` and `b` rounded on its own, in the profile's form: `Fma(a, b, -0.0)`
-    // where its `float` functions are Metal's, an `OpFMul` elsewhere.
+    // The product of `a` and `b`: an `OpFMul`.
     let product = |w: &[u32], of: &[u32]| {
-        if metal {
-            op(w) == crate::spv::Op::ExtInst as u32
-                && glsl.contains(&w[3])
-                && w[4] == crate::spv::GlslStd450Op::Fma as u32
-                && negative_zero.contains(&w[7])
-                && (of.contains(&w[5]) || of.contains(&w[6]))
-        } else {
-            op(w) == crate::spv::Op::FMul as u32 && (of.contains(&w[3]) || of.contains(&w[4]))
-        }
+        op(w) == crate::spv::Op::FMul as u32 && (of.contains(&w[3]) || of.contains(&w[4]))
     };
     let decorated: Vec<u32> = insts
         .iter()
@@ -1368,9 +1354,8 @@ fn footprint_ops(words: &[u32], metal: bool) -> [Vec<(u32, bool)>; 3] {
 
 /// The footprint's `x = c n` (normalized coordinates only), `y = 256 x`, and `r = y - floor(y)` are
 /// each rounded on its own on every committed profile, one of each per plane axis, so no device
-/// fuses them into the arithmetic after them: the products in the profile's form (`Fma(a, b, -0.0)`
-/// where its `float` functions are Metal's, an `OpFMul` elsewhere), each decorated `NoContraction`
-/// as the subtraction is. A re-bless of the golden table would not notice the form dropped; this
+/// fuses them into the arithmetic after them: the products an `OpFMul`, each decorated
+/// `NoContraction` as the subtraction is. A re-bless of the golden table would not notice the form dropped; this
 /// test does.
 #[test]
 fn the_footprint_arithmetic_is_no_contraction() {
@@ -1386,8 +1371,7 @@ fn the_footprint_arithmetic_is_no_contraction() {
             let a = compile(&bc, "k", &p).unwrap_or_else(|e| panic!("{name} on {stem}: {e}"));
             let (_, spv) =
                 link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{name} on {stem}: {e}"));
-            let metal = p.fields().float_functions == FloatFunctions::Metal;
-            let [cn, y, r] = footprint_ops(&spv, metal);
+            let [cn, y, r] = footprint_ops(&spv);
             for (what, ops, want) in [
                 ("c n", cn, products),
                 ("256 x", y, 2),
@@ -1399,48 +1383,6 @@ fn the_footprint_arithmetic_is_no_contraction() {
                     "{name} on {stem}: {what} not rounded on its own: {ops:?}"
                 );
             }
-        }
-    }
-}
-
-/// The plan's word estimate bounds the emitted module of every public bicubic fixture (its samples'
-/// call sites, and the routines once) on every committed profile.
-#[test]
-fn the_estimate_bounds_the_bicubic_fixtures() {
-    use crate::budget::SPIRV_WORDS;
-    use crate::library::FunctionConstantValues;
-    use crate::lower::select::LowerInputs;
-    use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
-    use crate::pipeline::testing::meter;
-    let fixtures = [
-        "bcu_address",
-        "bcu_edges",
-        "bcu_formats",
-        "bcu_forms",
-        "bcu_fragment",
-        "bcx_rules",
-        "bcx_table",
-    ];
-    for name in fixtures {
-        let Ok(bc) = llvm_assemble(&engine_dir().join(format!("{name}.ll"))) else {
-            eprintln!("SKIPPED: llvm-as");
-            return;
-        };
-        for (stem, p) in crate::spirv::testing::committed_profiles().expect("profiles") {
-            let what = format!("{name} on {stem}");
-            let (entry, consts) = (EntryRef::Name(name), FunctionConstantValues::defaults());
-            let inputs = LowerInputs::new();
-            let plan = plan_bitcode(&bc, entry, &consts, &p, &inputs, &mut meter())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let a = compile_bitcode(&bc, entry, &consts, &p, &inputs, &mut meter(), SPIRV_WORDS)
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let words = a.module.words.len() as u64;
-            eprintln!("{what}: estimate {} emitted {words}", plan.estimate.words);
-            assert!(
-                plan.estimate.words >= words,
-                "{what}: estimate {} < emitted {words}",
-                plan.estimate.words
-            );
         }
     }
 }
@@ -1460,7 +1402,7 @@ fn a_bicubic_sample_is_one_call_of_the_planes_sum() {
         }
         Err(AssembleError::Rejected(e)) => panic!("llvm-as rejected bcx_rules: {e}"),
     };
-    let p = profile("intel-irisxe-rplp-anv", DevicePolicy::default()).expect("profile");
+    let p = profile("intel-irisxe-rplp-anv", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let (_, m) = typed_module(&bc, "bcx_rules", &p).expect("typed module");
     let functions = m.functions();
     let entry = functions.get(m.entry().func.index()).expect("entry");

@@ -12,18 +12,6 @@ fn one_of_each() -> Vec<Error> {
         )),
         Error::Unsupported(Unsupported::not_implemented(Feature::Tessellation)),
         Error::Unsupported(Unsupported::not_representable(Feature::HandleAsPointer)),
-        Error::Unsupported(Unsupported::driver_defect(
-            Feature::FramebufferFetch,
-            DriverWorkaround::EarlyTestsDropMultisampledImageWrites,
-        )),
-        Error::Unsupported(Unsupported::runtime_driver_defect(
-            Feature::SeparateMultisampledDepthStencil,
-            RuntimeDriverDefect::MultisampledDepthStencilColourCopies,
-        )),
-        Error::Unsupported(Unsupported::metal_gpu_family(
-            Feature::IndirectRenderState,
-            1010,
-        )),
         Error::NeedsInput(RuntimeInput::VertexDescriptor { attribute: 3 }),
         Error::InvalidInput(InputError::new(
             InputErrorKind::Container(ContainerError::BadMagic),
@@ -49,52 +37,39 @@ fn one_of_each() -> Vec<Error> {
     ]
 }
 
-/// Retry() and is_permanent_for() for every outcome class.
+/// Retry() for every outcome class.
 #[test]
-fn retry_and_permanence_table() {
+fn retry_table() {
     for err in one_of_each() {
         // Exhaustive over `Error`, so a new variant must be classified here.
-        let (retry, permanence) = match &err {
+        let retry = match &err {
             Error::Unsupported(u) => match u.needs {
-                Needs::AnyOf(_) => (Retry::Never, Permanence::InputAndDevice),
-                Needs::NotImplemented | Needs::NotRepresentable => {
-                    (Retry::Never, Permanence::Input)
-                }
-                // A defect of the device's driver: another device translates the input. A Metal GPU
-                // family the device does not claim: another device, one that claims it, may. A
-                // form Metal refuses on the measured devices: an unmeasured device is not refused
-                // so. A device capability outside the compile layer's vocabulary: a device with
-                // it runs the input.
-                Needs::DriverDefect(_)
-                | Needs::RuntimeDriverDefect(_)
-                | Needs::DeviceCapability(_)
-                | Needs::MetalGpuFamily(_)
-                | Needs::MetalRefuses(_) => (Retry::Never, Permanence::InputAndDevice),
+                Needs::AnyOf(_) => Retry::Never,
+                Needs::NotImplemented | Needs::NotRepresentable => Retry::Never,
             },
-            Error::NeedsInput(_) => (Retry::Never, Permanence::Input),
-            Error::InvalidInput(_) => (Retry::Never, Permanence::Input),
-            Error::InvalidDescriptor(_) => (Retry::Never, Permanence::Input),
-            Error::LimitExceeded(_) => (Retry::Never, Permanence::Input),
-            Error::Budget(BudgetExceeded::Time) => (Retry::Later, Permanence::Never),
+            Error::NeedsInput(_) => Retry::Never,
+            Error::InvalidInput(_) => Retry::Never,
+            Error::InvalidDescriptor(_) => Retry::Never,
+            Error::LimitExceeded(_) => Retry::Never,
+            Error::Budget(BudgetExceeded::Time) => Retry::Later,
             // `BudgetExceeded` and `InternalKind` are the front end's crate's, `#[non_exhaustive]`
             // there: each variant this pinned version has is listed, and a new one fails here until
             // it is.
             Error::Budget(other) => panic!("classify {other:?}"),
-            Error::Cancelled => (Retry::Later, Permanence::Never),
+            Error::Cancelled => Retry::Later,
             // Every `InternalKind`: the host allocator failing a reservation the ledger admitted is
             // transient; every other kind is an invariant of the emitted, profile-dependent module.
             Error::Internal(internal) => match internal.kind {
-                InternalKind::AllocationFailed => (Retry::Later, Permanence::Never),
+                InternalKind::AllocationFailed => Retry::Later,
                 InternalKind::Build
                 | InternalKind::Verify
                 | InternalKind::RequirementsExceedProfile
                 | InternalKind::Panic
-                | InternalKind::Invariant => (Retry::Never, Permanence::InputAndDevice),
+                | InternalKind::Invariant => Retry::Never,
                 other => panic!("classify {other:?}"),
             },
         };
         assert_eq!(err.retry(), retry, "{err:?}");
-        assert_eq!(err.is_permanent_for(), permanence, "{err:?}");
         assert!(!err.to_string().is_empty());
     }
 }
@@ -105,11 +80,6 @@ fn only_transient_outcomes_are_retryable() {
         let transient = matches!(err, Error::Cancelled | Error::Budget(_))
             || matches!(&err, Error::Internal(i) if i.kind == InternalKind::AllocationFailed);
         assert_eq!(err.retry() == Retry::Later, transient, "{err:?}");
-        assert_eq!(
-            err.is_permanent_for() == Permanence::Never,
-            transient,
-            "{err:?}"
-        );
     }
 }
 
@@ -142,7 +112,6 @@ fn input_error_mapping() {
             err,
             Error::InvalidInput(InputError::new(kind, Location::module()))
         );
-        assert_eq!(err.is_permanent_for(), Permanence::Input);
     }
 
     let not_implemented = [
@@ -214,10 +183,6 @@ fn single_capability_needs_is_one_alternative() {
         Needs::AnyOf(vec![vec![Capability::Extension(
             VkExtension::ExtRasterizationOrderAttachmentAccess
         )]])
-    );
-    assert_eq!(
-        Error::from(u).is_permanent_for(),
-        Permanence::InputAndDevice
     );
 }
 

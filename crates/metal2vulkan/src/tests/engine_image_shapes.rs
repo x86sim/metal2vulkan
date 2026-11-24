@@ -3,13 +3,12 @@
 //! old engine's reflected `texture_shape` until 0.2.0 deleted both.
 //!
 //! Vulkan requires an image view's type to match the `Dim` and `Arrayed` of the image variable a
-//! descriptor is read through, and its sample count the variable's `MS`. The binder makes each
+//! descriptor is read through, and its sample count the variable's `MS`. A consumer makes each
 //! view from what the interface reports: the slot's Metal texture type, and the pipeline's
 //! `ImageViewShape` fact for a cube viewed as the 2D array it is declared as (SPIR-V has no texel
-//! read of a cube). `bind::plan::resources`' own tests pin the binder's mapping from those to a
-//! view. This file pins the other half: an independent walk of the final words finds every
-//! variable a texture slot's binding names and requires its image to be the one that mapping
-//! gives, so a module never declares an image its view cannot show.
+//! read of a cube). This file pins the module's half: an independent walk of the final words finds
+//! every variable a texture slot's binding names and requires its image to be the one that
+//! mapping gives, so a module never declares an image its view cannot show.
 //!
 //! The mapping, written out again here: 1D, 2D and 3D types are their dimension, an array type
 //! is arrayed, a multisample type is multisampled, a cube is a cube, a cube array an arrayed
@@ -156,12 +155,7 @@ fn texture_slot(resource: &ResourceSlot) -> Option<(u32, bool)> {
 
 /// Profiles that bind textures by descriptor and differ in what they support: robust image
 /// access and its absence, formatless storage images, and the floor.
-const PROFILES: [&str; 4] = [
-    "lunarg-desktop-baseline-2023",
-    "vk12-floor",
-    "moltenvk-m3",
-    "nvidia-rtx5080-laptop",
-];
+const PROFILES: [&str; 3] = ["runtime-floor", "moltenvk-m3", "nvidia-rtx5080-laptop"];
 
 fn device(stem: &str) -> Device {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -170,7 +164,8 @@ fn device(stem: &str) -> Device {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let description =
         DeviceDescription::from_khronos_json(&text, None).unwrap_or_else(|e| panic!("{stem}: {e}"));
-    Device::new(description, DevicePolicy::default()).unwrap_or_else(|e| panic!("{stem}: {e}"))
+    Device::from_queries(description, DevicePolicy::RESIDENT_TABLES)
+        .unwrap_or_else(|e| panic!("{stem}: {e}"))
 }
 
 fn fixtures() -> Vec<PathBuf> {

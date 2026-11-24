@@ -1,7 +1,7 @@
 //! The case API: a case is written once and run by either side.
 //!
 //! A case names itself, sets its resources up, runs, and emits the sites it observes
-//! ([`Case::run`]). It is written against [`Side`], the vocabulary both sides answer in, so porting
+//! ([`Case::run`]). It is written against [`Side`], the vocabulary both sides answer in, so writing
 //! a case is a matter of saying which calls it makes and which sites it emits, and nothing about
 //! which implementation is running it.
 //!
@@ -10,14 +10,14 @@
 //! answers `Unavailable` there and the case's Metal answer is carried from a measurement this tree
 //! already holds ([`MetalSource::Carried`]). The case body stays one body.
 //!
-//! The vocabulary grows one family at a time as cases are ported. Nothing here reads an
+//! The vocabulary grows one family at a time as cases are added. Nothing here reads an
 //! environment variable, a device name or a vendor: a case that needs a feature finds out by making
 //! the call and reading the typed refusal.
 
 use crate::allowance::Allowance;
 use crate::recording::ShaderRef;
 use crate::transcript::{Node, NodeName, Observed, Sites, Transcript, Value};
-use crate::verdict::device_gap;
+use crate::verdict::device_gap_of;
 use metal2vulkan::metal::state::DepthStencilDescriptor;
 use metal2vulkan::metal::{
     AttributeFormat, BindingAccess, CompareFunction, IndexType, PixelFormat, RenderStages,
@@ -438,6 +438,23 @@ pub enum StageInRegion {
 /// What a side answered a call with.
 pub type Answer<T> = Result<T, Failure>;
 
+/// One getter's answer inside a call that answers many (a descriptor's or a function's facts),
+/// which a side answers or refuses on its own.
+///
+/// A field a side cannot answer is the same typed refusal a whole call is ([`Failure`], recorded
+/// by [`Failure::recorded`] at the field's own site), so the comparison reads it as a refusal at
+/// that site and the known-gaps ledger holds it exactly as it holds a call's: an unlisted field
+/// refusal fails the run as an unlisted call refusal does. The fields beside it still compare.
+pub type Field<T> = Answer<T>;
+
+/// The site of one [`Field`]: what `observed` records of its answer, or its refusal.
+pub fn field<T>(field: &Field<T>, observed: impl FnOnce(&T) -> Value) -> Observed {
+    match field {
+        Ok(answer) => Observed::value(observed(answer)),
+        Err(failure) => Observed::value(failure.recorded()),
+    }
+}
+
 /// A call that did not answer: the typed error as the transcript records it, and whether it is the
 /// venue's honest gap rather than ours.
 ///
@@ -455,30 +472,72 @@ pub type Answer<T> = Result<T, Failure>;
 /// `Err` as the site is written, and the annotation ([`Failure::at_step`]) can only reach the
 /// inside of it. Nothing a failure carries, now or later, can displace the layer the comparison
 /// reads.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
     /// The typed error **inside** the call's `Err`: a `Value::Variant` of the error's variant
     /// path and its payload. Private, so the `Err` layer cannot be lost: see the type's own
     /// documentation.
     error: Value,
     /// What the venue lacks, where the typed refusal names capabilities a device could enable or
-    /// a measured driver defect ([`device_gap`]). `None` where the refusal is ours to answer for.
+    /// a measured driver defect ([`device_gap_of`]). `None` where the refusal is ours to answer for.
     pub lacks: Option<String>,
-    /// The typed runtime error's own text where the failure is one ([`Failure::of`]); `None` for
+    /// The typed runtime error's own text where the failure is one ([`Failure::of_rt`]); `None` for
     /// a failure outside the runtime's typed errors. What a run that stopped at it reports
     /// ([`Abort::stopped`]).
     refusal: Option<String>,
 }
 
 impl Failure {
-    /// The failure a typed runtime error is.
-    pub fn of(error: &metal2vulkan_runtime::Error) -> Self {
+    /// The failure a typed error of the runtime (`metal2vulkan-runtime`) is. A translator refusal
+    /// that names a capability the device could enable is the venue's gap ([`device_gap_of`]).
+    /// The functions a refused pipeline state names are the case's own, a diagnostic: the failure
+    /// holds the error's text without them.
+    pub fn of_rt(error: &metal2vulkan_runtime::Error) -> Self {
+        let text = match error {
+            metal2vulkan_runtime::Error::Translation { error, .. } => {
+                let unnamed = metal2vulkan_runtime::Error::Translation {
+                    error: error.clone(),
+                    functions: Box::default(),
+                };
+                unnamed.to_string()
+            }
+            other => other.to_string(),
+        };
+        let lacks = match error {
+            metal2vulkan_runtime::Error::Translation {
+                error: metal2vulkan::error::Error::Unsupported(unsupported),
+                ..
+            } => device_gap_of(unsupported),
+            // A threadgroup Metal runs and this device's limits for the kernel do not.
+            metal2vulkan_runtime::Error::Limit(
+                metal2vulkan_runtime::Limit::ThreadgroupThreads { .. },
+            ) => Some(error.to_string()),
+            _ => None,
+        };
         Self {
             error: Value::Variant {
                 name: error_variant(error),
+                payload: Box::new(Value::Lines(vec![text.clone()])),
+            },
+            lacks,
+            refusal: Some(text),
+        }
+    }
+
+    /// The failure a translator error is, where the runtime's side calls the translator's
+    /// library itself: recorded as the runtime's `Error::Translation` of it, the form the runtime
+    /// gives it in.
+    pub fn of_translation(error: &metal2vulkan::error::Error) -> Self {
+        let lacks = match error {
+            metal2vulkan::error::Error::Unsupported(unsupported) => device_gap_of(unsupported),
+            _ => None,
+        };
+        Self {
+            error: Value::Variant {
+                name: "Error::Translation".to_owned(),
                 payload: Box::new(Value::Lines(vec![error.to_string()])),
             },
-            lacks: device_gap(error),
+            lacks,
             refusal: Some(error.to_string()),
         }
     }
@@ -586,7 +645,7 @@ const LACKS: &str = "lacks";
 
 /// What the venue honestly lacks at a site a [`Failure`] recorded, read back out of the recorded
 /// value: `Some` where the typed refusal names capabilities a device could enable or a driver
-/// measured to run the thing wrong ([`device_gap`]), and `None` for a refusal that is ours.
+/// measured to run the thing wrong ([`device_gap_of`]), and `None` for a refusal that is ours.
 ///
 /// The comparison's reading of [`Failure::recorded`], and the reason a case cannot lose the fact
 /// by naming its abort's site differently from the node it pushed: see that method.
@@ -608,7 +667,7 @@ pub fn lacks_recorded(value: &Value) -> Option<&str> {
 
 /// The variant path a typed runtime error records as: the error's outermost variant, which is what
 /// a consumer matches on.
-fn error_variant(error: &metal2vulkan_runtime::Error) -> String {
+fn error_variant(error: &dyn std::fmt::Debug) -> String {
     let debug = format!("{error:?}");
     let head = debug
         .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -650,9 +709,9 @@ pub struct Venue {
     pub driver: String,
     /// The API version the device runs.
     pub api: String,
-    /// Whether the device presents a Mac that keeps textures losslessly compressed
-    /// (`DeviceProperties::lossless_compression`), as the Apple silicon Mac every recording was
-    /// taken on does: what a venue's own answer (`Justification::WithoutCompression`) holds by.
+    /// Whether the device presents a Mac that keeps textures losslessly compressed, as the Apple
+    /// silicon Mac every recording was taken on does (false on the runtime, true on Metal's Apple
+    /// GPUs): what a venue's own answer (`Justification::WithoutCompression`) holds by.
     pub lossless_compression: bool,
     /// For a CPU implementation (`DeviceKind::Cpu`), the host's widest vector instruction set
     /// ([`host_vector_isa`]), which its shader compiler targets; `None` for a GPU. The device's
@@ -734,6 +793,19 @@ pub trait Side {
 
     /// `newComputePipelineStateWithFunction:error:` of the library's `entry`.
     fn compute_pipeline(&mut self, library: Handle, entry: &str) -> Answer<Handle>;
+
+    /// `newComputePipelineStateWithFunction:error:` of the library's `entry` made with `constants`
+    /// (`newFunctionWithName:constantValues:error:`): a kernel its function constants specialize,
+    /// in the handle space of [`Side::compute_pipeline`].
+    fn compute_pipeline_with_constants(
+        &mut self,
+        library: Handle,
+        entry: &str,
+        constants: &[crate::function_facts::ConstantValue],
+    ) -> Answer<Handle> {
+        let _ = (library, entry, constants);
+        Err(Failure::unavailable("compute_pipeline_with_constants"))
+    }
 
     /// `staticThreadgroupMemoryLength` of a compute pipeline state: the bytes the kernel's own
     /// `threadgroup` arrays take.
@@ -853,7 +925,7 @@ pub trait Side {
     ///
     /// `stage` is one stage, not a union. Metal states this per stage — the reflection holds a
     /// binding list a stage — so one bit has a Metal answer and a union has only a composition
-    /// rule of ours, which belongs in a lane rather than in a transcript. A side answers
+    /// rule of ours, which belongs in a runtime test rather than in a transcript. A side answers
     /// [`Failure::unavailable`] for anything but a single stage.
     fn texture_accesses(
         &mut self,
@@ -1447,6 +1519,22 @@ pub trait Side {
         Err(Failure::unavailable("fragment_fill"))
     }
 
+    /// Run one execution of a kernel-encoded indirect command buffer over a range the GPU writes
+    /// ([`EncodedRange`]) and answer the command buffer's status and the target's bytes.
+    ///
+    /// Both sides run it whole, in one command buffer: the indirect command buffer
+    /// (`newIndirectCommandBufferWithDescriptor:maxCommandCount:options:`), its `gpuResourceID`
+    /// in a buffer the kernel reads as an argument buffer; a compute encoder that makes the
+    /// indirect command buffer resident for writing and dispatches one thread a command; the
+    /// range's write ([`RangeWrite`]); one render pass over a private target cleared to zero
+    /// that makes the commands' buffers resident and runs
+    /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`; then a blit of level 0
+    /// into a shared buffer the host reads.
+    fn encoded_range(&mut self, run: &EncodedRange<'_>) -> Answer<FragmentFilled> {
+        let _ = run;
+        Err(Failure::unavailable("encoded_range"))
+    }
+
     /// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` of the library's
     /// functions, over `functions.attachments` color attachments of [`TARGET_FORMAT`].
     fn mesh_pipeline(&mut self, library: Handle, functions: &MeshFunctions<'_>) -> Answer<Handle> {
@@ -1597,6 +1685,16 @@ pub trait Side {
     fn plane_texture(&mut self, buffer: Handle, over: &PlaneTexture) -> Answer<Handle> {
         let _ = (buffer, over);
         Err(Failure::unavailable("plane_texture"))
+    }
+
+    /// `newTextureWithDescriptor:iosurface:plane:` of a surface the side makes as `surface` states
+    /// ([`SurfaceTexture`]): a 2D texture of the plane's format and extent, Shared, that shaders
+    /// read, over that plane.
+    fn surface_texture(&mut self, surface: &SurfaceTexture) -> Answer<Handle> {
+        let _ = surface;
+        Err(Failure::unavailable(
+            "newTextureWithDescriptor:iosurface:plane:",
+        ))
     }
 
     /// One command buffer with one blit encoder holding one fill of `texture` ([`Fill`]),
@@ -1889,10 +1987,10 @@ pub trait Side {
     /// Whether `newTextureWithDescriptor:` of the descriptor `query` names answers a texture.
     ///
     /// The answer is a **fact about the descriptor**, not about the object: Metal answers nil for a
-    /// descriptor it describes no texture of, and the runtime answers a typed `Nil` error for the
-    /// same descriptor, which is the same fact in the two APIs' spellings. So both sides answer
-    /// `false` there, and a side that refuses the call for any other reason answers its typed
-    /// error, which compares as a refusal.
+    /// descriptor it describes no texture of, and the Metal side answers `false` there. The
+    /// runtime side answers its typed error for a descriptor it makes no texture of, recorded as
+    /// the failure it is, and a side that refuses the call for any other reason answers its typed
+    /// error too, which compares as a refusal.
     ///
     /// A case asks this only of descriptors Metal makes no texture of, so nothing is allocated.
     /// `newTextureWithDescriptor:` of the descriptor `query` names, and every `MTLTexture` getter
@@ -2280,6 +2378,19 @@ pub trait Side {
         Err(Failure::unavailable("event_wait_behind_a_running_signal"))
     }
 
+    /// What one fence experiment between two queues observed ([`crate::fence_orders::FenceOrder`])
+    /// in `shape`: an updater on one queue fills a buffer and updates a fence, and a waiter on
+    /// another, committed after it, waits on the fence and copies the buffer.
+    ///
+    /// One call, because the facts are orders between two command buffers.
+    fn fence_order(
+        &mut self,
+        shape: crate::fence_orders::FenceShape,
+    ) -> Answer<crate::fence_orders::FenceOrder> {
+        let _ = shape;
+        Err(Failure::unavailable("fence_order"))
+    }
+
     /// What the scheduled-handler order probe observed
     /// ([`crate::scheduled_handlers::ScheduledHandlerOrder`]): a command buffer whose scheduled
     /// handler is held inside itself while the probe reads the status and a wait for the scheduling
@@ -2370,7 +2481,7 @@ pub trait Side {
     fn heap_purgeable_state(
         &mut self,
         heap: Handle,
-        state: metal2vulkan_runtime::PurgeableState,
+        state: crate::values::PurgeableState,
     ) -> Answer<u64> {
         let _ = (heap, state);
         Err(Failure::unavailable("heap_purgeable_state"))
@@ -2406,6 +2517,14 @@ pub trait Side {
         Err(Failure::unavailable("resource_facts"))
     }
 
+    /// `storageMode` of the resource `of` names, by its raw `MTLStorageMode`: the one of
+    /// [`Side::resource_facts`]' answers a side may hold apart from the rest. By default it is
+    /// that answer's own field, read through the same getter.
+    fn resource_storage_mode(&mut self, of: crate::heap_query::QueriedResource) -> Answer<u64> {
+        self.resource_facts(of, None)
+            .map(|facts| facts.storage_mode)
+    }
+
     /// `setLabel:` of `label` on the resource `of` names, as [`Side::set_heap_label`] is for a
     /// heap.
     fn set_resource_label(
@@ -2429,7 +2548,7 @@ pub trait Side {
     fn resource_purgeable_state(
         &mut self,
         of: crate::heap_query::QueriedResource,
-        state: metal2vulkan_runtime::PurgeableState,
+        state: crate::values::PurgeableState,
     ) -> Answer<u64> {
         let _ = (of, state);
         Err(Failure::unavailable("resource_purgeable_state"))
@@ -2630,10 +2749,10 @@ impl TileStep {
 /// One layer of a rasterization-rate map's descriptor
 /// (`MTLRasterizationRateLayerDescriptor`), as its quality samples along each axis.
 ///
-/// Both axes hold at least one sample, because Metal's
-/// `initWithSampleCount:horizontal:vertical:` answers nil for an axis of none (verified while
-/// porting this family). A descriptor of **no layers** is the shape whose `layerCount` is 0, and a
-/// case says that by holding no layer at all rather than by a layer with an empty axis.
+/// Both axes hold at least one sample, because Metal's `initWithSampleCount:horizontal:vertical:`
+/// answers nil for an axis of none (measured). A descriptor of **no layers** is the shape whose
+/// `layerCount` is 0, and a case says that by holding no layer at all rather than by a layer with
+/// an empty axis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateMapLayer {
     pub horizontal: Vec<f32>,
@@ -2855,6 +2974,61 @@ pub enum CommandDraw {
     },
 }
 
+/// A surface a case makes a texture over one plane of ([`Side::surface_texture`]): its
+/// four-character OSType, its planes where the case lays them, and the plane the texture covers.
+///
+/// The layout is what Metal's side asks `IOSurfaceCreate` for. A case of this shape writes and
+/// reads the texture's texels alone, never the surface's bytes, so a side that lays the planes its
+/// own way (the runtime's exported surface) answers
+/// the same texels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurfaceTexture {
+    /// The surface's OSType (`kIOSurfacePixelFormat`).
+    pub ostype: [u8; 4],
+    /// Whether the surface is made with a plane dictionary (`kIOSurfacePlaneInfo`): a planar
+    /// surface answers `IOSurfaceGetPlaneCount` its planes, and one without answers 0 and is its
+    /// own plane 0.
+    pub planar: bool,
+    /// Each plane, in its order in the surface: one for a surface without a plane dictionary.
+    pub planes: Vec<SurfacePlane>,
+    /// The surface's allocation, in bytes.
+    pub length: u64,
+    /// The plane the texture covers, whose format and extent it takes.
+    pub plane: u32,
+    /// The route the runtime's side makes the surface by. Metal's side lays it as the case states
+    /// and reads nothing of it, so it is not one of the case's inputs.
+    pub route: SurfaceRoute,
+}
+
+/// How the runtime's consumer makes a [`SurfaceTexture`]'s surface for one decoder
+/// (`Device::new_exported_surface`): the handles it tries in turn and the layout's multiples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceRoute {
+    /// VA-API's: a dma-buf at 256-byte pitch and start multiples, then an opaque fd and an NT
+    /// handle at the same multiples, the first surface in place kept.
+    VaApi,
+    /// NVIDIA's decoder's: an opaque fd, then an NT handle, at a pitch multiple of 4 and a start
+    /// multiple of 1, each plane directly below the one before.
+    Nvidia,
+}
+
+/// One plane of a [`SurfaceTexture`]: the format a texture over it takes, its extent in that
+/// format's texels, and where it lies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfacePlane {
+    /// The pixel format of a texture over the plane, one texel an element of the plane.
+    pub format: PixelFormat,
+    /// The plane's extent in texels.
+    pub size: [u32; 2],
+    /// The bytes of one texel, which is the plane's `kIOSurfacePlaneBytesPerElement`: the case
+    /// states it, as it states the layout.
+    pub texel: u64,
+    /// The plane's first byte in the surface's allocation.
+    pub offset: u64,
+    /// The bytes between its rows.
+    pub bytes_per_row: u64,
+}
+
 /// A texture a case makes over a buffer: over one plane of the surface the buffer stands for, or
 /// over the buffer itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2982,6 +3156,61 @@ pub struct FragmentFilled {
     pub status: Value,
     /// The target's level 0, row after row at the fill's row pitch.
     pub bytes: Vec<u8>,
+}
+
+/// One execution of a kernel-encoded indirect command buffer over a range a buffer holds, which
+/// the GPU writes first: the one shape of indirect command buffer both sides build, indexed
+/// triangle draws that inherit the pipeline state and bind their own buffers, encoded by a
+/// kernel through the buffer's `gpuResourceID`.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedRange<'a> {
+    /// The library of the kernel and of the drawing functions.
+    pub library: Handle,
+    /// The kernel: thread `t` encodes command `t`, through the `command_buffer` member of the
+    /// argument buffer at its buffer 0, which holds the indirect command buffer's
+    /// `gpuResourceID` alone.
+    pub kernel: &'a str,
+    /// The kernel's buffers 1 and up, in order.
+    pub buffers: &'a [Handle],
+    /// The commands the indirect command buffer holds, which the kernel's threads encode.
+    pub commands: u32,
+    /// `maxVertexBufferBindCount` and `maxFragmentBufferBindCount`.
+    pub bind_counts: [u32; 2],
+    /// The pipeline the commands inherit: these vertex and fragment functions over one color
+    /// attachment of `format`, with `supportIndirectCommandBuffers`.
+    pub vertex: &'a str,
+    pub fragment: &'a str,
+    pub format: PixelFormat,
+    /// The target's extent in texels, cleared to zero, and the row pitch of its read-back.
+    pub size: [u32; 2],
+    pub row_pitch: u32,
+    /// The buffers the commands read through their bindings, made resident for the vertex and
+    /// fragment stages (`useResource:usage:stages:`, read).
+    pub used: &'a [Handle],
+    /// The buffer holding the range (`MTLIndirectCommandBufferExecutionRange`), and the range's
+    /// offset in it.
+    pub range: Handle,
+    pub offset: u64,
+    /// How the GPU writes the range before the execution reads it.
+    pub written: RangeWrite<'a>,
+}
+
+/// How [`EncodedRange`]'s range is written by the GPU, in the command buffer of the execution.
+#[derive(Clone, Copy, Debug)]
+pub enum RangeWrite<'a> {
+    /// `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:` of `from`'s first 8 bytes
+    /// to the range, a blit before the pass.
+    Copied { from: Handle },
+    /// In the pass, before the execution: a rasterization-disabled pipeline of `function` (a
+    /// `vertex void` function of `library`) over the pass's attachment, `params` at vertex buffer
+    /// 0 and the range buffer at the range's offset at vertex buffer 1, `drawPrimitives:` of two
+    /// points, then `memoryBarrierWithScope:afterStages:beforeStages:` of buffers, after the
+    /// vertex stage and before the vertex and fragment stages.
+    Drawn {
+        library: Handle,
+        function: &'a str,
+        params: Handle,
+    },
 }
 
 /// The color format every mesh case's attachments take: `MTLPixelFormatRGBA32Uint`, whose texel is
@@ -3150,6 +3379,13 @@ pub struct PassOutcome {
     pub error: Option<Value>,
 }
 
+impl PassOutcome {
+    /// Our refusal of piece `at` of the program, where the side refused it.
+    pub fn refusal(&self, at: usize) -> Option<&Failure> {
+        self.refused.get(at)?.as_ref()
+    }
+}
+
 /// What an indirect render command's getters answered, beside what the whole record holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndirectReadBack {
@@ -3218,12 +3454,11 @@ impl MetalSource {
         }
     }
 
-    /// The same carried answer, measured on `chip` rather than on the oracle this round records
-    /// on.
+    /// The same carried answer, measured on `chip` rather than on the oracle.
     ///
-    /// A case says this where its table predates the oracle — the two families carrying an Apple
-    /// M4's values — so the recording holds the chip in a field a reader and the report can see,
-    /// instead of in the `from` prose where nothing could.
+    /// A case says this where its table was taken on another chip — the two families carrying an
+    /// Apple M4's values — so the recording holds the chip in a field a reader and the report can
+    /// see, instead of in the `from` prose where nothing could.
     pub const fn measured_on(self, chip: &'static str) -> Self {
         match self {
             Self::Carried {
@@ -3442,4 +3677,51 @@ pub fn probe<T>(
 /// what it answered.
 pub fn made<T>(sites: &mut Sites, at: &str, answer: Answer<T>) -> Result<T, Abort> {
     call(sites, at, answer, |_| Value::Absent)
+}
+
+/// [`probe`] of a pipeline state that keeps the side's refusal: the state, or the failure its site
+/// recorded, which each leg that needed the state answers with ([`refused_leg`]).
+pub fn pipeline_or_refused(
+    sites: &mut Sites,
+    at: &str,
+    answer: Answer<Handle>,
+) -> Result<Handle, Failure> {
+    match answer {
+        Ok(state) => {
+            sites.value(at, Value::ok(Value::Absent));
+            Ok(state)
+        }
+        Err(failure) => {
+            probe::<Handle>(sites, at, Err(failure.clone()), |_| Value::Absent);
+            Err(failure)
+        }
+    }
+}
+
+/// The side's refusal of a leg: of the pipeline state it needed, where the side refused that and
+/// so never drew the leg, else of the piece that drew it, `piece` being its place in the program
+/// where it was encoded at all.
+pub fn refused_leg<'a>(
+    pipeline: &'a Result<Handle, Failure>,
+    outcome: &'a PassOutcome,
+    piece: Option<usize>,
+) -> Option<&'a Failure> {
+    match pipeline {
+        Err(failure) => Some(failure),
+        Ok(_) => outcome.refusal(piece?),
+    }
+}
+
+/// A leg's site as a side answers it: `node`, the leg's answer, or where the side did not run the
+/// leg, the refusal that stopped it (its pipeline's or a piece's) as the site's own value with
+/// nothing under it.
+///
+/// A leg that did not run has no answer: what its read-back holds is the buffer's starting bytes,
+/// which no site records. The comparison reads a refusal at a site whose Metal answer is a tree as
+/// that refusal alone and does not descend under it, so the leg's one row is the refusal's.
+pub fn drawn_or_refused(node: Node, refused: Option<&Failure>) -> Node {
+    match refused {
+        Some(failure) => Node::leaf(node.name, Observed::value(failure.recorded())),
+        None => node,
+    }
 }

@@ -1,21 +1,20 @@
 //! A swizzled **extended-range, bfloat or packed-normalized** texture read, sampled and gathered at
-//! a sampled slot, ported from `runtime_lane::extended_swizzles`.
+//! a sampled slot.
 //!
 //! These are the formats whose image holds raw codes the function decodes, so a swizzle in the
 //! view's component mapping hands a channel's codes to another channel's lane. Metal applies the
 //! texture's swizzle to the texel it reads — each channel the source its swizzle names, `Zero` 0 and
 //! `One` 1.0, border texels included — and a gather of a component gathers the swizzle's source of
-//! it. The lane asked whether our swizzled reads, samples and gathers of such a texture are its
-//! unswizzled ones swizzled, as Metal's are, and compared them against the **unswizzled texture on
-//! the same device**, because for the extended-range formats it held no Metal rule at all.
+//! it. So a swizzled read, sample and gather of such a texture is its unswizzled one swizzled; for
+//! the extended-range formats there is no computed Metal rule, so a cross-check holds the swizzled
+//! answers to the **unswizzled texture's**.
 //!
-//! **The port records Metal's own words for every swizzle**, which is strictly more than the lane
-//! had: comparison is then exact against Metal rather than against our own unswizzled leg. The
-//! lane's two claims survive as committed cross-checks over the recordings —
-//! `every_recorded_swizzle_is_the_unswizzled_texture_swizzled`, which is the lane's whole subject,
-//! and `every_recorded_packed_read_is_metals_rule`, the code-to-value rule the lane did hold for the
-//! four packed formats (each channel's code `c` of `b` bits reads `c / (2^b - 1)`, correctly
-//! rounded, and an alpha the format lacks reads 1).
+//! **The case records Metal's own words for every swizzle**, so comparison is exact against Metal.
+//! Two cross-checks hold the recordings to rules —
+//! `every_recorded_swizzle_is_the_unswizzled_texture_swizzled`, and
+//! `every_recorded_packed_read_is_metals_rule`, the code-to-value rule of the four packed formats
+//! (each channel's code `c` of `b` bits reads `c / (2^b - 1)`, correctly rounded, and an alpha the
+//! format lacks reads 1).
 //!
 //! The kernels are the owned fixture `fpv_swizzled_reads`'s, all binding the texture at
 //! `[[texture(0)]]`, writing `o[i]` (buffer 0) from position `p[i]` (buffer 1): `fpv_swz_read`
@@ -23,20 +22,18 @@
 //! sampler at `[[sampler(0)]]`, and `fpv_swz_gather_x` through `_w` gather one component of the
 //! footprint.
 //!
-//! **The positions are a stated reduction of the lane's**, and this is the one place the port is
-//! narrower than the lane. The lane sweeps three offsets on each axis independently, nine points in
-//! each of the 60 cells of the texture and the ring of cells around it: 540 positions, which at
-//! six sampled operations and five swizzles would put each format's recording well past the
+//! **The positions are a stated reduction.** Three offsets on each axis independently, nine points
+//! in each of the 60 cells of the texture and the ring of cells around it, are 540 positions, which
+//! at six sampled operations and five swizzles would put each format's recording well past the
 //! recording ceiling. The case keeps [`OFFSETS`] on the cell's **diagonal**, three points a cell
 //! and 180 in all: a point below the half-texel line on both axes, the texel centre where a linear
 //! sample reduces to the texel itself, and a point above it on both axes. Between them every tap of
 //! a 2 by 2 linear footprint is reached, in the cells inside the texture and in the ring outside it
-//! where the footprint holds only border texels. The six points the lane also takes are the mixed
-//! ones (below on one axis, above on the other), and they are not here.
+//! where the footprint holds only border texels. The six mixed points (below on one axis, above on
+//! the other) are not here.
 //!
 //! One case per format, so a venue that holds no texture of one answers its typed refusal at that
-//! row rather than leaving the other fourteen sweeps uncompared — which is what the lane does when
-//! it prints `EXT-SWIZZLE-REFUSED` and moves on.
+//! row rather than leaving the other fourteen sweeps uncompared.
 //!
 //! The output buffer holds a fill byte before each dispatch (`BLANK`), so a lane the kernel did
 //! not write is a recorded value rather than whatever was there.
@@ -77,13 +74,13 @@ pub struct Format {
     /// Bytes one texel takes, which the case states because no `MTLTexture` answers it.
     pub texel_bytes: u32,
     /// Each channel's `(shift, bits)` in the texel's 16-bit word, red first, `None` where the
-    /// format lacks the channel: the packed-normalized formats, whose code-to-value rule the lane
-    /// held. `None` for a format whose codes the lane had no rule for.
+    /// format lacks the channel: the packed-normalized formats, whose code-to-value rule the case
+    /// holds. `None` for a format whose codes have no such rule here.
     pub packed: Option<[Option<(u32, u32)>; 4]>,
 }
 
 /// The one-plane extended-range formats, the padded 10-bit ones, their `_sRGB` twins, the bfloat
-/// formats, and the four packed normalized ones whose rule the lane held.
+/// formats, and the four packed normalized ones whose code-to-value rule the case holds.
 ///
 /// The packed fields are the Vulkan formats' that hold them (`R5G6B5_UNORM_PACK16`,
 /// `R5G5B5A1_UNORM_PACK16`, `A1R5G5B5_UNORM_PACK16`, `R4G4B4A4_UNORM_PACK16`).
@@ -180,7 +177,7 @@ pub const FORMATS: [Format; 15] = [
     },
 ];
 
-/// The swizzles, the default first, as the lane made them.
+/// The swizzles, the default first.
 pub fn swizzles() -> [(&'static str, TextureSwizzleChannels); 5] {
     use TextureSwizzle::{Alpha, Blue, Green, One, Red, Zero};
     let s = |red, green, blue, alpha| TextureSwizzleChannels {
@@ -278,7 +275,7 @@ fn sample_coords() -> Vec<u8> {
         .collect()
 }
 
-/// The sampler of `filter`, at clamp-to-border opaque white on both axes, as the lane made it.
+/// The sampler of `filter`, at clamp-to-border opaque white on both axes.
 fn sampler_spec(filter: SamplerMinMagFilter) -> SamplerSpec {
     let mut spec = SamplerSpec::filtered(filter);
     spec = spec.addressed(SamplerAddressMode::ClampToBorderColor);
@@ -359,19 +356,11 @@ impl Case for ExtendedSwizzles {
         MetalSource::Run
     }
 
-    /// The venue's memory model, and for a format the module filters itself the device's
-    /// arithmetic of that filter (`bicubic-filter-arithmetic`).
+    /// For a format the module filters itself, the device's arithmetic of that filter
+    /// (`bicubic-filter-arithmetic`).
     ///
     /// Each op reads every lane of its sweep in one dispatch, in groups of at most 64 threads, and
-    /// no lane count here is a whole number of such groups. That shape used to make our side run
-    /// the interior and the partial edge as dispatches of their own, announcing
-    /// `metal2vulkan-degrade-split-dispatch`, and the family declared the code for it. It does not
-    /// any more: a ragged `dispatchThreads:` on a kernel that cannot observe its threadgroup
-    /// partition runs as Metal's single dispatch, and `Degradation::SplitDispatch` fires on more
-    /// than one region. Measured on this M3 Max, 8 runs of the whole 1,103-case set: every row of
-    /// this family announced no notice at all, where the recordings taken before that landing hold
-    /// `metal2vulkan-degrade-split-dispatch` in their cost record's `degraded` set. So the
-    /// declaration is gone, and a split here reads as an undeclared notice at once.
+    /// no lane count here is a whole number of such groups.
     ///
     /// The loosening that is left reaches `case/notices/*` alone. Every texel this family records
     /// is still compared bit for bit, which is the point of the family: a swizzle moves channels
@@ -379,22 +368,15 @@ impl Case for ExtendedSwizzles {
     /// tolerance. `every_recorded_swizzle_is_the_unswizzled_texture_swizzled` and
     /// `every_recorded_packed_read_is_metals_rule` hold those words to Metal's own answers.
     fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 15 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        //
         // An extended-range or padded 10-bit format's linear sample (`sl`) blends its decoded taps
         // in the device's arithmetic, announced as `bicubic-filter-arithmetic` (the M3 Max, each
-        // of the four extended-range formats); its values move by it (`known-gaps.tsv`).
-        let mut named = vec![crate::replay::shared_memory_notice()];
+        // of the four extended-range formats); its values move by it (`known-gaps-rt.tsv`).
+        //
+        // Every kernel samples or gathers through the runtime sampler at `[[sampler(0)]]`, which
+        // the runtime's pipelines note as scaled (`crate::replay::pixel_sampler_scaling_notice`
+        // holds why). Measured through the rt side on lavapipe, the Radeon 780M and the RX 550:
+        // it fired for every row the side does not refuse (the four 16-bit packed formats).
+        let mut named = vec![crate::replay::pixel_sampler_scaling_notice()];
         if matches!(
             self.format().format,
             PixelFormat::BGRA10XR
@@ -407,7 +389,7 @@ impl Case for ExtendedSwizzles {
                 | PixelFormat::RG10UnormX12SRGB
         ) {
             named.push(crate::replay::notice_allowance(
-                metal2vulkan_runtime::Degradation::BicubicFilterArithmetic.code(),
+                crate::degradation::Degradation::BicubicFilterArithmetic.code(),
             ));
         }
         named
@@ -653,10 +635,8 @@ mod tests {
     /// Every swizzled read, sample and gather Metal recorded is the **unswizzled** texture's
     /// recorded answer swizzled.
     ///
-    /// This is the lane's whole subject, now checked against Metal's own words on both sides of the
-    /// equation rather than against our own unswizzled leg: for the extended-range and bfloat
-    /// formats the lane held no Metal rule at all, so it could only ask whether *we* were
-    /// self-consistent. Here both terms are Metal's.
+    /// Both sides of the equation are Metal's own words: for the extended-range and bfloat formats
+    /// there is no computed Metal rule, so the swizzled reads are held to the unswizzled ones.
     #[test]
     fn every_recorded_swizzle_is_the_unswizzled_texture_swizzled() {
         let mut unrecorded = Vec::new();
@@ -792,12 +772,12 @@ mod tests {
     }
 
     /// Every unswizzled read, nearest sample and gather of a **packed normalized** texture that
-    /// Metal recorded is the lane's code-to-value rule's.
+    /// Metal recorded is the code-to-value rule's.
     ///
-    /// The four packed formats are the only ones of the fifteen the lane held a Metal rule for, so
-    /// this is where the recordings can be held to a computed answer rather than to each other. A
-    /// linear sample and an access past the edges are not here: the rule covers neither, which is
-    /// exactly why the lane compared those against the unswizzled texture instead.
+    /// The four packed formats are the only ones of the fifteen with a computed Metal rule, so this
+    /// is where the recordings can be held to a computed answer rather than to each other. A linear
+    /// sample and an access past the edges are not here: the rule covers neither, so those are held
+    /// to the unswizzled texture instead.
     #[test]
     fn every_recorded_packed_read_is_metals_rule() {
         let mut unrecorded = Vec::new();
@@ -835,8 +815,8 @@ mod tests {
         assert_eq!(families, 4, "the four packed normalized formats");
         assert!(
             differ.is_empty(),
-            "{checked} results checked; Metal's recorded texels differ from the lane's \
-             code-to-value rule:\n{}",
+            "{checked} results checked; Metal's recorded texels differ from the code-to-value \
+             rule:\n{}",
             differ.join("\n")
         );
         assert!(

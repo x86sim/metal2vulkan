@@ -40,6 +40,15 @@ pub enum Limit {
     /// every executor (no case can be qualified), and its rows are classified and closed without a
     /// reference: the census counts them apart and never as unresolved.
     Metal,
+    /// `metal2vulkan-runtime` answers the structure with a typed refusal, or offers no call for it
+    /// and the consumer refuses it itself (its README's known gaps): the Metal oracle runs it, the
+    /// engine's candidate refuses it, typed, and its rows are classified and closed without a
+    /// candidate run, counted apart and never as unresolved. A device test holds each such
+    /// requirement to the refusal both ways on lavapipe where the runtime has a call for it: the
+    /// shape the requirement's check accepts gets the named refusal, and the same shape without it
+    /// is made. The day the runtime builds the shape that test fails, and the limit goes back to
+    /// [`Limit::Tooling`] while the executor's support is built.
+    Runtime,
 }
 
 impl Limit {
@@ -47,6 +56,7 @@ impl Limit {
         match self {
             Self::Tooling => "tooling",
             Self::Metal => "metal",
+            Self::Runtime => "runtime",
         }
     }
 }
@@ -75,7 +85,6 @@ pub enum ToolingRequirement {
     TessellationSystemInputLiteral,
     FragmentImageblockMemberLiteral,
     KernelStageInputLiteral,
-    TextureBufferLiteral,
     StorageTextureFormatLiteral,
     ImplicitImageblockLiteral,
     IndirectCommandBuffer,
@@ -115,14 +124,159 @@ pub enum ToolingRequirement {
     /// (`companion::MeshStages`).
     MeshCompanion,
     /// A case gives a 32-bit float depth image a depth outside `[0, 1]`
-    /// (`executor_contract::depth_range`): a `Depth32Float` texture's texels or a depth
-    /// attachment's initial depth holds a NaN, a negative value other than `-0.0`, or a value
-    /// above 1.0, which Metal's texel keeps. Vulkan takes no such value into a depth image without
-    /// `VK_EXT_depth_range_unrestricted` (`VUID-vkCmdCopyBufferToImage-pRegions-07931`), so on a
-    /// device without the extension the engine's candidate cannot put the case's depths where
-    /// Metal holds them and stops there; on a device with it, it runs. A case's data on the
-    /// executing device raises it, never a source's structure, so no census row carries it.
+    /// (`executor_contract::depth_range`): a `Depth32Float` texture's texels (a texture-array
+    /// element's or an argument buffer's texture's among them) or a depth attachment's initial
+    /// depth holds a NaN, a negative value other than `-0.0`, or a value above 1.0, which Metal's
+    /// texel keeps. The runtime's upload of a 32-bit float depth leaves such a value the device's
+    /// on every device (`metal2vulkan_runtime::Texture::FLOAT_DEPTH_UPLOAD_NOTE`: Vulkan defines no
+    /// copy of one into a depth aspect without `VK_EXT_depth_range_unrestricted`, which it does not
+    /// enable), and a draw writes depths clamped to the viewport's `[0, 1]`: no call of the runtime
+    /// puts such a value where Metal holds it on every device, so the limit is the runtime's
+    /// ([`Limit::Runtime`]) and the engine's candidate does not run the case. The case checker
+    /// raises it from the case's literals on every device (`executor_contract::case_requirements`),
+    /// never a source's structure, so no census row carries it. The Metal oracle runs it, so a case
+    /// of it stays Metal-qualified ([`Self::qualifies_on_metal`]).
     DepthOutsideUnitRange,
+    /// An object or mesh function's row or case (`executor_contract::mesh`), or a case that runs a
+    /// pipeline template of one: the engine's candidate draws no mesh render pipeline. The runtime
+    /// has no mesh call: it makes no mesh render pipeline state and records no mesh draw, and the
+    /// consumer refuses mesh pipelines itself (`crates/metal2vulkan-runtime/README.md`, its known
+    /// gaps), so the limit is the runtime's ([`Limit::Runtime`]) with no call to hold a device
+    /// test to; that README sentence is its guard. When a guest uses a mesh pipeline it is built
+    /// natively with its call, and the limit goes back to [`Limit::Tooling`] then. The Metal
+    /// oracle draws it, so a case of it stays Metal-qualified ([`Self::qualifies_on_metal`]), and
+    /// the authored compile census still compiles an object or mesh case's pipeline
+    /// (`engine::prepare_compile`).
+    MeshRenderPipeline,
+    /// A sequentially consistent fence its entry's pipeline compiles
+    /// (`executor_contract::seq_cst_fence`): an `atomic_thread_fence` of `memory_order_seq_cst`
+    /// that orders a memory beyond its thread, or a `seq_cst` barrier of the MSL 4.1 form whose
+    /// memory scope is the device. The translator orders such a fence with the command buffer's
+    /// other ones through an atomic on its execution status word, which the runtime's identity
+    /// domains do not reach: the runtime refuses the pipeline (`Unsupported{IdentityDomains}`,
+    /// naming the fence, "a sequentially consistent fence"), so the limit is the runtime's
+    /// ([`Limit::Runtime`]) and the engine's candidate does not run the case. The device tests
+    /// `candidate::tests::engine_compute::a_seq_cst_fence_is_refused_through_the_runtime_as_its_requirement_says`
+    /// and `..::a_fence_of_another_order_is_made_through_the_runtime` hold it both ways. The Metal
+    /// oracle runs it, so a case of it stays Metal-qualified ([`Self::qualifies_on_metal`]).
+    SeqCstFence,
+    /// A visible function table bound to a vertex or fragment function (`executor_contract`'s
+    /// `engine_source_requirements` and `case_requirements`): function pointers called from a
+    /// render pipeline, which Metal lets a program ask for through
+    /// `supportsFunctionPointersFromRender`, an Apple6-family feature. The runtime's render
+    /// pipeline state reads no function table (its make is
+    /// `metal2vulkan_runtime::Gap::RenderPipeline` of `DrawInput`, a known gap its README states,
+    /// which is its guard), so the limit is the runtime's ([`Limit::Runtime`]) and the engine's
+    /// candidate does not run the case. The Metal oracle draws it, so a case of it stays
+    /// Metal-qualified ([`Self::qualifies_on_metal`]).
+    RenderFunctionTable,
+    /// An indexed draw that reads past its index buffer: a case's out-of-bounds target of a draw's
+    /// index buffer (`executor_contract::case_requirements`). The runtime refuses a draw whose
+    /// indices run past the buffer, as Metal's validation stops it
+    /// (`metal2vulkan_runtime::Refusal::IndexBufferOffset`, a refusal its README states, which is
+    /// its guard), so the limit is the runtime's ([`Limit::Runtime`]) and the engine's candidate
+    /// does not run the case. The case checker raises it from the case's literals, never a
+    /// source's structure, so no census row carries it. The Metal oracle draws it, so a case of it
+    /// stays Metal-qualified ([`Self::qualifies_on_metal`]).
+    IndexBufferPastEnd,
+    /// A 64-bit texture atomic its module calls (`executor_contract::unsupported_air_requirements`):
+    /// an `atomic_min` or `atomic_max` on a Metal `ulong` texture, an Apple8-family feature (Metal's
+    /// feature set tables: "GPU devices in the Apple8 family support 64-bit atomic minimum and
+    /// maximum using ulong, on both buffers and textures, only on macOS"). The translator refuses
+    /// it on every device as `Unsupported{ImageAtomics}`, not implemented (its one exact form is a
+    /// 64-bit image atomic, `shaderImageInt64Atomics`, which the runtime enables on no device), a
+    /// known gap the runtime's README states, which is its guard: the limit
+    /// is the runtime's ([`Limit::Runtime`]) and the engine's candidate does not run the case. The
+    /// Metal oracle runs it, so a case of it stays Metal-qualified ([`Self::qualifies_on_metal`]).
+    UlongTextureAtomic,
+    /// A depth/stencil attachment of both aspects (`executor_contract::case_requirements`), which
+    /// the Metal oracle makes as Metal's separate `Depth32Float` and `Stencil8` textures, both
+    /// attached to one pass: plain Metal on every Mac. The runtime does not build that form yet: it
+    /// renders into no separate depth and stencil textures in one pass
+    /// (`metal2vulkan_runtime::Gap::RenderPass` of `DepthStencilViews`, and its pipeline state
+    /// `Gap::RenderPipeline` of `DepthStencilFormats`, known gaps its README states, which are its
+    /// guard), so the limit is the runtime's ([`Limit::Runtime`]) and the engine's candidate does
+    /// not run the case. The case checker raises it from the case's literals, never a source's
+    /// structure, so no census row carries it. The Metal oracle draws it, so a case of it stays
+    /// Metal-qualified ([`Self::qualifies_on_metal`]).
+    SeparateDepthStencil,
+    /// A compute kernel's implicit imageblock, a tile pass's coverage of it
+    /// (`ImageblockResource::implicit_coverage`, `executor_contract::case_requirements`): the
+    /// runtime builds no tile function, a known gap its README states. An explicit imageblock is
+    /// none: the run sets its size (`ComputeCommandEncoder::set_imageblock_size`).
+    KernelImageblock,
+    /// A fragment function's imageblock, the case's cells of it
+    /// (`executor_contract::case_requirements`). The runtime refuses a fragment function with an
+    /// `[[imageblock_data]]` input or output at creation on every device (`Error::Translation`
+    /// naming `Imageblocks`, `NotImplemented`), a known gap its README states, which is its guard.
+    FragmentImageblock,
+    /// A sparse texture a case binds (`executor_contract::case_requirements`). The runtime makes
+    /// no sparse texture: its texture descriptor has no sparse form, so no call of it makes one.
+    SparseTexture,
+    /// An acceleration structure or an intersection-function table bound to a compute kernel
+    /// (`executor_contract::case_requirements`; a render function's is
+    /// [`Self::RenderAccelerationStructure`]). The runtime makes no acceleration structure, and its
+    /// compute encoder binds neither, so no call of it runs such a kernel.
+    KernelAccelerationStructure,
+    /// A compute kernel's `[[stage_in]]` inputs, or its dispatch's stage-in region
+    /// (`executor_contract::case_requirements`). The runtime fetches stage inputs, but the engine's
+    /// run through it (`candidate::platform::runtime`) makes its pipeline state without the
+    /// case's stage-input descriptor and sets no stage-in region, so no call of it runs such a
+    /// case as written.
+    KernelStageInput,
+    /// A rasterization-rate map (`executor_contract::case_requirements`): a render pass's, or one
+    /// whose parameter data a buffer or an argument buffer's buffer holds. The runtime makes no
+    /// rate map, and its render pass descriptor has no field for one, so no call of it makes one.
+    RasterizationRateMap,
+    /// A vertex buffer bound at the stride its draw sets, a dynamic layout stride
+    /// (`executor_contract::case_requirements`). The runtime's render encoder does not build
+    /// `setVertexBuffer:offset:attributeStride:atIndex:`, a known gap its README states, which is
+    /// its guard.
+    DynamicVertexStride,
+    /// An indirect command buffer of compute commands a case holds
+    /// (`executor_contract::case_requirements`). The runtime builds no compute command:
+    /// `Device::new_indirect_command_buffer` makes indexed draw commands alone
+    /// (`metal2vulkan_runtime::Gap::IndirectCommandBuffers` of `IndirectCommandsKind::CommandTypes`
+    /// for any other type), and a compute pipeline state made for indirect command buffers is
+    /// `IndirectCommandsKind::ComputeCommands`, known gaps its README states, which are its guard.
+    IndirectComputeCommands,
+    /// An indirect command buffer of render commands whose descriptor allows draws other than
+    /// indexed draws alone (`executor_contract::case_requirements`): draws of primitives, patch or
+    /// indexed patch draws, or mesh draws of threadgroups or threads. The runtime's indirect
+    /// command buffer holds indexed draws alone
+    /// (`metal2vulkan_runtime::Gap::IndirectCommandBuffers` of `IndirectCommandsKind::CommandTypes`
+    /// for any other type), and the translator refuses a kernel's encoding of any draw but an
+    /// indexed triangle draw (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`), known
+    /// gaps its README states, which are its guard.
+    IndirectDrawTypes,
+    /// An indirect command buffer of render commands that set their own pipeline state
+    /// (`inheritPipelineState` false) or draw with the executing encoder's buffers
+    /// (`inheritBuffers` true) (`executor_contract::case_requirements`). The runtime builds commands
+    /// that inherit the pipeline state and bind their own buffers alone
+    /// (`metal2vulkan_runtime::Gap::IndirectCommandBuffers` of
+    /// `IndirectCommandsKind::CommandPipelines` or `IndirectCommandsKind::InheritedBuffers`),
+    /// known gaps its README states, which are its guard.
+    IndirectCommandInheritance,
+    /// A command the host encodes into an indirect command buffer before its producer runs
+    /// (`executor_contract::case_requirements`, the command buffer's `commands`). The runtime has
+    /// no `indirectRenderCommandAtIndex:` or `indirectComputeCommandAtIndex:`: the CPU encodes no
+    /// command into its Private records, a known gap its README states, which is its guard.
+    HostEncodedIndirectCommands,
+    /// A render or compute pipeline state an argument buffer holds
+    /// (`executor_contract::case_requirements`, the case's `pipeline_states`). The runtime's
+    /// pipeline states answer no `gpuResourceID`, so no call of it gives the word a program writes
+    /// into an argument buffer's pipeline-state field, and its indirect commands set no pipeline
+    /// state of their own (`IndirectCommandsKind::CommandPipelines`).
+    ArgumentBufferPipelineState,
+    /// An indirect command buffer of the one shape the runtime builds, which no runtime limit
+    /// above names (`executor_contract::case_requirements`): render commands of indexed draws
+    /// alone that inherit the pipeline state and bind their own buffers, none of them encoded by
+    /// the host. `Device::new_indirect_command_buffer` makes it, but the engine's candidate maps no
+    /// case's indirect command buffer, so no executor pair evidences such a case: this crate's
+    /// gap ([`Limit::Tooling`]). The case checker raises it from the case's literals, never a
+    /// source's structure, so no census row carries it. Mapping the shape waits on a guest count:
+    /// it is built when a guest reaches an indirect command buffer.
+    IndirectIndexedDraws,
 }
 
 /// Every executor (the requirement leaves no case to author, or none to observe).
@@ -130,14 +284,13 @@ const AUTHORING: &[Executor] = &Executor::ALL;
 const ENGINE: &[Executor] = &[Executor::EngineCandidate];
 
 impl ToolingRequirement {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 41] = [
         Self::FunctionConstantLiteral,
         Self::VertexAttributeLiteral,
         Self::TessellationAttributeLiteral,
         Self::TessellationSystemInputLiteral,
         Self::FragmentImageblockMemberLiteral,
         Self::KernelStageInputLiteral,
-        Self::TextureBufferLiteral,
         Self::StorageTextureFormatLiteral,
         Self::ImplicitImageblockLiteral,
         Self::IndirectCommandBuffer,
@@ -154,6 +307,25 @@ impl ToolingRequirement {
         Self::KernelMinLodClamp,
         Self::MeshCompanion,
         Self::DepthOutsideUnitRange,
+        Self::MeshRenderPipeline,
+        Self::SeqCstFence,
+        Self::RenderFunctionTable,
+        Self::IndexBufferPastEnd,
+        Self::UlongTextureAtomic,
+        Self::SeparateDepthStencil,
+        Self::KernelImageblock,
+        Self::FragmentImageblock,
+        Self::SparseTexture,
+        Self::KernelAccelerationStructure,
+        Self::KernelStageInput,
+        Self::RasterizationRateMap,
+        Self::DynamicVertexStride,
+        Self::IndirectComputeCommands,
+        Self::IndirectDrawTypes,
+        Self::IndirectCommandInheritance,
+        Self::HostEncodedIndirectCommands,
+        Self::ArgumentBufferPipelineState,
+        Self::IndirectIndexedDraws,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -164,7 +336,6 @@ impl ToolingRequirement {
             Self::TessellationSystemInputLiteral => "tessellation_system_input_literal",
             Self::FragmentImageblockMemberLiteral => "fragment_imageblock_member_literal",
             Self::KernelStageInputLiteral => "kernel_stage_input_literal",
-            Self::TextureBufferLiteral => "texture_buffer_literal",
             Self::StorageTextureFormatLiteral => "storage_texture_format_literal",
             Self::ImplicitImageblockLiteral => "implicit_imageblock_literal",
             Self::IndirectCommandBuffer => "indirect_command_buffer",
@@ -183,6 +354,25 @@ impl ToolingRequirement {
             Self::KernelMinLodClamp => "kernel_min_lod_clamp",
             Self::MeshCompanion => "mesh_companion",
             Self::DepthOutsideUnitRange => "depth_outside_unit_range",
+            Self::MeshRenderPipeline => "mesh_render_pipeline",
+            Self::SeqCstFence => "seq_cst_fence",
+            Self::RenderFunctionTable => "render_function_table",
+            Self::IndexBufferPastEnd => "index_buffer_past_end",
+            Self::UlongTextureAtomic => "ulong_texture_atomic",
+            Self::SeparateDepthStencil => "separate_depth_stencil",
+            Self::KernelImageblock => "kernel_imageblock",
+            Self::FragmentImageblock => "fragment_imageblock",
+            Self::SparseTexture => "sparse_texture",
+            Self::KernelAccelerationStructure => "kernel_acceleration_structure",
+            Self::KernelStageInput => "kernel_stage_input",
+            Self::RasterizationRateMap => "rasterization_rate_map",
+            Self::DynamicVertexStride => "dynamic_vertex_stride",
+            Self::IndirectComputeCommands => "indirect_compute_commands",
+            Self::IndirectDrawTypes => "indirect_draw_types",
+            Self::IndirectCommandInheritance => "indirect_command_inheritance",
+            Self::HostEncodedIndirectCommands => "host_encoded_indirect_commands",
+            Self::ArgumentBufferPipelineState => "argument_buffer_pipeline_state",
+            Self::IndirectIndexedDraws => "indirect_indexed_draws",
         }
     }
 
@@ -199,9 +389,14 @@ impl ToolingRequirement {
     ///   implement yet (`candidate::engine`), each of which the Metal oracle runs, and
     ///   rasterization-rate map data a case can author only as bytes, which hold one
     ///   implementation's private layout where the engine's module decodes this crate's, and a
-    ///   depth outside `[0, 1]` a case gives a depth image, which its executor raises only on a
-    ///   device without `VK_EXT_depth_range_unrestricted`
-    ///   ([`ToolingRequirement::DepthOutsideUnitRange`]).
+    ///   depth outside `[0, 1]` a case gives a depth image, which the runtime puts nowhere
+    ///   ([`ToolingRequirement::DepthOutsideUnitRange`]), and a mesh render pipeline it does not
+    ///   draw ([`ToolingRequirement::MeshRenderPipeline`]), and a sequentially consistent fence, a
+    ///   render function's function table, an indexed draw past its index buffer, a 64-bit texture
+    ///   atomic and separate depth and stencil attachments, which the runtime refuses
+    ///   ([`ToolingRequirement::SeqCstFence`], [`ToolingRequirement::RenderFunctionTable`],
+    ///   [`ToolingRequirement::IndexBufferPastEnd`], [`ToolingRequirement::UlongTextureAtomic`],
+    ///   [`ToolingRequirement::SeparateDepthStencil`]).
     ///
     /// The requirements that stopped only the old engine's candidate were retired with it.
     pub const fn stops(self) -> &'static [Executor] {
@@ -212,7 +407,6 @@ impl ToolingRequirement {
             | Self::TessellationSystemInputLiteral
             | Self::FragmentImageblockMemberLiteral
             | Self::KernelStageInputLiteral
-            | Self::TextureBufferLiteral
             | Self::StorageTextureFormatLiteral
             | Self::ImplicitImageblockLiteral
             | Self::IndirectCommandBuffer
@@ -228,16 +422,74 @@ impl ToolingRequirement {
             | Self::VertexDepthStencilAttachment
             | Self::RasterizationDisabledRenderTarget
             | Self::RasterizationRateMapPlacement
-            | Self::DepthOutsideUnitRange => ENGINE,
+            | Self::DepthOutsideUnitRange
+            | Self::MeshRenderPipeline
+            | Self::SeqCstFence
+            | Self::RenderFunctionTable
+            | Self::IndexBufferPastEnd
+            | Self::UlongTextureAtomic
+            | Self::SeparateDepthStencil
+            | Self::KernelImageblock
+            | Self::FragmentImageblock
+            | Self::SparseTexture
+            | Self::KernelAccelerationStructure
+            | Self::KernelStageInput
+            | Self::RasterizationRateMap
+            | Self::DynamicVertexStride
+            | Self::IndirectComputeCommands
+            | Self::IndirectDrawTypes
+            | Self::IndirectCommandInheritance
+            | Self::HostEncodedIndirectCommands
+            | Self::ArgumentBufferPipelineState
+            | Self::IndirectIndexedDraws => ENGINE,
         }
+    }
+
+    /// Whether a case carrying this requirement is still a case to keep: the Metal oracle runs it
+    /// and its observation is evidence for a candidate that runs the family again, so the checker
+    /// accepts it with no candidate (`executor_contract::evidence_gap`), and the engine's candidate
+    /// refuses it, typed. Exactly the runtime's limits ([`Limit::Runtime`]): their cases are
+    /// qualified on Metal.
+    pub const fn qualifies_on_metal(self) -> bool {
+        matches!(self.limit(), Limit::Runtime)
     }
 
     /// Whose limit this requirement records. Every requirement is this crate's tooling's except
     /// [`ToolingRequirement::KernelMinLodClamp`], which Apple's compiler cannot build a pipeline
-    /// for.
+    /// for, and [`ToolingRequirement::SeqCstFence`], [`ToolingRequirement::DepthOutsideUnitRange`],
+    /// [`ToolingRequirement::MeshRenderPipeline`], [`ToolingRequirement::RenderFunctionTable`],
+    /// [`ToolingRequirement::IndexBufferPastEnd`], [`ToolingRequirement::UlongTextureAtomic`],
+    /// [`ToolingRequirement::SeparateDepthStencil`], [`ToolingRequirement::KernelImageblock`],
+    /// [`ToolingRequirement::FragmentImageblock`], [`ToolingRequirement::SparseTexture`],
+    /// [`ToolingRequirement::KernelAccelerationStructure`],
+    /// [`ToolingRequirement::KernelStageInput`], [`ToolingRequirement::RasterizationRateMap`],
+    /// [`ToolingRequirement::DynamicVertexStride`], [`ToolingRequirement::IndirectComputeCommands`],
+    /// [`ToolingRequirement::IndirectDrawTypes`], [`ToolingRequirement::IndirectCommandInheritance`],
+    /// [`ToolingRequirement::HostEncodedIndirectCommands`] and
+    /// [`ToolingRequirement::ArgumentBufferPipelineState`], which the runtime refuses or does not
+    /// build.
     pub const fn limit(self) -> Limit {
         match self {
             Self::KernelMinLodClamp => Limit::Metal,
+            Self::SeqCstFence
+            | Self::DepthOutsideUnitRange
+            | Self::MeshRenderPipeline
+            | Self::RenderFunctionTable
+            | Self::IndexBufferPastEnd
+            | Self::UlongTextureAtomic
+            | Self::SeparateDepthStencil
+            | Self::KernelImageblock
+            | Self::FragmentImageblock
+            | Self::SparseTexture
+            | Self::KernelAccelerationStructure
+            | Self::KernelStageInput
+            | Self::RasterizationRateMap
+            | Self::DynamicVertexStride
+            | Self::IndirectComputeCommands
+            | Self::IndirectDrawTypes
+            | Self::IndirectCommandInheritance
+            | Self::HostEncodedIndirectCommands
+            | Self::ArgumentBufferPipelineState => Limit::Runtime,
             _ => Limit::Tooling,
         }
     }
@@ -250,7 +502,8 @@ impl ToolingRequirement {
     /// Whether a row carrying this requirement keeps the authoring-capability census open: it is
     /// a tooling gap ([`Limit::Tooling`]), and every requirement stops an executor the census
     /// closes on. A [`Limit::Metal`] requirement closes its row without a reference: no tooling
-    /// can give Metal an answer its compiler cannot build.
+    /// can give Metal an answer its compiler cannot build. A [`Limit::Runtime`] requirement closes
+    /// its row without a candidate run: the product refuses the structure, typed.
     pub fn blocks_closure(self) -> bool {
         self.limit() == Limit::Tooling
     }
@@ -363,21 +616,155 @@ mod tests {
         }
     }
 
-    /// The mesh render pipeline's requirement: both executors draw one, an object function's
-    /// threadgroup memory among it, so only a stage nothing generates stops them
-    /// (`mesh_companion`), this crate's gap, never Metal's, which keeps the census open.
+    /// The mesh render pipeline's requirements: a stage nothing generates stops both executors
+    /// (`mesh_companion`), this crate's gap, which keeps the census open; and the engine's
+    /// candidate draws none (`mesh_render_pipeline`), whose cases stay Metal-qualified, the
+    /// runtime's limit (it has no mesh call), which closes its rows.
     #[test]
     fn mesh_requirements_stop_the_executors_that_do_not_draw_them_yet() {
         let requirement = ToolingRequirement::MeshCompanion;
         assert_eq!(requirement.stops(), Executor::ALL);
         assert_eq!(requirement.limit(), Limit::Tooling, "{requirement}");
         assert!(requirement.blocks_closure(), "{requirement}");
+        assert!(!requirement.qualifies_on_metal(), "{requirement}");
+        let requirement = ToolingRequirement::MeshRenderPipeline;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+    }
+
+    /// A sequentially consistent fence: the Metal oracle runs it, so its cases stay
+    /// Metal-qualified; the runtime refuses it, so the engine's candidate runs none, the runtime's
+    /// limit, which closes its rows.
+    #[test]
+    fn a_seq_cst_fence_stops_only_the_candidate() {
+        let requirement = ToolingRequirement::SeqCstFence;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("seq_cst_fence".parse(), Ok(requirement));
+    }
+
+    /// A render function's function table: the Metal oracle draws it, so its cases stay
+    /// Metal-qualified; the runtime's render pipeline state reads none, so the engine's candidate
+    /// runs none, the runtime's limit, which closes its rows.
+    #[test]
+    fn a_render_function_table_stops_only_the_candidate() {
+        let requirement = ToolingRequirement::RenderFunctionTable;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("render_function_table".parse(), Ok(requirement));
+    }
+
+    /// An indexed draw past its index buffer: the Metal oracle draws it, so its cases stay
+    /// Metal-qualified; the runtime refuses the draw as Metal's validation does, so the engine's
+    /// candidate runs none, the runtime's limit, which closes its rows.
+    #[test]
+    fn an_index_buffer_past_its_end_stops_only_the_candidate() {
+        let requirement = ToolingRequirement::IndexBufferPastEnd;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("index_buffer_past_end".parse(), Ok(requirement));
+    }
+
+    /// A 64-bit texture atomic: the Metal oracle runs it, so its cases stay Metal-qualified; the
+    /// runtime enables no 64-bit image atomic, so the engine's candidate runs none, the runtime's
+    /// limit, which closes its rows. The retired `ulong_texture` name stays retired.
+    #[test]
+    fn a_ulong_texture_atomic_stops_only_the_candidate() {
+        let requirement = ToolingRequirement::UlongTextureAtomic;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("ulong_texture_atomic".parse(), Ok(requirement));
+    }
+
+    /// Separate depth and stencil attachments: the Metal oracle draws them, so their cases stay
+    /// Metal-qualified; the runtime does not build that pass yet, so the engine's candidate runs
+    /// none, the runtime's limit, which closes its rows.
+    #[test]
+    fn a_separate_depth_stencil_attachment_stops_only_the_candidate() {
+        let requirement = ToolingRequirement::SeparateDepthStencil;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+        assert!(!requirement.blocks_closure(), "{requirement}");
+        assert!(requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("separate_depth_stencil".parse(), Ok(requirement));
+    }
+
+    /// The runtime's own indirect command shape, which the engine's candidate does not map: a
+    /// tooling gap, so the checker takes no case of it.
+    #[test]
+    fn the_runtime_s_indirect_command_shape_stops_the_candidate_as_a_tooling_gap() {
+        let requirement = ToolingRequirement::IndirectIndexedDraws;
+        assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+        assert_eq!(requirement.limit(), Limit::Tooling, "{requirement}");
+        assert!(!requirement.qualifies_on_metal(), "{requirement}");
+        assert_eq!("indirect_indexed_draws".parse(), Ok(requirement));
+    }
+
+    /// The families the runtime builds no call for, or refuses at creation on every device: the
+    /// Metal oracle runs each, so its cases stay Metal-qualified; the engine's candidate runs none,
+    /// the runtime's limit, which closes their rows.
+    #[test]
+    fn what_the_runtime_does_not_build_stops_only_the_candidate() {
+        for (requirement, name) in [
+            (ToolingRequirement::KernelImageblock, "kernel_imageblock"),
+            (
+                ToolingRequirement::FragmentImageblock,
+                "fragment_imageblock",
+            ),
+            (ToolingRequirement::SparseTexture, "sparse_texture"),
+            (
+                ToolingRequirement::KernelAccelerationStructure,
+                "kernel_acceleration_structure",
+            ),
+            (ToolingRequirement::KernelStageInput, "kernel_stage_input"),
+            (
+                ToolingRequirement::RasterizationRateMap,
+                "rasterization_rate_map",
+            ),
+            (
+                ToolingRequirement::DynamicVertexStride,
+                "dynamic_vertex_stride",
+            ),
+            (
+                ToolingRequirement::IndirectComputeCommands,
+                "indirect_compute_commands",
+            ),
+            (ToolingRequirement::IndirectDrawTypes, "indirect_draw_types"),
+            (
+                ToolingRequirement::IndirectCommandInheritance,
+                "indirect_command_inheritance",
+            ),
+            (
+                ToolingRequirement::HostEncodedIndirectCommands,
+                "host_encoded_indirect_commands",
+            ),
+            (
+                ToolingRequirement::ArgumentBufferPipelineState,
+                "argument_buffer_pipeline_state",
+            ),
+        ] {
+            assert_eq!(requirement.stops(), [Executor::EngineCandidate]);
+            assert_eq!(requirement.limit(), Limit::Runtime, "{requirement}");
+            assert!(!requirement.blocks_closure(), "{requirement}");
+            assert!(requirement.qualifies_on_metal(), "{requirement}");
+            assert_eq!(name.parse(), Ok(requirement));
+        }
     }
 
     /// Every requirement stops some executor, and an executor's name is as stable as a
     /// requirement's. A requirement that stops the Metal oracle stops every executor: when Metal
     /// cannot run a case, no candidate has an observation to be compared with. Only a tooling gap
-    /// keeps the census open.
+    /// keeps the census open; the runtime's limit stops the candidate alone.
     #[test]
     fn every_requirement_stops_an_executor_and_a_metal_stop_is_an_authoring_stop() {
         for requirement in ToolingRequirement::ALL {
@@ -397,6 +784,11 @@ mod tests {
                     assert_eq!(stops, Executor::ALL, "{requirement}");
                     assert!(!requirement.blocks_closure(), "{requirement}");
                 }
+                Limit::Runtime => {
+                    assert_eq!(stops, [Executor::EngineCandidate], "{requirement}");
+                    assert!(requirement.qualifies_on_metal(), "{requirement}");
+                    assert!(!requirement.blocks_closure(), "{requirement}");
+                }
                 Limit::Tooling => assert!(requirement.blocks_closure(), "{requirement}"),
             }
         }
@@ -407,6 +799,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ToolingRequirement::KernelMinLodClamp]
         );
+        assert_eq!(
+            ToolingRequirement::ALL
+                .into_iter()
+                .filter(|requirement| requirement.limit() == Limit::Runtime)
+                .collect::<Vec<_>>(),
+            [
+                ToolingRequirement::DepthOutsideUnitRange,
+                ToolingRequirement::MeshRenderPipeline,
+                ToolingRequirement::SeqCstFence,
+                ToolingRequirement::RenderFunctionTable,
+                ToolingRequirement::IndexBufferPastEnd,
+                ToolingRequirement::UlongTextureAtomic,
+                ToolingRequirement::SeparateDepthStencil,
+                ToolingRequirement::KernelImageblock,
+                ToolingRequirement::FragmentImageblock,
+                ToolingRequirement::SparseTexture,
+                ToolingRequirement::KernelAccelerationStructure,
+                ToolingRequirement::KernelStageInput,
+                ToolingRequirement::RasterizationRateMap,
+                ToolingRequirement::DynamicVertexStride,
+                ToolingRequirement::IndirectComputeCommands,
+                ToolingRequirement::IndirectDrawTypes,
+                ToolingRequirement::IndirectCommandInheritance,
+                ToolingRequirement::HostEncodedIndirectCommands,
+                ToolingRequirement::ArgumentBufferPipelineState,
+            ]
+        );
         for executor in Executor::ALL {
             assert_eq!(
                 serde_json::to_string(&executor).unwrap(),
@@ -416,7 +835,17 @@ mod tests {
         // The old engine's candidate and the requirements that stopped only it are retired: neither
         // name parses.
         assert!(serde_json::from_str::<Executor>("\"old_engine_candidate\"").is_err());
-        for retired in ["static_sampler_pixel_address", "tile_grid", "ulong_texture"] {
+        // So are the texture-buffer requirements: the runtime makes texture buffers, bound and in
+        // argument buffers, and the engine's candidate runs them.
+        let retired = [
+            "static_sampler_pixel_address",
+            "tile_grid",
+            "ulong_texture",
+            "texture_buffer",
+            "texture_buffer_member",
+            "texture_buffer_literal",
+        ];
+        for retired in retired {
             assert!(retired.parse::<ToolingRequirement>().is_err(), "{retired}");
         }
     }

@@ -6,13 +6,10 @@
 //!
 //! Each kernel loops over its rows (three operand words a row in `[[buffer(0)]]`) and stores one
 //! answer word a row in `[[buffer(1)]]`. The CPU SPIR-V interpreter keeps denormals, as a device
-//! without `DriverDeviation::MetalFloatDenormals` may, so on each such committed profile (one per
-//! fused multiply-add route) an entry that records no `PrecisionNote::DeviceDenormals` must answer
-//! every row as Metal did. `llvm-as` assembles the module; without it the tests skip visibly.
+//! may, so on each committed profile (one per fused multiply-add route) an entry that records no
+//! `PrecisionNote::DeviceDenormals` must answer every row as Metal did. `llvm-as` assembles the module; without it the tests skip visibly.
 
 use crate::device::{DevicePolicy, DeviceProfile};
-use crate::error::DriverDeviation;
-use crate::lower::arith::fma;
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
@@ -20,7 +17,6 @@ use crate::pipeline::testing::{
 };
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::testing::committed_profiles_with;
-use std::collections::BTreeSet;
 
 /// Metal's words.
 const WORDS: &str = include_str!("metal_denormals_m3.txt");
@@ -257,15 +253,13 @@ fn interpret(bc: &[u8], name: &str, p: &DeviceProfile, rows: &[([u32; 3], [u32; 
         .collect()
 }
 
-/// The committed profiles under `policy` whose device may keep denormals (no
-/// `DriverDeviation::MetalFloatDenormals`), one per fused multiply-add route.
+/// The first committed profile under `policy` (every one's fused multiply-add is the device's
+/// `Fma`): each device may keep denormals.
 fn profiles(policy: DevicePolicy) -> Vec<(String, DeviceProfile)> {
-    let mut seen = BTreeSet::new();
     committed_profiles_with(policy)
         .expect("profiles")
         .into_iter()
-        .filter(|(_, p)| !p.takes_driver_deviation(DriverDeviation::MetalFloatDenormals))
-        .filter(|(_, p)| seen.insert(fma::float_route(p)))
+        .take(1)
         .collect()
 }
 
@@ -326,8 +320,7 @@ fn run_policy(bc: &[u8], policy: DevicePolicy, what: &str, noted: &[Fun]) -> Vec
     for (stem, p) in profiles(policy) {
         let report = check(bc, &stem, &p);
         eprintln!(
-            "{what} on {stem} ({:?}): DeviceDenormals on {:?}; {} other answers off Metal's",
-            fma::float_route(&p),
+            "{what} on {stem}: DeviceDenormals on {:?}; {} other answers off Metal's",
             report.noted,
             report.wrong.len()
         );
@@ -345,108 +338,11 @@ fn the_default_forms_note_what_they_leave_to_the_device() {
     let Some(bc) = assemble() else {
         return;
     };
-    let wrong = run_policy(&bc, DevicePolicy::default(), "default", &FUNS);
+    let wrong = run_policy(&bc, DevicePolicy::RESIDENT_TABLES, "default", &FUNS);
     assert!(
         wrong.is_empty(),
         "{} answers off Metal's, the first: {:#?}",
         wrong.len(),
         &wrong[..wrong.len().min(40)]
     );
-}
-
-/// In an entry that declares the 16-bit float controls (`narrow::controlled_modes`: the owned
-/// fixtures `fmx_fma_precise` and `fmx_fma_fast`, which compute `half` in 16 bits beside `float`
-/// `fma`, `a * b + c` and `a * w`), the `float` denormals of a device whose driver keeps them
-/// there (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`: NVIDIA's on the RTX 5080 Laptop
-/// GPU and on the RTX 3090) are the device's own: the module records `DeviceDenormals` and
-/// requires no `VkProperty::MetalFloatDenormals`. In an entry that declares no float-controls
-/// mode (`nan_denormals`, the deviation's probe) the same profiles require the deviation's
-/// property, and so does RADV on the Radeon 780M, which flushes them under the controls too.
-/// Another NVIDIA GPU (the desktop RTX 5080) carries neither the deviation nor the workaround.
-/// `llvm-as` assembles the fixtures; without it the test skips visibly.
-#[test]
-fn float_denormals_under_the_half_controls_are_the_devices_where_its_driver_keeps_them() {
-    use crate::device::driver_facts::{NVIDIA_RTX_3090, NVIDIA_RTX_5080_LAPTOP};
-    use crate::device::profile::DriverWorkaround;
-    use crate::device::requirements::{FloatControl, FloatWidth, VkProperty};
-    use crate::device::{Device, DeviceDescription};
-    use crate::pipeline::testing::engine_dir;
-    let mut fixtures = Vec::new();
-    for entry in ["fmx_fma_precise", "fmx_fma_fast", "nan_denormals"] {
-        match llvm_assemble(&engine_dir().join(format!("{entry}.ll"))) {
-            Ok(bitcode) => fixtures.push((entry, bitcode)),
-            Err(AssembleError::Missing(tool)) => {
-                eprintln!("SKIP float_denormals_under_the_half_controls: {tool}");
-                return;
-            }
-            Err(AssembleError::Rejected(e)) => panic!("llvm-as rejected {entry}: {e}"),
-        }
-    }
-    let description = |stem: &str| {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../metal2vulkan-validation/profiles")
-            .join(format!("{stem}.json"));
-        let text = std::fs::read_to_string(&path).expect("profile");
-        DeviceDescription::from_khronos_json(&text, None).expect("description")
-    };
-    let laptop = description("nvidia-rtx5080-laptop");
-    assert_eq!(laptop.device_id, NVIDIA_RTX_5080_LAPTOP);
-    let mut rtx_3090 = laptop.clone();
-    rtx_3090.device_id = NVIDIA_RTX_3090;
-    let mut desktop = laptop.clone();
-    desktop.device_id = 0x2c02;
-    // (name, description, whether its driver keeps the denormals under the controls, whether it
-    // takes the deviation).
-    let devices = [
-        ("RTX 5080 Laptop GPU", laptop, true, true),
-        ("RTX 3090", rtx_3090, true, true),
-        ("RTX 5080 desktop", desktop, false, false),
-        ("Radeon 780M", description("amd-780m-radv"), false, true),
-    ];
-    let mut kept_noted = 0;
-    for (name, desc, keeps, deviates) in devices {
-        let p = Device::new(desc, DevicePolicy::default())
-            .expect("device")
-            .profile()
-            .clone();
-        assert_eq!(
-            p.workarounds()
-                .contains(&DriverWorkaround::FloatDenormalsKeptUnderHalfControls),
-            keeps,
-            "{name}"
-        );
-        assert_eq!(
-            p.takes_driver_deviation(DriverDeviation::MetalFloatDenormals),
-            deviates,
-            "{name}"
-        );
-        for (entry, bitcode) in &fixtures {
-            let what = format!("{entry} on {name}");
-            let a = compile(bitcode, entry, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
-            link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            let properties = &a.requirements.properties;
-            let controls = properties.contains(&VkProperty::FloatControl(
-                FloatControl::DenormPreserve,
-                FloatWidth::F16,
-            ));
-            let requires = properties.contains(&VkProperty::MetalFloatDenormals);
-            let noted = a.precision.contains(&PrecisionNote::DeviceDenormals);
-            eprintln!(
-                "{what}: 16-bit controls {controls}, requires MetalFloatDenormals {requires}, \
-                 DeviceDenormals {noted}"
-            );
-            assert_eq!(
-                controls,
-                *entry != "nan_denormals",
-                "{what}: the 16-bit controls"
-            );
-            let kept = keeps && controls;
-            assert_eq!(requires, deviates && !kept, "{what}: MetalFloatDenormals");
-            if kept {
-                assert!(noted, "{what}: DeviceDenormals");
-                kept_noted += 1;
-            }
-        }
-    }
-    assert_eq!(kept_noted, 4, "the two fixtures on the two GPUs measured");
 }

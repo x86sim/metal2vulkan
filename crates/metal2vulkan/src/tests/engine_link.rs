@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::budget::SPIRV_WORDS;
-use crate::device::requirements::{FormatUsage, VkFeature};
-use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
+use crate::device::requirements::FormatUsage;
+use crate::device::{DevicePolicy, DeviceProfile};
 use crate::error::{
     DescriptorError, Error, Feature, LowerFamily, MetalAnswer, Needs, RuntimeInput,
 };
@@ -40,7 +40,7 @@ use crate::spirv::testing::{check_words_valid, committed_profiles, spirv_dis};
 use crate::vk;
 
 /// Profiles whose format tables list the fixture's vertex and attachment formats.
-const PROFILES: [&str; 3] = ["moltenvk-m3", "lavapipe", "amd-rdna3-radv"];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "lavapipe", "amd-780m-radv"];
 
 fn assemble(name: &str) -> Option<Vec<u8>> {
     match llvm_assemble(&engine_dir().join(name)) {
@@ -54,22 +54,13 @@ fn assemble(name: &str) -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
-/// Committed profile `stem` without buffer robustness: its containment is checked in the shader.
-fn without_robustness(stem: &str) -> DeviceProfile {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    desc.features.remove(&VkFeature::RobustBufferAccess);
-    desc.features.remove(&VkFeature::RobustBufferAccess2);
-    Device::new(desc, DevicePolicy::default())
-        .expect("device")
-        .profile()
-        .clone()
+/// Committed profile `stem` under the identity domains, the runtime's: the only domains where a
+/// vertex attribute is fetched in fixed function (outside them every attribute is pulled).
+fn identity_prof(stem: &str) -> DeviceProfile {
+    profile(stem, DevicePolicy::default()).expect("committed profile")
 }
 
 /// The vertex descriptor of `stage_io_vertex`'s `Attributes`: one interleaved per-vertex buffer.
@@ -166,15 +157,16 @@ fn validate_all(l: &Linked, stages: &[&FunctionArtifact], p: &DeviceProfile) -> 
 }
 
 /// The fixture's vertex and fragment entries link as one render pipeline on every profile with
-/// the formats: dense attribute locations in `VertexInputState`, fragment inputs at their vertex
-/// outputs' locations, colors at their attachments, and L3 on both relocated modules.
+/// the formats, under the identity domains (where the attributes are fixed function): dense
+/// attribute locations in `VertexInputState`, fragment inputs at their vertex outputs' locations,
+/// colors at their attachments, and L3 on both relocated modules.
 #[test]
 fn a_vertex_fragment_pipeline_links_end_to_end() {
     let Some(bc) = assemble("stage_io.ll") else {
         return;
     };
     for stem in PROFILES {
-        let p = prof(stem);
+        let p = identity_prof(stem);
         assert!(
             p.supports_format(vk::Format::R32G32B32_SFLOAT, FormatUsage::VertexBuffer),
             "{stem} lists vertex formats"
@@ -242,7 +234,10 @@ fn pipeline_mismatches_are_typed_refusals() {
     };
     let p = prof("moltenvk-m3");
     let v = vertex_under(&bc, &vertex_descriptor(), &p).expect("vertex");
-    let f = compile(&bc, "stage_io_fragment", &p).expect("fragment");
+    // The fragment compiled for the attachments' color writes, which every change below keeps.
+    let targets = render_inputs(vertex_descriptor());
+    let f = compile_with(&bc, "stage_io_fragment", &p, &fragment_inputs(&targets, &p))
+        .expect("fragment");
     // Attribute 4 as a signed format: its projection is pulled, so the fixed-function stage is
     // foreign to the descriptor; compiled under that projection it is fetched in the shader
     // and links.
@@ -353,20 +348,20 @@ fn a_color_without_an_attachment_is_written_nowhere() {
     }
 }
 
-/// Without buffer robustness nothing bounds fixed-function vertex input
-/// (`VUID-vkCmdDraw-None-02721`), so the projection pulls every attribute. On each profile with
-/// its robustness removed, the fixture's descriptor (the one `a_vertex_fragment_pipeline_links_end_to_end`
-/// fetches fixed function) links with no fixed-function binding or attribute, every attribute is
+/// Without buffer robustness, which no profile enables, nothing bounds fixed-function vertex input
+/// (`VUID-vkCmdDraw-None-02721`), so outside the identity domains the projection pulls every
+/// attribute. On each profile, the fixture's descriptor (the one
+/// `a_vertex_fragment_pipeline_links_end_to_end` fetches fixed function) links with no fixed-function binding or attribute, every attribute is
 /// pulled from buffer 0 through a read-only storage descriptor, and both modules pass L3. The
 /// vertex stage compiled with fixed-function input for the same profile is another pipeline's:
 /// link refuses it against the descriptor.
 #[test]
-fn without_buffer_robustness_every_attribute_is_pulled() {
+fn outside_the_identity_domains_every_attribute_is_pulled() {
     let Some(bc) = assemble("stage_io.ll") else {
         return;
     };
     for stem in PROFILES {
-        let p = without_robustness(stem);
+        let p = prof(stem);
         let d = vertex_descriptor();
         let v = vertex_under(&bc, &d, &p).unwrap_or_else(|e| panic!("{stem}: vertex: {e}"));
         let attrs = v.interface.io.attributes();
@@ -546,13 +541,15 @@ fn dual_source_blending_needs_the_second_output() {
     };
     let p = prof("moltenvk-m3");
     let v = compile(&bc, "stage_io_vertex_position", &p).expect("vertex");
-    let dual = compile(&bc, "stage_io_fragment_dual_source", &p).expect("dual source");
-    let single = compile(&bc, "stage_io_fragment_point", &p).expect("single output");
     let mut r = RenderLinkInputs::new();
     let mut blend = ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm);
     blend.blending_enabled = true;
     blend.destination_rgb_blend_factor = BlendFactor::OneMinusSource1Color;
     r.color_attachments[0] = Some(blend);
+    let inputs = fragment_inputs(&r, &p);
+    let dual =
+        compile_with(&bc, "stage_io_fragment_dual_source", &p, &inputs).expect("dual source");
+    let single = compile_with(&bc, "stage_io_fragment_point", &p, &inputs).expect("single output");
     let l = link(&[&v, &dual], &render(&r), &p).expect("dual-source pipeline");
     validate_all(&l, &[&v, &dual], &p);
     assert_eq!(
@@ -599,13 +596,20 @@ fn a_device_address_slot_needs_pointer_translation() {
     assert!(addressed > 0, "some committed profile has device addresses");
 }
 
-/// The fixture's vertex function compiles fixed function for the descriptor's attributes.
+/// The fixture's vertex function compiles fixed function for the descriptor's attributes under
+/// the identity domains, and pulls every one outside them.
 #[test]
 fn the_projection_of_the_fixture_is_fixed_function() {
     let Some(bc) = assemble("stage_io.ll") else {
         return;
     };
-    let p = prof("moltenvk-m3");
+    let tables = vertex_under(&bc, &vertex_descriptor(), &prof("moltenvk-m3")).expect("vertex");
+    let pulled = tables.interface.io.attributes();
+    assert_eq!(pulled.len(), 4);
+    assert!(pulled
+        .values()
+        .all(|(_, f)| matches!(f, VertexFetch::Pulled { .. })));
+    let p = identity_prof("moltenvk-m3");
     let v = vertex_under(&bc, &vertex_descriptor(), &p).expect("vertex");
     let attrs = v.interface.io.attributes();
     assert_eq!(attrs.len(), 4);
@@ -616,11 +620,10 @@ fn the_projection_of_the_fixture_is_fixed_function() {
 }
 
 /// A fragment function's write to a half-float channel records the device's NaN encoding
-/// (`PrecisionNote::DeviceNanEncoding`) only where the profile's driver is not measured to store
-/// Metal's NaN: a `float` output's everywhere but MoltenVK, whose conversion is Metal's (the
-/// output's own NaN reaches the device's conversion, which no other driver is measured with), a
-/// `half` output's everywhere, its widening's NaN the device's (NVIDIA's on the RTX 5080 Laptop
-/// GPU stores `0x7fff`). A write to an `RGBA8Unorm` attachment records none.
+/// (`PrecisionNote::DeviceNanEncoding`) on every profile: a `float` output's, whose own NaN
+/// reaches the device's conversion, and a `half` output's, its widening's NaN the device's
+/// (NVIDIA's on the RTX 5080 Laptop GPU stores `0x7fff`). A write to an `RGBA8Unorm` attachment
+/// records none.
 #[test]
 fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
     use crate::pipeline::artifact::PrecisionNote;
@@ -631,11 +634,11 @@ fn half_float_writes_note_the_nan_encoding_where_the_device_rewrites_it() {
     for (stem, float_note, half_note) in [
         ("lavapipe", true, true),
         ("gate-lavapipe-x86_64", true, true),
-        ("amd-rdna3-radv", true, true),
+        ("amd-780m-radv", true, true),
         ("intel-irisxe-rplp-anv", true, true),
         ("nvidia-rtx50-linux", true, true),
         ("nvidia-rtx5080-laptop", true, true),
-        ("moltenvk-m3", false, true),
+        ("moltenvk-m3", true, true),
     ] {
         let p = prof(stem);
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
@@ -880,6 +883,8 @@ fn mode_two_refuses_fragment_texture_writes_it_would_round() {
                 if let Some(c) = choice {
                     inputs.storage_images.insert(slot, c);
                 }
+                // The fragment's push fields follow the vertex function's.
+                inputs.push_base = (v.interface.push.push_range).map_or(0, |(at, size)| at + size);
                 inputs
             };
             // The default mode: recorded where it may be such, linked, valid.
@@ -925,71 +930,33 @@ fn mode_two_refuses_fragment_texture_writes_it_would_round() {
 /// A fragment function's output to a normalized or small float attachment is written as computed
 /// on every profile, its conversion the device's: nothing rounds (no `OpIsNan` of a rounding), the
 /// attachment is not listed as rounded, and its blend of one and zero takes no Vulkan blend, as
-/// Metal's stores the output as written. Where the profile's
-/// driver is measured to convert a `float` output to a half-float or unsigned small float channel
-/// as Metal does (`MetalSmallFloatColorWrites`: RADV on the Radeon 780M, ANV on the Iris Xe of
-/// RPL-P and the UHD 770 of RPL-S, NVIDIA's on the RTX 3090), or an output to a 16-bit unorm or
-/// snorm channel (`MetalNorm16ColorWrites`: the 780M; a blended snorm channel's NaN aside), the
-/// module requires the property and records no `PrecisionNote::DeviceColorConversion` (a small
-/// float's NaN, as computed, is the device's: `PrecisionNote::DeviceNanEncoding`); elsewhere (the
-/// RTX 5080 Laptop GPU, lavapipe; a `half` output to `RG11B10Float`) it records the conversion and
-/// requires neither, but for a `half` output to a half-float channel, a half already, which records
-/// none.
+/// Metal's stores the output as written. The module records `PrecisionNote::DeviceColorConversion`
+/// but for a `half` output to a half-float channel, a half already, which records none.
 #[test]
-fn measured_color_conversions_are_left_to_the_device() {
-    use crate::device::requirements::VkProperty;
+fn color_conversions_are_left_to_the_device() {
     use crate::pipeline::artifact::PrecisionNote;
     let Some(bc) = assemble("rt6_samples.ll") else {
         return;
     };
-    let small = VkProperty::MetalSmallFloatColorWrites;
-    let norm16 = VkProperty::MetalNorm16ColorWrites;
-    // The RTX 3090 (not a committed capture): the RTX 5080 Laptop GPU's capture with its id.
-    let rtx_3090 = {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../metal2vulkan-validation/profiles/nvidia-rtx5080-laptop.json");
-        let text = std::fs::read_to_string(path).expect("profile");
-        let mut d = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        d.device_id = crate::device::driver_facts::NVIDIA_RTX_3090;
-        Device::new(d, DevicePolicy::default())
-            .expect("device")
-            .profile()
-            .clone()
-    };
-    for (stem, p, small_taken, norm16_taken) in [
-        ("amd-780m-radv", prof("amd-780m-radv"), true, true),
-        (
-            "intel-irisxe-rplp-anv",
-            prof("intel-irisxe-rplp-anv"),
-            true,
-            false,
-        ),
-        ("rtx-3090", rtx_3090, true, false),
-        (
-            "intel-uhd770-rpls-anv",
-            prof("intel-uhd770-rpls-anv"),
-            true,
-            false,
-        ),
-        (
-            "nvidia-rtx5080-laptop",
-            prof("nvidia-rtx5080-laptop"),
-            false,
-            false,
-        ),
-        ("lavapipe", prof("lavapipe"), false, false),
+    for stem in [
+        "amd-780m-radv",
+        "intel-irisxe-rplp-anv",
+        "intel-uhd770-rpls-anv",
+        "nvidia-rtx5080-laptop",
+        "lavapipe",
     ] {
+        let p = prof(stem);
         let v = compile(&bc, "rt6_fill_vertex", &p).expect("vertex");
         for (entry, float) in [
             ("rt6_fill_rgba32float", true),
             ("rt6_fill_rgba16float", false),
         ] {
-            for (pf, property, taken) in [
-                (PixelFormat::RGBA16Float, small, small_taken && float),
-                (PixelFormat::R16Float, small, small_taken && float),
-                (PixelFormat::RG11B10Float, small, small_taken && float),
-                (PixelFormat::RGBA16Unorm, norm16, norm16_taken),
-                (PixelFormat::RG16Snorm, norm16, norm16_taken),
+            for pf in [
+                PixelFormat::RGBA16Float,
+                PixelFormat::R16Float,
+                PixelFormat::RG11B10Float,
+                PixelFormat::RGBA16Unorm,
+                PixelFormat::RG16Snorm,
             ] {
                 for blended in [false, true] {
                     let what = format!("{stem} {entry} {pf:?} blended {blended}");
@@ -1005,29 +972,15 @@ fn measured_color_conversions_are_left_to_the_device() {
                     let text = spirv_dis(&words[1]);
                     assert!(!text.contains("OpIsNan"), "{what}\n{text}");
                     assert!(!f.interface.io.rounded_colors.contains(&0), "{what}");
-                    // A blended snorm channel's NaN is Metal's -1.0, which no device stores.
-                    let taken = taken && !(blended && pf == PixelFormat::RG16Snorm);
-                    assert_eq!(
-                        f.requirements.properties.contains(&property),
-                        taken,
-                        "{what}"
-                    );
                     // A `half` output to a half-float channel is a half already.
                     let held =
                         !float && matches!(pf, PixelFormat::RGBA16Float | PixelFormat::R16Float);
                     assert_eq!(
                         f.precision.contains(&PrecisionNote::DeviceColorConversion),
-                        !taken && !held,
+                        !held,
                         "{what}: {:?}",
                         f.precision
                     );
-                    if taken && property == small {
-                        assert!(
-                            f.precision.contains(&PrecisionNote::DeviceNanEncoding),
-                            "{what}: {:?}",
-                            f.precision
-                        );
-                    }
                     let blend = l.graphics.as_ref().expect("graphics").color_attachments[0]
                         .as_ref()
                         .expect("attachment")

@@ -5,8 +5,14 @@
 //! ([`linked_signatures`]), a tool's identity, the MoltenVK toolchain the MSL
 //! checks reproduce, and the generated-program fuzzers ([`fuzz`]) the product's CPU-interpreter
 //! tests and validation's device tests both run, the extended-range bicubic table both check
-//! ([`xr_bicubic`]), and the store-buffering litmus kernel both compile
-//! ([`litmus`]).
+//! ([`xr_bicubic`]), the store-buffering litmus kernel both compile
+//! ([`litmus`]), the loop kernels whose trips leave values read after the loop and their answers
+//! both run ([`loop_kernels`]), the inputs and answer of the vector word-phase fixture the product's
+//! interpreter test, the runtime's device test and the conformance suite all hold
+//! ([`vector_word_phases`]), the dispatches and answer of the threadgroup-memory fixture the
+//! runtime's device test and the conformance suite both hold ([`threadgroup_start`]), and the
+//! counter of a thread's user-space instructions the matrix's
+//! instructions-per-draw records are measured with ([`instructions`]).
 //!
 //! Scratch directories every suite's temporaries go in ([`scratch`]): one root under the OS temp
 //! directory, each run's directory removed when its owner drops and, when its owner is killed
@@ -26,13 +32,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 pub mod fuzz;
+pub mod instructions;
 pub mod linked_signatures;
 pub mod litmus;
+pub mod loop_kernels;
 pub mod metallib;
 pub mod scratch;
 pub mod spirv;
 pub mod stitched;
+pub mod threadgroup_start;
 pub mod tools;
+pub mod vector_word_phases;
 pub mod xr_bicubic;
 
 #[cfg(test)]
@@ -42,9 +52,11 @@ mod tests;
 /// the manifest directory it names (`cargo test` and `cargo nextest` name the test's crate,
 /// `crates/<name>`; a run of a nextest archive on another machine names it in that machine's
 /// checkout, `--workspace-remap`) where that root holds the validation crate's fixtures, else above
-/// this crate as it was built. Tests read the checkout through it and the helpers on it
-/// ([`validation_dir`], [`fixtures_dir`], [`engine_dir`]), never through a path the build baked in
-/// (`env!("CARGO_MANIFEST_DIR")`), which names the build machine's checkout.
+/// this crate as it was built (a binary run outside cargo, which names no manifest directory).
+/// Tests, and the validation library's paths to committed files (its profiles, corpus and lists),
+/// read the checkout through it and the helpers on it ([`validation_dir`], [`fixtures_dir`],
+/// [`engine_dir`]), never through a path the build baked in (`env!("CARGO_MANIFEST_DIR")`), which
+/// names the build machine's checkout.
 pub fn workspace_dir() -> PathBuf {
     let root = |manifest: &Path| {
         manifest

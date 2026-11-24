@@ -18,12 +18,12 @@
 //! to 128-bit vectors (`LP_NATIVE_VECTOR_WIDTH=128`, the width arm64 lavapipe runs) they are 4
 //! lanes, one quad, and `counted_dependent`, `counted_store` and `counted_atomic` read 0 in the
 //! first word of each kept texel and nothing else. The note derives no tolerance, so those sites
-//! are `known-gaps.tsv` rows scoped to the width.
+//! are `known-gaps-rt.tsv` rows scoped to the width.
 //!
-//! Thirteen fragment functions, one row each: the shapes the lane measured for where Metal's
-//! compiler places the sum. Record mode runs every one of them on native Metal, so the recording
-//! holds Metal's own target rather than the lane's two-valued table, and the lane's table becomes a
-//! cross-check this module's tests apply to the recorded targets.
+//! Thirteen fragment functions, one row each: the shapes measured for where Metal's compiler places
+//! the sum. Record mode runs every one of them on native Metal, so the recording holds Metal's own
+//! target, and a two-valued table is a cross-check this module's tests apply to the recorded
+//! targets.
 //!
 //! A row's site is the whole target under a layout whose row is a row of texels and whose element
 //! is one 32-bit signed word, so a diff names the pixel and the channel: "row 1, index 0" of the
@@ -39,9 +39,10 @@
 
 use crate::allowance::Allowance;
 use crate::case::{
-    call, made, Abort, Case, Failure, Handle, Input, MetalSource, SamplerSpec, Side, TextureRole,
-    TextureSpec,
+    call, drawn_or_refused, made, Abort, Case, Failure, Handle, Input, MetalSource, SamplerSpec,
+    Side, TextureRole, TextureSpec,
 };
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -52,7 +53,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture every function of the case lives in.
 const FIXTURE: &str = "fragment_discard_hoist";
@@ -82,7 +82,7 @@ const CLEAR: i32 = -7;
 /// `(0..2, 0..2)` alone.
 const KEPT_QUADS: u32 = 1;
 
-/// The thirteen fragment functions, in the order the lane lists them.
+/// The thirteen fragment functions, in order.
 const SHAPES: [&str; 13] = [
     "hoisted_known",
     "counted_dependent",
@@ -204,16 +204,12 @@ impl Case for DiscardHoist {
                     crate::allowance::Justification::notice(Degradation::QuadsCountedBeforeDiscard),
                 )
             })
-            // Two more kinds our side announces on lavapipe, declared so the notices site stays
-            // readable there: it splits a fragment quad at a clipped edge where Metal keeps it
-            // whole (`quads-split-by-clipping`) and groups a fragment simdgroup its own way
-            // (`fragment-simdgroup-grouping`). Declarations only: the grouping's note derives no
-            // tolerance, so a sum it moves stays divergent, a ledger row (the module doc).
-            // And the notice a card without unified memory announces for the `Shared` buffer the
-            // case reads its sums back through, which is the venue's memory model and not this
-            // case's shape. Measured on the RTX 5080 Laptop (615.71.09), where it fired for this
-            // case with nothing declaring it (replay-nvidia.log).
-            .chain(std::iter::once(crate::replay::shared_memory_notice()))
+            // Two more kinds our side announces, declared so the notices site stays readable: a
+            // device may split a fragment quad at a clipped edge where Metal keeps it whole
+            // (`quads-split-by-clipping`, on every device), and lavapipe groups a fragment
+            // simdgroup its own way (`fragment-simdgroup-grouping`). Declarations only: the
+            // grouping's note derives no tolerance, so a sum it moves stays divergent, a ledger
+            // row (the module doc).
             .chain(
                 [
                     Degradation::QuadsCountedBeforeDiscard,
@@ -223,6 +219,11 @@ impl Case for DiscardHoist {
                 .into_iter()
                 .map(|kind| crate::replay::notice_allowance(kind.code())),
             )
+            // And the runtime's note of a sample through a runtime sampler slot, which every
+            // shape's sample records under the identity domains (`pixel_sampler_scaling_notice`).
+            .chain(std::iter::once(
+                crate::replay::pixel_sampler_scaling_notice(),
+            ))
             .collect()
     }
 
@@ -354,19 +355,14 @@ impl Case for DiscardHoist {
         for (at, shape) in SHAPES.iter().enumerate() {
             let first = at * TARGET_BYTES as usize;
             let target_bytes = bytes[first..first + TARGET_BYTES as usize].to_vec();
-            let mut row = Node::branch(*shape, Vec::new()).with(Node::leaf(
+            let row = Node::branch(*shape, Vec::new()).with(Node::leaf(
                 "texels",
                 Observed::bytes(target_bytes, layout()),
             ));
-            // What each of the row's two pieces of work answered, which is `None` on Metal's side:
-            // a piece of ours that refuses compares against Metal answering and reads as a refusal
-            // rather than a divergence.
-            for (piece, what) in [(2 * at, "pass"), (2 * at + 1, "read")] {
-                if let Some(Some(failure)) = outcome.refused.get(piece) {
-                    row = row.with(Node::leaf(what, Observed::value(failure.recorded())));
-                }
-            }
-            sites.push(row);
+            // A row whose pass or read our side refused has no texels: Metal's encoder calls
+            // answer nothing, so the refusal is the row's answer and compares as one.
+            let refused = (outcome.refusal(2 * at)).or_else(|| outcome.refusal(2 * at + 1));
+            sites.push(drawn_or_refused(row, refused));
         }
         Ok(())
     }
@@ -381,7 +377,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// What a kept thread's simdgroup counted ahead of the discard, as the lane names it.
+    /// What a kept thread's simdgroup counted ahead of the discard.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Answer {
         /// `(0, 0, 0, 0)`: the lanes that survive the discard alone, so the sum moved past it.
@@ -390,9 +386,8 @@ mod tests {
         DroppedQuads,
     }
 
-    /// Metal's answer for each shape, copied from `runtime_lane::discard_hoist::SHAPES` to be
-    /// checked against the recording, never to stand in for it.
-    const LANE_ANSWERS: [(&str, Answer); 13] = [
+    /// Metal's answer for each shape, checked against the recording, never to stand in for it.
+    const TABLE_ANSWERS: [(&str, Answer); 13] = [
         ("hoisted_known", Answer::Survivors),
         ("counted_dependent", Answer::DroppedQuads),
         ("hoisted_const", Answer::Survivors),
@@ -462,14 +457,14 @@ mod tests {
         }
     }
 
-    /// Every target Metal recorded answers as the lane's table says Metal answers, shape for
+    /// Every target Metal recorded answers as the table says Metal answers, shape for
     /// shape, and every texel outside the kept quad holds the clear value.
     ///
-    /// This is the cross-check the port owes the lane: the lane carried a two-valued table, the
-    /// case carries Metal's targets, and this says whether the two agree. It reads the recording,
+    /// The table is two-valued, the case carries Metal's targets, and this says whether the two
+    /// agree. It reads the recording,
     /// so it runs where there is no GPU.
     #[test]
-    fn metal_s_recorded_targets_answer_as_the_lane_s_table() {
+    fn metal_s_recorded_targets_answer_as_the_table() {
         let case = DiscardHoist;
         let Ok(recording) = crate::recording::read(case.name()) else {
             println!("{}: no recording in the tree yet", case.name());
@@ -479,7 +474,7 @@ mod tests {
         let mut differ = Vec::new();
         for recorded in &recording.answers {
             for outcome in &recorded.outcomes {
-                for (shape, expected) in LANE_ANSWERS {
+                for (shape, expected) in TABLE_ANSWERS {
                     let Some(Value::Bytes(bytes)) = outcome
                         .transcript
                         .root
@@ -492,9 +487,9 @@ mod tests {
                     checked += 1;
                     match answer(bytes) {
                         Ok(got) if got == expected => {}
-                        Ok(got) => differ.push(format!(
-                            "{shape}: Metal {got:?}, the lane's table {expected:?}"
-                        )),
+                        Ok(got) => {
+                            differ.push(format!("{shape}: Metal {got:?}, the table {expected:?}"))
+                        }
                         Err(why) => differ.push(format!("{shape}: {why}")),
                     }
                 }
@@ -506,7 +501,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{} of {checked} recorded targets differ from the lane's table",
+            "{} of {checked} recorded targets differ from the table",
             differ.len()
         );
     }

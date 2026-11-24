@@ -59,7 +59,6 @@ mod structs;
 mod tests;
 mod visible;
 
-pub(crate) use args::input_in_stage;
 pub use check::data_type_is;
 pub use sampler::Half;
 pub use sampler::{
@@ -118,7 +117,7 @@ pub struct AirAbi {
     pub function_constants: Vec<FunctionConstantDecl>,
     /// `!air.sampler_states`: constexpr samplers.
     pub static_samplers: Vec<StaticSampler>,
-    /// `!air.global_bindings`: MSL 3.2 program-scope bindings, in list order.
+    /// `!air.global_bindings`: the program-scope bindings, in list order.
     pub global_bindings: Vec<GlobalBinding>,
     /// `!air.visible_function_references`.
     pub visible_function_refs: Vec<VisibleFunctionRef>,
@@ -1169,18 +1168,6 @@ pub struct FunctionConstantDecl {
     pub type_name: DiagName,
 }
 
-/// An MSL 3.2 program-scope binding (`constant T* constant p [[buffer(n)]];`, `texture2d<half>
-/// t [[texture(n)]];` at program scope): `!{!"air.global_binding", <global>, <node>}`. The
-/// global is an `externally_initialized` constant whose value Metal gives from the argument the
-/// node describes, a parameter node of index -1 read as an entry's parameter node would be.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GlobalBinding {
-    /// The program-scope global the argument's value is read through.
-    pub global: GlobalId,
-    /// The argument, as an entry parameter's binding; `param` is the node's index (`u32::MAX`).
-    pub binding: ParamBinding,
-}
-
 /// A constexpr sampler: its global and decoded state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StaticSampler {
@@ -1188,6 +1175,22 @@ pub struct StaticSampler {
     pub global: GlobalId,
     /// The state those words decode to.
     pub state: SamplerState,
+}
+
+/// A program-scope binding of MSL 3.2 (`constant T * constant p [[buffer(n)]];` at program scope),
+/// one entry of `!air.global_bindings`: a constant-space global, externally initialized and
+/// `undef`, whose value the executing stage's argument table holds at the slot its node states.
+/// The node is a parameter node whose index is -1, decoded as a parameter's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalBinding {
+    /// The global each read of the binding loads.
+    pub global: GlobalId,
+    /// What the node binds: its role key and role attributes.
+    pub role: ParamRole,
+    /// `air.arg_type_size`, `air.arg_type_align_size`, and `air.arg_type_name`, as stated.
+    pub ty: ArgTypeInfo,
+    /// `air.arg_name`, for diagnostics.
+    pub name: Option<DiagName>,
 }
 
 /// What an `air.visible_function_reference` names.

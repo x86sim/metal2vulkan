@@ -2,8 +2,8 @@
 //! code itself rather than leaving the conversion to the device.
 //!
 //! A fragment function's color output is the device's to convert (`LoweringInputs::color_writes`),
-//! a unorm channel's too, also where the shader computes a blend in the storage form of framebuffer
-//! fetch (`PrecisionNote::DeviceColorConversion`): these rules serve the writes whose value the
+//! a unorm channel's too, also where the shader computes a blend over its input attachment
+//! (`PrecisionNote::DeviceColorConversion`): these rules serve the writes whose value the
 //! translation computes, Metal's `textureWriteRoundingMode` 2 (a half-float channel rounded to
 //! nearest even), and the private alpha test's 8-bit code ([`unorm8_code`]):
 //!
@@ -27,29 +27,6 @@ use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::{BResult, BuildError, OperandRule};
 use crate::spirv::ids::Value;
 use crate::spirv::ir::{BinOp, ConvOp, GlslOp, UnOp};
-
-/// An upper estimate of the SPIR-V words of one channel's rounding by `rule`.
-pub fn channel_words(rule: ChannelWrite) -> u64 {
-    match rule {
-        ChannelWrite::FloatTowardZero { .. } => 32 * 6,
-        // The rounding's bias and the denormal's shift clamped beside the toward-zero rule's.
-        ChannelWrite::FloatNearestEven { .. } => 36 * 6,
-        // Written as computed, or no rule [`round`] takes.
-        _ => 0,
-    }
-}
-
-/// An upper estimate of the SPIR-V words of rounding an output by `rules`, its extracts and
-/// construct included.
-pub fn words(rules: &[Option<ChannelWrite>; 4]) -> u64 {
-    let written = rules.iter().flatten().count() as u64;
-    rules
-        .iter()
-        .flatten()
-        .map(|&r| channel_words(r))
-        .sum::<u64>()
-        + written.saturating_add(1).saturating_mul(6)
-}
 
 fn malformed() -> BuildError {
     BuildError::Operand {

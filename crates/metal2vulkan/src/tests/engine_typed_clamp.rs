@@ -7,11 +7,11 @@
 //!   again, a `float *` carried across the rows (a flattened index), or the pointer's own index
 //!   over the rows. The first and the last line up; the other two recover their indices from the
 //!   offset, and every enclosing array level is recovered with them.
-//! - An out-of-range dynamic index, from a buffer (past the end, and -1), on a load and a store of
-//!   a threadgroup object and a load of a constant object, reaches its level's last element: a load
-//!   reads it and a store writes it. On a typed alloca the access is checked: the load reads zero
-//!   and the store is dropped. The neighbouring object is untouched, and an in-range index on each
-//!   kind reads every element as stored.
+//! - An out-of-range dynamic index, from a buffer (past the end, and -1), on a load of a constant
+//!   object reaches its level's last element. On a typed alloca the access is checked: the load
+//!   reads zero and the store is dropped. The neighbouring object is untouched, and an in-range
+//!   index on each kind reads every element as stored. A threadgroup object's accesses are not
+//!   contained: one past the object is undefined, as in Metal.
 //! - The tiled matrix product of a kernel's two `float[16][16]` threadgroup tiles, every access
 //!   lined up, answers the CPU's fused multiply-adds in the kernel's order bit for bit.
 //!
@@ -27,19 +27,19 @@ use crate::lower::access::AccessStrategy;
 use crate::lower::select::Plan;
 use crate::lower::strategy::Strategy;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::TypedModule;
 
-const PROFILES: [&str; 3] = ["moltenvk-m3", "vk12-floor", "lavapipe"];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "runtime-floor", "lavapipe"];
 
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
 fn p(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn assemble(name: &str, body: &str) -> Option<Vec<u8>> {
@@ -101,10 +101,12 @@ fn slot(index: u32) -> ResourceSlot {
 /// its grid position) is one region at the grid's origin.
 fn resources(plan: &Plan, local: (u64, u64), bufs: &[Vec<u32>]) -> Resources {
     let mut s = BTreeMap::new();
-    s.insert(SpecKey::LocalSize(Axis::X), local.0);
-    s.insert(SpecKey::LocalSize(Axis::Y), local.1);
-    s.insert(SpecKey::LocalSize(Axis::Z), 1);
-    s.insert(SpecKey::FlatLocalSize, local.0 * local.1);
+    let side = |v: u64| u32::try_from(v).expect("a threadgroup side");
+    s.extend(crate::pipeline::threadgroup_constants([
+        side(local.0),
+        side(local.1),
+        1,
+    ]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -267,7 +269,7 @@ fn every_in_range_element_moves_as_its_bits_however_the_pointer_is_formed() {
             let accesses = typed_accesses(&plan);
             assert_eq!(accesses.len(), 2, "{what}");
             for (op, a) in accesses {
-                assert!(a.clamped, "{what}: {op}");
+                assert!(!a.clamped, "{what}: {op}");
                 assert_eq!(a.path.dynamic().count(), 2, "{what}: {op}: both levels");
                 let lined_up = op == "store" || lined;
                 assert_eq!(a.indices.is_some(), lined_up, "{what}: {op}");
@@ -338,51 +340,12 @@ const FIRST: u32 = 0x4100_0000;
 const SECOND: u32 = 0x4200_0000;
 const STORED: u32 = 0x4300_0000;
 
-/// An out-of-range dynamic index never leaves its object. A threadgroup object's load and store,
-/// and a constant object's load, reach the level's last element; a typed alloca's are checked, the
-/// load reading zero and the store dropped, so the alloca's last element keeps its value. The
-/// neighbouring object keeps its elements, and every in-range element reads back as stored.
+/// An out-of-range dynamic index never leaves its object. A constant object's load reaches the
+/// level's last element; a typed alloca's are checked, the load reading zero and the store dropped,
+/// so the alloca's last element keeps its value. The neighbouring object keeps its elements, and
+/// every in-range element reads back as stored.
 #[test]
 fn an_out_of_range_index_stays_inside_its_object() {
-    // Threadgroup objects: threads 0..7 fill both, thread 0 stores out of range after a barrier.
-    let threadgroup = format!(
-        r#"@ga = internal addrspace(3) global [8 x float] undef, align 4
-@gb = internal addrspace(3) global [8 x float] undef, align 4
-
-define void @tg(ptr addrspace(1) %out, ptr addrspace(1) %inp, i32 %t) {{
-entry:
-  %pa = getelementptr inbounds [8 x float], ptr addrspace(3) @ga, i64 0, i64 0
-  %pb = getelementptr inbounds [8 x float], ptr addrspace(3) @gb, i64 0, i64 0
-  %k = and i32 %t, 7
-  %ki = zext i32 %k to i64
-  %wa = add i32 %k, FIRST
-  %fa = bitcast i32 %wa to float
-  %qa = getelementptr inbounds [8 x float], ptr addrspace(3) @ga, i64 0, i64 %ki
-  store float %fa, ptr addrspace(3) %qa, align 4
-  %wb = add i32 %k, SECOND
-  %fb = bitcast i32 %wb to float
-  %qb = getelementptr inbounds [8 x float], ptr addrspace(3) @gb, i64 0, i64 %ki
-  store float %fb, ptr addrspace(3) %qb, align 4
-  tail call void @air.wg.barrier(i32 2, i32 1)
-  %first = icmp eq i32 %t, 0
-  br i1 %first, label %st, label %join
-st:
-  %s0 = load i32, ptr addrspace(1) %inp, align 4
-  %s0i = sext i32 %s0 to i64
-  %ps = getelementptr inbounds [8 x float], ptr addrspace(3) @ga, i64 0, i64 %s0i
-  store float bitcast (i32 STORED to float), ptr addrspace(3) %ps, align 4
-  br label %join
-join:
-  tail call void @air.wg.barrier(i32 2, i32 1)
-{tail}}}
-
-{md}"#,
-        tail = CONTAINED_TAIL.replace("ADDR", "addrspace(3)"),
-        md = kernel_md("tg")
-    )
-    .replace("FIRST", &FIRST.to_string())
-    .replace("SECOND", &SECOND.to_string())
-    .replace("STORED", &STORED.to_string());
     // Two typed allocas of the thread's own, filled by constant-index stores.
     let mut fill = String::new();
     for k in 0..8 {
@@ -440,7 +403,6 @@ entry:
     );
     for stem in PROFILES {
         for (name, text, objects, writes, checked) in [
-            ("tg", &threadgroup, 2, true, false),
             ("al", &alloca, 2, true, true),
             ("co", &constant, 2, false, false),
         ] {
@@ -448,14 +410,9 @@ entry:
             if got.is_empty() {
                 return;
             }
-            // A clamped out-of-range store wrote the first object's last element, which the
-            // clamped out-of-range load reads; a checked store was dropped and a checked load read
-            // zero. The second object is untouched.
-            let last = if writes && !checked {
-                STORED
-            } else {
-                FIRST + 7
-            };
+            // A checked store was dropped and a checked load read zero; a clamped out-of-range
+            // load reads the first object's last element. The second object is untouched.
+            let last = FIRST + 7;
             let loaded = if checked { 0 } else { last };
             let mut want: Vec<u32> = (0..64).map(|_| loaded).collect();
             want.extend((0..64u32).map(|t| if t % 8 == 7 { last } else { FIRST + t % 8 }));
@@ -500,7 +457,7 @@ fn a_store_past_a_thread_local_array_changes_none_of_its_words() {
         want.extend(&array);
         want.extend([0, 0, 0xF000_0000 | t]);
     }
-    for stem in ["amd-780m-radv", "lavapipe", "moltenvk-m3", "vk12-floor"] {
+    for stem in ["amd-780m-radv", "lavapipe", "moltenvk-m3", "runtime-floor"] {
         let prof = p(stem);
         l3(&bc, "ob2_sized_array", &prof, stem);
         let (plan, m) = typed_module(&bc, "ob2_sized_array", &prof).expect("module");

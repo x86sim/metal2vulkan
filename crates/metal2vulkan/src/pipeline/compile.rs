@@ -14,14 +14,16 @@
 //! key derivation is [`key`].
 
 pub mod api;
-pub(crate) mod color_group;
 mod entry;
+mod images;
 pub mod key;
 mod numbered;
-mod partition;
+pub(crate) mod partition;
 mod stage_bound;
 #[cfg(test)]
 mod tests;
+mod unbound;
+pub(crate) mod weights;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -48,20 +50,22 @@ use crate::library::{
 };
 use crate::lower::dispatch::LocalSizeForm;
 use crate::lower::select::{LowerInputs, Plan};
-use crate::pipeline::artifact::{PrecisionNote, StrategyCensus, StrategyUse};
+use crate::lower::simd::lockstep::{self, OrderKey};
+use crate::pipeline::artifact::{PrecisionNote, Reconvergence, StrategyCensus, StrategyUse};
 use crate::pipeline::compile::key::{DynamicKey, LinkedKey};
 use crate::pipeline::descriptor::{
     ColorAttachmentDescriptor, DynamicLibraries, FunctionDescriptor, LinkedFunction,
     LinkedFunctions, LinkedList, MeshPipelineDescriptor, RenderPipelineDescriptor,
-    TessellationDescriptor, VertexDescriptor,
+    VertexDescriptor,
 };
 use crate::pipeline::interface::{SlotInterface, StageInterface};
-use crate::pipeline::sym::VaryingKey;
+use crate::pipeline::sym::{SlotClass, SlotRef, Stage, VaryingKey};
 use crate::reflection;
 use crate::spirv::ir::TypedModule;
 
 pub use entry::{EntryDescriptor, EntryPlan, StandaloneModule};
 pub(crate) use stage_bound::StageBounds;
+pub use stage_bound::COMPILED_STAGE_WEIGHT;
 
 /// Which entry of a bitcode module to compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,26 +88,23 @@ pub enum InputsFrom<'a> {
     /// vertex-stage inputs (`VariantKey::lowering_inputs`), the pipeline's
     /// `maxVertexCallStackDepth` (the `u32`), whether the pipeline's fragment function reads
     /// `[[primitive_id]]` where the device carries it through a varying
-    /// ([`reads_primitive_id_varying`]), and its tessellation state (`None` for Metal's
-    /// defaults), which a post-tessellation vertex function bakes in on a device without
-    /// `tessellationShader` (`LoweringInputs::tessellation`). A plain vertex function writes the
-    /// primitive ID's varying where the device cannot declare a fragment `PrimitiveId`, and a
-    /// post-tessellation one the device emulates on any device
-    /// (`LoweringInputs::primitive_id_varying`).
+    /// ([`reads_primitive_id_varying`]). A vertex function writes the primitive ID's varying where
+    /// the device cannot declare a fragment `PrimitiveId` (`LoweringInputs::primitive_id_varying`),
+    /// and whether the pipeline state is made for indirect command buffers
+    /// (`supportIndirectCommandBuffers`): a vertex function then pulls every attribute it reads
+    /// and tests its command against the execution range (`LoweringInputs::indirect_range`).
     Vertex(
         Option<&'a VertexDescriptor>,
         &'a VariantKey,
         u32,
         bool,
-        Option<&'a TessellationDescriptor>,
+        bool,
     ),
     /// The fragment stage of this render pipeline under a variant key: the key's fragment-stage
     /// inputs, the attachments among the pipeline's color attachments that the specialized entry
     /// writes and whose pixel format is a signed integer
     /// (`LoweringInputs::signed_color_attachments`), whether the pipeline rasterizes more than one
-    /// sample (`LoweringInputs::multisampled`), on a device that orders framebuffer fetch only
-    /// through the pixel interlock the state of the attachments the entry reads
-    /// (`LoweringInputs::framebuffer_fetch`), and, for each index the pipeline's vertex function
+    /// sample (`LoweringInputs::multisampled`), and, for each index the pipeline's vertex function
     /// writes (the [`RawIndices`]), whether the entry reads it
     /// (`LoweringInputs::viewport_index_varying`;
     /// `LoweringInputs::render_target_array_index_varying`). The pipeline's
@@ -132,17 +133,14 @@ pub enum InputsFrom<'a> {
 pub(crate) static NO_PRIMITIVE_VARYINGS: BTreeSet<VaryingKey> = BTreeSet::new();
 
 /// The pipeline state a fragment stage compiles under ([`InputsFrom::Fragment`]): its render
-/// pipeline's, or its mesh render pipeline's, which has no vertex amplification and no call stack
-/// depth of its own (Metal's default, 1).
+/// pipeline's, or its mesh render pipeline's, which has no call stack depth of its own (Metal's
+/// default, 1).
 #[derive(Clone, Copy, Debug)]
 pub struct FragmentPass<'a> {
     pub(crate) color_attachments: &'a [Option<ColorAttachmentDescriptor>; 8],
-    /// The pipeline has a depth or a stencil attachment.
-    pub(crate) depth_or_stencil: bool,
     pub(crate) raster_sample_count: u32,
     pub(crate) rasterization_enabled: bool,
     pub(crate) alpha_to_coverage: bool,
-    pub(crate) max_vertex_amplification_count: u32,
     pub(crate) max_call_stack_depth: u32,
     /// The pipeline's `textureWriteRoundingMode`.
     pub(crate) texture_write_rounding_mode: crate::metal::TextureWriteRoundingMode,
@@ -152,28 +150,22 @@ pub struct FragmentPass<'a> {
     pub(crate) sample_mask: Option<[u32; 4]>,
     /// The pipeline's private alpha test (`LoweringInputs::alpha_test`).
     pub(crate) alpha_test: Option<crate::metal::CompareFunction>,
-    /// The pipeline's private logic operation the function computes itself
-    /// (`LoweringInputs::logic_operation`); `None` from a descriptor, set by the compile layer on
-    /// a device without Vulkan's `logicOp` (`private_state::logic_operation`).
-    pub(crate) logic_operation: Option<crate::vk::LogicOp>,
     /// The pipeline's private `fragmentDepthCompareClampMask`
     /// (`LoweringInputs::depth_compare_clamp_mask`).
     pub(crate) depth_compare_clamp_mask: u32,
-    /// The group of the pipeline's color attachments the function writes
-    /// (`LoweringInputs::color_group`), whose variant's descriptor `color_attachments` is
-    /// (`color_group::descriptor`); `None` from a descriptor, set by the compile layer.
-    pub(crate) color_group: Option<&'a crate::pipeline::lower_inputs::ColorGroup>,
+    /// Where the function's push fields start on the floor (`LoweringInputs::push_base`): 0 from
+    /// a render descriptor, set by the compile layer from the vertex function it compiled; past
+    /// the object and mesh functions' windows for a mesh pipeline's.
+    pub(crate) push_base: u32,
 }
 
 impl<'a> From<&'a RenderPipelineDescriptor> for FragmentPass<'a> {
     fn from(d: &'a RenderPipelineDescriptor) -> FragmentPass<'a> {
         FragmentPass {
             color_attachments: &d.color_attachments,
-            depth_or_stencil: d.depth_format.is_some() || d.stencil_format.is_some(),
             raster_sample_count: d.raster_sample_count,
             rasterization_enabled: d.rasterization_enabled,
             alpha_to_coverage: d.alpha_to_coverage,
-            max_vertex_amplification_count: d.max_vertex_amplification_count,
             max_call_stack_depth: d.max_fragment_call_stack_depth,
             texture_write_rounding_mode: d.texture_write_rounding_mode,
             sample_mask: None,
@@ -181,9 +173,8 @@ impl<'a> From<&'a RenderPipelineDescriptor> for FragmentPass<'a> {
             alpha_test: crate::pipeline::private_state::alpha_test(&d.private)
                 .ok()
                 .flatten(),
-            logic_operation: None,
             depth_compare_clamp_mask: d.private.fragment_depth_compare_clamp_mask,
-            color_group: None,
+            push_base: 0,
         }
     }
 }
@@ -192,18 +183,15 @@ impl<'a> From<&'a MeshPipelineDescriptor> for FragmentPass<'a> {
     fn from(d: &'a MeshPipelineDescriptor) -> FragmentPass<'a> {
         FragmentPass {
             color_attachments: &d.color_attachments,
-            depth_or_stencil: d.depth_format.is_some() || d.stencil_format.is_some(),
             raster_sample_count: d.raster_sample_count,
             rasterization_enabled: d.rasterization_enabled,
             alpha_to_coverage: d.alpha_to_coverage,
-            max_vertex_amplification_count: 1,
             max_call_stack_depth: 1,
             texture_write_rounding_mode: d.texture_write_rounding_mode,
             sample_mask: None,
             alpha_test: None,
-            logic_operation: None,
             depth_compare_clamp_mask: 0,
-            color_group: None,
+            push_base: crate::lower::push::MESH_END,
         }
     }
 }
@@ -228,7 +216,7 @@ impl<'a> InputsFrom<'a> {
     fn call_stack_depth(&self) -> u32 {
         match self {
             InputsFrom::Given(i) => i.max_call_stack_depth.unwrap_or(1),
-            InputsFrom::Vertex(_, _, depth, _, _) => (*depth).max(1),
+            InputsFrom::Vertex(_, _, depth, ..) => (*depth).max(1),
             InputsFrom::Fragment(pass, ..) => pass.max_call_stack_depth.max(1),
         }
     }
@@ -252,40 +240,29 @@ impl<'a> InputsFrom<'a> {
         }
     }
 
-    /// The group of its pipeline's color attachments a fragment stage compiles for
-    /// (`LoweringInputs::color_group`): the given inputs', or the render pipeline variant's.
-    fn color_group(&self) -> Option<&'a crate::pipeline::lower_inputs::ColorGroup> {
+    /// The kernel's texture slots of OpenCL mode's 1D images bound to a 1D texture
+    /// (`LoweringInputs::open_cl_lines`): the given inputs'; a render pipeline's stage has none.
+    fn open_cl_lines(&self) -> &'a BTreeSet<SlotRef> {
+        static NONE: BTreeSet<SlotRef> = BTreeSet::new();
         match self {
-            InputsFrom::Given(i) => i.color_group.as_ref(),
-            InputsFrom::Vertex(..) => None,
-            InputsFrom::Fragment(pass, ..) => pass.color_group,
+            InputsFrom::Given(i) => {
+                let given: &'a LowerInputs = i;
+                &given.open_cl_lines
+            }
+            InputsFrom::Vertex(..) | InputsFrom::Fragment(..) => &NONE,
         }
-    }
-}
-
-/// The specialized entry `spec` as a compile under `inputs` lowers it on `p`: renumbered for its
-/// color group (`color_group::entry`) where it compiles for one.
-fn grouped_entry(
-    spec: air::Entry,
-    inputs: InputsFrom<'_>,
-    p: &DeviceProfile,
-) -> Result<air::Entry, Error> {
-    match inputs.color_group() {
-        Some(g) => color_group::entry(spec, g, p),
-        None => Ok(spec),
     }
 }
 
 /// Where `inputs` are a render pipeline's fragment stage's, each `[[color(n)]]` input the
 /// specialized fragment entry `spec` declares has an attachment with a pixel format in the
-/// pipeline (the pass's attachments, or its color group's `ColorGroup::present`, the pipeline's
-/// own), whether or not the body reads it: plain Metal refuses the pipeline otherwise, with the
+/// pipeline, whether or not the body reads it: plain Metal refuses the pipeline otherwise, with the
 /// read dead after specialization as with it live ("Shaders reads from a color attachment whose
 /// pixel format is MTLPixelFormatInvalid",
 /// `metal2vulkan-conformance/probes/dead_ordered_and_unattached_reads.m`, an M3 Max under macOS
 /// 27.0.1). `InvalidDescriptor(ColorAttachment)` at the first index without one. An input its
-/// constants gate is no parameter of the specialized entry. Checked on the entry before its
-/// group renumbers it, by both a stage's keys ([`stage_inputs`]) and its compile.
+/// constants gate is no parameter of the specialized entry. Checked by both a stage's keys
+/// ([`stage_inputs`]) and its compile.
 fn color_inputs_attached(spec: &air::Entry, inputs: InputsFrom<'_>) -> Result<(), Error> {
     let InputsFrom::Fragment(pass, ..) = inputs else {
         return Ok(());
@@ -298,13 +275,10 @@ fn color_inputs_attached(spec: &air::Entry, inputs: InputsFrom<'_>) -> Result<()
         else {
             continue;
         };
-        let attached = match pass.color_group {
-            Some(g) => g.present.contains(&color),
-            None => pass
-                .color_attachments
-                .get(color as usize)
-                .is_some_and(Option::is_some),
-        };
+        let attached = pass
+            .color_attachments
+            .get(color as usize)
+            .is_some_and(Option::is_some);
         if !attached {
             return Err(Error::InvalidDescriptor(DescriptorError::ColorAttachment {
                 index: color,
@@ -625,15 +599,10 @@ pub fn stage_inputs(
     m: &mut Meter,
 ) -> Result<StageInputs, Error> {
     guarded(|| {
-        let specialized =
-            entries.specialized(fd, inputs.call_stack_depth(), inputs.open_cl_mode(), m)?;
+        let open_cl = (inputs.open_cl_mode(), inputs.open_cl_lines());
+        let specialized = entries.specialized(fd, inputs.call_stack_depth(), open_cl, m)?;
         color_inputs_attached(&specialized.spec, inputs)?;
-        // A color group's variant reads its own renumbering of the entry the creation shares.
-        let grouped = match inputs.color_group() {
-            Some(_) => Some(grouped_entry(specialized.spec.clone(), inputs, p)?),
-            None => None,
-        };
-        let spec = grouped.as_ref().unwrap_or(&specialized.spec);
+        let spec = &specialized.spec;
         let inputs = lower_inputs(spec, inputs, p, m)?;
         let uniform = crate::lower::stage_io::uniform_varyings(spec, &inputs, m)?;
         let writes = raw_indices_written(spec, &inputs);
@@ -643,6 +612,39 @@ pub fn stage_inputs(
             varyings: varyings_written(spec),
             uniform,
         })
+    })
+}
+
+/// Where the fragment function's push fields start behind vertex stage `fd` compiled under
+/// `inputs` on the floor ([`CompiledFunction::fragment_push_base`] of that compile): the end of the
+/// push range its plan places, from a selection alone. The entry is decoded and specialized as
+/// [`stage_inputs`] does (the one `entries` holds, or one made there now), analyzed and selected;
+/// nothing is emitted. A vertex stage is selected once ([`stage_bound`]'s second selection is a
+/// kernel's alone), so the plan is the compile's.
+pub(crate) fn vertex_push_end(
+    fd: &FunctionDescriptor,
+    p: &DeviceProfile,
+    inputs: InputsFrom<'_>,
+    entries: &StageEntries,
+    m: &mut Meter,
+) -> Result<u32, Error> {
+    guarded(|| {
+        with_request_shared(
+            &fd.function,
+            &fd.constants,
+            (&fd.linked, &fd.libraries),
+            inputs,
+            Shared::Entry(entries, fd),
+            |r| {
+                m.weighted(weights::REST, |m| {
+                    let analyzed = analyze_one(r, p, m)?;
+                    let widest = crate::lower::simd::WidestPin::Weighed;
+                    let (plan, _) = analyzed.select(p, widest, m)?;
+                    let tessellated = crate::lower::tessellation::interface(&plan).is_some();
+                    Ok(crate::lower::push::fragment_base(&plan.push, tessellated))
+                })
+            },
+        )
     })
 }
 
@@ -720,10 +722,10 @@ fn bound_entry<'a>(
             "the entry's function is not in its module",
         ))
     })?;
-    Ok(std::borrow::Cow::Owned(air::canon::opencl::entry(
-        ep.clone(),
-        first,
-    )?))
+    // The reflection states each 1D image as the 2D texture Apple's OpenCL binds for it, whatever
+    // a variant binds.
+    let (ep, _) = air::canon::opencl::entry(ep.clone(), first, &BTreeSet::new())?;
+    Ok(std::borrow::Cow::Owned(ep))
 }
 
 /// What a pipeline's reflection states for its stage `fd`, its calls nesting `depth` deep through
@@ -939,12 +941,12 @@ pub struct StageEntries {
 /// The most entries one [`StageEntries`] keeps, whatever their sizes. One creation asks for at
 /// most three (its stages), so this is room for the stages of many states' worth of functions,
 /// while the search stays a scan of a handful.
-const KEPT_ENTRIES: usize = 32;
+pub(crate) const KEPT_ENTRIES: usize = 32;
 
 /// The most bytes of specialized entries one [`StageEntries`] keeps: 64 MiB, each entry counted
 /// as the ledger bytes specializing it held. One translation attempt may use 500 MiB, so
 /// an object shared between creations holds a fraction of one attempt's room.
-const KEPT_ENTRY_BYTES: u64 = 64 << 20;
+pub(crate) const KEPT_ENTRY_BYTES: u64 = 64 << 20;
 
 /// The most module decodes one [`StageEntries`] keeps, whatever their sizes: a render creation's
 /// three stages and one more, which is the window a sweep of states, or a library's entries
@@ -973,6 +975,10 @@ struct Kept {
     decodes_read: u64,
     decodes_copied: u64,
     decode_bytes: u64,
+    /// The entries ordered ([`StageEntries::ordered`]), and the asks that found one ordered
+    /// before.
+    orders_made: u64,
+    orders_found: u64,
 }
 
 /// One module decode of [`StageEntries`], with what tells it apart: the bitcode's own AIR hash,
@@ -1009,11 +1015,29 @@ struct StageEntry {
     depth: u32,
     /// Specialized as the kernel of a compute pipeline of OpenCL mode.
     open_cl_mode: bool,
+    /// With it, the slots of its 1D images bound to a 1D texture (`LoweringInputs::open_cl_lines`).
+    open_cl_lines: BTreeSet<SlotRef>,
     /// What specializing it charged, which every ask that finds it is charged; the byte bound
     /// counts the bytes it holds.
     spent: Spent,
     specialized: Arc<Specialized>,
+    /// The entry ordered for each key asked of it, least recently used first, at most
+    /// [`KEPT_ORDERS`]; the byte bound counts the bytes each holds.
+    ordered: Vec<KeptOrder>,
 }
+
+/// One ordered entry of a [`StageEntry`]: the specialized entry ordered for `key`
+/// ([`lockstep::order`]), with what ordering it charged, which every ask that finds it is charged
+/// beside what specializing it charged.
+struct KeptOrder {
+    key: OrderKey,
+    spent: Spent,
+    ordered: Arc<Specialized>,
+}
+
+/// The most ordered entries one [`StageEntry`] keeps. A device's profile fixes all of the key
+/// but whether the kernel is its one-row variant, so a creation asks for at most two.
+const KEPT_ORDERS: usize = 2;
 
 impl std::fmt::Debug for StageEntries {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1035,6 +1059,20 @@ impl StageEntries {
     pub fn counts(&self) -> (u64, u64) {
         let kept = self.kept.lock();
         kept.as_ref().map_or((0, 0), |k| (k.made, k.found))
+    }
+
+    /// What it holds now: its specialized entries, its module decodes, and the bytes both hold
+    /// (each counted as the ledger bytes making it held, as its bounds count them). Each falls as
+    /// the least recently used go.
+    pub fn held(&self) -> (u64, u64, u64) {
+        let kept = self.kept.lock();
+        kept.as_ref().map_or((0, 0, 0), |k| {
+            (
+                k.entries.len() as u64,
+                k.decodes.len() as u64,
+                k.bytes + k.decode_bytes,
+            )
+        })
     }
 
     /// How many module decodes it has read of bitcode, and how many asks copied a decode an
@@ -1120,7 +1158,9 @@ impl StageEntries {
     }
 
     /// The entry of stage `fd`, its calls nesting `depth` deep through visible functions (0 is
-    /// taken as 1, Metal's default), specialized as a compile specializes it before lowering
+    /// taken as 1, Metal's default), as the kernel of a pipeline of OpenCL mode where `open_cl`
+    /// says so, its 1D images bound to a 1D texture at the slots it names, specialized as a
+    /// compile specializes it before lowering
     /// (its constants bound, its linked functions resolved, its calls inlined, SCCP run), with
     /// what a compile takes beside it (The AIR hash, the entry name, what its code read before, so
     /// a compile of the stage reads it too, [`specialize_one`]): the one made before, charged to
@@ -1130,14 +1170,15 @@ impl StageEntries {
         &self,
         fd: &FunctionDescriptor,
         depth: u32,
-        open_cl_mode: bool,
+        (open_cl_mode, open_cl_lines): (bool, &BTreeSet<SlotRef>),
         m: &mut Meter,
     ) -> Result<Arc<Specialized>, Error> {
         let depth = depth.max(1);
         // The library's table states it without decoding (`Function::info`).
         let air_hash = fd.function.info().air_hash;
         let lock = || self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let found = lock().take(&air_hash, fd, depth, open_cl_mode);
+        let open_cl = (open_cl_mode, open_cl_lines);
+        let found = lock().take(&air_hash, fd, depth, open_cl);
         if let Some((specialized, spent)) = found {
             m.spend(spent)?;
             return Ok(specialized);
@@ -1145,6 +1186,7 @@ impl StageEntries {
         let mut inputs = LowerInputs::new();
         inputs.max_call_stack_depth = call_stack_input(depth);
         inputs.open_cl_mode = open_cl_mode;
+        inputs.open_cl_lines = open_cl_lines.clone();
         let (specialized, spent) = m.measured(|m| {
             with_request_shared(
                 &fd.function,
@@ -1159,7 +1201,7 @@ impl StageEntries {
         let mut kept = lock();
         // Another caller may have specialized the same stage meanwhile: its entry is this one, so
         // the two share one.
-        if let Some((theirs, _)) = kept.take(&air_hash, fd, depth, open_cl_mode) {
+        if let Some((theirs, _)) = kept.take(&air_hash, fd, depth, open_cl) {
             return Ok(theirs);
         }
         kept.made += 1;
@@ -1169,11 +1211,67 @@ impl StageEntries {
             function: fd.clone(),
             depth,
             open_cl_mode,
+            open_cl_lines: inputs.open_cl_lines,
             spent,
             specialized: Arc::clone(&specialized),
+            ordered: Vec::new(),
         });
         kept.evict();
         Ok(specialized)
+    }
+
+    /// The entry of stage `fd` as [`StageEntries::specialized`] gives it, ordered for `key`
+    /// ([`lockstep::order`], under [`weights::LOCKSTEP`]): the one ordered before, charged to `m`
+    /// what specializing and ordering it charged, else ordered now under `m` and kept beside the
+    /// specialized entry. A creation's check of the partition its kernel observes
+    /// ([`kernel_observes_partition`]) and its compile ask for the same key, so the compile orders
+    /// nothing again. A refusal is not kept: the next ask orders it again.
+    fn ordered(
+        &self,
+        fd: &FunctionDescriptor,
+        depth: u32,
+        open_cl: (bool, &BTreeSet<SlotRef>),
+        key: OrderKey,
+        m: &mut Meter,
+    ) -> Result<Arc<Specialized>, Error> {
+        let depth = depth.max(1);
+        // The library's table states it without decoding (`Function::info`).
+        let air_hash = fd.function.info().air_hash;
+        let lock = || self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let found = lock().take_ordered(&air_hash, fd, depth, open_cl, key);
+        if let Some((ordered, specializing, ordering)) = found {
+            m.spend(specializing)?;
+            m.spend(ordering)?;
+            return Ok(ordered);
+        }
+        let specialized = self.specialized(fd, depth, open_cl, m)?;
+        let (ordered, spent) =
+            m.measured(|m| order_specialized(Specialized::clone(&specialized), key, m))?;
+        let ordered = Arc::new(ordered);
+        let mut kept = lock();
+        // Another caller may have ordered the same entry meanwhile: its order is this one, so the
+        // two share one.
+        if let Some((theirs, ..)) = kept.take_ordered(&air_hash, fd, depth, open_cl, key) {
+            return Ok(theirs);
+        }
+        kept.keep_ordered(
+            &air_hash,
+            fd,
+            depth,
+            open_cl,
+            (key, spent, Arc::clone(&ordered)),
+        );
+        kept.evict();
+        Ok(ordered)
+    }
+
+    /// How many entries it has ordered, and how many asks found one ordered before, over its
+    /// whole life (neither ever falls).
+    #[cfg(test)]
+    pub(crate) fn orders(&self) -> (u64, u64) {
+        let kept = self.kept.lock();
+        kept.as_ref()
+            .map_or((0, 0), |k| (k.orders_made, k.orders_found))
     }
 }
 
@@ -1186,19 +1284,85 @@ impl Kept {
         air_hash: &Hash256,
         fd: &FunctionDescriptor,
         depth: u32,
-        open_cl_mode: bool,
+        open_cl: (bool, &BTreeSet<SlotRef>),
     ) -> Option<(Arc<Specialized>, Spent)> {
+        let entry = self.used(air_hash, fd, depth, open_cl)?;
+        let found = (Arc::clone(&entry.specialized), entry.spent);
+        self.found += 1;
+        Some(found)
+    }
+
+    /// The entry of `fd` at `depth` whose function's AIR hash is `air_hash`, made the most
+    /// recently used: `None` where none is held. The hash is compared first, so a scan reads a
+    /// function descriptor only where the hashes agree.
+    fn used(
+        &mut self,
+        air_hash: &Hash256,
+        fd: &FunctionDescriptor,
+        depth: u32,
+        (open_cl_mode, open_cl_lines): (bool, &BTreeSet<SlotRef>),
+    ) -> Option<&mut StageEntry> {
         let at = self.entries.iter().position(|e| {
             e.depth == depth
                 && e.open_cl_mode == open_cl_mode
+                && e.open_cl_lines == *open_cl_lines
                 && e.air_hash == *air_hash
                 && e.function == *fd
         })?;
         let entry = self.entries.remove(at);
-        let found = (Arc::clone(&entry.specialized), entry.spent);
         self.entries.push(entry);
+        self.entries.last_mut()
+    }
+
+    /// The entry of `fd` at `depth` ordered for `key`, both made the most recently used, with
+    /// what specializing it and what ordering it charged, counted found as an entry and as an
+    /// order: `None` where either is not held.
+    fn take_ordered(
+        &mut self,
+        air_hash: &Hash256,
+        fd: &FunctionDescriptor,
+        depth: u32,
+        open_cl: (bool, &BTreeSet<SlotRef>),
+        key: OrderKey,
+    ) -> Option<(Arc<Specialized>, Spent, Spent)> {
+        let entry = self.used(air_hash, fd, depth, open_cl)?;
+        let at = entry.ordered.iter().position(|o| o.key == key)?;
+        let order = entry.ordered.remove(at);
+        let found = (Arc::clone(&order.ordered), entry.spent, order.spent);
+        entry.ordered.push(order);
+        // The ask found the specialized entry too, as `take` counts it.
         self.found += 1;
+        self.orders_found += 1;
         Some(found)
+    }
+
+    /// Keeps `ordered`, the entry of `fd` at `depth` ordered for its key with what ordering it
+    /// charged, beside that entry, dropping the entry's least recently used order past
+    /// [`KEPT_ORDERS`]. Nothing where the entry itself is no longer held.
+    fn keep_ordered(
+        &mut self,
+        air_hash: &Hash256,
+        fd: &FunctionDescriptor,
+        depth: u32,
+        open_cl: (bool, &BTreeSet<SlotRef>),
+        (key, spent, ordered): (OrderKey, Spent, Arc<Specialized>),
+    ) {
+        let Some(entry) = self.used(air_hash, fd, depth, open_cl) else {
+            return;
+        };
+        let mut bytes = spent.held();
+        entry.ordered.push(KeptOrder {
+            key,
+            spent,
+            ordered,
+        });
+        let mut freed = 0;
+        while entry.ordered.len() > KEPT_ORDERS {
+            freed += entry.ordered.remove(0).spent.held();
+        }
+        bytes = bytes.saturating_sub(freed);
+        self.orders_made += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 
     /// The plain answer of `fd` whose function's AIR hash is `air_hash`, made the most recently
@@ -1236,7 +1400,10 @@ impl Kept {
             && (self.entries.len() > KEPT_ENTRIES || self.bytes > KEPT_ENTRY_BYTES)
         {
             let gone = self.entries.remove(0);
-            self.bytes = self.bytes.saturating_sub(gone.spent.held());
+            let ordered: u64 = gone.ordered.iter().map(|o| o.spent.held()).sum();
+            self.bytes = self
+                .bytes
+                .saturating_sub(gone.spent.held().saturating_add(ordered));
         }
         while self.answers.len() > KEPT_ENTRIES.max(1) {
             self.answers.remove(0);
@@ -1262,7 +1429,7 @@ pub(crate) fn stage_entry<T>(
 ) -> Result<T, Error> {
     guarded(|| {
         // A render or mesh pipeline's stage, never a kernel of OpenCL mode.
-        let specialized = entries.specialized(fd, depth, false, m)?;
+        let specialized = entries.specialized(fd, depth, (false, &BTreeSet::new()), m)?;
         f(&specialized.spec, m)
     })
 }
@@ -1490,8 +1657,8 @@ pub(crate) fn primitive_id_varying_on(p: &DeviceProfile) -> bool {
 /// specialized entry (the one `entries` holds, else one made there now under `m`) declares the
 /// parameter, or a `Compiled` stage whose interface reads the varying or Vulkan's `PrimitiveId`
 /// (link refuses the second behind a vertex function that writes the varying). Called only on a
-/// device without a fragment `PrimitiveId` ([`primitive_id_varying_on`]) or without
-/// `tessellationShader` (`lower::tessellation::emulates`), so no other decodes anything.
+/// device without a fragment `PrimitiveId` ([`primitive_id_varying_on`]), so no other decodes
+/// anything.
 pub(crate) fn reads_primitive_id_varying(
     fragment: Option<&crate::pipeline::descriptor::StageSource>,
     depth: u32,
@@ -1501,7 +1668,7 @@ pub(crate) fn reads_primitive_id_varying(
     use crate::pipeline::descriptor::StageSource;
     Ok(match fragment {
         Some(StageSource::Function(fd)) => entries
-            .specialized(fd, depth, false, m)?
+            .specialized(fd, depth, (false, &BTreeSet::new()), m)?
             .spec
             .ep
             .params
@@ -1522,14 +1689,6 @@ pub(crate) fn reads_primitive_id_varying(
         }
         None => false,
     })
-}
-
-/// Whether render pipelines on `p` may carry `[[primitive_id]]` through a varying, so that a
-/// pipeline's fragment entry is read for it ([`reads_primitive_id_varying`]): `p` cannot declare a
-/// fragment `PrimitiveId` ([`primitive_id_varying_on`]), or it emulates post-tessellation vertex
-/// functions (`lower::tessellation::emulates`), whose patch's position the fragment reads.
-pub(crate) fn primitive_id_carried_on(p: &DeviceProfile) -> bool {
-    primitive_id_varying_on(p) || crate::lower::tessellation::emulates(p)
 }
 
 /// Run `g` on the compile request of function `f`. A visible function is not a stage: it is
@@ -1603,9 +1762,8 @@ fn with_request_shared<'k, T>(
     g(&r)
 }
 
-/// Compile entry `entry` of one wrapped or raw bitcode module (`bitcode`), refusing an estimate
-/// above `word_cap` SPIR-V words before emission and a module above it after serialization
-/// (`budget::SPIRV_WORDS` in production).
+/// Compile entry `entry` of one wrapped or raw bitcode module (`bitcode`), refusing a module
+/// above `word_cap` SPIR-V words after serialization (`budget::SPIRV_WORDS` in production).
 #[cfg(test)]
 pub(crate) fn compile_bitcode(
     bitcode: &[u8],
@@ -1680,6 +1838,25 @@ pub(crate) fn compile_bitcode_bounded(
     })
 }
 
+/// One plan of `bitcode`'s entry with default lowering inputs, keeping the widest mode's pin or
+/// weighing it as `widest` says, and its module emitted and weighed as the stage bound makes each
+/// plan it compares (`stage_bound`), with that weight.
+#[cfg(test)]
+pub(crate) fn emit_bitcode_as(
+    bitcode: &[u8],
+    entry: EntryRef<'_>,
+    p: &DeviceProfile,
+    widest: crate::lower::simd::WidestPin,
+    m: &mut Meter,
+) -> Result<(Plan, TypedModule, u64), Error> {
+    guarded(|| {
+        let consts = FunctionConstantValues::defaults();
+        let inputs = LowerInputs::new();
+        let r = Request::bitcode(bitcode, entry, &consts, &[], &inputs);
+        stage_bound::emit_as(&r, p, widest, m)
+    })
+}
+
 /// Stage `fd` compiled with default lowering inputs as [`compile_stage`] compiles it, or as
 /// [`compile_stage_from`] compiles it reading `entries` where given, under the stage bounds
 /// `bounds` in place of [`StageBounds::MEASURED`]: so a test reaches each bound with a small
@@ -1732,7 +1909,7 @@ pub(crate) fn compile_stage_kept(
 
 /// The [`Plan`] of entry `entry` of `bitcode`: everything [`compile_bitcode`] does before the
 /// size check (decode, specialize, analyze, select), under `catch_unwind`. For tests and
-/// measurement of the plan's own claims, such as `SizeEstimate` being an upper bound.
+/// measurement of the plan's own claims.
 #[cfg(test)]
 pub(crate) fn plan_bitcode(
     bitcode: &[u8],
@@ -2087,6 +2264,7 @@ pub(crate) fn spec_request(
         constants: constant_values(&decoded.abi, consts)?,
         call_stack_depth: 1,
         open_cl_mode: false,
+        open_cl_lines: BTreeSet::new(),
     })
 }
 
@@ -2103,7 +2281,8 @@ fn params_used(spec: &air::Entry) -> BTreeSet<u32> {
 /// The Metal attribute indices the specialized vertex entry `spec` reads: its `[[attribute(n)]]`
 /// parameters that survived function-constant specialization and that an instruction uses (the
 /// parameters `lower::stage_io` plans), each with the numeric class it is declared with. Empty for
-/// any other stage.
+/// any other stage. An attribute whose value reaches only an output the constants gate off is not
+/// among them, as Metal reports it inactive: specialization inserts `undef` in that output's field.
 pub(crate) fn declared_attributes(
     spec: &air::Entry,
 ) -> std::collections::BTreeMap<u32, crate::pipeline::stage_io::IoNumeric> {
@@ -2187,11 +2366,41 @@ pub(crate) fn kernel_inputs_read(
             return Ok(inputs.clone());
         };
         let depth = inputs.max_call_stack_depth.unwrap_or(1);
-        let specialized = entries.specialized(fd, depth, inputs.open_cl_mode, m)?;
+        let open_cl = (inputs.open_cl_mode, &inputs.open_cl_lines);
+        let specialized = entries.specialized(fd, depth, open_cl, m)?;
         let read = stage_in_attributes(&specialized.spec);
         let mut out = inputs.clone();
         out.stage_input = Some(given.narrowed_to(&read));
         Ok(out)
+    })
+}
+
+/// Whether the kernel of stage `fd` observes its threadgroup partition under `inputs`, as its
+/// compile decides it (`KernelFacts::partition_oblivious`, which
+/// `CompiledFunction::observes_threadgroup_partition` answers): of the entry the compile selects
+/// from, specialized (the entry `entries` holds, or one made there now) and ordered for the
+/// device of `p` where its profile takes the order (`lower::simd::lockstep::order`, whose barriers
+/// observe it), lowering nothing.
+/// Any other stage observes it.
+pub(crate) fn kernel_observes_partition(
+    fd: &FunctionDescriptor,
+    p: &DeviceProfile,
+    inputs: InputsFrom<'_>,
+    entries: &StageEntries,
+    m: &mut Meter,
+) -> Result<bool, Error> {
+    guarded(|| {
+        with_request_shared(
+            &fd.function,
+            &fd.constants,
+            (&fd.linked, &fd.libraries),
+            inputs,
+            Shared::Entry(entries, fd),
+            |r| {
+                let ordered = ordered_entry(r, p, m)?;
+                Ok(partition::partition(&ordered.spec) != Partition::Oblivious)
+            },
+        )
     })
 }
 
@@ -2212,6 +2421,41 @@ pub(crate) fn signed_colors_written(
         .filter_map(|o| match o.role {
             OutputRole::RenderTarget {
                 attachment: AbiInt::Const(a),
+                ..
+            } => Some(a),
+            _ => None,
+        })
+        .filter(|a| {
+            colors
+                .get(*a as usize)
+                .copied()
+                .flatten()
+                .and_then(|c| crate::metal::format::sampled_type(c.pixel_format))
+                == Some(SampledType::Sint)
+        })
+        .collect()
+}
+
+/// The colors the specialized fragment entry `spec` reads (`[[color(n)]]`) that a render pipeline
+/// whose color attachments are `colors` gives a signed-integer pixel format, under the identity
+/// domains, where an integer read fetches the attachment's own view through an `int` image
+/// (`lower::fragment::color`'s `texture_class`); none elsewhere, where it reads the attachment's
+/// bits through a `uint` input attachment.
+fn signed_colors_fetched(
+    spec: &air::Entry,
+    colors: &[Option<ColorAttachmentDescriptor>],
+    p: &DeviceProfile,
+) -> BTreeSet<u32> {
+    use crate::pipeline::sym::SampledType;
+    if !crate::lower::access::identity(p) || !matches!(spec.ep.stage, AbiStage::Fragment { .. }) {
+        return BTreeSet::new();
+    }
+    spec.ep
+        .params
+        .iter()
+        .filter_map(|param| match param.role {
+            ParamRole::ColorInput {
+                index: AbiInt::Const(a),
                 ..
             } => Some(a),
             _ => None,
@@ -2254,175 +2498,6 @@ pub(crate) fn unattached_colors_written(
         .collect()
 }
 
-/// The framebuffer-fetch state of pass `d` for the specialized fragment entry `spec` on `p`
-/// (`LoweringInputs::framebuffer_fetch`): on a device that orders fetch only through the pixel
-/// interlock, the state of every attachment the entry reads through a `[[color(n)]]` input of a
-/// constant index (one an instruction of its specialized body uses: an input the function's
-/// constants leave unread reads nothing), of every extended-range attachment it writes that the
-/// pass blends (whose blend the function computes from the texel it reads) or writes unblended
-/// under a mask of some of the codes one word holds (`color_writes::merged_extended`), of every
-/// attachment held with its channels rotated whose blend the function computes
-/// (`color_writes::shader_rotated_blend`, in either form below), and of every attachment variant
-/// `v`'s instance keeps out of its subpass that the entry writes through its first output
-/// (`VariantKey::interlocked_colors`); `None` on another device or for an entry that declares none
-/// of them. On a device that orders fetch through rasterization-order input attachments, the state
-/// of every extended-range attachment the entry writes that the pass blends (whose blend the
-/// function computes over its input attachment, `lower::fragment`'s `input_blend`), of every
-/// word attachment it writes under a mask of some of the word's channels (whose word the function
-/// merges into its input attachment's, `color_writes::merged_word`), and of every extended-range
-/// attachment it writes unblended under a mask of some of the codes one word holds (merged so,
-/// `color_writes::merged_extended`); and, where `v`'s instance holds extended-range shadows
-/// (`VariantKey::extended_shadows`), the state of each shadowed attachment the entry reads or
-/// writes through its first output, with the pass's depth or stencil attachment and alpha to
-/// coverage, which bear on the shadow the function stores (`lower::fragment`'s `input_shadow`).
-/// On either device, under a private logic operation the function computes
-/// (`FragmentPass::logic_operation`), the state of every attachment whose format the operation
-/// serves that the entry writes through its first output (`lower::fragment`'s `logic`).
-pub(crate) fn fetch_inputs(
-    spec: &air::Entry,
-    d: FragmentPass<'_>,
-    v: &VariantKey,
-    p: &DeviceProfile,
-) -> Option<crate::pipeline::lower_inputs::FramebufferFetchInputs> {
-    let interlock = crate::lower::fragment::interlock_orders(p);
-    let inputs = crate::lower::fragment::inputs_order(p);
-    if !matches!(spec.ep.stage, AbiStage::Fragment { .. }) || !(interlock || inputs) {
-        return None;
-    }
-    // An extended-range color whose `half` shadow the draw's instance holds, which a function on
-    // a device that fetches through input attachments reads beside it.
-    let shadowed = |color: u32| inputs && v.extended_shadows.contains(&color);
-    let blended = |color: u32| {
-        d.color_attachments
-            .get(color as usize)
-            .copied()
-            .flatten()
-            .is_some_and(|c| {
-                c.blending_enabled
-                    && crate::metal::format::ExtendedRange::of(c.pixel_format).is_some()
-            })
-    };
-    // An extended-range attachment whose word's codes an unblended write of some of them merges
-    // into the word it reads.
-    let merged_extended = |color: u32| {
-        d.color_attachments
-            .get(color as usize)
-            .copied()
-            .flatten()
-            .is_some_and(|c| crate::pipeline::color_writes::merged_extended(&c))
-    };
-    // A word attachment whose writes the function blends over, or merges into, the word it reads.
-    let stored_word = |color: u32| {
-        d.color_attachments
-            .get(color as usize)
-            .copied()
-            .flatten()
-            .and_then(|c| crate::pipeline::color_writes::stored_word(&c, p))
-            .is_some()
-    };
-    // A word attachment whose writes the function merges into the word its input attachment
-    // holds.
-    let merged_word = |color: u32| {
-        d.color_attachments
-            .get(color as usize)
-            .copied()
-            .flatten()
-            .and_then(|c| {
-                crate::pipeline::color_writes::merged_word(color, &c, d.alpha_to_coverage, p)
-            })
-            .is_some()
-    };
-    // An attachment held with its channels rotated whose blend the function computes over the
-    // texel it reads, in either form (`color_writes::shader_rotated_blend`).
-    let rotated_blend = |color: u32| {
-        d.color_attachments
-            .get(color as usize)
-            .copied()
-            .flatten()
-            .is_some_and(|c| crate::pipeline::color_writes::shader_rotated_blend(&c, p))
-    };
-    // An attachment whose codes the function's write operates on under the pipeline's private
-    // logic operation, over the texel it reads (`lower::fragment`'s `logic`), in either form.
-    let logic = |color: u32| {
-        d.logic_operation.is_some()
-            && d.color_attachments
-                .get(color as usize)
-                .copied()
-                .flatten()
-                .is_some_and(|c| crate::lower::fragment::logic_channels(c.pixel_format).is_some())
-    };
-    // A color input counts only where the specialized body reads it, as the lowering plans only
-    // a used parameter: a read the function's constants make dead reads nothing, so it takes
-    // neither the storage form nor its blend in the shader.
-    let used = params_used(spec);
-    let read: BTreeSet<u32> = spec
-        .ep
-        .params
-        .iter()
-        .filter(|b| used.contains(&b.param))
-        .filter_map(|b| match b.role {
-            ParamRole::ColorInput {
-                index: AbiInt::Const(color),
-                ..
-            } if interlock || shadowed(color) => Some(color),
-            _ => None,
-        })
-        .chain(spec.ep.outputs.iter().filter_map(|o| match o.role {
-            OutputRole::RenderTarget {
-                attachment: AbiInt::Const(color),
-                index: 0,
-                ..
-            } if blended(color)
-                || rotated_blend(color)
-                || logic(color)
-                || (interlock && (stored_word(color) || merged_extended(color)))
-                || (inputs && (merged_word(color) || merged_extended(color))) =>
-            {
-                Some(color)
-            }
-            // A color the draw's instance keeps out of its subpass, written through the storage
-            // form as a fetched one is.
-            OutputRole::RenderTarget {
-                attachment: AbiInt::Const(color),
-                index: 0,
-                ..
-            } if interlock && v.interlocked_colors.contains(&color) => Some(color),
-            // An extended-range color whose `half` shadow the draw's instance holds, written
-            // through the storage form against it, or over an input attachment beside its shadow
-            // (`lower::fragment`'s `input_shadow`).
-            OutputRole::RenderTarget {
-                attachment: AbiInt::Const(color),
-                index: 0,
-                ..
-            } if v.extended_shadows.contains(&color) => Some(color),
-            _ => None,
-        }))
-        .collect();
-    if read.is_empty() {
-        return None;
-    }
-    // The blend over an input attachment depends on the attachments' state alone: its write is
-    // the fixed function's, which the tests, coverage and views take as any other's. A shadow
-    // beside it is stored by the function, so the tests and the coverage bear on it.
-    let shadows = inputs && !v.extended_shadows.is_empty();
-    Some(match interlock {
-        true => crate::pipeline::lower_inputs::FramebufferFetchInputs::of(
-            read,
-            d.color_attachments,
-            d.depth_or_stencil,
-            d.alpha_to_coverage,
-            d.max_vertex_amplification_count,
-        ),
-        false => crate::pipeline::lower_inputs::FramebufferFetchInputs::of(
-            read,
-            d.color_attachments,
-            shadows && d.depth_or_stencil,
-            shadows && d.alpha_to_coverage,
-            1,
-        ),
-    })
-}
-
 /// A fragment stage's lowering inputs under variant `v` on `p` that need no decoded entry: the
 /// key's, whether pass `d` rasterizes more than one sample (`LoweringInputs::multisampled`), and
 /// how its color attachments take float outputs (`LoweringInputs::color_writes`).
@@ -2455,9 +2530,10 @@ pub(crate) fn fragment_inputs(
     out.rotated_blends = crate::pipeline::color_writes::rotated_blends(d.color_attachments, p);
     out.sample_mask = d.sample_mask;
     out.alpha_test = d.alpha_test;
-    out.logic_operation = d.logic_operation;
     out.depth_compare_clamp_mask = d.depth_compare_clamp_mask;
     out.texture_write_rounding = d.texture_write_rounding_mode;
+    // The floor's one render range moves the fragment function's fields.
+    out.push_base = d.push_base;
     out
 }
 
@@ -2470,8 +2546,8 @@ pub(crate) fn fragment_inputs(
 /// A constant step is in that set because it is the stronger statement of the same thing: the
 /// fetch reads the layout's first element for every vertex and every instance, so a varying it
 /// makes is alike at every vertex of a primitive as surely as a per-instance one's is. It needs
-/// saying here only since the step became a fixed-function binding (`metal::vertex::fetch_as`
-/// answers a divisor of 0): a pulled constant-step fetch reads element 0 in the shader, where the
+/// saying here only since the step became a fixed-function binding of stride 0
+/// (`metal::vertex::fetch_as`): a pulled constant-step fetch reads element 0 in the shader, where the
 /// uniformity is already plain, so this listing is what keeps the two fetch paths writing the
 /// same varyings flat.
 fn instanced_attributes(
@@ -2486,7 +2562,13 @@ fn instanced_attributes(
     let stepped: BTreeSet<u32> = projection
         .attributes
         .iter()
-        .filter(|(_, f)| matches!(f, crate::pipeline::lower_inputs::VertexFetch::FixedFunction))
+        .filter(|(_, f)| {
+            use crate::pipeline::lower_inputs::VertexFetch;
+            matches!(
+                f,
+                VertexFetch::FixedFunction | VertexFetch::SignedFixedFunction
+            )
+        })
         .filter(|(a, _)| {
             desc.attributes
                 .get(a)
@@ -2522,6 +2604,9 @@ fn instanced_attributes(
 fn given_inputs(spec: &air::Entry, i: &LowerInputs) -> LowerInputs {
     let mut out = i.clone();
     out.open_cl_mode = i.open_cl_mode && matches!(spec.ep.stage, AbiStage::Kernel { .. });
+    if !out.open_cl_mode {
+        out.open_cl_lines = BTreeSet::new();
+    }
     out.object_payload = i.object_payload.filter(|&bytes| {
         matches!(
             spec.ep.stage,
@@ -2542,7 +2627,7 @@ fn lower_inputs(
     match inputs {
         InputsFrom::Given(i) => Ok(given_inputs(spec, i)),
         // A post-tessellation vertex function pulls every attribute it reads.
-        InputsFrom::Vertex(desc, variant, depth, primitive_id, tessellation)
+        InputsFrom::Vertex(desc, variant, depth, primitive_id, _)
             if matches!(spec.ep.stage, AbiStage::Vertex { patch: Some(_) }) =>
         {
             let attributes = crate::lower::tessellation::attributes_read(spec);
@@ -2551,20 +2636,18 @@ fn lower_inputs(
             let mut out = variant.lowering_inputs(crate::pipeline::sym::Stage::Vertex);
             out.vertex_fetch = Some(projection);
             out.max_call_stack_depth = call_stack_input(depth);
-            // Only an emulated function bakes the tessellation state in, and writes its patch's
-            // position for a fragment function that reads `[[primitive_id]]`; one drawn through the
-            // device's tessellation stages is refused under the field (`lower::stage_io`).
-            if crate::lower::tessellation::emulates(p) {
-                out.tessellation = tessellation.copied();
-            }
+            // A fragment function that reads `[[primitive_id]]` behind it is refused under the
+            // field (`lower::stage_io`).
             out.primitive_id_varying = primitive_id;
             Ok(key::canonical_inputs(&out))
         }
-        InputsFrom::Vertex(desc, variant, depth, primitive_id, _) => {
+        InputsFrom::Vertex(desc, variant, depth, primitive_id, indirect) => {
             let attributes = declared_attributes(spec);
-            // The primitive ID's de-indexed form and the private list form pull every attribute,
-            // whatever the caller's projection would fetch in fixed function.
-            let pull_every = variant.primitive_id_indices.is_some() || variant.private_list;
+            // The primitive ID's de-indexed form, the private list form and a state made for
+            // indirect command buffers pull every attribute, whatever the caller's projection
+            // would fetch in fixed function: a command binds its vertex buffers by address alone.
+            let pull_every =
+                variant.primitive_id_indices.is_some() || variant.private_list || indirect;
             let projection = crate::pipeline::link::vertex::vertex_fetch_projection_for(
                 desc,
                 &attributes,
@@ -2578,16 +2661,20 @@ fn lower_inputs(
             // Only on a device that cannot declare a fragment `PrimitiveId`: elsewhere a plain
             // vertex function's fragment function reads Vulkan's, Metal's there.
             out.primitive_id_varying = primitive_id && primitive_id_varying_on(p);
+            out.indirect_range = indirect;
             out.instanced_attributes = instanced_attributes(spec, &out, desc, m)?;
             Ok(key::canonical_inputs(&out))
         }
         InputsFrom::Fragment(d, variant, written, primitive, varyings, uniform) => {
             let mut out = fragment_inputs(d, variant, p);
-            out.color_group = d.color_group.cloned();
             out.signed_color_attachments = signed_colors_written(spec, d.color_attachments);
+            out.signed_color_attachments.extend(signed_colors_fetched(
+                spec,
+                d.color_attachments,
+                p,
+            ));
             out.unattached_colors =
                 unattached_colors_written(spec, d.color_attachments, d.alpha_to_coverage);
-            out.framebuffer_fetch = fetch_inputs(spec, d, variant, p);
             let read = raw_indices_read(spec);
             out.viewport_index_varying = written.viewport && read.viewport;
             out.render_target_array_index_varying = written.layer && read.layer;
@@ -2595,8 +2682,8 @@ fn lower_inputs(
             // a fragment function that reads `[[viewport_array_index]]` reads 0 in its place.
             out.region_viewports = variant.region_viewports && read.viewport;
             // Behind a vertex function that writes the primitive ID's varying, on a device that
-            // declares a fragment `PrimitiveId` (behind an emulated post-tessellation vertex
-            // function): elsewhere the fragment function reads the varying without the field.
+            // declares a fragment `PrimitiveId` (one compiled under the field): elsewhere the
+            // fragment function reads the varying without the field.
             out.primitive_id_varying =
                 written.primitive_id && read.primitive_id && !primitive_id_varying_on(p);
             out.primitive_varyings = varyings_read(spec, &out)
@@ -2642,6 +2729,7 @@ struct Planned {
     before: reflection::UnspecializedReads,
     plan: Plan,
     kernel: KernelFacts,
+    unbound: unbound::Unbound,
 }
 
 /// What [`specialize_one`] makes: the AIR hash, the entry name, the specialized entry, and what
@@ -2655,15 +2743,21 @@ struct Specialized {
 }
 
 /// Decode, cross-check a metallib function's container tags, and specialize: the AIR hash, the
-/// entry name, the specialized entry, and what its code read before.
+/// entry name, the specialized entry, and what its code read before. Its work weighs
+/// [`weights::SPECIALIZE`] whoever asks.
 fn specialize_one(r: &Request<'_>, m: &mut Meter) -> Result<Specialized, Error> {
+    m.weighted(weights::SPECIALIZE, |m| specialize_unweighed(r, m))
+}
+
+/// [`specialize_one`]'s work.
+fn specialize_unweighed(r: &Request<'_>, m: &mut Meter) -> Result<Specialized, Error> {
     #[cfg(test)]
     tests::inject::panic_if_armed();
     // The creation's entry of this stage: the same request's, made by a check or key of the
     // creation, else made there now.
     if let Shared::Entry(entries, fd) = r.shared {
-        let kept =
-            entries.specialized(fd, r.inputs.call_stack_depth(), r.inputs.open_cl_mode(), m)?;
+        let open_cl = (r.inputs.open_cl_mode(), r.inputs.open_cl_lines());
+        let kept = entries.specialized(fd, r.inputs.call_stack_depth(), open_cl, m)?;
         return Ok(Specialized::clone(&kept));
     }
     let mut decoded = decoded_module(r, m)?;
@@ -2675,6 +2769,11 @@ fn specialize_one(r: &Request<'_>, m: &mut Meter) -> Result<Specialized, Error> 
     // pipeline's OpenCL mode.
     req.call_stack_depth = r.inputs.call_stack_depth();
     req.open_cl_mode = r.inputs.open_cl_mode();
+    // And a kernel's 1D images bound to a 1D texture, by texture index, which stay 1D.
+    req.open_cl_lines = (r.inputs.open_cl_lines().iter())
+        .filter(|s| s.stage == Stage::Kernel && s.class == SlotClass::Texture)
+        .map(|s| s.index)
+        .collect();
     // Only a module that declares function constants needs them; specialization selects the
     // entry the same way.
     let before = if reflection::specialization_decides_reads(&decoded.abi) {
@@ -2707,17 +2806,40 @@ fn decoded_module(r: &Request<'_>, m: &mut Meter) -> Result<air::Decoded, Error>
 }
 
 /// [`specialize_one`], then the order Apple's simdgroup lockstep gives threadgroup accesses made
-/// explicit for `p`: the entry selection reads, whose instruction indices a refusal's location
-/// names. [`plan_one`] and `DeviceProfile::specialized_entry` both build it
+/// explicit for `p` where its profile takes one ([`OrderKey::of`]; under the identity domains the
+/// specialized entry with its pairs found and none ordered): the entry selection reads, whose instruction indices a refusal's
+/// location names. [`plan_one`] and `DeviceProfile::specialized_entry` both build it
 /// here, so a tool that resolves a refusal's location reads the compile's own entry.
+///
+/// A request that shares the creation's entries orders the entry there once for the creation
+/// ([`StageEntries::ordered`]): the check of the partition its kernel observes and its compile
+/// read one ordered entry.
 fn ordered_entry(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Specialized, Error> {
+    let key = OrderKey::of(p, r.inputs.one_row());
+    if let Shared::Entry(entries, fd) = r.shared {
+        let open_cl = (r.inputs.open_cl_mode(), r.inputs.open_cl_lines());
+        let depth = r.inputs.call_stack_depth();
+        let kept = entries.ordered(fd, depth, open_cl, key, m)?;
+        return Ok(Specialized::clone(&kept));
+    }
+    let specialized = specialize_one(r, m)?;
+    order_specialized(specialized, key, m)
+}
+
+/// The specialized entry `specialized` ordered for `key` ([`lockstep::order`]), its work weighing
+/// [`weights::LOCKSTEP`].
+fn order_specialized(
+    specialized: Specialized,
+    key: OrderKey,
+    m: &mut Meter,
+) -> Result<Specialized, Error> {
     let Specialized {
         air_hash,
         entry,
         spec,
         before,
-    } = specialize_one(r, m)?;
-    let spec = crate::lower::simd::lockstep::order(spec, p, r.inputs.one_row(), m)?;
+    } = specialized;
+    let spec = m.weighted(weights::LOCKSTEP, |m| lockstep::order(spec, key, m))?;
     Ok(Specialized {
         air_hash,
         entry,
@@ -2757,8 +2879,8 @@ fn plan_one(
 }
 
 /// What [`plan_one`] reads of a request before it selects: the ordered entry, what its code read
-/// before specialization, the inputs it lowers under, its key, its memory plan and the partition
-/// it observes. A plan made again past the stage bound (`stage_bound`) selects from it again,
+/// before specialization, the inputs it lowers under, its key, its memory plan, the partition
+/// it observes, whether it is image-only, and what it reads and writes through anything but its bound slots. A plan made again past the stage bound (`stage_bound`) selects from it again,
 /// without decoding, specializing, ordering or analyzing the entry again.
 struct Analyzed {
     key: FunctionCompileKey,
@@ -2767,6 +2889,8 @@ struct Analyzed {
     inputs: LowerInputs,
     memory: crate::memory::plan::MemoryPlan,
     observed: Partition,
+    image_only: bool,
+    unbound: unbound::Unbound,
 }
 
 impl Analyzed {
@@ -2779,7 +2903,9 @@ impl Analyzed {
         m: &mut Meter,
     ) -> Result<(Plan, KernelFacts), Error> {
         let (spec, memory, observed) = (&self.spec, &self.memory, self.observed);
-        let plan = crate::lower::select::select(spec, memory, p, (&self.inputs, widest), m)?;
+        let plan = m.weighted(weights::SELECT, |m| {
+            crate::lower::select::select(spec, memory, p, (&self.inputs, widest), m)
+        })?;
         let kernel = KernelFacts {
             max_total_threads: spec.ep.stage.max_total_threads(),
             work_group_size: spec.ep.stage.work_group_size(),
@@ -2799,6 +2925,7 @@ impl Analyzed {
             },
             partition_oblivious: observed == Partition::Oblivious,
             partition_simdgroups: observed == Partition::Simdgroups,
+            image_only: self.image_only,
         };
         Ok((plan, kernel))
     }
@@ -2811,6 +2938,7 @@ impl Analyzed {
             before: self.before,
             plan,
             kernel,
+            unbound: self.unbound,
         }
     }
 }
@@ -2824,12 +2952,23 @@ fn analyze_one(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Anal
         before,
     } = ordered_entry(r, p, m)?;
     color_inputs_attached(&spec, r.inputs)?;
-    let spec = grouped_entry(spec, r.inputs, p)?;
     let inputs = lower_inputs(&spec, r.inputs, p, m)?;
+    // A partial threadgroups variant runs a direct `dispatchThreads` on subgroups, whose
+    // invocations past the grid it walks: none of the other forms, and no emulated simdgroups. It
+    // is refused first, so the variant asked with another form is refused as itself.
+    if inputs.partial_threadgroups
+        && (inputs.flat_grid
+            || inputs.folded_groups
+            || inputs.replay_bindings
+            || inputs.emulated_simdgroups)
+    {
+        return Err(Unsupported::not_implemented(Feature::PartialThreadgroups).into());
+    }
     // A flat variant runs its grid in threadgroups of its own: only a kernel that does not observe
     // its partition computes the same there; one of the call's threadgroups, also a kernel that
     // observes it through its simdgroups alone.
     let observed = partition::partition(&spec);
+    let image_only = images::image_only(&spec);
     let flat_runs = match inputs.call_threadgroups {
         false => observed == Partition::Oblivious,
         true => observed <= Partition::Simdgroups,
@@ -2839,16 +2978,9 @@ fn analyze_one(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Anal
     }
     // A folded variant runs one threadgroup dispatch of its own threadgroup size: neither a flat
     // grid nor a device replay's bindings. The call's threadgroups are a flat grid's alone, and
-    // not a device replay's, whose commands' threadgroups its preprocess reads. A partial
-    // threadgroups variant runs a direct `dispatchThreads` on subgroups, whose invocations past
-    // the grid it walks: none of the other forms, and no emulated simdgroups.
+    // not a device replay's, whose commands' threadgroups its preprocess reads.
     if inputs.folded_groups && (inputs.flat_grid || inputs.replay_bindings)
         || inputs.call_threadgroups && (!inputs.flat_grid || inputs.replay_bindings)
-        || inputs.partial_threadgroups
-            && (inputs.flat_grid
-                || inputs.folded_groups
-                || inputs.replay_bindings
-                || inputs.emulated_simdgroups)
     {
         return Err(Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into());
     }
@@ -2861,7 +2993,10 @@ fn analyze_one(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Anal
         &inputs,
         (&linked, &r.dynamic.key()),
     );
-    let memory = crate::memory::plan::analyze_memory(&spec, p, m)?;
+    let memory = m.weighted(crate::pipeline::compile::weights::MEMORY, |m| {
+        crate::memory::plan::analyze_memory(&spec, p, m)
+    })?;
+    let unbound = unbound::unbound(&spec, &memory);
     Ok(Analyzed {
         key,
         spec,
@@ -2869,6 +3004,8 @@ fn analyze_one(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Anal
         inputs,
         memory,
         observed,
+        image_only,
+        unbound,
     })
 }
 
@@ -2893,9 +3030,21 @@ fn compile_kept<K>(
     compile_bounded(r, p, m, (word_cap, StageBounds::MEASURED), keep)
 }
 
-/// [`compile_kept`] under the stage bounds `bounds` where the profile has their defects
-/// (`stage_bound`; [`StageBounds::MEASURED`] in production).
+/// [`compile_kept`] under the stage bounds `bounds` where the profile has their defects or bounds
+/// every stage (`stage_bound`; [`StageBounds::MEASURED`] in production). The work of no stage
+/// with a weight of its own weighs [`weights::REST`].
 fn compile_bounded<K>(
+    r: &Request<'_>,
+    p: &DeviceProfile,
+    m: &mut Meter,
+    bounds: (u64, StageBounds),
+    keep: impl FnOnce(&TypedModule) -> K,
+) -> Result<(Arc<FunctionArtifact>, Plan, K), Error> {
+    m.weighted(weights::REST, |m| lower_bounded(r, p, m, bounds, keep))
+}
+
+/// [`compile_bounded`]'s lowering.
+fn lower_bounded<K>(
     r: &Request<'_>,
     p: &DeviceProfile,
     m: &mut Meter,
@@ -2909,13 +3058,15 @@ fn compile_bounded<K>(
             before,
             plan,
             kernel,
+            unbound,
         },
-        crate::lower::emit::Emitted { mut module, merged },
-    ) = stage_bound::emit(r, p, (word_cap, bounds), m)?;
-    // On a driver whose compiler loses a simdgroup's storage writes after an `optnone` call only
-    // its helper invocations make, those invocations take another arm where that is exact, and
-    // each such call left is fenced once every analysis below has read the module.
-    let (helper_guard, fences) = crate::spirv::helper_branches::guard_for(&mut module, p, m)?;
+        crate::lower::emit::Emitted {
+            mut module,
+            merged,
+            held,
+        },
+        entry_weight,
+    ) = stage_bound::emit(r, p, bounds, m)?;
     let function_tables = spec.function_tables.clone();
     let reaches_command_buffers = spec.may_encode_indirect_commands();
     let command_writes = spec.command_writes();
@@ -2941,37 +3092,9 @@ fn compile_bounded<K>(
     // count's) are the product's.
     let writes_memory = crate::spirv::requirements::writes_memory(&module)?;
     // A fragment function's texture slots read only at the fragment's own pixel.
-    let mut own_pixel_textures = crate::spirv::requirements::own_pixel_textures(&module, m)?;
+    let own_pixel_textures = crate::spirv::requirements::own_pixel_textures(&module, m)?;
     // The levels of its bound view each texture slot's reads reach.
     let level_reads = crate::spirv::requirements::level_reads(&module, m)?;
-    // Those a draw can read through a snapshot an earlier draw of the same primitives took, of a
-    // function that writes no memory, and why each other one is left out. A variant compiled to
-    // read them so states its own, and judges none: its only texel access of each is the entry's
-    // copy, at the fragment's own pixel.
-    let snapshots: Vec<u32> = plan.families.fragment.snapshot.keys().copied().collect();
-    let snapshot_textures = match snapshots.is_empty() {
-        false => {
-            if !crate::spirv::requirements::snapshot_copies_alone(&module, &snapshots, m)? {
-                return Err(Error::Internal(InternalError::new(
-                    InternalKind::Invariant,
-                    "a snapshot variant that reads its texture outside the copy",
-                )));
-            }
-            own_pixel_textures.extend(&snapshots);
-            own_pixel_textures.sort_unstable();
-            own_pixel_textures.dedup();
-            crate::spirv::requirements::Judged {
-                slots: snapshots,
-                refusals: Vec::new(),
-            }
-        }
-        true => crate::spirv::requirements::snapshot_textures(
-            &module,
-            &own_pixel_textures,
-            writes_memory,
-            m,
-        )?,
-    };
     // A `half` rounded through `OpQuantizeToF16` (`QuantizeForm::Device`): the module records the
     // native note on every profile, a result below the smallest normal half the device's.
     let mut precision = plan.precision.clone();
@@ -2983,75 +3106,49 @@ fn compile_bounded<K>(
     let device_quantize = quantize == crate::spirv::builder::QuantizeForm::Device
         && crate::lower::arith::narrow::quantizes(&module);
     // A `half` rounded through the device's conversion to 16 bits and back, with no quantize: the
-    // module records the native note, but where the device's conversion is measured to answer
-    // Metal's (`DriverDeviation::MetalHalfConversion`) and every such rounding is of a form the
-    // measurement covers (a `float` the function converts, or an image instruction's texel),
-    // which the module then requires.
+    // module records the native note.
     let converts = quantize == crate::spirv::builder::QuantizeForm::Converted
         && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?;
-    let measured_conversion = converts
-        && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
-        && !crate::lower::arith::narrow::rounds_unmeasured(&module, m)?;
     // A `half` read from its bits by the device's widening, or encoded to them by its narrowing
     // (every profile: `OpFConvert` with `shaderFloat16`, `UnpackHalf2x16` and `PackHalf2x16`
     // without): a NaN's bits are the device's, recorded. Under the float controls its denormals
-    // are Metal's, as a single conversion's, also on a driver that folds the round trip; on a
-    // device whose conversion is measured to read and
-    // narrow every `half` as Metal's (`DriverDeviation::MetalHalfArithmetic`) the module requires
-    // that fact; elsewhere the device may flush them, within the native conversion's note.
+    // are Metal's, as a single conversion's, also on a driver that folds the round trip; elsewhere
+    // the device may flush them, within the native conversion's note.
     let widens = crate::lower::arith::narrow::widens_bits(&module, m)?
         || crate::lower::arith::narrow::encodes_bits(&module, m)?;
-    let measured_widening = widens
-        && quantize == crate::spirv::builder::QuantizeForm::Converted
-        && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfArithmetic);
-    let native_widening = widens && !controls && !measured_widening;
-    // A `half` rounded from `float` arithmetic through the conversion under the float controls,
-    // on a driver that fuses the operation into the narrowing
-    // (`DriverWorkaround::HalfConversionFusedWithArithmetic`): its exact result rounded once,
-    // where Metal rounds the `float` result; the module records the native note.
-    let fused = quantize == crate::spirv::builder::QuantizeForm::Controlled
-        && p.workarounds()
-            .contains(&crate::device::profile::DriverWorkaround::HalfConversionFusedWithArithmetic)
-        && crate::lower::arith::narrow::rounds_arithmetic(&module, m)?;
-    // Its NaN's bits, and those of a `half` held widened that a widening to `float` or a `half`
-    // `fabs` moves: Metal's where the device's widening and narrowing are measured to answer
-    // them (`DriverDeviation::MetalNanMoves`) and the module moves its `half` values only as
-    // measured, which it then requires; the device's, recorded, elsewhere.
-    let held_moves = plan.families.arith.held_nan_moves;
-    let unfolded = (widens || held_moves)
-        && p.takes_driver_deviation(crate::error::DriverDeviation::MetalNanMoves)
-        && crate::lower::arith::narrow::moves_unfolded(&module, m)?;
-    let moved_nans = widens
-        && p.takes_driver_deviation(crate::error::DriverDeviation::MetalNanMoves)
-        && !unfolded;
+    let native_widening = widens && !controls;
+    // A `half` rounded through the conversion and its widening under the float controls: Metal's
+    // `half(float)` by the Vulkan spec, but a driver's compiler may fold the pair into the value it
+    // started from or fuse the `float` operation computing the value into the narrowing and round
+    // its exact result once. The module records the native note on every device, a static note of
+    // the rounding.
+    let controlled = quantize == crate::spirv::builder::QuantizeForm::Controlled;
+    let fused = controlled && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?;
     // A `half` rounded through the device's conversion and its widening, each decorated
     // `NoContraction`, under the float controls that make it Metal's, computed by the device's
     // 16-bit arithmetic, which they make Metal's too, or read from its bits by the device's
     // widening, which they make exact but for a NaN's bits: the entry declares them, and so
-    // requires the device's float-controls properties for them, and no fact. On a driver that
-    // folds the round trip (`DriverWorkaround::HalfConversionPairFolded`, so `Converted`) the
-    // pair's rounding is the device's whatever the entry declares, recorded below, and the rest
-    // is Metal's under them as elsewhere.
-    let declares_controls = controls
-        && (widens
-            || crate::lower::arith::narrow::computes_in_16_bits(&module)
-            || (quantize == crate::spirv::builder::QuantizeForm::Controlled
-                && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?));
+    // requires the device's float-controls properties for them, and no fact. A driver may fold
+    // the round trip whatever the entry declares (NVIDIA's does): the pair's rounding is then the
+    // device's, the static note recorded below, and the rest is Metal's under them.
+    let declares_controls =
+        controls && (widens || crate::lower::arith::narrow::computes_in_16_bits(&module) || fused);
     if declares_controls {
         let modes = crate::lower::arith::narrow::controlled_modes(p).unwrap_or_default();
         module.declare_modes(&modes)?;
     }
+    // An entry whose tangled instructions all stand where their invocations reach them together
+    // takes its reconvergence mode only where the module holds one in a loop a back edge re-enters
+    // from inside a selection.
+    let reconvergence = crate::lower::simd::reentry::settle(&plan.families.simd, &mut module)?;
     // Native half rounding and widening: a module that rounds through the device's quantize or
-    // conversion, or widens a `half` by the device where that is not measured or controlled to be
-    // Metal's, records each kind, and requires no fact.
+    // conversion, or widens a `half` by the device where that is not controlled to be Metal's,
+    // records each kind, and requires no fact.
     let native_half = [
-        (
-            (widens && !moved_nans) || (held_moves && unfolded),
-            PrecisionNote::NativeNanEncoding,
-        ),
+        (widens, PrecisionNote::NativeNanEncoding),
         (device_quantize, PrecisionNote::NativeHalfQuantize),
         (
-            (converts && !measured_conversion) || native_widening || fused,
+            converts || native_widening || fused,
             PrecisionNote::NativeHalfConversion,
         ),
     ];
@@ -3061,43 +3158,37 @@ fn compile_bounded<K>(
             precision.sort_unstable();
         }
     }
-    if helper_guard.exposed {
-        precision.push(PrecisionNote::HelperBranchDropsSimdgroupStores);
-        precision.sort_unstable();
-    }
     if numbering_differs {
         precision.push(PrecisionNote::LinkedSamplerNumbering);
         precision.sort_unstable();
     }
-    // A sample left to the sampler of a device that samples natively: the device's answer.
-    let sampled = plan.families.sampler.metal_sampler || plan.families.sampler.device_sampling;
-    if sampled
-        && p.fields()
-            .enabled
-            .properties
-            .contains(&crate::device::requirements::VkProperty::DeviceSampling)
-        && !precision.contains(&PrecisionNote::DeviceSampling)
+    // A sample left to the device's sampler: the device's answer.
+    if plan.families.sampler.device_sampling && !precision.contains(&PrecisionNote::DeviceSampling)
     {
         precision.push(PrecisionNote::DeviceSampling);
         precision.sort_unstable();
     }
-    // The fences are identities, which the analyses above would read as moves between lanes.
-    fences.apply(&mut module)?;
-    let stats = crate::spirv::verify::verify(&module, p, m)?;
+    let stats = crate::pipeline::artifact::ModuleStats {
+        entry_weight,
+        ..crate::spirv::verify::verify(&module, p, m)?
+    };
     let kept = keep(&module);
     let mut symbols =
         crate::pipeline::link::contract::stage_symbols(&module, &plan.families.stage_io.interface)?;
     // The bits of each specialization constant the module never reads.
     crate::spirv::spec_bits::mark_unread(&module, &mut symbols.spec, &specialized, m)?;
     // The serializer's id tables live while it writes.
-    let ids = crate::spirv::serialize::id_table_bytes(&module, p);
+    let ids = crate::spirv::serialize::id_table_bytes(&module);
     m.charge(ids)?;
-    let module = crate::spirv::serialize::serialize_for(module, p)?;
-    m.release(ids);
+    let module = crate::spirv::serialize::serialize(module)?;
+    // The typed module is gone with its serialization, and its charge with it.
+    m.release(ids.saturating_add(held));
     m.charge(module.footprint())?; // The retained words and relocations.
 
-    // The estimate refused early; the cap holds on what was emitted.
-    crate::lower::estimate::check_emitted(module.words.len(), word_cap)?;
+    // The cap holds on what was emitted.
+    if u64::try_from(module.words.len()).map_or(true, |w| w > word_cap) {
+        return Err(Error::LimitExceeded(crate::error::Limit::SpirvWords));
+    }
     let interface = stage_interface(
         &plan,
         symbols,
@@ -3106,138 +3197,17 @@ fn compile_bounded<K>(
         &function_tables,
         (reaches_command_buffers, command_writes),
         (writes_textures, numbered_samplers),
-        (own_pixel_textures, snapshot_textures, level_reads),
+        (own_pixel_textures, level_reads),
+        unbound,
     );
     let mut requirements = module.requirements.clone();
-    // Pairs only the device's simdgroup lockstep orders.
-    if plan.families.simd.device_lockstep != 0 {
+    // Every sample, gather and comparison is the device's own sampler's, which the stage records
+    // and requires.
+    if plan.families.sampler.device_sampling {
         requirements
             .properties
-            .insert(crate::device::requirements::VkProperty::SimdgroupLockstep);
+            .insert(crate::device::requirements::VkProperty::DeviceSampling);
     }
-    // Every sample, gather and comparison is the device's sampler's: Metal's own on a device
-    // that samples through it, whose answers the stage claims as Metal's, else the device's own,
-    // which the stage records. The module requires whichever it is.
-    let sampling = &plan.families.sampler;
-    if sampling.metal_sampler || sampling.device_sampling {
-        use crate::device::requirements::VkProperty;
-        let native = p
-            .fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::DeviceSampling);
-        requirements.properties.insert(match native {
-            true => VkProperty::DeviceSampling,
-            false => VkProperty::MetalSampler,
-        });
-    }
-    // A `half` fused multiply-add left to the device's 16-bit `Fma` because it is Metal's.
-    if plan.families.arith.f16_fma {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalHalfFma);
-    }
-    // A NaN's bits left to the device's widening, narrowing, negation or magnitude because they
-    // are Metal's.
-    if plan.families.arith.nan_moves || moved_nans || (held_moves && !unfolded) {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalNanMoves);
-    }
-    // A `half` rounded by the device's conversion with no note because it is Metal's.
-    if measured_conversion {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalHalfConversion);
-    }
-    // A packed format's conversion left to the device with no note because it is Metal's.
-    if plan.families.arith.metal_packs {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalPackConversions);
-    }
-    // Metal's `float` and `half` minimum and maximum family left to the device's `NMin`, `NMax`
-    // and `NClamp` because they are Metal's.
-    if plan.families.arith.device_min_max {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalMinMax);
-    }
-    // `half` `+ - * /` left to the device's 16-bit arithmetic because it is Metal's, and a `half`
-    // read from its bits by the device's widening, whose denormals that measurement makes Metal's.
-    if plan.families.arith.f16_arith || measured_widening {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalHalfArithmetic);
-    }
-    // A fragment's simdgroup lane read from its subgroup lane because the device's fragment
-    // subgroups are Metal's simdgroups.
-    if plan.families.simd.metal_lane {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalFragmentSimdgroups);
-    }
-    // A fragment's quads run whole without `RequireFullQuadsKHR` because the device runs its
-    // helpers as Metal does.
-    if plan.families.simd.metal_full_quads {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalFullQuads);
-    }
-    // `float` denormals left to the device because it reads them as Metal does: measured in
-    // entries that declare no float-controls mode, so in one that declares the 16-bit controls,
-    // on a driver measured to keep them there
-    // (`DriverWorkaround::FloatDenormalsKeptUnderHalfControls`), they are the device's own, noted.
-    if plan.families.arith.device_denormals {
-        let kept_by_device = declares_controls
-            && p.workarounds().contains(
-                &crate::device::profile::DriverWorkaround::FloatDenormalsKeptUnderHalfControls,
-            );
-        if !kept_by_device {
-            requirements
-                .properties
-                .insert(crate::device::requirements::VkProperty::MetalFloatDenormals);
-        } else if !precision.contains(&PrecisionNote::DeviceDenormals) {
-            precision.push(PrecisionNote::DeviceDenormals);
-            precision.sort_unstable();
-        }
-    }
-    // The negations, absolute values, floors and ceilings whose `float` denormals the device
-    // reads as Metal does.
-    if plan.families.arith.unary_denormals {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalUnaryDenormals);
-    }
-    // Center varyings read as they are as their pixel form, because the device reads them at
-    // the pixel center as Metal does.
-    if plan.families.stage_io.center_varyings_by_device {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalCenterVaryings);
-    }
-    // Varyings the device interpolates, with no note, because it interpolates as Metal does.
-    if plan.families.stage_io.interpolation_by_metal {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalInterpolation);
-    }
-    // An index stored to its builtin although it differs among a primitive's vertices, because
-    // the device takes the first vertex's as Metal does.
-    if plan.families.stage_io.first_vertex_indices_by_device {
-        requirements
-            .properties
-            .insert(crate::device::requirements::VkProperty::MetalFirstVertexIndices);
-    }
-    // Color channels written as computed, because the device converts them as Metal does.
-    requirements
-        .properties
-        .extend(plan.families.stage_io.color_properties.iter().copied());
-    // Storage writes left to the device's conversion with no note, because the device stores
-    // Metal's codes or NaN there.
-    requirements
-        .properties
-        .extend(plan.families.texture.storage_properties.iter().copied());
     // The set-1 heap's binding flags need their features beside the module's.
     requirements
         .features
@@ -3277,19 +3247,29 @@ fn compile_bounded<K>(
                 .insert(VkFeature::ShaderSampleRateInterpolationFunctions);
         }
     }
+    // Implementation-defined where a tangled instruction runs without maximal reconvergence
+    // (`lower::simd` chooses the entry's reconvergence mode), which the stage's note records.
+    if reconvergence == Reconvergence::ImplementationDefined
+        && !precision.contains(&PrecisionNote::DeviceReconvergence)
+    {
+        precision.push(PrecisionNote::DeviceReconvergence);
+        precision.sort_unstable();
+    }
     let artifact = Arc::new(FunctionArtifact {
         key,
         module,
         interface,
         facts: plan.facts.clone(),
         subgroup: plan.subgroup,
-        // Implementation-defined where a tangled instruction runs without maximal reconvergence
-        // (`lower::simd` chooses the entry's reconvergence mode).
-        reconvergence: crate::lower::simd::reconvergence(&plan),
+        reconvergence,
         precision,
-        strategies: emitted_census(&plan, helper_guard),
+        strategies: census(&plan),
         stats,
-        blob: plan.families.access.blob.as_ref().map(|b| b.bytes.clone()),
+        // The module's own blob (the identity domains) is in its words: the artifact carries a
+        // bound blob's bytes alone.
+        blob: (plan.families.access.blob.as_ref())
+            .filter(|b| b.home == crate::memory::blob::BlobHome::Bound)
+            .map(|b| b.bytes.clone()),
         requirements,
         variant_bits: 0,
         profile: p.fingerprint(),
@@ -3365,37 +3345,6 @@ fn census(plan: &Plan) -> StrategyCensus {
     c
 }
 
-/// [`census`] of the emitted module: the plan's, the selections whose helper invocations take
-/// another arm (`spirv::helper_branches`), each with its helper query and one or two logical
-/// operations (about 12 words), and the `optnone` calls an identity shuffle follows, each with
-/// its lane's load and its shuffle (about 10 words; a structure's two members and their
-/// construction about 30).
-fn emitted_census(
-    plan: &Plan,
-    helper_guard: crate::spirv::helper_branches::Guarded,
-) -> StrategyCensus {
-    let mut c = census(plan);
-    if helper_guard.selections > 0 {
-        c.entries.insert(
-            crate::spirv::helper_branches::STRATEGY.to_owned(),
-            StrategyUse {
-                uses: helper_guard.selections,
-                words: u64::from(helper_guard.selections) * 12,
-            },
-        );
-    }
-    if helper_guard.fences > 0 {
-        c.entries.insert(
-            crate::spirv::helper_branches::FENCE_STRATEGY.to_owned(),
-            StrategyUse {
-                uses: helper_guard.fences,
-                words: u64::from(helper_guard.fences) * 30,
-            },
-        );
-    }
-    c
-}
-
 /// The stage interface the artifact carries: the slots, the push placement, the module's link
 /// contract (every descriptor binding and specialization constant it declares), and whether it
 /// writes memory. A buffer slot's access is the function's, with what the accesses through loaded
@@ -3404,8 +3353,9 @@ fn emitted_census(
 /// store's atomics read the word they modify. A buffer slot at an index of `function_tables` holds
 /// a visible-function table read as its words. `reaches_command_buffers` is the canonical entry's
 /// `Entry::may_encode_indirect_commands`, `command_writes` its `Entry::command_writes`,
-/// `writes_textures` its `Entry::may_write_textures`, and
-/// `numbered_samplers` the samplers a pipeline state numbers for it (`numbered::samplers`).
+/// `writes_textures` its `Entry::may_write_textures`,
+/// `numbered_samplers` the samplers a pipeline state numbers for it (`numbered::samplers`), and
+/// `unbound` what it reads and writes through anything but its bound slots (`unbound`).
 fn stage_interface(
     plan: &Plan,
     symbols: crate::pipeline::link::contract::StageSymbols,
@@ -3414,14 +3364,11 @@ fn stage_interface(
     function_tables: &std::collections::BTreeSet<u32>,
     (reaches_command_buffers, command_writes): (bool, crate::pipeline::interface::CommandWrites),
     (writes_textures, numbered_samplers): (bool, Vec<crate::pipeline::interface::NumberedSampler>),
-    (own_pixel_textures, snapshots, level_reads): (
-        Vec<u32>,
-        crate::spirv::requirements::Judged,
-        Vec<crate::pipeline::interface::LevelReads>,
-    ),
+    (own_pixel_textures, level_reads): (Vec<u32>, Vec<crate::pipeline::interface::LevelReads>),
+    unbound: unbound::Unbound,
 ) -> StageInterface {
     use crate::pipeline::interface::{BufferKind, BufferSlot};
-    use crate::pipeline::sym::{PushField, SlotClass};
+    use crate::pipeline::sym::PushField;
     let mut slots = std::collections::BTreeMap::new();
     for c in plan.slots.iter().flatten() {
         let mut access = c.access;
@@ -3474,17 +3421,15 @@ fn stage_interface(
         io: plan.families.stage_io.interface.clone(),
         tessellation: crate::lower::tessellation::interface(plan),
         writes_memory,
-        mesh_records: crate::lower::mesh::records(&plan.families.mesh),
-        mesh_corners: (plan.families.mesh.mesh).map(crate::lower::mesh::MeshShape::per_primitive),
-        emulated_payload: crate::lower::mesh::emulated_payload(&plan.families.mesh),
         payload: plan.families.mesh.payload,
         reaches_command_buffers,
         command_writes,
         writes_textures,
+        reads_unbound_resources: unbound.reads,
+        writes_unbound_resources: unbound.writes,
+        unbound_storage_textures: unbound.storage_textures,
         numbered_samplers,
         own_pixel_textures,
-        snapshot_textures: snapshots.slots,
-        snapshot_refusals: snapshots.refusals,
         level_reads,
         private_bytes: plan.private_bytes,
         sampler_arrays: crate::lower::sampler::sampler_arrays(plan),

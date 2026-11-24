@@ -1,53 +1,45 @@
-//! How a PVRTC texture's blocks move under `MTLBlitOptionRowLinearPVRTC`, ported from
-//! `runtime_lane::pvrtc_textures`' two row-linear lanes.
+//! How a PVRTC texture's blocks move under `MTLBlitOptionRowLinearPVRTC`.
 //!
 //! PVRTC is the one compressed family whose blocks do **not** lie row by row in a texture by
 //! default: Metal places them in a block order of its own, and
 //! `MTLBlitOptionRowLinearPVRTC` with a `bytesPerRow` is what makes a copy move them row by row.
-//! That option is the whole subject here, and the lane's rows are these, per format and in both
+//! That option is the whole subject here, and the rows are these, per format and in both
 //! `Private` and `Shared` storage:
 //!
 //! - `whole-16` and `whole-32`: a whole level in and out at its own row of blocks;
 //! - `region`: a 32-texel level filled with `0x11`, then 2 x 2 blocks written at texel (8, 4), then
 //!   the whole level and the region read back — so the blocks outside the region are recorded as
 //!   well as those inside it;
-//! - `offset` and `padded` (the 4-bit formats, as the lane): a copy from byte 8 of the buffer, and
+//! - `offset` and `padded` (the 4-bit formats): a copy from byte 8 of the buffer, and
 //!   rows 48 bytes apart, where the 16 bytes past each row's blocks must come back untouched;
 //! - `level-0` to `level-4`: every level of a 16-texel chain, the last levels one block each;
 //! - `t2t`: one texture's blocks copied whole into another's.
 //!
-//! **What the port changes.** The lane's expectation is our own probe's measurement **on an Apple
-//! M4**, asserted as Rust arithmetic over bytes the lane itself generates. Record mode runs the
-//! same copies on this M3 Max, so each recording holds Metal's own bytes and the arithmetic becomes
-//! a cross-check (the test `every_recorded_row_linear_copy_moved_the_blocks`). A difference then
-//! says which side moved.
+//! **Metal's own bytes.** Record mode runs the copies on an Apple M3 Max, so each recording holds
+//! Metal's own bytes. Rust arithmetic over bytes the case generates, which a probe's measurement
+//! **on an Apple M4** agrees with, is a cross-check (the test
+//! `every_recorded_row_linear_copy_moved_the_blocks`). A difference then says which side moved.
 //!
 //! **Every row here is valid Metal usage** — the option with a nonzero `bytesPerRow` — so Metal's
 //! own API validation layer lets the whole program run, and the case needs no recorded-only row.
-//! The lane's `bytesPerRow`-of-0 rows, which validation stops and whose order is Metal's own Morton
-//! order, are not ported and are named as their own packet below; its host copies are
-//! [`crate::cases::pvrtc_cpu_order`].
+//! Copies at a `bytesPerRow` of 0, which validation stops and whose order is Metal's own Morton
+//! order, are not cases; the host copies are [`crate::cases::pvrtc_cpu_order`].
 //!
 //! **One case per format**, so a venue that holds no texture of one answers its typed refusal there
-//! and counts as lacking that format rather than taking the other seven down. A device without the
-//! Vulkan format keeps the blocks in a carrier image — half as wide for a 2-bit format, whose block
-//! is 8 x 4 texels — which is the mechanism these rows exist to check, and it announces
-//! `carried-decoded-twin` once.
+//! and counts as lacking that format rather than taking the other seven down.
 //!
 //! Nothing here can fault a GPU: blit copies between textures and buffers the program makes, no
 //! dispatch, no draw, no loop, every region block-aligned and inside its level.
 
-use crate::allowance::Allowance;
 use crate::case::{made, Abort, Case, Failure, Input, MetalSource, Side};
 use crate::transcript::{ByteLayout, Element, Node, Observed, Sites, Value};
 use crate::work::{Plane, Rect, Resource, Step, TextureSpec, Work};
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
 /// The bytes one PVRTC block takes, 2-bit and 4-bit alike.
 pub const BLOCK: u64 = 8;
 
-/// The byte a read-back's buffer holds before the copy, as the lane's `get` fills it: a position no
+/// The byte a read-back's buffer holds before the copy: a position no
 /// block reached is a recorded value and not whatever was there.
 pub const BEFORE: u8 = 0xee;
 
@@ -61,7 +53,7 @@ pub struct Format {
     pub block_width: u64,
 }
 
-/// Every PVRTC format, the 4-bit ones then the 2-bit ones, as the lane lists them.
+/// Every PVRTC format, the 4-bit ones then the 2-bit ones.
 pub const FORMATS: [Format; 8] = [
     Format {
         name: "pvrtc-rows-rgb-4bpp",
@@ -105,7 +97,7 @@ pub const FORMATS: [Format; 8] = [
     },
 ];
 
-/// `n` bytes of the lane's blocks: each 8-byte block's first byte its index, the others `tag` plus
+/// `n` bytes of the case's blocks: each 8-byte block's first byte its index, the others `tag` plus
 /// its place in the block, so a block that moved to the wrong place names where it came from.
 pub fn blocks(n: usize, tag: u8) -> Vec<u8> {
     (0..n)
@@ -121,7 +113,7 @@ pub fn blocks(n: usize, tag: u8) -> Vec<u8> {
 
 /// A level's blocks in row-linear order: block (x, y) at `(y * across + x) * BLOCK`.
 ///
-/// It is the model of what a row-linear copy does — the arithmetic the lane asserts — kept here so
+/// It is the model of what a row-linear copy does, kept here so
 /// the recordings can be held against it.
 pub struct Linear {
     pub across: u64,
@@ -230,14 +222,14 @@ impl Copy {
             buffer: self.buffer,
             offset: self.offset,
             bytes_per_row: self.row,
-            // The lane passes the whole buffer's bytes as the image pitch of a copy out.
+            // The whole buffer's bytes are the image pitch of a copy out.
             bytes_per_image: length,
             plane: Plane::RowLinearPvrtc,
         }
     }
 }
 
-/// The plan for `format`: both storage modes' rows, in the lane's order.
+/// The plan for `format`: both storage modes' rows, in order.
 fn plan(format: &Format) -> Plan {
     let width = format.block_width;
     let mut work = Work::new();
@@ -526,7 +518,7 @@ pub struct PvrtcRows {
     at: usize,
 }
 
-/// Every format's case, in the lane's order.
+/// Every format's case, in `FORMATS` order.
 pub fn all() -> Vec<PvrtcRows> {
     (0..FORMATS.len()).map(|at| PvrtcRows { at }).collect()
 }
@@ -550,21 +542,6 @@ impl Case for PvrtcRows {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // A device with no Vulkan format for this PVRTC format keeps the blocks in a carrier image
-        // and its reads through a decoded twin, which the runtime announces once per device. Metal
-        // announces nothing. Every block still compares exactly: the only site loosened is the set
-        // of notices, which Metal holds empty, and the allowance fails the case if the notice did
-        // not fire.
-        // The buffer each pass reads its blocks back through is `Shared`, which a device with no
-        // unified memory keeps in system memory because that is the only memory both sides can
-        // reach: the venue's memory model, not this family's subject.
-        vec![
-            crate::replay::notice_allowance(Degradation::CarriedDecodedTwin.code()),
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -665,11 +642,11 @@ mod tests {
         }
     }
 
-    /// Every recorded read-back is the lane's row-linear arithmetic's, byte for byte.
+    /// Every recorded read-back is the row-linear arithmetic's, byte for byte.
     ///
-    /// This is the cross-check the port exists for: the recordings hold what Metal answered on this
-    /// M3 Max, where the lane's numbers came from our own probe on an Apple M4. A difference is a
-    /// finding either way and never something to edit away.
+    /// The recordings hold what Metal answered on an Apple M3 Max; the arithmetic agrees with a
+    /// probe's numbers on an Apple M4. A difference is a finding either way and never something to
+    /// edit away.
     #[test]
     fn every_recorded_row_linear_copy_moved_the_blocks() {
         let mut unrecorded = Vec::new();
@@ -719,7 +696,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{checked} bytes checked; Metal's recorded row-linear copies differ from the lane's \
+            "{checked} bytes checked; Metal's recorded row-linear copies differ from the \
              arithmetic:\n{}",
             differ.join("\n")
         );

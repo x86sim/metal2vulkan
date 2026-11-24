@@ -62,7 +62,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn ok(bc: &[u8], entry: &str, p: &DeviceProfile) -> std::sync::Arc<FunctionArtifact> {
@@ -154,10 +154,7 @@ fn every_entry_compiles_or_refuses_on_every_profile() {
         // lane's low four bits, and 16 samples, each with its level and a `ConstOffset` and none
         // with `Offset`; the module needs neither feature (a function past the arms' bound is
         // refused, `engine_offset_arms`).
-        let armed = matches!(
-            stem.as_str(),
-            "lunarg-desktop-baseline-2023" | "roadmap-2022" | "swiftshader" | "vk12-floor"
-        );
+        let armed = stem == "runtime-floor";
         let a = compile(&bc, "sample_dynamic_offset", &p)
             .unwrap_or_else(|e| panic!("sample_dynamic_offset on {stem}: {e}"));
         link_and_validate(&a, &p)

@@ -8,11 +8,10 @@
 //!   draws `dfr_color` (a color 0 input in group 0) and `dfr_buffer` (a buffer in group 0) over
 //!   five colors, and `dfr_output` (a color 0 input of a color 0 output in group 0) over one, with
 //!   the read dead as with it live. Specialized dead, each compiles on every profile here without
-//!   an interlock, including a device without one, passing L3; specialized live, each takes the
-//!   pixel interlock where the device has it, and is refused where it has neither interlock but
-//!   orders a color read in rasterization order. On a device with neither ordered fetch form
-//!   (`vk12-floor`) the group on `dfr_output`'s color orders only what its read orders there: the
-//!   input attachment, between draws, compiled without an interlock and noted
+//!   an interlock, including a device without one, passing L3. Specialized live, `dfr_buffer`
+//!   takes the pixel interlock where the device has it and is refused where it has none. On
+//!   every device the group on the color of `dfr_color` and `dfr_output` orders only what the read
+//!   orders: the input attachment, between draws, compiled without an interlock and noted
 //!   (`PrecisionNote::UnorderedFetchWithinDraw`).
 //! - **A color input without an attachment** is Metal's pipeline error whether or not the body
 //!   reads it ("Shaders reads from a color attachment whose pixel format is
@@ -59,7 +58,7 @@ fn device_without(stem: &str, features: &[VkFeature]) -> Device {
     for f in features {
         assert!(desc.features.remove(f), "{stem} has {f:?}");
     }
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// The devices of the raster order tests, each with whether it has the pixel interlock.
@@ -128,13 +127,6 @@ fn interlocks(words: &[u32]) -> bool {
     false
 }
 
-/// Whether `dev` orders framebuffer fetch in neither form: no rasterization-order color attachment
-/// access and no pixel interlock.
-fn unordered(dev: &Device) -> bool {
-    let f = dev.profile().fragment();
-    !f.rasterization_order_color_access && !f.pixel_interlock
-}
-
 fn fragment(p: &RenderPipeline) -> &[u32] {
     let m = p
         .stages
@@ -153,10 +145,10 @@ fn validate(p: &RenderPipeline, dev: &Device, what: &str) {
 /// A raster order group on an input the specialized body never reads orders nothing (the module
 /// docs): dead, `dfr_color`, `dfr_buffer` (five colors) and `dfr_output` (one) compile without an
 /// interlock on `lavapipe`, `moltenvk-m3` and `moltenvk-m3` without either interlock, and
-/// `dfr_output` on `vk12-floor` (no interlock); live, each interlocks where the device has the
-/// pixel interlock, and is refused on `moltenvk-m3` without either interlock. `dfr_output` live on
-/// `vk12-floor`, which has neither ordered fetch form, reads its color as the input attachment
-/// without an interlock, its fragment stage noting `UnorderedFetchWithinDraw`.
+/// `dfr_output` on `runtime-floor` (no interlock). Live, `dfr_buffer` interlocks where the device
+/// has the pixel interlock and is refused on `moltenvk-m3` without either interlock; `dfr_color`
+/// and `dfr_output` read their color as the input attachment without an interlock on every device,
+/// the fragment stage noting `UnorderedFetchWithinDraw`.
 #[test]
 fn a_raster_order_group_on_an_input_dead_after_specialization_takes_no_interlock() {
     let (Some(vs), Some(fs)) = (fixture("color_groups"), fixture("dfk_dead_rog")) else {
@@ -173,12 +165,18 @@ fn a_raster_order_group_on_an_input_dead_after_specialization_takes_no_interlock
         }
         cases.push((name.to_owned(), dev, interlock, "dfr_output", vec![0]));
     }
-    let floor = Device::new(
-        description("vk12-floor").expect("profile"),
-        DevicePolicy::default(),
+    let floor = Device::from_queries(
+        description("runtime-floor").expect("profile"),
+        DevicePolicy::RESIDENT_TABLES,
     )
     .expect("device");
-    cases.push(("vk12-floor".to_owned(), floor, false, "dfr_output", vec![0]));
+    cases.push((
+        "runtime-floor".to_owned(),
+        floor,
+        false,
+        "dfr_output",
+        vec![0],
+    ));
     let mut misses = BTreeMap::<String, Vec<String>>::new();
     let mut checked = 0;
     for (name, dev, interlock, entry, colors) in &cases {
@@ -203,13 +201,9 @@ fn a_raster_order_group_on_an_input_dead_after_specialization_takes_no_interlock
         let live =
             dev.compile_render_pipeline(&specialized(&vs, &fs, entry, colors, true), &budget);
         match (interlock, live) {
-            (true, Ok(p)) => {
-                assert!(interlocks(fragment(&p)), "{what}: no interlock");
-                validate(&p, dev, &what);
-            }
-            // Neither ordered fetch form: the group orders the color read alone, which is ordered
-            // between draws there.
-            (false, Ok(p)) if unordered(dev) => {
+            // Fetch ordered between draws alone: a group on a color read orders that read alone,
+            // which is ordered between draws.
+            (_, Ok(p)) if *entry != "dfr_buffer" => {
                 assert!(!interlocks(fragment(&p)), "{what}: interlocked");
                 assert_eq!(p.graphics.input_attachments.len(), 1, "{what}");
                 let noted = (p.stages.iter()).any(|m| {
@@ -219,8 +213,12 @@ fn a_raster_order_group_on_an_input_dead_after_specialization_takes_no_interlock
                 assert!(noted, "{what}: not noted");
                 validate(&p, dev, &what);
             }
-            // What the device lacks: the interlock, or a fetch form for a color read.
-            (false, Err(Error::Unsupported(_))) => {}
+            (true, Ok(p)) => {
+                assert!(interlocks(fragment(&p)), "{what}: no interlock");
+                validate(&p, dev, &what);
+            }
+            // What the device lacks: the interlock.
+            (false, Err(Error::Unsupported(u))) if u.feature == Feature::RasterOrderGroups => {}
             (_, other) => panic!("{what}: {:?}", other.map(|_| ())),
         }
     }
@@ -277,7 +275,6 @@ fn a_color_input_without_an_attachment_is_refused_dead_or_live() {
             .compile_render_pipeline(&d, &budget)
             .unwrap_or_else(|e| panic!("dfr_lacks dead with color 1 on {stem}: {e}"));
         assert!(p.graphics.input_attachments.is_empty(), "{stem}");
-        assert!(p.graphics.storage_attachments.is_empty(), "{stem}");
         validate(&p, &dev, stem);
     }
     for (kind, whats) in &misses {

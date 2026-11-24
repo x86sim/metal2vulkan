@@ -1,10 +1,9 @@
 //! What Metal's tile store leaves in the texels a draw did not write: a signed normalized
 //! attachment's minimum codes, and an `RGB9E5Float` attachment's unnormalized words.
 //!
-//! Ported from the runtime lane `runtime_lane/snorm_tile_store.rs`. The lane's claim is Metal's
-//! behaviour, measured on this same chip: once a pass **draws**, Metal writes each 32x32 tile back
-//! through its channels' *values*, so a channel's minimum code (-128, or -32768), which reads as
-//! -1.0 exactly as the code above it does, is stored as that code above (-127, -32767) in every
+//! Metal's behaviour, measured on this chip: once a pass **draws**, Metal writes each 32x32 tile
+//! back through its channels' *values*, so a channel's minimum code (-128, or -32768), which reads
+//! as -1.0 exactly as the code above it does, is stored as that code above (-127, -32767) in every
 //! texel of the tile — including the texels no fragment wrote. An `RGB9E5Float` attachment's tiles
 //! go back the same way, so a word whose largest mantissa is below 256 under an exponent above 0 is
 //! stored normalized. A pass that **draws nothing** keeps every code.
@@ -13,8 +12,8 @@
 //! fixture's fullscreen triangle under a write mask of **no channel** — a draw that writes no
 //! texel, which still makes the pass a drawing pass — and then a pass that loads the same codes and
 //! encodes nothing at all. Metal's answer to both is **run** here rather than copied: record mode
-//! takes it on this M3 Max, and the module's own tests cross-check the recordings against the
-//! lane's table, which is the evidence the port owes the lane.
+//! takes it on an Apple M3 Max, and the module's own tests cross-check the recordings against the
+//! table.
 //!
 //! One case a format, so a format a device cannot render is its own row rather than a refusal that
 //! costs the other five their sites.
@@ -28,6 +27,7 @@
 
 use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{Abort, Case, Failure, Handle, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -38,7 +38,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::{ColorWriteMask, PixelFormat};
-use metal2vulkan_runtime::Degradation;
 
 /// The owned fixture whose vertex function is Metal's fullscreen triangle at the depth a vertex
 /// buffer holds, and whose fragment function returns white.
@@ -46,10 +45,10 @@ const FIXTURE: &str = "rt6_resolves";
 const VERTEX: &str = "rt6_resolve_full";
 const FRAGMENT: &str = "rt6_resolve_white";
 
-/// The target's side, as the lane's is.
+/// The target's side.
 const SIDE: u32 = 4;
 
-/// The depth the lane's draw takes, which its vertex buffer holds as one `float`.
+/// The depth the draw takes, which its vertex buffer holds as one `float`.
 const DEPTH: f32 = 0.5;
 
 /// What one case asks about: a format, the bytes of one texel, and what the host writes into
@@ -72,7 +71,7 @@ struct Subject {
 }
 
 /// The six signed normalized formats Metal's tile store rewrites, each with its channel's minimum
-/// code, and `RGB9E5Float` with the unnormalized word the lane measured (mantissas 1, 2 and 3
+/// code, and `RGB9E5Float` with the unnormalized word measured (mantissas 1, 2 and 3
 /// under the exponent 20: its largest mantissa below 256).
 const SUBJECTS: &[Subject] = &[
     Subject {
@@ -133,12 +132,12 @@ const SUBJECTS: &[Subject] = &[
     },
 ];
 
-/// The `RGB9E5Float` word the lane writes: mantissas 1, 2 and 3 under the exponent 20.
+/// The `RGB9E5Float` word the case writes: mantissas 1, 2 and 3 under the exponent 20.
 const UNNORMALIZED: [u8; 4] = (1u32 | 2 << 9 | 3 << 18 | 20 << 27).to_le_bytes();
 
 /// The word Metal's store leaves in its place: mantissas 128, 256 and 384 under the exponent 13,
-/// which is the same value normalized. The lane's table, which [`tests`] checks the recording
-/// against, and nothing else reads.
+/// which is the same value normalized. The table, which [`tests`] checks the recording against,
+/// and nothing else reads.
 #[cfg(test)]
 const NORMALIZED: [u8; 4] = (128u32 | 256 << 9 | 384 << 18 | 13 << 27).to_le_bytes();
 
@@ -310,9 +309,6 @@ impl Case for SnormTileStore {
                 Justification::notice(*kind),
             ));
         }
-        // The buffer each pass reads the stored tiles back through is `Shared`
-        // ([`crate::replay::shared_memory_notice`]).
-        allowances.push(crate::replay::shared_memory_notice());
         allowances
     }
 
@@ -401,13 +397,11 @@ impl Case for SnormTileStore {
 
 #[cfg(test)]
 mod tests {
-    //! The cross-check the port owes the lane: the codes Metal's own store left, as the recordings
-    //! hold them, against the lane's table.
+    //! The cross-check: the codes Metal's own store left, as the recordings hold them, against a
+    //! table.
     //!
-    //! The table is the lane's (`runtime_lane/snorm_tile_store.rs`), restated here because a
-    //! conformance case may not depend on the validation crate. It is the claim under test, not a
-    //! helper: if a recorded texel disagrees, either Apple's store moved or the lane's table was
-    //! never Metal's, and the test says which format.
+    //! The table is the claim under test, not a helper: if a recorded texel disagrees, either
+    //! Apple's store moved or the table was never Metal's, and the test says which format.
 
     use super::*;
     use crate::recording::Recording;
@@ -448,7 +442,7 @@ mod tests {
     }
 
     /// Metal's store raised every signed normalized minimum code to the code above it, in every
-    /// texel of the tile, and a pass that drew nothing kept every one: the lane's claim, measured.
+    /// texel of the tile, and a pass that drew nothing kept every one.
     #[test]
     fn the_recorded_drawing_pass_raises_every_snorm_minimum() {
         for subject in SUBJECTS {
@@ -515,10 +509,8 @@ mod tests {
                 );
                 match &allowance.justified_by {
                     Justification::Degradation(code) => assert!(
-                        PASS_NOTICES.iter().any(|kind| kind.code() == code)
-                            || code == Degradation::SharedInSystemMemory.code(),
-                        "{}: {code} is neither a tile-store notice nor the one a device's own \
-                         memory model provokes",
+                        PASS_NOTICES.iter().any(|kind| kind.code() == code),
+                        "{}: {code} is not a tile-store notice",
                         case.name()
                     ),
                     other => panic!("{}: an unexpected tolerance: {other:?}", case.name()),

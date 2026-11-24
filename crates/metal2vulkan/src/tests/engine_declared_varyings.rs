@@ -106,7 +106,7 @@ fn device(stem: &str) -> Device {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let description = DeviceDescription::from_khronos_json(&text, None).expect(stem);
-    Device::new(description, DevicePolicy::default()).expect(stem)
+    Device::from_queries(description, DevicePolicy::RESIDENT_TABLES).expect(stem)
 }
 
 /// The `Location` of every user variable of storage class `class` in `words` (built-ins carry no
@@ -141,7 +141,7 @@ fn locations(words: &[u32], class: u32) -> Vec<u32> {
 }
 
 /// Profiles with and without device addresses, and the floor.
-const PROFILES: [&str; 3] = ["nvidia-rtx5080-laptop", "moltenvk-m3", "vk12-floor"];
+const PROFILES: [&str; 3] = ["nvidia-rtx5080-laptop", "moltenvk-m3", "runtime-floor"];
 
 #[test]
 fn an_unwritten_varying_has_a_producer_for_the_fragment_that_reads_it() {

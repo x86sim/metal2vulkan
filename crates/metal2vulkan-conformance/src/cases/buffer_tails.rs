@@ -9,11 +9,14 @@
 //! holds before anything writes it is the allocation's: over a buffer of 4096 bytes, whose
 //! `allocatedSize` is its length, it is the buffer allocated next, which no case can state; over
 //! a buffer of 20000 bytes, whose `allocatedSize` is 32768, it is the rest of the buffer's own
-//! allocation, and it reads zero. The runtime keeps those texels in a tail of the texture's own
-//! (`metal2vulkan-runtime`'s `buffer_texture.rs`), zero when made, so this family asks the second
-//! shape, where Metal's answer is one a case can compare: a 16 by 256 `RGBA8Uint` texture at
-//! offset 4096, its rows 64 bytes apart, over 20000 bytes. Its rows 0 to 247 lie inside the
-//! length, row 248 crosses it 32 bytes (8 texels) in, and rows 249 to 255 lie past it.
+//! allocation, and it reads zero. So this family asks the second shape, where Metal's answer is
+//! one a case can compare: a 16 by 256 `RGBA8Uint` texture at offset 4096, its rows 64 bytes
+//! apart, over 20000 bytes. Its rows 0 to 247 lie inside the length, row 248 crosses it 32 bytes
+//! (8 texels) in, and rows 249 to 255 lie past it.
+//!
+//! The runtime makes no such texture: texels past the buffer are refused
+//! (`Refusal::BufferTextureLayout`, its README, Textures), as they would lie in memory the buffer
+//! does not hold, so each case's run of it ends at that refusal.
 //!
 //! - `buffer-tails-kernels` reads the texture through the format scout's `scout_read_u` and
 //!   `getBytes:` as made, after `scout_write_u` wrote every texel, and after `replaceRegion:`
@@ -22,14 +25,7 @@
 //!   by a blit from a buffer (across the length) and rows 252 to 255 by a blit from a texture
 //!   (wholly past it), copies rows 240 to 255 into a texture of its own, and reads every one of
 //!   those back, with the buffer's bytes.
-//!
-//! Every byte compares exactly. What differs is the announcing: the runtime keeps a texture with
-//! a tail as a shadow image and announces `shadowed-texture`, which Metal never does, and a
-//! device without unified memory announces `shared-in-system-memory` for the `Shared` buffers the
-//! answers are read back through. Nothing here can fault a GPU: one small texture, one thread a
-//! texel, no loop.
 
-use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, PlaneTexture, Side,
 };
@@ -80,18 +76,6 @@ fn written(n: u64, set: u64) -> Vec<u8> {
     (0..n)
         .map(|i| ((i * 13 + set * 101) % 253) as u8 + 2)
         .collect()
-}
-
-/// What both cases loosen: the notices, and nothing else.
-fn allowances() -> Vec<Allowance> {
-    // The runtime keeps a texture whose texels run past its buffer's length as a shadow image of
-    // the buffer's bytes and its tail, and announces `shadowed-texture`, which Metal never does.
-    // Every case reads its answers back through `Shared` buffers, so a device without unified
-    // memory announces `shared-in-system-memory` (`crate::replay::shared_memory_notice`).
-    vec![
-        crate::replay::shared_memory_notice(),
-        crate::replay::notice_allowance(metal2vulkan_runtime::Degradation::ShadowedTexture.code()),
-    ]
 }
 
 /// The numbers that place the texture in the buffer, for both cases' inputs.
@@ -232,10 +216,6 @@ impl Case for Kernels {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        allowances()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -478,10 +458,6 @@ impl Case for Blits {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        allowances()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {

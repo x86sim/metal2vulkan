@@ -536,10 +536,6 @@ fn every_feature_has_a_source() {
             structure.as_raw()
         );
     }
-    assert!(dev
-        .property_chain
-        .borrow()
-        .contains(&avk::PhysicalDeviceSampleLocationsPropertiesEXT::STRUCTURE_TYPE.as_raw()));
     assert!(
         chain.contains(&avk::PhysicalDeviceDepthBiasControlFeaturesEXT::STRUCTURE_TYPE.as_raw())
     );
@@ -573,7 +569,7 @@ fn unexposed_structures_are_never_chained() {
         ]
     );
     for absent in [
-        VkFeature::RobustBufferAccess2,
+        VkFeature::RobustImageAccess2,
         VkFeature::RobustImageAccess,
         VkFeature::SubgroupSizeControl,
         VkFeature::Maintenance4,
@@ -952,18 +948,6 @@ fn rgba4_opaque_black_swizzled_is_read() {
     assert!(!dev.property_chain.borrow().contains(&ty));
 }
 
-/// `robustBufferAccessUpdateAfterBind` is read from `VkPhysicalDeviceVulkan12Properties`, which
-/// every description's version chains.
-#[test]
-fn robust_buffer_access_update_after_bind_is_read() {
-    for reported in [false, true] {
-        let mut dev = FakeDevice::new(ApiVersion::V1_2);
-        dev.v12_props.robust_buffer_access_update_after_bind = reported.into();
-        let d = dev.query().unwrap();
-        assert_eq!(d.robust_buffer_access_update_after_bind, reported);
-    }
-}
-
 /// Exactly the formats `FormatSupport::queries_for` the device's version and available
 /// extensions is asked about, and formats without features are omitted.
 #[test]
@@ -1169,7 +1153,7 @@ fn a_queried_description_derives_a_device() {
     dev.v11_props.subgroup_supported_stages = avk::ShaderStageFlags::ALL;
     dev.v11_props.subgroup_supported_operations = avk::SubgroupFeatureFlags::from_raw(0xff);
     let desc = dev.query().unwrap();
-    Device::new(desc, DevicePolicy::default()).expect("queried description derives");
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("queried description derives");
 }
 
 #[test]

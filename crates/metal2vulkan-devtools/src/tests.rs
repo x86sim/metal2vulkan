@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// The test trees, relative to the workspace, that run from nextest archives carried to other
-/// machines (`cargo nextest run --archive-file ... --workspace-remap <checkout>`): the runtime
-/// lanes and the runtime's lib tests (`src/tests/` and the test modules beside its sources).
-const CARRIED: [&str; 3] = [
-    "crates/metal2vulkan-validation/src/runtime_lane",
-    "crates/metal2vulkan-validation/src/runtime_lane.rs",
-    "crates/metal2vulkan-runtime/src",
+/// The trees, relative to the workspace, whose tests run from nextest archives carried to other
+/// machines (`cargo nextest run --archive-file ... --workspace-remap <checkout>`): all of the
+/// validation crate (its lib test binary and the library code it calls; its integration tests and
+/// binaries ride a full archive).
+const CARRIED: [&str; 2] = [
+    "crates/metal2vulkan-validation/src",
+    "crates/metal2vulkan-validation/tests",
 ];
 
 /// The `.rs` files at or below `path`.
@@ -38,7 +38,7 @@ fn the_carried_tests_read_the_checkout_where_the_runner_names_it() {
         sources(&path, &mut files);
     }
     files.sort();
-    assert!(files.len() > 500, "{} sources read", files.len());
+    assert!(files.len() > 300, "{} sources read", files.len());
     let mut baked = Vec::new();
     for file in &files {
         let text = std::fs::read_to_string(file).unwrap();

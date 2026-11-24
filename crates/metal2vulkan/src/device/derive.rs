@@ -1,6 +1,7 @@
-//! `Device::new`: the only producer of a `DeviceProfile`.
+//! `Device::from_queries`: the only producer of a `DeviceProfile`.
 //!
-//! The profile is a pure function of the description and the policy. Memory's A/F split is the
+//! The profile is a pure function of the description's Vulkan queries and the policy: no driver or
+//! GPU identity decides anything. Memory's A/F split is the
 //! only field that selects a pointer model; every other field selects leaf encodings or feeds the
 //! requirement check.
 
@@ -8,22 +9,21 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::device::description::{
-    AllocationLimits, DeviceDescription, GeneratedCommandsProperties, APPLE_VENDOR_ID,
+    AllocationLimits, DeviceDescription, GeneratedCommandsProperties,
 };
 use crate::device::function_storage;
 use crate::device::metal::MetalDeviceProperties;
-use crate::device::policy::{ContainmentPolicy, DevicePolicy};
+use crate::device::policy::DevicePolicy;
 use crate::device::profile::{
-    BufferAccess, Containment, CubeGradientRoute, CubeGradients, DescriptorCaps, DeviceProfile,
-    DriverWorkaround, EnabledCaps, FloatFunctions, FormatTable, FragmentCaps, GuestIsolation,
-    ImageCaps, Independence, LeafCaps, NanEncoding, ProfileFields, Robustness,
+    BufferAccess, DescriptorCaps, DeviceProfile, EnabledCaps, FormatTable, FragmentCaps,
+    FunctionStorage, HandleDomain, ImageCaps, Independence, LeafCaps, PointerDomain, ProfileFields,
 };
 use crate::device::requirements::{
     ApiVersion, FloatControl, FloatWidth, FormatUsage, ResolveMode, SubgroupOp, VkExtension,
-    VkFeature, VkProperty,
+    VkFeature, VkLimit, VkProperty,
 };
 use crate::device::subgroup::{OpBits, StageSubgroup, SubgroupModel, SubgroupSizes};
-use crate::error::{Capability, DescriptorError, DriverDeviation, Error, Feature, Unsupported};
+use crate::error::{Capability, DescriptorError, Error, Feature, Unsupported};
 use crate::pipeline::sym::Stage;
 use crate::vk;
 
@@ -39,58 +39,42 @@ struct DeviceInner {
     fingerprint: crate::cache::Hash256,
     metal: MetalDeviceProperties,
     policy: DevicePolicy,
-    /// The description's `robustBufferAccessUpdateAfterBind`, which decides what
-    /// `Device::required_enables` may name together. No translation reads it, so it is not a
-    /// profile field: two devices that differ only in it share every artifact.
-    robust_buffer_access_update_after_bind: bool,
-    /// The description's `generated_commands`, which only the device replay reads; not a profile
-    /// field, as above.
+    /// The description's `generated_commands`, which only the device replay reads. No translation
+    /// reads it, so it is not a profile field: two devices that differ only in it share every
+    /// artifact.
     generated_commands: Option<GeneratedCommandsProperties>,
-    /// The description's allocation sizes, which the Metal-facing `maxBufferLength` and the
-    /// runtime's heap sizes read; not a profile field, as above.
+    /// The description's allocation sizes, which the Metal-facing `maxBufferLength` reads; not a
+    /// profile field, as above.
     allocation: AllocationLimits,
 }
 
 impl Device {
-    /// Derives the device profile from what the consumer enabled and its policy.
+    /// The device its Vulkan queries decide, under `policy`: the profile is a function of what
+    /// the description states the device supports and the consumer enabled, and of the policy.
+    /// The description need not come from a device: one read from a Khronos profiles JSON document
+    /// ([`DeviceDescription::from_khronos_json`]) or built field by field
+    /// ([`DeviceDescription::new`]) makes a device with no `VkDevice` behind it.
     ///
-    /// Refuses a device below Vulkan 1.2 (`Unsupported{VulkanVersion}`), a description that lists
-    /// a feature neither its version nor its listed extensions expose or a feature without the
-    /// feature Vulkan requires enabled with it (`InvalidDescriptor`, the invariants
-    /// `device::enables` states), and a policy that turns containment off while guest isolation
-    /// is on (`InvalidDescriptor`).
-    pub fn new(desc: DeviceDescription, policy: DevicePolicy) -> Result<Device, Error> {
-        // The driver's measured deviations on its GPU, never its name.
-        let deviations = super::driver_facts::deviations(&desc);
-        Device::with_deviations(desc, policy, deviations)
-    }
-
-    /// [`Device::new`] with `deviation` taken or not, and the driver's other deviations as
-    /// measured: a test's way to take one route alone, which no driver in the table gives.
-    #[cfg(test)]
-    pub(crate) fn with_deviation(
-        desc: DeviceDescription,
-        policy: DevicePolicy,
-        deviation: DriverDeviation,
-        taken: bool,
-    ) -> Result<Device, Error> {
-        let mut deviations = super::driver_facts::deviations(&desc);
-        match taken {
-            true => {
-                deviations.insert(deviation);
-            }
-            false => {
-                deviations.remove(&deviation);
-            }
-        }
-        Device::with_deviations(desc, policy, deviations)
-    }
-
-    fn with_deviations(
-        desc: DeviceDescription,
-        policy: DevicePolicy,
-        deviations: BTreeSet<DriverDeviation>,
-    ) -> Result<Device, Error> {
+    /// Refuses a device below Vulkan 1.2 (`Unsupported{VulkanVersion}`), a description whose
+    /// `maxPushConstantsSize` is below 128 bytes, Vulkan's least, the least push window a stage is
+    /// lowered for (`Unsupported{PushWindow}`, a `Limit` of `MaxPushConstantsSize`; the window is
+    /// the limit up to 256 bytes, [`DeviceProfile::push_window`]), a description that lists
+    /// a feature neither its version nor its listed extensions expose, a feature without the
+    /// feature Vulkan requires enabled with it, or `shaderQuadControl` without
+    /// `shaderMaximalReconvergence`, which every device with the one supports (`InvalidDescriptor`,
+    /// the invariants `device::enables` states), a policy that turns containment off while guest isolation
+    /// is on (`InvalidDescriptor`), a policy that takes one identity domain without the other
+    /// (`InvalidDescriptor`), and the identity domains on a device without `bufferDeviceAddress`
+    /// and `shaderInt64` (`Unsupported{IdentityDomains}`).
+    ///
+    /// No identity decides anything: the description's `driver_id`, `driver_version`,
+    /// `vendor_id`, `device_id` and `device_name` are not read. The rasterizer splits clipped
+    /// coverage and the tessellator orders triangles as the device does (each module records its
+    /// static note, `PrecisionNote::ClippedCoverageSplit` and
+    /// `PrecisionNote::TessellationTriangleOrder`), `InterpolateAtOffset` reads from the pixel's center as GLSL.std.450 states, and a thread's
+    /// Function storage is the 16 KiB floor. Every stage output is 32-bit: a `half` color output
+    /// reaches the device widened to `float`, whatever `storageInputOutput16` says.
+    pub fn from_queries(desc: DeviceDescription, policy: DevicePolicy) -> Result<Device, Error> {
         if desc.api_version < ApiVersion::V1_2 {
             return Err(Unsupported::needs(
                 Feature::VulkanVersion,
@@ -98,25 +82,27 @@ impl Device {
             )
             .into());
         }
-        crate::device::enables::check_invariants(&desc)?;
-        if policy.containment == ContainmentPolicy::UnsafeOff
-            && policy.isolation == GuestIsolation::On
-        {
-            return Err(Error::InvalidDescriptor(
-                DescriptorError::DeviceDescription {
-                    detail: "containment UnsafeOff contradicts GuestIsolation::On".into(),
+        let push = desc.limits.max_push_constants_size;
+        if push < crate::lower::push::LEAST_BYTES {
+            return Err(Unsupported::needs(
+                Feature::PushWindow,
+                Capability::Limit {
+                    limit: VkLimit::MaxPushConstantsSize,
+                    required: u64::from(crate::lower::push::LEAST_BYTES),
+                    available: u64::from(push),
                 },
-            ));
+            )
+            .into());
         }
-        let fields = derive_fields(&desc, &policy, &deviations);
-        let profile = DeviceProfile::of(fields);
+        crate::device::enables::check_invariants(&desc)?;
+        identity_domains(&desc, &policy)?;
+        let profile = DeviceProfile::of(derive_fields(&desc, &policy));
         let metal = MetalDeviceProperties::derive(&profile, &desc.allocation);
         Ok(Device(Arc::new(DeviceInner {
             fingerprint: profile.fingerprint(),
             profile,
             metal,
             policy,
-            robust_buffer_access_update_after_bind: desc.robust_buffer_access_update_after_bind,
             generated_commands: desc.generated_commands,
             allocation: desc.allocation,
         })))
@@ -144,11 +130,6 @@ impl Device {
         &self.0.policy
     }
 
-    /// The description's `robustBufferAccessUpdateAfterBind`.
-    pub(crate) fn robust_buffer_access_update_after_bind(&self) -> bool {
-        self.0.robust_buffer_access_update_after_bind
-    }
-
     /// `VK_EXT_device_generated_commands` as the description states the consumer enabled it: the
     /// limits and stages the device replay's generated-commands layout is held to. It is not part
     /// of [`Device::profile`], so it changes no artifact.
@@ -164,15 +145,30 @@ impl Device {
     }
 }
 
-fn derive_fields(
-    desc: &DeviceDescription,
-    policy: &DevicePolicy,
-    deviations: &BTreeSet<DriverDeviation>,
-) -> ProfileFields {
+/// The identity domains come as a pair, and need device addresses and 64-bit integers: a
+/// pointer is a 64-bit device address.
+fn identity_domains(desc: &DeviceDescription, policy: &DevicePolicy) -> Result<(), Error> {
+    let pointers = policy.pointer_domain == PointerDomain::Identity;
+    let handles = policy.handle_domain == HandleDomain::Identity;
+    if pointers != handles {
+        return Err(Error::InvalidDescriptor(
+            DescriptorError::DeviceDescription {
+                detail: "the identity pointer and handle domains are taken together".into(),
+            },
+        ));
+    }
+    let needs = [VkFeature::BufferDeviceAddress, VkFeature::ShaderInt64];
+    if pointers && !needs.iter().all(|&f| desc.has(f)) {
+        let all = needs.iter().map(|&f| Capability::Feature(f)).collect();
+        return Err(Unsupported::needs_any_of(Feature::IdentityDomains, vec![all]).into());
+    }
+    Ok(())
+}
+
+fn derive_fields(desc: &DeviceDescription, policy: &DevicePolicy) -> ProfileFields {
     let has = |f: VkFeature| desc.has(f);
     let ext = |e: VkExtension| desc.extensions.contains(&e);
     let api = desc.api_version;
-    let v1_4 = api >= ApiVersion { major: 1, minor: 4 };
 
     // Memory's A/F split: Profile A needs device addresses and 64-bit integers; scalar block layout
     // is required only where an emitted type needs it, so it does not select the profile.
@@ -181,20 +177,6 @@ fn derive_fields(
     } else {
         BufferAccess::Floor
     };
-    // The containment encoding is a leaf choice from the enabled robustness.
-    let containment = match policy.containment {
-        ContainmentPolicy::UnsafeOff => Containment::UnsafeOff,
-        ContainmentPolicy::Contained => Containment::On {
-            robust: if has(VkFeature::RobustBufferAccess2) {
-                Robustness::Rba2
-            } else if has(VkFeature::RobustBufferAccess) {
-                Robustness::Rba
-            } else {
-                Robustness::None
-            },
-        },
-    };
-
     let leaf = LeafCaps {
         int8: has(VkFeature::ShaderInt8),
         int16: has(VkFeature::ShaderInt16),
@@ -202,36 +184,17 @@ fn derive_fields(
         float16: has(VkFeature::ShaderFloat16),
         float64: has(VkFeature::ShaderFloat64),
         storage_buffer_8bit: has(VkFeature::StorageBuffer8BitAccess),
-        uniform_buffer_8bit: has(VkFeature::UniformAndStorageBuffer8BitAccess),
-        push_constant_8bit: has(VkFeature::StoragePushConstant8),
         storage_buffer_16bit: has(VkFeature::StorageBuffer16BitAccess),
-        uniform_buffer_16bit: has(VkFeature::UniformAndStorageBuffer16BitAccess),
-        push_constant_16bit: has(VkFeature::StoragePushConstant16),
-        input_output_16bit: has(VkFeature::StorageInputOutput16),
-        workgroup_explicit_layout: has(VkFeature::WorkgroupMemoryExplicitLayout),
-        workgroup_explicit_layout_8bit: has(VkFeature::WorkgroupMemoryExplicitLayout8BitAccess),
-        workgroup_explicit_layout_16bit: has(VkFeature::WorkgroupMemoryExplicitLayout16BitAccess),
         buffer_int64_atomics: has(VkFeature::ShaderBufferInt64Atomics),
         shared_int64_atomics: has(VkFeature::ShaderSharedInt64Atomics),
-        buffer_float32_atomic_add: has(VkFeature::ShaderBufferFloat32AtomicAdd),
-        buffer_float32_atomic_min_max: has(VkFeature::ShaderBufferFloat32AtomicMinMax),
-        shared_float32_atomic_add: has(VkFeature::ShaderSharedFloat32AtomicAdd),
-        shared_float32_atomic_min_max: has(VkFeature::ShaderSharedFloat32AtomicMinMax),
-        image_float32_atomic_add: has(VkFeature::ShaderImageFloat32AtomicAdd),
-        image_float32_atomic_min_max: has(VkFeature::ShaderImageFloat32AtomicMinMax),
-        image_int64_atomics: has(VkFeature::ShaderImageInt64Atomics),
         vertex_stores_and_atomics: has(VkFeature::VertexPipelineStoresAndAtomics),
         fragment_stores_and_atomics: has(VkFeature::FragmentStoresAndAtomics),
         zero_initialize_workgroup_memory: has(VkFeature::ShaderZeroInitializeWorkgroupMemory),
-        fma32: has(VkFeature::ShaderFmaFloat32),
-        fma16: has(VkFeature::ShaderFmaFloat16),
-        float8: has(VkFeature::ShaderFloat8),
     };
     let images = ImageCaps {
         storage_read_without_format: has(VkFeature::ShaderStorageImageReadWithoutFormat),
         storage_write_without_format: has(VkFeature::ShaderStorageImageWriteWithoutFormat),
         storage_extended_formats: has(VkFeature::ShaderStorageImageExtendedFormats),
-        storage_multisample: has(VkFeature::ShaderStorageImageMultisample),
         cube_array: has(VkFeature::ImageCubeArray),
         gather_extended: has(VkFeature::ShaderImageGatherExtended),
         dynamic_sample_offset: has(VkFeature::Maintenance8),
@@ -240,9 +203,7 @@ fn derive_fields(
             || has(VkFeature::RobustImageAccess2),
         robust_image_access2: has(VkFeature::RobustImageAccess2),
         sampler_anisotropy: has(VkFeature::SamplerAnisotropy),
-        sampler_filter_minmax: has(VkFeature::SamplerFilterMinmax),
         sampler_mirror_clamp_to_edge: has(VkFeature::SamplerMirrorClampToEdge),
-        compute_derivative_quads: has(VkFeature::ComputeDerivativeGroupQuads),
         compute_derivative_linear: has(VkFeature::ComputeDerivativeGroupLinear),
     };
     let descriptors = DescriptorCaps {
@@ -251,15 +212,11 @@ fn derive_fields(
         uniform_buffer_standard_layout: has(VkFeature::UniformBufferStandardLayout),
         runtime_descriptor_array: has(VkFeature::RuntimeDescriptorArray),
         partially_bound: has(VkFeature::DescriptorBindingPartiallyBound),
-        variable_descriptor_count: has(VkFeature::DescriptorBindingVariableDescriptorCount),
         update_after_bind_sampled_image: has(
             VkFeature::DescriptorBindingSampledImageUpdateAfterBind,
         ),
         update_after_bind_storage_image: has(
             VkFeature::DescriptorBindingStorageImageUpdateAfterBind,
-        ),
-        update_after_bind_storage_buffer: has(
-            VkFeature::DescriptorBindingStorageBufferUpdateAfterBind,
         ),
         update_after_bind_uniform_texel_buffer: has(
             VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind,
@@ -270,28 +227,23 @@ fn derive_fields(
         update_unused_while_pending: has(VkFeature::DescriptorBindingUpdateUnusedWhilePending),
         non_uniform_sampled_image: has(VkFeature::ShaderSampledImageArrayNonUniformIndexing),
         non_uniform_storage_image: has(VkFeature::ShaderStorageImageArrayNonUniformIndexing),
-        non_uniform_storage_buffer: has(VkFeature::ShaderStorageBufferArrayNonUniformIndexing),
         non_uniform_uniform_texel_buffer: has(
             VkFeature::ShaderUniformTexelBufferArrayNonUniformIndexing,
         ),
         non_uniform_storage_texel_buffer: has(
             VkFeature::ShaderStorageTexelBufferArrayNonUniformIndexing,
         ),
-        // Push descriptors are unconditionally required by Vulkan 1.4 (vk.xml VK_VERSION_1_4).
-        push_descriptor: ext(VkExtension::KhrPushDescriptor) || v1_4,
         null_descriptor: has(VkFeature::NullDescriptor),
     };
     let fragment = FragmentCaps {
         demote_to_helper: has(VkFeature::ShaderDemoteToHelperInvocation),
         terminate_invocation: has(VkFeature::ShaderTerminateInvocation),
         pixel_interlock: has(VkFeature::FragmentShaderPixelInterlock),
-        sample_interlock: has(VkFeature::FragmentShaderSampleInterlock),
         barycentric: has(VkFeature::FragmentShaderBarycentric),
         stencil_export: ext(VkExtension::ExtShaderStencilExport),
         sample_rate_shading: has(VkFeature::SampleRateShading),
         dual_src_blend: has(VkFeature::DualSrcBlend),
         independent_blend: has(VkFeature::IndependentBlend),
-        geometry_shader: has(VkFeature::GeometryShader),
         tessellation_shader: has(VkFeature::TessellationShader),
         // The features alone: at the 1.2 floor they replace `VK_EXT_shader_viewport_index_layer`'s
         // one capability (`ShaderViewportIndexLayerEXT`) with the `ShaderLayer` and
@@ -301,24 +253,16 @@ fn derive_fields(
         output_layer: has(VkFeature::ShaderOutputLayer),
         output_viewport_index: has(VkFeature::ShaderOutputViewportIndex),
         clip_distance: has(VkFeature::ShaderClipDistance),
-        cull_distance: has(VkFeature::ShaderCullDistance),
-        rasterization_order_color_access: has(VkFeature::RasterizationOrderColorAttachmentAccess),
-        dynamic_rendering_local_read: has(VkFeature::DynamicRenderingLocalRead),
         vertex_attribute_divisor: has(VkFeature::VertexAttributeInstanceRateDivisor),
-        vertex_attribute_zero_divisor: has(VkFeature::VertexAttributeInstanceRateZeroDivisor),
     };
 
     let (vertex_formats, storage_formats, image_formats) = format_tables(desc);
-    let deviates = |d: DriverDeviation| deviations.contains(&d);
     ProfileFields {
         buffer_access,
         pointer_domain: policy.pointer_domain,
         handle_domain: policy.handle_domain,
-        containment,
-        isolation: policy.isolation,
-        half_chains: policy.half_chains,
         leaf,
-        subgroup: subgroup_model(desc, deviates(DriverDeviation::MetalVertexSimdgroups)),
+        subgroup: subgroup_model(desc),
         images,
         descriptors,
         fragment,
@@ -329,123 +273,18 @@ fn derive_fields(
         vertex_formats,
         storage_formats,
         image_formats,
-        workarounds: workarounds(desc),
         api_version: api,
         // The feature, which both description readers list from 1.3 (core without a member),
         // so the extended dynamic states a pipeline makes are exactly what it requires.
         dynamic_vertex_stride: has(VkFeature::ExtendedDynamicState),
-        enabled: enabled_caps(desc, deviations),
-        // The measured deviation; unmeasured, the device's own functions.
-        float_functions: if deviates(DriverDeviation::MetalFloatFunctions) {
-            FloatFunctions::Metal
-        } else {
-            FloatFunctions::Native
-        },
-        // The measured deviation; unmeasured, the device's NaN, noted.
-        nan_encoding: if deviates(DriverDeviation::MetalCanonicalNans) {
-            NanEncoding::MetalCanonical
-        } else {
-            NanEncoding::Native
-        },
-        // The planes of a two-plane YCbCr texture read in place where the GPU reads host memory
-        // with no bus between: an integrated GPU's, a CPU device's.
-        ycbcr_in_place: matches!(
-            desc.device_type,
-            Some(vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU)
-        ),
-        ycbcr_in_place_reads: policy.ycbcr_in_place_reads,
-        // The device's measured value, keyed on its identity as the workarounds are, or the floor.
-        function_storage: function_storage::of(desc),
-        // The measured deviations, one per pipeline kind; unmeasured, Vulkan's rule, the device's
-        // own reading of the gradients handed to it.
-        cube_gradients: {
-            let route = |measured: &[(DriverDeviation, CubeGradientRoute)]| {
-                measured
-                    .iter()
-                    .find(|(deviation, _)| deviates(*deviation))
-                    .map_or(CubeGradientRoute::Vulkan, |&(_, route)| route)
-            };
-            CubeGradients {
-                graphics: route(&[(
-                    DriverDeviation::GraphicsCubeGradientTangents,
-                    CubeGradientRoute::AppleProjected,
-                )]),
-                compute: route(&[(DriverDeviation::CubeGradientRoute, CubeGradientRoute::Metal)]),
-            }
-        },
+        enabled: enabled_caps(desc),
+        // The planes of a two-plane YCbCr texture read in place on every device.
+        ycbcr_in_place: true,
+        // The floor: no Vulkan query states how much a thread holds.
+        function_storage: FunctionStorage::Assumed(function_storage::FLOOR),
+        // Vulkan's rule, the device's own reading of the gradients handed to it.
     }
 }
-
-/// The driver workarounds of the driver `desc` names (`driver_id`), on its GPU (`vendor_id`, or its
-/// generation's `device_id`s) where the defect is the GPU's, and those of the measured table
-/// (`driver_facts::DEFECTS`), in order.
-fn workarounds(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
-    let mut found = by_identity(desc);
-    // Every rasterizer but Apple's hands a clipped primitive's fragments their coverage by the
-    // whole primitive (or, lavapipe, by its own pieces), never by Apple's pieces; and every
-    // tessellator but Apple's orders a patch's triangles its own way.
-    if !(desc.driver_id == Some(vk::DriverId::MOLTENVK) && desc.vendor_id == APPLE_VENDOR_ID) {
-        found.push(DriverWorkaround::ClippedCoverageNotMetals);
-        found.push(DriverWorkaround::TessellatorNotMetals);
-    }
-    found.extend(super::driver_facts::defects(desc));
-    found.sort();
-    found.dedup();
-    found
-}
-
-/// The workarounds of [`workarounds`] keyed on the driver's identity alone.
-fn by_identity(desc: &DeviceDescription) -> Vec<DriverWorkaround> {
-    match desc.driver_id {
-        Some(vk::DriverId::GOOGLE_SWIFTSHADER) => vec![DriverWorkaround::BufferAtomicsUncontained],
-        Some(vk::DriverId::MOLTENVK) if desc.vendor_id == APPLE_VENDOR_ID => vec![
-            DriverWorkaround::EarlyTestsDropMultisampledImageWrites,
-            DriverWorkaround::DiscardDropsSimdgroupStores,
-        ],
-        Some(vk::DriverId::MESA_LLVMPIPE) => {
-            vec![DriverWorkaround::ClippedTrianglesSplitPixelFragments]
-        }
-        // A `half` round trip folded on every GPU it drives, and on the 3090's generation a
-        // narrow integer's mask dropped.
-        Some(vk::DriverId::NVIDIA_PROPRIETARY) => {
-            let mut found = vec![DriverWorkaround::HalfConversionPairFolded];
-            if super::NVIDIA_AMPERE_GA10X.contains(&desc.device_id) {
-                found.push(DriverWorkaround::NarrowMaskAfterSignedClamp);
-            }
-            found
-        }
-        // An `f32` operation fused into the conversion of its result to `half`, on every GPU it
-        // drives.
-        Some(vk::DriverId::MESA_RADV) => vec![DriverWorkaround::HalfConversionFusedWithArithmetic],
-        // A register allocator that faults compiling a module past a word bound, products of one
-        // value by zeros of opposite sign kept as one, a stage past 2^20 objects of its
-        // serialized form corrupted, and a compiler whose memory outgrows the stage, on every GPU
-        // it drives.
-        Some(vk::DriverId::INTEL_OPEN_SOURCE_MESA) => vec![
-            DriverWorkaround::RegisterAllocatorOverflowsLargeModules,
-            DriverWorkaround::OppositeZeroProductsMerged,
-            DriverWorkaround::SerializedStageWrapsLargeModules,
-            DriverWorkaround::CompilerMemoryGrowsWithStageSize,
-        ],
-        _ => Vec::new(),
-    }
-}
-
-/// The operation classes measured exact in a vertex function on a driver that takes
-/// `DriverDeviation::MetalVertexSimdgroups`: with the vertex stage forced into the profile,
-/// MoltenVK 1.4.1 ran `rvc_simd_vertex`'s `simd_sum`, `simd_shuffle`, `simd_shuffle_xor` and
-/// `simd_ballot` as Metal does (200 of 200 words on the M4 and the M3 Max), and with the votes
-/// added, `gsm2_vertex_votes_shifts`' `simd_all` and `simd_any` over full and partial simdgroups
-/// (the four cases matching in both legs on both chips).
-///
-/// The clustered class stays out: with it added, MoltenVK 1.4.1 refused `gsm2_quad_ops`' vertex
-/// functions, whose quad reductions then lowered to it ("Subgroup builtins are not available in
-/// this type of function", SPIRV-Cross's MSL conversion). They now take the ballot
-/// and shuffles, so no quad or simdgroup operation of a vertex function on the `Direct` tier needs
-/// it.
-const MEASURED_VERTEX_OPS: OpBits = OpBits(
-    OpBits::BASIC.0 | OpBits::VOTE.0 | OpBits::ARITHMETIC.0 | OpBits::BALLOT.0 | OpBits::SHUFFLE.0,
-);
 
 /// The subgroup model.
 ///
@@ -453,12 +292,7 @@ const MEASURED_VERTEX_OPS: OpBits = OpBits(
 /// `requiredSubgroupSizeStages`; its size range is then `[minSubgroupSize, maxSubgroupSize]`.
 /// Otherwise SPIR-V 1.5 modules run with the API-constant `subgroupSize`, which is the only size
 /// the stage exposes. `full_subgroups` is compute-only (`computeFullSubgroups`).
-///
-/// Where the driver is measured to run a vertex function's subgroup operations as Metal does
-/// though `subgroupSupportedStages` leaves the vertex stage out (`vertex_simdgroups`,
-/// `DriverDeviation::MetalVertexSimdgroups`), the vertex stage has subgroups of the device's
-/// operations that were measured exact there ([`MEASURED_VERTEX_OPS`]).
-fn subgroup_model(desc: &DeviceDescription, vertex_simdgroups: bool) -> SubgroupModel {
+fn subgroup_model(desc: &DeviceDescription) -> SubgroupModel {
     let sg = &desc.subgroup;
     let control = desc.has(VkFeature::SubgroupSizeControl);
     let ops = OpBits(sg.supported_operations.as_raw() & OpBits(0xff).0);
@@ -468,15 +302,9 @@ fn subgroup_model(desc: &DeviceDescription, vertex_simdgroups: bool) -> Subgroup
             && sg.required_size_stages.contains(bit)
             && sg.min_size > 0
             && sg.max_size >= sg.min_size;
-        let advertised = sg.supported_stages.contains(bit);
-        let measured = !advertised && vertex_simdgroups && stage == Stage::Vertex;
         StageSubgroup {
-            supported: advertised || measured,
-            ops: if measured {
-                OpBits(ops.0 & MEASURED_VERTEX_OPS.0)
-            } else {
-                ops
-            },
+            supported: sg.supported_stages.contains(bit),
+            ops,
             api_size: sg.size,
             sizes: if pinnable {
                 SubgroupSizes {
@@ -497,7 +325,6 @@ fn subgroup_model(desc: &DeviceDescription, vertex_simdgroups: bool) -> Subgroup
         vertex: stage(Stage::Vertex),
         fragment: stage(Stage::Fragment),
         kernel: stage(Stage::Kernel),
-        quad_all_stages: sg.quad_operations_in_all_stages,
         maximal_reconvergence: desc.has(VkFeature::ShaderMaximalReconvergence),
         uniform_control_flow: desc.has(VkFeature::ShaderSubgroupUniformControlFlow),
         quad_control: desc.has(VkFeature::ShaderQuadControl),
@@ -665,7 +492,7 @@ pub(crate) fn usage_class(usage: FormatUsage) -> UsageClass {
     }
 }
 
-fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>) -> EnabledCaps {
+fn enabled_caps(desc: &DeviceDescription) -> EnabledCaps {
     let sg = &desc.subgroup;
     let mut properties = BTreeSet::new();
     for (stage, bit) in STAGE_BITS {
@@ -676,9 +503,6 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
         {
             properties.insert(VkProperty::RequiredSubgroupSizeStage(stage));
         }
-    }
-    if sg.supported_stages.contains(vk::ShaderStageFlags::GEOMETRY) {
-        properties.insert(VkProperty::SubgroupGeometryStage);
     }
     for op in SUBGROUP_OPS {
         if OpBits(sg.supported_operations.as_raw()).contains(OpBits::of(op)) {
@@ -738,108 +562,10 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
     if desc.rgba4_opaque_black_swizzled {
         properties.insert(VkProperty::Rgba4OpaqueBlackSwizzled);
     }
-    // Where `InterpolateAtOffset` reads, and the measured deviations.
-    if desc.interpolates_at_offset_centered() {
-        properties.insert(VkProperty::InterpolateAtOffsetCentered);
-    } else {
-        properties.insert(VkProperty::InterpolateAtOffsetFromSevenSixteenths);
-    }
-    if deviations.contains(&DriverDeviation::SimdgroupLockstep) {
-        properties.insert(VkProperty::SimdgroupLockstep);
-    }
-    if deviations.contains(&DriverDeviation::MetalSampler) {
-        properties.insert(VkProperty::MetalSampler);
-    } else {
-        // Native device sampling, where the device's sampler is not Metal's.
-        properties.insert(VkProperty::DeviceSampling);
-    }
-    if deviations.contains(&DriverDeviation::MetalColorWrites) {
-        properties.insert(VkProperty::MetalColorWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalFloatColorNans) {
-        properties.insert(VkProperty::MetalFloatColorNans);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfFma) {
-        properties.insert(VkProperty::MetalHalfFma);
-    }
-    if deviations.contains(&DriverDeviation::MetalFloatDenormals) {
-        properties.insert(VkProperty::MetalFloatDenormals);
-    }
-    if deviations.contains(&DriverDeviation::MetalCenterVaryings) {
-        properties.insert(VkProperty::MetalCenterVaryings);
-    }
-    if deviations.contains(&DriverDeviation::MetalSmallFloatColorWrites) {
-        properties.insert(VkProperty::MetalSmallFloatColorWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalNorm16ColorWrites) {
-        properties.insert(VkProperty::MetalNorm16ColorWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalMinMax) {
-        properties.insert(VkProperty::MetalMinMax);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfArithmetic) {
-        properties.insert(VkProperty::MetalHalfArithmetic);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfStorageWrites) {
-        properties.insert(VkProperty::MetalHalfStorageWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfStorageNans) {
-        properties.insert(VkProperty::MetalHalfStorageNans);
-    }
-    if deviations.contains(&DriverDeviation::MetalFragmentSimdgroups) {
-        properties.insert(VkProperty::MetalFragmentSimdgroups);
-    }
-    if deviations.contains(&DriverDeviation::MetalVertexSimdgroups) {
-        properties.insert(VkProperty::MetalVertexSimdgroups);
-    }
-    if deviations.contains(&DriverDeviation::CenterFragCoordDepth) {
-        properties.insert(VkProperty::CenterFragCoordDepth);
-    }
-    if deviations.contains(&DriverDeviation::SampleFragCoordDepth) {
-        properties.insert(VkProperty::SampleFragCoordDepth);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfTexelWrites) {
-        properties.insert(VkProperty::MetalHalfTexelWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalNormStorageWrites) {
-        properties.insert(VkProperty::MetalNormStorageWrites);
-    }
-    if deviations.contains(&DriverDeviation::MetalDepth16Stores) {
-        properties.insert(VkProperty::MetalDepth16Stores);
-    }
-    if deviations.contains(&DriverDeviation::MetalDepth16BiasedStores) {
-        properties.insert(VkProperty::MetalDepth16BiasedStores);
-    }
-    if deviations.contains(&DriverDeviation::MetalInterpolation) {
-        properties.insert(VkProperty::MetalInterpolation);
-    }
-    if deviations.contains(&DriverDeviation::MetalFirstVertexIndices) {
-        properties.insert(VkProperty::MetalFirstVertexIndices);
-    }
-    if deviations.contains(&DriverDeviation::MetalFullQuads) {
-        properties.insert(VkProperty::MetalFullQuads);
-    }
-    if deviations.contains(&DriverDeviation::MetalNormalizedVertexFetch) {
-        properties.insert(VkProperty::MetalNormalizedVertexFetch);
-    }
-    if deviations.contains(&DriverDeviation::MetalAlphaCoverage) {
-        properties.insert(VkProperty::MetalAlphaCoverage);
-    }
-    if deviations.contains(&DriverDeviation::MetalNanMoves) {
-        properties.insert(VkProperty::MetalNanMoves);
-    }
-    if deviations.contains(&DriverDeviation::MetalPackConversions) {
-        properties.insert(VkProperty::MetalPackConversions);
-    }
-    if deviations.contains(&DriverDeviation::MetalHalfConversion) {
-        properties.insert(VkProperty::MetalHalfConversion);
-    }
-    if deviations.contains(&DriverDeviation::MetalSmallFloatNans) {
-        properties.insert(VkProperty::MetalSmallFloatNans);
-    }
-    if deviations.contains(&DriverDeviation::MetalUnaryDenormals) {
-        properties.insert(VkProperty::MetalUnaryDenormals);
-    }
+    // `InterpolateAtOffset` reads from the pixel's center, as GLSL.std.450 states, and the device
+    // samples natively.
+    properties.insert(VkProperty::InterpolateAtOffsetCentered);
+    properties.insert(VkProperty::DeviceSampling);
     let l = &desc.limits;
     let sample_counts: [(vk::SampleCountFlags, fn(u32) -> VkProperty); 6] = [
         (
@@ -898,27 +624,6 @@ fn enabled_caps(desc: &DeviceDescription, deviations: &BTreeSet<DriverDeviation>
     }
     if l.independent_resolve {
         properties.insert(VkProperty::IndependentResolve);
-    }
-    // The provoking-vertex property holds only where the extension is listed (after
-    // `with_enabled`, enabled).
-    if desc.extensions.contains(&VkExtension::ExtProvokingVertex)
-        && l.provoking_vertex_mode_per_pipeline
-    {
-        properties.insert(VkProperty::ProvokingVertexModePerPipeline);
-    }
-    // The sample-location properties hold only where the extension is listed (after
-    // `with_enabled`, enabled): a device that has not enabled it sets no locations.
-    if desc.extensions.contains(&VkExtension::ExtSampleLocations) {
-        if l.variable_sample_locations {
-            properties.insert(VkProperty::VariableSampleLocations);
-        }
-        for count in (0..7).map(|shift| 1u32 << shift) {
-            if l.sample_location_sample_counts
-                .contains(vk::SampleCountFlags::from_raw(count))
-            {
-                properties.insert(VkProperty::SampleLocationSampleCount(count));
-            }
-        }
     }
     EnabledCaps {
         features: desc.features.clone(),

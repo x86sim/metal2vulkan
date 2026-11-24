@@ -2,19 +2,19 @@
 //! of every `half` bit pattern.
 //!
 //! Metal's conversion here is **not** IEEE's round-to-nearest, which is the whole reason the family
-//! exists: `runtime_lane::half_storage_writes` measured that Metal rounds each channel **toward
-//! zero**, stores a finite value at or past 65504 as 65504, keeps an infinity, and stores every NaN
-//! as `0x7e00`. A device that rounds to nearest is wrong by one code on half the inputs, and a
-//! device that quiets a NaN its own way is wrong in the payload — both are differences a comparison
-//! in floats would call almost right, so every site here records unsigned words.
+//! exists: Metal rounds each channel **toward zero**, stores a finite value at or past 65504 as
+//! 65504, keeps an infinity, and stores every NaN as `0x7e00`. A device that rounds to nearest is
+//! wrong by one code on half the inputs, and a device that quiets a NaN its own way is wrong in the
+//! payload — both are differences a comparison in floats would call almost right, so every site
+//! here records unsigned words.
 //!
-//! **The sweep is exhaustive over a complete space**, which is why it records whole rather than as a
-//! digest: all 65,536 `half` bit patterns, each widened to its exact `f32` and written back, so
+//! **The sweep is exhaustive over a complete space**, which is why it records whole rather than as
+//! a digest: all 65,536 `half` bit patterns, each widened to its exact `f32` and written back, so
 //! every NaN payload, every denormal, both zeros, both infinities and every normal is a row. Ahead
-//! of them sit the lane's own specials, which are the inputs no half code can be: the `f32`
-//! denormals that have to flush, 65519 and 65520 either side of the half's last rounding boundary,
-//! 1e10 past the format's range, and four `f32` NaN payloads. The tail of the last row holds one
-//! signalling `f32` NaN, stated so every texel of the level is a value the case named.
+//! of them sit specials, the inputs no half code can be: the `f32` denormals that have to flush,
+//! 65519 and 65520 either side of the half's last rounding boundary, 1e10 past the format's range,
+//! and four `f32` NaN payloads. The tail of the last row holds one signalling `f32` NaN, stated so
+//! every texel of the level is a value the case named.
 //!
 //! One case per format and per form, so a form or a format a venue honestly lacks is that venue's
 //! gap ([`crate::verdict::Verdict::LacksFeature`]) at its own row.
@@ -28,10 +28,9 @@
 //! | `read-write` | `hsw_read_write`, a `texture2d<float, access::read_write>` at slot 0 |
 //! | `held` | `hsw_held`, the `texture2d<float, access::write>` an argument buffer at buffer 2 holds |
 //!
-//! The lane's fourth form, `hsw_buffer`'s `texture_buffer<float, access::write>`, is not ported: a
-//! texture over a buffer's bytes has no call in the vocabulary a case is written against, so there
-//! is nowhere to say it. The module docs of `runtime_lane::half_storage_writes` record that plain
-//! Metal stored the same codes through all four.
+//! A fourth form, `hsw_buffer`'s `texture_buffer<float, access::write>`, is not a case: a texture
+//! over a buffer's bytes has no call in the vocabulary a case is written against, so there is
+//! nowhere to say it.
 //!
 //! Every texel holds [`FILL`] before the dispatch, so a texel the kernel did not reach is a
 //! recorded value rather than whatever the allocator left.
@@ -39,7 +38,6 @@
 //! Nothing here can fault a GPU: one compute pass, one texture, one thread a texel inside it, no
 //! loop and no sampling.
 
-use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, ArgumentSlot, Bindings, Case, Failure, Handle, Input, MetalSource, Side,
     TextureRole, TextureSpec,
@@ -54,8 +52,7 @@ use metal2vulkan::metal::PixelFormat;
 /// The fixture the three kernels live in.
 const FIXTURE: &str = "hsw_storage_writes";
 
-/// The texture's row of texels, which is the lane's own width and the `width` the kernels read
-/// from buffer 1.
+/// The texture's row of texels, the `width` the kernels read from buffer 1.
 const WIDTH: u32 = 1024;
 
 /// The rows the sweep takes: 65,536 codes and the specials fit in sixty-five.
@@ -71,12 +68,12 @@ pub const FILL: u8 = 0xab;
 /// texel of the level is a value the case stated and the NaN rule is asked once more.
 const TAIL: u32 = 0x7f80_0001;
 
-/// The lane's specials, as `f32` bits: the inputs no `half` code can be.
+/// The specials, as `f32` bits: the inputs no `half` code can be.
 ///
 /// Zeros and ones of both signs, the two `f32` denormals that must flush, a tiny normal, both
 /// infinities, 65504 and the two values either side of the half's last rounding boundary, a value
-/// far past the range, and four `f32` NaN payloads. These are `runtime_lane::color_writes`'
-/// `specials`, by their bits so a transcription cannot move one by a step.
+/// far past the range, and four `f32` NaN payloads, by their bits so a transcription cannot move
+/// one by a step.
 const SPECIALS: [u32; 27] = [
     0x0000_0000, // 0.0
     0x8000_0000, // -0.0
@@ -299,40 +296,6 @@ impl Case for HalfStorageWrites {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // The sweep's grid is 1,024 by 65 threads at 32 by 32 a threadgroup, so 65 is not a whole
-        // number of threadgroups. That used to make the runtime run the dispatch as more than one
-        // Vulkan dispatch and announce `metal2vulkan-degrade-split-dispatch`, and the family
-        // declared the code for it. It does not any more: a ragged `dispatchThreads:` on a kernel
-        // that cannot observe its threadgroup partition runs as Metal's single dispatch, and
-        // `Degradation::SplitDispatch` fires on more than one region. Measured on this M3 Max, 8
-        // runs of the whole 1,103-case set: every row of this family announced no notice at all,
-        // where the recordings taken before that landing hold the code in their cost record's
-        // `degraded` set. So the declaration is gone, and a split here reads as an undeclared
-        // notice at once.
-        //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 9 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        //
-        // The held form writes a texture held in an argument buffer, whose heap set MoltenVK's
-        // layout query refuses ([`crate::replay::set_past_layout_notice`]): announced by the three
-        // held rows on the M3 Max under MoltenVK 1.4.2, by none on lavapipe.
-        let mut allowances = vec![crate::replay::shared_memory_notice()];
-        if self.form == Form::Held {
-            allowances.push(crate::replay::set_past_layout_notice());
-        }
-        allowances
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let mut shaders = Vec::new();
         for extension in [RUNTIME_TEXT, METAL_TEXT] {
@@ -426,9 +389,8 @@ impl Case for HalfStorageWrites {
     }
 }
 
-/// The code Metal's conversion stores for `x`, as `runtime_lane::half_storage_writes` measured it:
-/// a NaN is `0x7e00`, an infinity is kept, a finite value at or past 65504 is the largest half, and
-/// everything else is rounded **toward zero**.
+/// The code Metal's conversion stores for `x`: a NaN is `0x7e00`, an infinity is kept, a finite
+/// value at or past 65504 is the largest half, and everything else is rounded **toward zero**.
 ///
 /// Public so the cross-check can name it and so a reader of the family can find the rule in one
 /// place rather than in prose.
@@ -543,19 +505,17 @@ mod tests {
         }
     }
 
-    /// Metal's recorded codes are the rule the lane measured, code for code, for every format,
-    /// every form and every channel.
+    /// Metal's recorded codes are the measured rule, code for code, for every format, every form
+    /// and every channel.
     ///
-    /// This is the cross-check the port exists for: the lane holds the rule in a function and
-    /// asserts a live device against it, which says nothing on a host with no Metal. Here the rule
-    /// is held against Metal's own recorded answer, so a release that changes Metal's conversion
-    /// shows as the input that moved rather than as a lane that stops passing on one Mac.
+    /// The rule is held against Metal's own recorded answer, so a release that changes Metal's
+    /// conversion shows as the input that moved.
     #[test]
-    fn metals_recorded_codes_are_the_rule_the_lane_measured() {
+    fn metals_recorded_codes_are_the_measured_rule() {
         let inputs = values();
         for case in all() {
             let Ok(recording) = crate::recording::read(case.name()) else {
-                // A case recorded in a later commit of this batch.
+                // A case with no recording.
                 continue;
             };
             let answer = recording
@@ -581,7 +541,7 @@ mod tests {
                     assert_eq!(
                         got, want,
                         "{} input {index} ({word:#010x}) channel {channel}: Metal stored \
-                         {got:#06x}, the lane's rule is {want:#06x}",
+                         {got:#06x}, the rule is {want:#06x}",
                         case.name
                     );
                 }

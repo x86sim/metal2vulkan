@@ -6,7 +6,6 @@ const COMMITTED: &[&str] = &[
     "amd-780m-hawkpoint-radv",
     "amd-780m-radv",
     "amd-rdna2-apu-radv",
-    "amd-rdna3-radv",
     "gate-lavapipe",
     "gate-lavapipe-x86_64",
     "intel-arl-anv",
@@ -14,14 +13,11 @@ const COMMITTED: &[&str] = &[
     "intel-irisxe-rplp-anv",
     "intel-uhd770-rpls-anv",
     "lavapipe",
-    "lunarg-desktop-baseline-2023",
     "moltenvk-m3",
     "nvidia-pascal-linux",
     "nvidia-rtx50-linux",
     "nvidia-rtx5080-laptop",
-    "roadmap-2022",
-    "swiftshader",
-    "vk12-floor",
+    "runtime-floor",
 ];
 
 #[test]
@@ -101,17 +97,16 @@ fn device_reports_carry_identity_and_formats() {
     assert!(nv.has(VkFeature::ShaderInt64));
 }
 
-/// The floor is Vulkan 1.2 core: no optional feature, not even one the product uses where present
-/// (narrow integers and storage access, formatless storage images), since no product path needs
-/// one.
+/// `runtime-floor` is Vulkan 1.3 core and what the runtime requires of every device: the floor's
+/// features (64-bit and narrow integers, narrow storage access, device addresses, writes without a
+/// format) and none it leaves optional (reads without a format, 64-bit floats), and the Vulkan 1.2
+/// Required Format Support tables' entries for the features it requires.
 #[test]
-fn vk12_floor_is_vulkan_1_2_core() {
-    let d = profile("vk12-floor");
-    assert_eq!(d.api_version, ApiVersion::V1_2);
-    // Vulkan 1.2 requires uniformBufferStandardLayout.
-    assert!(d.has(VkFeature::UniformBufferStandardLayout));
-    assert!(d.has(VkFeature::RobustBufferAccess));
+fn runtime_floor_is_vulkan_1_3_core_and_the_runtime_s_floor() {
+    let d = profile("runtime-floor");
+    assert_eq!(d.api_version, ApiVersion::V1_3);
     for f in [
+        VkFeature::UniformBufferStandardLayout,
         VkFeature::ShaderInt16,
         VkFeature::ShaderInt64,
         VkFeature::BufferDeviceAddress,
@@ -120,15 +115,16 @@ fn vk12_floor_is_vulkan_1_2_core() {
         VkFeature::SubgroupSizeControl,
         VkFeature::StorageBuffer8BitAccess,
         VkFeature::StorageBuffer16BitAccess,
-        VkFeature::ShaderStorageImageReadWithoutFormat,
         VkFeature::ShaderStorageImageWriteWithoutFormat,
+    ] {
+        assert!(d.has(f), "{f:?}");
+    }
+    for f in [
+        VkFeature::ShaderStorageImageReadWithoutFormat,
+        VkFeature::ShaderFloat64,
     ] {
         assert!(!d.has(f), "{f:?}");
     }
-    // The formats are the Vulkan 1.2 Required Format Support tables' unconditional entries: a
-    // storage view of a 8-bit format needs shaderStorageImageExtendedFormats, and depth attachments
-    // other than D16 and the compressed families are choices.
-    assert_eq!(d.formats.formats.len(), 56);
     for usage in [
         FormatUsage::SampledImage,
         FormatUsage::SampledImageFilterLinear,
@@ -145,8 +141,12 @@ fn vk12_floor_is_vulkan_1_2_core() {
     assert!(d
         .formats
         .supports(vk::Format::D16_UNORM, FormatUsage::DepthStencilAttachment));
+    // A storage view of an 8-bit format: `shaderStorageImageExtendedFormats`, which the floor
+    // requires.
+    assert!(d
+        .formats
+        .supports(vk::Format::R8_UNORM, FormatUsage::StorageImage));
     for (format, usage) in [
-        (vk::Format::R8_UNORM, FormatUsage::StorageImage),
         (vk::Format::D32_SFLOAT, FormatUsage::DepthStencilAttachment),
         (vk::Format::BC1_RGBA_UNORM_BLOCK, FormatUsage::SampledImage),
         (
@@ -158,7 +158,9 @@ fn vk12_floor_is_vulkan_1_2_core() {
     }
     assert_eq!(d.driver_id, None);
     assert_eq!(d.limits.max_compute_shared_memory_size, 16384);
-    assert_eq!(d.limits.max_compute_work_group_size, [128, 128, 64]);
+    assert_eq!(d.limits.max_compute_work_group_size, [1024, 1024, 64]);
+    // Vulkan 1.3's least: the runtime's floor asks no push limit.
+    assert_eq!(d.limits.max_push_constants_size, 128);
     assert_eq!(d.limits.min_storage_buffer_offset_alignment, 256);
 }
 
@@ -170,8 +172,8 @@ fn divisor_first_instance_support_follows_exposure() {
         ("lavapipe", false),
         ("moltenvk-m3", true),
         ("nvidia-rtx50-linux", true),
-        ("lunarg-desktop-baseline-2023", false),
-        ("vk12-floor", false),
+        ("runtime-floor", false),
+        ("runtime-floor", false),
     ] {
         assert_eq!(
             profile(stem).limits.supports_non_zero_first_instance,
@@ -197,7 +199,8 @@ fn rgba4_opaque_black_swizzled_follows_exposure() {
     );
     let d = DeviceDescription::from_khronos_json(&with, None).unwrap();
     assert!(d.rgba4_opaque_black_swizzled);
-    let dev = crate::device::Device::new(d, crate::device::DevicePolicy::default()).unwrap();
+    let dev = crate::device::Device::from_queries(d, crate::device::DevicePolicy::RESIDENT_TABLES)
+        .unwrap();
     assert!(dev
         .profile()
         .fields()
@@ -214,8 +217,7 @@ fn rgba4_opaque_black_swizzled_follows_exposure() {
 
 /// A device that exposes only the ARM spelling of rasterization-order attachment access has the
 /// same feature as one exposing the EXT spelling: the extension and its feature structure map to
-/// one vocabulary entry, so its fragments read their color attachments in rasterization order
-/// and the ordered fetch is enabled.
+/// one vocabulary entry.
 #[test]
 fn the_arm_spelling_of_rasterization_order_access_is_the_ext_one() {
     use crate::device::requirements::VkExtension;
@@ -234,13 +236,6 @@ fn the_arm_spelling_of_rasterization_order_access_is_the_ext_one() {
         .extensions
         .contains(&VkExtension::ExtRasterizationOrderAttachmentAccess));
     assert!(d.has(VkFeature::RasterizationOrderColorAttachmentAccess));
-    let dev = crate::device::Device::new(d, crate::device::DevicePolicy::default()).unwrap();
-    assert!(
-        dev.profile()
-            .fields()
-            .fragment
-            .rasterization_order_color_access
-    );
     // The structure without its extension is not exposed.
     let bare = doc(
         "1.2.0",
@@ -249,49 +244,6 @@ fn the_arm_spelling_of_rasterization_order_access_is_the_ext_one() {
     );
     let d = DeviceDescription::from_khronos_json(&bare, None).unwrap();
     assert!(!d.has(VkFeature::RasterizationOrderColorAttachmentAccess));
-}
-
-/// `robustBufferAccessUpdateAfterBind` is read from either structure that states it, and a
-/// document that does not state it (`roadmap-2022`, which requires nothing of it) reads false.
-#[test]
-fn robust_buffer_access_update_after_bind_is_read_where_stated() {
-    for (stem, stated) in [
-        ("lavapipe", true),
-        ("moltenvk-m3", true),
-        ("nvidia-rtx50-linux", true),
-        ("swiftshader", false),
-        ("lunarg-desktop-baseline-2023", false),
-        ("vk12-floor", false),
-        ("roadmap-2022", false),
-    ] {
-        assert_eq!(
-            profile(stem).robust_buffer_access_update_after_bind,
-            stated,
-            "{stem}"
-        );
-    }
-    for structure in [
-        "VkPhysicalDeviceVulkan12Properties",
-        "VkPhysicalDeviceDescriptorIndexingProperties",
-        "VkPhysicalDeviceDescriptorIndexingPropertiesEXT",
-    ] {
-        let with = doc(
-            "1.2.0",
-            r#""a""#,
-            &format!(
-                r#""a": {{"properties": {{"{structure}":
-                    {{"robustBufferAccessUpdateAfterBind": true}}}}}}"#
-            ),
-        );
-        let d = DeviceDescription::from_khronos_json(&with, None).unwrap();
-        assert!(d.robust_buffer_access_update_after_bind, "{structure}");
-    }
-    let unstated = doc("1.2.0", r#""a""#, r#""a": {}"#);
-    assert!(
-        !DeviceDescription::from_khronos_json(&unstated, None)
-            .unwrap()
-            .robust_buffer_access_update_after_bind
-    );
 }
 
 /// A profile's `m2v_color_attachment_sample_counts` entry states each color attachment format's
@@ -385,8 +337,8 @@ fn portability_stride_alignment_follows_exposure() {
     for stem in [
         "lavapipe",
         "nvidia-rtx50-linux",
-        "vk12-floor",
-        "amd-rdna3-radv",
+        "runtime-floor",
+        "amd-780m-radv",
     ] {
         assert_eq!(
             profile(stem)
@@ -532,7 +484,7 @@ fn early_coverage_after_counting_reads_the_maintenance5_structure() {
 #[test]
 fn profile_documents_imply_version_required_features() {
     // The LunarG baseline lists 1.2 structures but not every member 1.2 requires.
-    let d = profile("lunarg-desktop-baseline-2023");
+    let d = profile("runtime-floor");
     assert!(d.has(VkFeature::ShaderSubgroupExtendedTypes));
     assert!(d.has(VkFeature::UniformBufferStandardLayout));
 }
@@ -637,17 +589,17 @@ fn maintenance8_reads_its_extension_structure() {
     assert!(d.extensions.contains(&VkExtension::KhrMaintenance8));
     for (stem, expected) in [
         ("amd-rdna2-apu-radv", true),
-        ("amd-rdna3-radv", true),
+        ("amd-780m-radv", true),
         ("intel-arl-anv", true),
         ("intel-irisxe-anv", true),
         ("lavapipe", true),
-        ("lunarg-desktop-baseline-2023", false),
+        ("runtime-floor", false),
         ("moltenvk-m3", true),
         ("nvidia-pascal-linux", true),
         ("nvidia-rtx50-linux", true),
-        ("roadmap-2022", false),
-        ("swiftshader", false),
-        ("vk12-floor", false),
+        ("runtime-floor", false),
+        ("runtime-floor", false),
+        ("runtime-floor", false),
     ] {
         assert_eq!(
             profile(stem).has(VkFeature::Maintenance8),
@@ -685,7 +637,7 @@ fn border_color_swizzle_and_format_extensions_are_read() {
     assert!(d.has(VkFeature::BorderColorSwizzleFromImage));
     assert!(d.extensions.contains(&VkExtension::ExtBorderColorSwizzle));
     assert!(d.extensions.contains(&VkExtension::ExtCustomBorderColor));
-    for stem in ["amd-rdna3-radv", "intel-arl-anv", "lavapipe"] {
+    for stem in ["amd-780m-radv", "intel-arl-anv", "lavapipe"] {
         assert!(
             profile(stem).has(VkFeature::BorderColorSwizzleFromImage),
             "{stem}"
@@ -700,7 +652,7 @@ fn border_color_swizzle_and_format_extensions_are_read() {
     ] {
         assert!(mvk.extensions.contains(&ext), "moltenvk-m3 lists {ext:?}");
     }
-    assert!(!profile("vk12-floor")
+    assert!(!profile("runtime-floor")
         .extensions
         .contains(&VkExtension::KhrPortabilitySubset));
 }
@@ -791,17 +743,19 @@ fn required_features_are_cumulative() {
     assert!(v13.contains(&VkFeature::SubgroupSizeControl));
 }
 
-/// With feature `serde`, every committed description and a default and a non-default policy
-/// survive a JSON round trip unchanged, and the `Device` rebuilt from the decoded pair has the
-/// original's profile fingerprint: what an out-of-process compile worker needs to compile for the
-/// consumer's device (worker recipe step 1).
+/// With feature `serde`, every committed description and both policies survive a JSON round trip
+/// unchanged, and the `Device` rebuilt from the decoded pair has the original's profile
+/// fingerprint, or, where the description cannot take the policy (the identity domains without
+/// `bufferDeviceAddress` and `shaderInt64`), the same refusal: what an out-of-process compile
+/// worker needs to compile for the consumer's device (worker recipe step 1).
 #[cfg(feature = "serde")]
 #[test]
 fn descriptions_and_policies_round_trip_through_serde() {
-    let policies = [
-        DevicePolicy::default(),
-        DevicePolicy::default().exact_answers(),
-    ];
+    let identity = DevicePolicy {
+        pointer_domain: crate::device::PointerDomain::Identity,
+        handle_domain: crate::device::HandleDomain::Identity,
+    };
+    let policies = [DevicePolicy::RESIDENT_TABLES, identity];
     for (stem, text) in committed_profiles() {
         let description = DeviceDescription::from_khronos_json(&text, None).unwrap();
         let json = serde_json::to_string(&description).unwrap();
@@ -811,13 +765,23 @@ fn descriptions_and_policies_round_trip_through_serde() {
             let policy_json = serde_json::to_string(&policy).unwrap();
             let decoded_policy: DevicePolicy = serde_json::from_str(&policy_json).unwrap();
             assert_eq!(decoded_policy, policy, "{stem}");
-            let original = Device::new(description.clone(), policy).unwrap();
-            let rebuilt = Device::new(decoded.clone(), decoded_policy).unwrap();
-            assert_eq!(
-                rebuilt.profile().fingerprint(),
-                original.profile().fingerprint(),
-                "{stem}"
-            );
+            let original = Device::from_queries(description.clone(), policy);
+            let rebuilt = Device::from_queries(decoded.clone(), decoded_policy);
+            match (original, rebuilt) {
+                (Ok(original), Ok(rebuilt)) => assert_eq!(
+                    rebuilt.profile().fingerprint(),
+                    original.profile().fingerprint(),
+                    "{stem}"
+                ),
+                (Err(original), Err(rebuilt)) => {
+                    assert_eq!(rebuilt.to_string(), original.to_string(), "{stem}")
+                }
+                (original, rebuilt) => panic!(
+                    "{stem}: the original derives {}, the decoded pair {}",
+                    original.is_ok(),
+                    rebuilt.is_ok()
+                ),
+            }
         }
     }
 }

@@ -151,6 +151,7 @@ use crate::case::{
     call, made, Abort, Bindings, Case, Failure, Handle, Input, MetalSource, SamplerSpec, Side,
     TextureRole, TextureSpec,
 };
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::replay::notice_allowance;
@@ -160,7 +161,6 @@ use metal2vulkan::metal::{
     CompareFunction, PixelFormat, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter,
     SamplerMipFilter, SamplerReductionMode, TextureType, TextureUsage,
 };
-use metal2vulkan_runtime::Degradation;
 
 /// The fixture whose slot kernels sample through the runtime sampler at `[[sampler(0)]]` beside a
 /// constexpr sampler of their own.
@@ -863,31 +863,36 @@ impl Case for SamplerFiltering {
         // notices site is the whole of the difference. The other families provoke no notice and
         // declare none, so a notice any of them starts announcing reads as divergent at once.
         //
-        // One more is declared: the `Shared` buffer every row writes its samples into
-        // ([`crate::replay::shared_memory_notice`]), for all fifteen rows (the RTX 5080). Where
-        // the device filters a float texture its own way (`float-sample-filter`,
-        // `sampler-mip-linear` and `sampler-r-address-modes` on llvmpipe and the 5080), the note
-        // is the device's own answer, which the suite declares for every case
-        // (`crate::replay::NATIVE_NOTES`).
-        let mut named = vec![crate::replay::shared_memory_notice()];
+        // And every family samples through the runtime sampler at `[[sampler(0)]]`, which the
+        // runtime's pipelines note as scaled (`crate::replay::pixel_sampler_scaling_notice` holds
+        // why). Measured through the rt side on lavapipe, the Radeon 780M and the RX 550: it fired
+        // for every row the side does not refuse (the mip, third-address-mode, reduction and
+        // border rows).
+        let mut named = vec![crate::replay::pixel_sampler_scaling_notice()];
+        // The border family's opaque-black rows read that border, which the runtime's sampler
+        // states note on every device (`crate::replay::swizzled_border_notice`).
+        if matches!(self.family, Family::Border) {
+            named.push(crate::replay::swizzled_border_notice());
+        }
         if matches!(self.family, Family::Cubic) {
             named.push(notice_allowance(
                 Degradation::BicubicFilterArithmetic.code(),
             ));
         }
-        // A `compare` row's `Depth32Float` texture: on a device without
-        // `VK_EXT_depth_range_unrestricted` (MoltenVK on the M3 Max) its upload clamps into
-        // [0, 1] (`restricted-depth-upload`) and the comparing stage records that its texels hold
-        // no value outside it (`restricted-depth-range`). Every texel of the family lies in
-        // [0, 1], so neither moves a sample: measured there, the notices site is the whole of the
-        // difference of each of the eight rows.
+        // A `compare` row's comparing stage records that its texels hold no value outside
+        // [0, 1] (`restricted-depth-range`). Every texel of the family lies in [0, 1], so it moves
+        // no sample: measured on the M3 Max, the notices site is the whole of the difference of
+        // each of the eight rows. Its texture's upload carries the note of an upload into a 32-bit
+        // float depth (`restricted-depth-upload`), which moves none of those texels either. And
+        // its kernel `rrp_mc_compare` writes `out[5 * i + k]` for five `k`, stores the translator
+        // does not find disjoint between two threads of one SIMD-group, so its pipeline carries
+        // `simdgroup-access-order` on every device (`crate::replay::simdgroup_access_order_notice`;
+        // measured through the rt side on lavapipe for each of the eight rows). Each thread writes
+        // slots of its own, so the note moves no value.
         if matches!(self.family, Family::Compare(_)) {
-            for kind in [
-                Degradation::RestrictedDepthUpload,
-                Degradation::RestrictedDepthRange,
-            ] {
-                named.push(notice_allowance(kind.code()));
-            }
+            named.push(notice_allowance(Degradation::RestrictedDepthRange.code()));
+            named.push(notice_allowance(Degradation::RestrictedDepthUpload.code()));
+            named.push(crate::replay::simdgroup_access_order_notice());
         }
         named
     }

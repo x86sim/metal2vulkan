@@ -1,880 +1,250 @@
-//! CPU tests of the runtime's pure parts, one file per runtime file. Device tests live in the
-//! validation crate, behind its GPU safety cfgs.
-//!
-//! Some read the repository beside this crate: device profiles from `../validation/profiles`,
-//! fixtures from `../validation/fixtures`, and `../docs`. They run only from the workspace
-//! checkout, not from a packaged crate; the crate's build (its build script and `include_str!`)
-//! reads nothing outside its own directory. They find the checkout through
-//! `metal2vulkan_devtools::workspace_dir` and the helpers on it, where the test runner names it,
-//! so an archive built on one machine runs on another (`--workspace-remap`).
-
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod a8_over_buffers;
-mod address;
-mod address_map;
-mod alias_split;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod aligned_byte;
-mod amplification;
-mod apple_only;
-mod argument_buffers;
-mod argument_encoder;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod argument_sampler_count;
-#[cfg(debug_assertions)]
-mod argument_table;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod attached_levels;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod attached_read_faces;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod attached_read_standing;
-mod attachmentless;
-mod attributes;
-mod batches;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod bc_own_image;
-mod binary;
-mod binary_archive;
-mod binding_view;
+mod ahead;
+mod alias;
+mod aliased_encoders;
+mod alpha_test;
+mod argument_sampling;
+mod argument_tier;
+mod arrays;
+mod barycentrics;
+mod bicubic;
+mod bicubic_draw;
+mod bind_without_index;
 mod blit;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod blit_cover;
-mod blit_fill;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod blit_holds;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod blit_order;
-mod blit_plan;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod blocks_ahead;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod bound_inline;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod buffer_carved_reads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod buffer_tail_device;
-mod buffer_texture;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod caller_queue_writes;
-mod capabilities;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod carried_draws;
-mod churn_counts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod clip_bursts;
-mod color_reformat;
-mod command_buffer;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod command_counts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod commit_and_submit;
-mod compile_memory;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion_here;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion_import_frees;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion_latency;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion_order;
-mod completion_seen;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod completion_wakes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod blit_options;
+mod border;
+mod buffer_accesses;
+mod cache;
+mod choice;
+pub(crate) mod command;
 mod compute;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod compute_bind_memo;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod compute_create_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod compute_instantiated;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod compute_parked;
-mod contexts;
-mod copied;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_bandwidth_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_base_device;
-mod copied_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_device;
-mod copied_log;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_log_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_pass_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copied_present_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copies_beside_a_held_wait;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copies_only_reads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod copy_bounds;
-mod copy_plan;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod core_image_libraries;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod cpu_copy_layouts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod cpu_copy_times;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod creation_prediction_kinds;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod creation_prediction_reach;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod creation_split;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod deferred_calls;
-mod degradation;
-mod degradation_catalogue;
-mod degradation_sites;
-mod depth_copy;
-mod depth_ranges;
-mod depth_stencil_resolve;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod derived_once;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod described_row_copies;
-mod descriptor_arena;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod descriptor_key_at_draw;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod descriptor_key_once;
-// A GPU hazard: its kernel spins up to 2^25 loads on a word the GPU may never see raised.
-#[cfg(any(m2v_cpu_icd, all(m2v_gpu, m2v_gpu_hazards)))]
-mod detach_lost;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod detached_contents;
+mod copy_out;
+mod copy_over;
+mod cube_views;
+mod d3d11;
+mod deep_threadgroups;
 mod device;
-#[cfg(any(m2v_cpu_icd, all(m2v_gpu, m2v_gpu_hazards)))]
-mod device_memory_overflow;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_carry;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_every_kind;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod device_recovery_exportable;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_handles;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_heap;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_live_table;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_no_copy;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_no_copy_heap;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_pipelines;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_samplers;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_states;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_recovery_textures;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod device_registry;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod direct_arguments_from_compiled;
-mod dirty_bytes_of;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dirty_pages_device;
-mod dirty_reports;
-mod dirty_runs;
-mod dirty_runs_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dispatch_pending;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dispatch_tracking;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_beside;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod dma_buf_export;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_fds;
-#[cfg(unix)]
-mod dma_buf_first_imports;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_import_cycles;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_leak_probe;
-#[cfg(unix)]
-mod dma_buf_pieces;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_plane_offset;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod dma_buf_shared_files;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod draw_again;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod draw_shape_notices;
-mod driver_defects;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod driver_pipeline_compile;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dropped_uncommitted;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dropped_usage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod dynamic_multi_variable;
-mod enables;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod encoder_fold;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod encoder_holds;
-mod encoder_moves;
-#[cfg(all(debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
-mod encoder_state_locks;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod encoder_times;
-mod error_kinds;
-mod event_listener;
-mod event_timeline;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod event_vk_signal;
-mod exactness;
-mod exit_guard;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod export_after_dma_buf;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod export_dedication;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod exported_memory;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod exported_semaphore;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod exported_textures;
-mod families;
-mod fences;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fetch_composite;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fill_queue;
-mod fill_value;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fill_waits;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fill_waits_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod first_host_texture;
-mod first_moves;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod first_overwrite;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod flat_simdgroups;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod footprint_locks;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod framebuffer_fetch;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod freed_memory;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod fresh_pages;
-mod fresh_unwritten;
-mod function_table;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod functions_translated;
-mod gate;
-mod general_form;
-mod gpu_pools;
-mod gpu_time;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod grid_widths;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod group_resolve_apart;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod hand_out_waits;
-#[cfg(unix)]
-mod handed_descriptor;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod handler_orders;
+mod dispatch_tiles;
+mod dma_bufs;
+mod draw;
+mod export;
+mod exported_overs;
+mod fault;
+mod feature_enables;
+mod fence;
+mod fetch;
+mod filter_nest;
+mod first_use_sites;
+mod float_depth;
+mod floor;
+mod function_tables;
+mod gpu_span;
+mod hazard;
 mod heap;
+mod heap_alias;
+mod image_reads;
+mod imageblock;
+mod import;
+mod import_overs;
+mod import_time;
+mod imported_aliases;
+mod indirect;
+mod interpolation;
+mod kept;
+mod kernel_map;
+mod kernel_variants;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_allocated_size;
+mod kernels;
+mod large;
+mod layered;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_border_texels;
-mod heap_footprint_formats;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_one_plane_rows;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_placed_reads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_placed_targets;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_reach_once;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_refused_notice;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_sampler_array;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_set_copies;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_set_unlocked;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_set_walk;
-mod heap_sets;
-mod heap_tiled;
-mod heap_tiled_blocks;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_tiled_scratch;
-#[cfg(all(m2v_gpu, target_os = "linux", target_env = "gnu"))]
-mod heap_trimmed;
-mod heap_usage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod heap_use_released;
-mod held_depth;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod held_lately;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod held_step_order;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod hold_sites;
-mod host_aliases;
-mod host_bytes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_hold_filter;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_image_room;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_import_counts;
-#[cfg(unix)]
-mod host_import_groups;
-mod host_memory;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_pages_placement;
+pub(crate) mod layouts;
+mod linear_planes;
 #[cfg(m2v_gpu)]
-mod host_ram_copy_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_ram_copy_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_ram_device;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod host_ram_dma_buf;
-#[cfg(m2v_gpu)]
-mod host_ram_first_fill_bench;
-#[cfg(all(m2v_gpu, target_os = "linux"))]
-mod host_ram_listed_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_ram_managed;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod host_ram_spread_bench;
-#[cfg(all(m2v_gpu, target_os = "linux"))]
-mod host_ram_surface_fill_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_ram_window_bench;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod host_residency;
-mod host_settable_event_waits;
-mod host_shadow;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_step_neutrals;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod host_step_rules;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icb_carry_race;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icb_encode_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icb_records_home;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod icb_records_policy;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icon_coverage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icon_levels;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod icon_mips;
-mod idle_heap_look;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux", target_env = "gnu"))]
-mod idle_heap_trim;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod idle_sweep;
-mod image_barriers;
-mod image_plan;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod image_standing;
-#[cfg(all(m2v_gpu, target_os = "linux"))]
-mod import_free_hold_bench;
-#[cfg(all(m2v_gpu, m2v_gpu_hazards, target_os = "linux"))]
-mod import_overlap_hazard;
-mod in_place;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod in_place_check;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod in_place_storage;
-mod inbox;
-mod indirect_command_buffer;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod indirect_command_buffer_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod inert_dispatch;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod inline_continues;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod inline_splits;
-mod interlocked_writes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod internal_texture_ids;
-mod interop;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod joined_residency;
-mod keeper;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_across_calls;
-mod kept_barriers;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_heap_uses;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_images;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_padding;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_shadowed_draws;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kept_variants;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod kernel_end_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod labels;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod layer_claim;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod leading_snapshots;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod learned_coverage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod least_queue_plan;
-mod left;
-mod linear_alignment;
-mod linear_attachment;
-mod linear_plan;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod linear_runs;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod linked_pipelines_shared;
-mod listed_extensions;
-mod live_bind;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod lone_fetch;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod mac_class;
-mod making;
+mod locks;
+mod lost_writes;
+mod lowered;
+mod main_cells;
+mod make_parts;
+mod maker_yield;
 mod managed;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod managed_copies_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod managed_copy_device;
-// A GPU hazard: it makes devices up to the driver's limit.
-#[cfg(all(m2v_gpu, m2v_gpu_hazards))]
-mod many_devices;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod many_passes;
-mod memo;
 mod memory;
-#[cfg(m2v_gpu)]
-mod memory_block_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod memory_frees;
-#[cfg(m2v_gpu)]
-mod memory_make_hold_bench;
-mod memory_reads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod memoryless_fresh;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod merge_scratch;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod mesh_reflection_derived;
-mod metal_release;
-mod mipmap_plan;
-mod mipmap_scratch;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod missing_layer;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod moltenvk_semaphores;
-mod msaa_32bit;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod multisample_buffer_copy;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod multisample_buffer_layouts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod nan_signs;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod narrow_writes_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod neutral_zeros_shared;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod no_copy_lies;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod no_pointer_import;
-mod noted_apart;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod notice_command_buffers;
-mod numbered_samplers;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod one_import;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opencl_data;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opencl_images;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opencl_kernels;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opencl_mode;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opencl_swizzles;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod opengl_mode;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod option_bit_20;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod optional_extensions;
-mod options;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod ordered_renders;
-mod own;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod owned_kernel_builds;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod owned_pushes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod padding_unobserved;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod partial_threadgroups;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pass_end_tiles;
-mod pass_log;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod passing_holds;
-mod pending_audit;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pending_audit_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pending_rebind;
-mod pipeline;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pipeline_dump;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pipeline_wait_order;
-#[cfg(unix)]
+mod min_lod;
+mod mipmaps;
+mod narrow;
+mod nil_slots;
+mod no_attachment;
+mod null_descriptor;
+mod one_path;
+mod over;
+mod over_aliases;
+mod over_causes;
+mod pass;
+mod patch;
 mod pixel_format_info;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod point_size_notices;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod pointer_residency;
-mod pool_room;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod pool_room_creations;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod posted_frees;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod primed_devices;
-mod private_properties;
-mod push_raw_writes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod query_reset_gap;
-mod queue;
-mod queue_limits;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod queue_limits_device;
-mod queue_quiet;
-mod queue_share;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod queue_share_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod queue_sharing;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod queue_switch_gate;
-mod range;
-mod rate_map;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_boxed_draws;
-mod rate_mapped_boxed_rule;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_depth_equal;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_fan_out;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_gpu_route;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_pieces;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rate_mapped_region_boxes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod read_through_constant;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod read_twin_device;
-mod reader_sizes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rebind_behind_a_wait;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rebind_descriptor_slip;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rebind_making_wait;
-mod recent_shape_keys;
-#[cfg(all(m2v_gpu, target_os = "linux"))]
-mod reclaim_submit_bench;
-mod record_pass_formats;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod record_storage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod recorded_at_the_call;
-mod recorder_shards;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod recorder_slots;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod recycle;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod region_widths;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod relay_facts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod released_programs;
+mod pixel_interlock;
+mod places;
+mod present;
+mod private_arena;
+mod private_sinks;
+mod push_window;
+mod quad_control;
+mod raster;
+mod read_write_tier;
+mod readback;
+mod refusal_basis;
 mod render;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod render_creation_cost;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod render_directory_trips;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod render_fold;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod render_sibling_work;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod render_stage_digests;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rerouted_scissors;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod rerun_arenas;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod reserved_queues;
-mod residency;
-#[cfg(all(debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
-mod resident_uses;
-mod resource;
-mod resource_ids;
-mod retained;
-mod rotated;
-mod sample_interleave;
-mod sample_planes;
+mod resolve;
+mod ring;
 mod sampler;
-mod sampler_cache;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod sampler_cache_live;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod sampler_prunes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod sampler_release;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod sampler_sets;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod sampler_table_binders;
-mod scheduler;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod scheduler_held_wakes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod scheduler_wakes;
-#[cfg(all(m2v_gpu, target_os = "linux"))]
-mod scroll_bos;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod self_read_storage;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod set_zero_at_offsets;
-mod shader_cache;
-mod shader_cache_chunks;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shader_cache_off_thread;
-mod shader_cache_queue;
-mod shader_cache_time;
+mod sampling;
 mod shadow;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_carried_read;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod shadow_causes_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_host_writes;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_merge_read;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_runs;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_standing_device;
-mod shadow_stencil;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod shadow_twins;
-#[cfg(all(debug_assertions, any(m2v_gpu, m2v_cpu_icd)))]
-mod shared_draw_locks;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod shared_pointers;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod short_row_kinds;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod small_heap;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod small_stack_device;
-mod snapshot_area;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod snapshot_reader_again;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod snapshot_reader_keeps;
-mod sorted_chunks;
-mod spares;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod spares_bench;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod spares_compute;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod spares_latency;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod spares_parts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod spares_walk;
-mod sparse;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod sparse_host_pages;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod split_keeps;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod srgb_fetch_images;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod stage_entries_shared;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod staged_work_teardown;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod staging_waits;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod stall;
-mod stand_in;
-mod storage_form;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod storage_form_recycle;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod store_out_device;
-mod submit_check;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod submit_check_device;
-mod submit_failure;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod submit_failure_device;
-mod submit_stalls;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod submit_stalls_idle;
-mod surface_depth;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod surface_depth_usage_shadow;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod surface_shapes;
-mod surface_two_planes;
-#[cfg(all(unix, any(m2v_gpu, m2v_cpu_icd)))]
-mod sync_file;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod teardown_threads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texel_rows_device;
+mod signed_zeros;
+mod sites;
+mod spill;
+mod stage;
+mod staging;
+#[cfg(m2v_gpu)]
+mod stamps;
+mod state_answers;
+mod stencil_export;
+mod storage_element;
+mod storage_levels;
+mod subgroup_sizes;
+mod submit_infos;
+mod surface;
+mod swizzle;
+mod take_split;
 mod texture;
+mod texture_accesses;
+mod texture_buffers;
+mod translate;
+mod translator_fields;
+mod upload;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texture_aggregates;
-mod texture_descriptor;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texture_facts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texture_holds;
-mod texture_placement;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texture_placement_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod texture_resource_options;
-mod this_thread;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod threadgroup_memory_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tile_pending;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tile_rebind_making_wait;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tiled_texture_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tiled_texture_failed;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tiled_texture_reencode;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod tiled_texture_step;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod told_once;
-mod tracker;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod trail_gpu_forms;
-mod trails;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod twin_flights;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod twin_reads;
-mod two_plane_rows;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod unchanged_truth_copies;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod uniform_bind_offsets;
-mod unique_identifier;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod unit_axes;
-#[cfg(all(any(m2v_gpu, m2v_cpu_icd), target_os = "linux"))]
-mod unmap_order;
-mod unshared_hold;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod unsubmitted;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod unwritten_parts;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod upload_chunk_zeros;
-mod values;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod vector_placement;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod vertex_conversion_notices;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod video_interop;
-mod view_plan;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod waited_reads;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod waiter_submits;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod warm;
-mod warm_record;
-mod word_samples;
-mod wrapped;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod write_routes_device;
-mod written_commands;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod ycbcr_device;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod ycbcr_in_place_loop;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod ycbcr_refresh;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod zeroed_start;
+mod validation;
+mod view;
+mod viewports;
+mod visibility;
 
-/// How long a device test waits for the device's submission checks to answer
-/// (`Device::settle_submit_checks`): their run takes milliseconds alone, longer beside the
-/// suite's other devices.
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-pub(crate) const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
+/// This crate's directory: the test process's `CARGO_MANIFEST_DIR` where it holds the crate's
+/// sources (cargo and nextest set it for each test, and an archive run elsewhere remaps it to the
+/// workspace it runs in), else the directory the tests were built in.
+pub(crate) fn crate_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.join("src").join("lib.rs").is_file())
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+}
 
-/// The textures over a buffer's bytes that took the shadow form between `before` and `after`:
-/// those whose shadow was made (`WorkCounts::shadowed_textures`) and those made with their shadow
-/// left unmade until the first reach of their image (`shadows_left_unmade`, where their rows are
-/// in place: `texture/lazy_shadow.rs`), less those left unmade earlier whose shadow a reach made in
-/// between (`shadows_made_at_use`, which `shadowed_textures` counts again). A form counted as a
-/// texture is made reads the same whether or not its shadow waits for a reach.
+/// Every product source file under `src/`, the tests excepted, with its path under `src/`, in
+/// path order.
+pub(crate) fn product_sources() -> Vec<(String, String)> {
+    use std::path::{Path, PathBuf};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()))
+            .map(|entry| entry.expect("a directory entry").path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "tests") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = crate_dir().join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(!files.is_empty(), "no source under {}", root.display());
+    files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            let label = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            (label, text)
+        })
+        .collect()
+}
+
+/// The instructions of SPIR-V module `words` after its five-word header, each its words from the
+/// one that holds its word count and opcode; a count of 0 ends the walk.
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
-pub(crate) fn shadow_forms(before: &crate::WorkCounts, after: &crate::WorkCounts) -> u64 {
-    after.shadowed_textures + after.shadows_left_unmade
-        - after.shadows_made_at_use
-        - (before.shadowed_textures + before.shadows_left_unmade - before.shadows_made_at_use)
+pub(crate) fn spirv_instructions(words: &[u32]) -> Vec<&[u32]> {
+    let mut out = Vec::new();
+    let mut at = 5;
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        if count == 0 || at + count > words.len() {
+            break;
+        }
+        out.push(&words[at..at + count]);
+        at += count;
+    }
+    out
+}
+
+/// The sampler indices of a test's states, whose kernels number no constexpr sampler: a read's
+/// or a write's sampler takes nothing at its index. A kernel that numbers a constexpr sampler is
+/// refused as one that reads what the test does not supply.
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+pub(crate) fn no_constexpr_samplers(
+    samplers: &[crate::NumberedSampler],
+) -> Result<Vec<u32>, crate::Error> {
+    match samplers
+        .iter()
+        .any(|sampler| matches!(sampler, crate::NumberedSampler::Constexpr(_)))
+    {
+        true => Err(crate::Error::Unsupported(crate::Gap::KernelInput {
+            kind: crate::KernelInputKind::ConstexprSampler,
+        })),
+        false => Ok(vec![0; samplers.len()]),
+    }
+}
+
+/// Whether `device`'s pipeline cache keeps a blob, once the reaper has seeded it: none where its
+/// driver's data of an empty cache begins with no header (`cache::usable_header`), as lavapipe's
+/// does, which is printed.
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+pub(crate) fn keeps_a_blob(name: &str, device: &crate::Device) -> bool {
+    let caches = &device.core().caches;
+    crate::tests::command::on_device::within("the seed", || caches.is_seeded());
+    let kept = caches.blob().is_some();
+    if !kept {
+        println!("{name}: its pipeline cache data begins with no header, so it keeps no blob");
+    }
+    kept
+}
+
+/// Each physical device of the device cfg's kind the loader lists, with its name: CPU devices
+/// under `m2v_cpu_icd`, the others under `m2v_gpu`. The legs pick one with `VK_DRIVER_FILES` and
+/// `MESA_VK_DEVICE_SELECT`.
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+pub(crate) fn devices_of_the_cfgs_kind(
+    instance: &crate::Instance,
+) -> Vec<(String, crate::PhysicalDevice)> {
+    let (_, vk_instance) = instance.raw();
+    let physicals = instance.physical_devices().expect("the physical devices");
+    physicals
+        .into_iter()
+        .filter_map(|physical| {
+            // SAFETY: `physical` is one of `instance`'s.
+            let properties = unsafe { vk_instance.get_physical_device_properties(physical.raw()) };
+            let cpu = properties.device_type == ash::vk::PhysicalDeviceType::CPU;
+            let name = properties
+                .device_name_as_c_str()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (cpu == cfg!(m2v_cpu_icd)).then_some((name, physical))
+        })
+        .collect()
 }

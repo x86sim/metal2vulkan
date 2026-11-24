@@ -9,15 +9,13 @@
 //! is exposed, and enable an extension only together with the extensions it depends on, so every
 //! enable set this module returns is **closed** under those three rules.
 //!
-//! Vulkan also forbids enabling some features without another ([`FEATURE_NEEDS`]) or together
-//! ([`BUFFER_UPDATE_AFTER_BIND`] beside `robustBufferAccess` on a device without
-//! `robustBufferAccessUpdateAfterBind`), so every enable set this module returns also keeps those
-//! **co-enable rules**.
+//! Vulkan also forbids enabling some features without another ([`FEATURE_NEEDS`]), so every enable
+//! set this module returns also keeps those **co-enable rules**.
 //!
 //! - [`DeviceDescription::recommended_enables`]: what the core can use on a device described by
 //!   what it supports (`DeviceDescription::query`); the consumer merges it into its own list.
-//! - [`DeviceDescription::with_enabled`]: that description restricted to what the consumer
-//!   enabled, the input of `Device::new` (which checks the exposure invariant and the feature
+//! - [`DeviceDescription::with_enabled`]: that description restricted to what the consumer enabled,
+//!   the input of `Device::from_queries` (which checks the exposure invariant and the feature
 //!   dependencies).
 //! - [`DeviceDescription::required_enables`]: what a compiled artifact's [`Requirements`] need
 //!   enabled on the device.
@@ -27,7 +25,6 @@ use std::collections::BTreeSet;
 
 use crate::device::derive::Device;
 use crate::device::description::DeviceDescription;
-use crate::device::policy::{ContainmentPolicy, DevicePolicy};
 use crate::device::requirements::{
     ApiVersion, Requirements, StageCreateFlag, VkExtension, VkFeature, WITHOUT_FORMAT_CAPABILITIES,
 };
@@ -195,8 +192,8 @@ const fn promoted(minor: u32, extensions: &'static [VkExtension]) -> Exposure {
 exposures! {
     // `VkPhysicalDeviceFeatures` (1.0).
     Core(v(0)) => [
-        RobustBufferAccess, ShaderInt16, ShaderInt64, ShaderFloat64,
-        VertexPipelineStoresAndAtomics, FragmentStoresAndAtomics, GeometryShader,
+        ShaderInt16, ShaderInt64, ShaderFloat64, VertexPipelineStoresAndAtomics,
+        FragmentStoresAndAtomics, GeometryShader,
         TessellationShader, SampleRateShading, DualSrcBlend, LogicOp, IndependentBlend,
         ShaderClipDistance,
         ShaderCullDistance, DrawIndirectFirstInstance, MultiDrawIndirect, DepthClamp,
@@ -255,7 +252,7 @@ exposures! {
     promoted(4, ROTATE) => [ShaderSubgroupRotate, ShaderSubgroupRotateClustered];
     promoted(4, &[E::KhrMaintenance5]) => [Maintenance5];
     // Extension-only.
-    Extension(ROBUSTNESS2) => [RobustBufferAccess2, RobustImageAccess2, NullDescriptor];
+    Extension(ROBUSTNESS2) => [RobustImageAccess2, NullDescriptor];
     Extension(&[E::ExtShaderImageAtomicInt64]) => [ShaderImageInt64Atomics];
     Extension(ATOMIC_FLOAT) => [
         ShaderBufferFloat32Atomics, ShaderBufferFloat32AtomicAdd, ShaderSharedFloat32Atomics,
@@ -312,9 +309,8 @@ exposures! {
 /// What the enable-set rules need to know about one extension.
 struct ExtensionFacts {
     /// The core enables it where it is available: it exposes a feature or format the core reads,
-    /// or the core reads it directly (stencil export, push descriptors, the runtime's sample
-    /// locations), or it is mandatory (the portability subset). Extensions that only name
-    /// refusals are not.
+    /// or the core reads it directly (stencil export), or it is mandatory (the portability
+    /// subset). Extensions that only name refusals are not.
     consumed: bool,
     /// The core version that promoted everything the core reads from it (then enabling it
     /// there adds nothing).
@@ -338,28 +334,22 @@ fn facts(ext: VkExtension) -> ExtensionFacts {
         &[(E::KhrSynchronization2, Some(v(3)))];
     match ext {
         E::ExtRobustness2
-        | E::ExtShaderImageAtomicInt64
         | E::ExtShaderStencilExport
         | E::ExtFragmentShaderInterlock
-        | E::ExtRasterizationOrderAttachmentAccess
         | E::KhrShaderMaximalReconvergence
         | E::KhrShaderSubgroupUniformControlFlow
         | E::KhrFragmentShaderBarycentric
         | E::KhrComputeShaderDerivatives
         | E::KhrWorkgroupMemoryExplicitLayout
         | E::KhrMaintenance8
-        | E::KhrShaderFma
-        | E::ExtDepthRangeUnrestricted
         | E::ExtDepthClipEnable
         | E::ExtDepthClampControl
-        | E::ExtSampleLocations
         | E::ExtPrimitiveTopologyListRestart
         | E::ExtProvokingVertex
         | E::ExtLineRasterization
         | E::ExtMultiDraw
         | E::ExtAttachmentFeedbackLoopLayout
         | E::ExtExtendedDynamicState3
-        | E::ExtPostDepthCoverage
         | E::ImgFormatPvrtc
         | E::KhrPortabilitySubset
         | E::ExtShaderAtomicFloat => fact(true, None, &[]),
@@ -381,21 +371,40 @@ fn facts(ext: VkExtension) -> ExtensionFacts {
         // The core reads it directly: a storage access without a format by the format's own bits
         // (`DeviceProfile::without_format_by_format_bits`).
         E::KhrFormatFeatureFlags2 => fact(true, Some(3), &[]),
-        // The core reads it directly: a `matmul2d` of 8-bit floats is refused where it is enabled
-        // (`lower::select`), the device's own conversion being the only form there.
-        E::ExtShaderFloat8 => fact(true, None, &[]),
+        // Described, never enabled: an 8-bit float widens by integer arithmetic on its fields on
+        // every device (`lower::arith::narrow::fp8_to_f32`), so the core reads none of it.
+        E::ExtShaderFloat8 => fact(false, None, &[]),
         E::KhrDynamicRenderingLocalRead | E::KhrMaintenance5 => {
             fact(true, Some(4), DYNAMIC_RENDERING_BELOW_1_3)
         }
         E::ExtVertexAttributeDivisor
         | E::KhrVertexAttributeDivisor
-        | E::KhrPushDescriptor
         | E::KhrShaderSubgroupRotate => fact(true, Some(4), &[]),
+        // Described, never enabled: a pipeline layout states no push-descriptor eligibility, so
+        // the core reads none of it.
+        E::KhrPushDescriptor => fact(false, Some(4), &[]),
         // Enabled only as another extension's requirement.
         E::ExtCustomBorderColor => fact(false, None, &[]),
         // Described, never enabled: a depth bias counts the device's own unit
         // (`metal::state::depth_bias`), so the core reads none of its features.
         E::ExtDepthBiasControl => fact(false, None, &[]),
+        // Described, never enabled: a depth comparison records `RestrictedDepthRange` on every
+        // device (`lower::texture::depth_comparison`), and Vulkan clamps a fragment depth itself.
+        E::ExtDepthRangeUnrestricted => fact(false, None, &[]),
+        // Described, never enabled: a float fma is the device's `Fma` on every device
+        // (`lower::arith::fma`), so the core reads none of its features.
+        E::KhrShaderFma => fact(false, None, &[]),
+        // Described, never enabled: the coverage after the depth and stencil tests is refused on
+        // every device (`Feature::PostDepthCoverage`), so the core reads none of it.
+        E::ExtPostDepthCoverage => fact(false, None, &[]),
+        // Described, never enabled: a `ulong` texture's atomics are refused on every device
+        // (`lower::texture::atomic`), so the core reads none of it.
+        E::ExtShaderImageAtomicInt64 => fact(false, None, &[]),
+        // Described, never enabled: the core reads none of its properties.
+        E::ExtSampleLocations => fact(false, None, &[]),
+        // Described, never enabled: a framebuffer fetch is ordered between draws alone on every
+        // device (`lower::fragment::fetch`), so the core reads none of its features.
+        E::ExtRasterizationOrderAttachmentAccess => fact(false, None, &[]),
         E::KhrDynamicRendering => fact(false, Some(3), &[]),
         // Object and mesh functions. `VK_KHR_spirv_1_4` is core at the 1.2 floor.
         E::ExtMeshShader => fact(true, None, &[]),
@@ -495,11 +504,6 @@ fn close_requirements(extensions: &mut BTreeSet<VkExtension>, api: ApiVersion) {
 /// chains. No companion needs one itself.
 pub const FEATURE_NEEDS: &[(VkFeature, VkFeature, &str)] = &[
     (
-        VkFeature::RobustBufferAccess2,
-        VkFeature::RobustBufferAccess,
-        "VUID-VkPhysicalDeviceRobustness2FeaturesKHR-robustBufferAccess2-04000",
-    ),
-    (
         VkFeature::MultiviewTessellationShader,
         VkFeature::Multiview,
         "VUID-VkPhysicalDeviceMultiviewFeatures-multiviewTessellationShader-00581",
@@ -511,66 +515,18 @@ pub const FEATURE_NEEDS: &[(VkFeature, VkFeature, &str)] = &[
     ),
 ];
 
-/// The update-after-bind features of buffer descriptor types, which a device whose
-/// `robustBufferAccessUpdateAfterBind` is false may not enable beside `robustBufferAccess`
-/// ([`BUFFER_UPDATE_AFTER_BIND_VUID`]). The rule's fourth,
-/// `descriptorBindingUniformBufferUpdateAfterBind`, is not in the vocabulary, so no set the core
-/// returns or reads names it.
-pub const BUFFER_UPDATE_AFTER_BIND: &[VkFeature] = &[
-    VkFeature::DescriptorBindingStorageBufferUpdateAfterBind,
-    VkFeature::DescriptorBindingUniformTexelBufferUpdateAfterBind,
-    VkFeature::DescriptorBindingStorageTexelBufferUpdateAfterBind,
-];
-
-/// "If the `robustBufferAccess` feature is enabled, and `robustBufferAccessUpdateAfterBind` is
-/// `VK_FALSE`, then `descriptorBindingUniformBufferUpdateAfterBind`,
-/// `descriptorBindingStorageBufferUpdateAfterBind`,
-/// `descriptorBindingUniformTexelBufferUpdateAfterBind`, and
-/// `descriptorBindingStorageTexelBufferUpdateAfterBind` must not be enabled" (Vulkan 1.4.357).
-pub const BUFFER_UPDATE_AFTER_BIND_VUID: &str = "VUID-VkDeviceCreateInfo-robustBufferAccess-10247";
-
-/// The first co-enable rule `features` breaks on a device whose
-/// `robustBufferAccessUpdateAfterBind` is `rba_update_after_bind`, naming the features and the
-/// rule's VUID.
-fn co_enable_violation(
-    features: &BTreeSet<VkFeature>,
-    rba_update_after_bind: bool,
-) -> Option<String> {
-    if !rba_update_after_bind && features.contains(&VkFeature::RobustBufferAccess) {
-        if let Some(f) = BUFFER_UPDATE_AFTER_BIND
-            .iter()
-            .find(|f| features.contains(f))
-        {
-            return Some(format!(
-                "{f:?} with RobustBufferAccess on a device that does not report \
-                 robustBufferAccessUpdateAfterBind ({BUFFER_UPDATE_AFTER_BIND_VUID})"
-            ));
-        }
-    }
+/// The first co-enable rule `features` breaks, naming the features and the rule's VUID.
+fn co_enable_violation(features: &BTreeSet<VkFeature>) -> Option<String> {
     FEATURE_NEEDS
         .iter()
         .find(|(f, needs, _)| features.contains(f) && !features.contains(needs))
         .map(|(f, needs, vuid)| format!("{f:?} without {needs:?} ({vuid})"))
 }
 
-/// `features` less what the co-enable rules forbid with the rest, on a device whose
-/// `robustBufferAccessUpdateAfterBind` is `rba_update_after_bind`. Where `robustBufferAccess`
-/// meets [`BUFFER_UPDATE_AFTER_BIND`] on a device without that property, the update-after-bind
-/// features go: the core reads `robustBufferAccess` to choose the containment encoding, and the
-/// set-1 arrays that need them (the function tables', the texel-buffer classes') are refused there,
-/// naming the feature.
-/// Then each feature whose [`FEATURE_NEEDS`] companion is missing goes; no companion is itself
-/// dropped, so one pass keeps every rule.
-fn co_enabled(
-    features: impl Iterator<Item = VkFeature>,
-    rba_update_after_bind: bool,
-) -> BTreeSet<VkFeature> {
+/// `features` less each feature whose [`FEATURE_NEEDS`] companion is missing; no companion is
+/// itself dropped, so one pass keeps every rule.
+fn co_enabled(features: impl Iterator<Item = VkFeature>) -> BTreeSet<VkFeature> {
     let mut out: BTreeSet<VkFeature> = features.collect();
-    if !rba_update_after_bind && out.contains(&VkFeature::RobustBufferAccess) {
-        for f in BUFFER_UPDATE_AFTER_BIND {
-            out.remove(f);
-        }
-    }
     let lonely: Vec<VkFeature> = FEATURE_NEEDS
         .iter()
         .filter(|(f, needs, _)| out.contains(f) && !out.contains(needs))
@@ -652,28 +608,14 @@ impl DeviceDescription {
     /// what it wants (normally all of it, merged into its own list) and passes the result to
     /// [`with_enabled`](DeviceDescription::with_enabled).
     ///
-    /// The policy removes what it makes useless: with `ContainmentPolicy::UnsafeOff`,
-    /// `robustBufferAccess` and `robustBufferAccess2` (the profile reads them only to choose a
-    /// containment encoding).
-    ///
-    /// The set keeps Vulkan's co-enable rules: where `robustBufferAccess` stays and the description
-    /// does not report `robustBufferAccessUpdateAfterBind`, the update-after-bind features of the
-    /// storage buffer, uniform texel buffer, and storage texel buffer descriptor types, which the
-    /// core does not read, are left out (VUID-VkDeviceCreateInfo-robustBufferAccess-10247); and
-    /// `robustBufferAccess2` without `robustBufferAccess`, or `multiviewTessellationShader` without
-    /// `multiview`, is left out. A consumer that wants those update-after-bind features itself on
-    /// such a device enables them without `robustBufferAccess` (and `robustBufferAccess2`), and the
-    /// profile then contains buffer accesses in the shader.
-    pub fn recommended_enables(&self, policy: &DevicePolicy) -> EnableSet {
-        let unsafe_off = policy.containment == ContainmentPolicy::UnsafeOff;
-        let features = self.features.iter().copied().filter(|&f| {
-            !(unsafe_off
-                && matches!(
-                    f,
-                    VkFeature::RobustBufferAccess | VkFeature::RobustBufferAccess2
-                ))
-        });
-        let features = co_enabled(features, self.robust_buffer_access_update_after_bind);
+    /// The set keeps Vulkan's co-enable rules: `multiviewTessellationShader` or
+    /// `multiviewGeometryShader` without `multiview` is left out. It names neither
+    /// `robustBufferAccess` nor `robustBufferAccess2`, which the core does not read: it checks
+    /// every buffer access in the shader. A consumer that enables `robustBufferAccess` itself
+    /// keeps its rule beside the update-after-bind features of buffer descriptor types the set
+    /// holds (VUID-VkDeviceCreateInfo-robustBufferAccess-10247).
+    pub fn recommended_enables(&self) -> EnableSet {
+        let features = co_enabled(self.features.iter().copied());
         closed(self.api_version, features.into_iter(), &self.extensions)
     }
 
@@ -687,12 +629,10 @@ impl DeviceDescription {
     /// version nor any of its extensions); enables an extension without one it requires; omits
     /// `VK_KHR_portability_subset` where the description lists it
     /// (VUID-VkDeviceCreateInfo-pProperties-04451); or breaks a co-enable rule, naming its VUID:
-    /// `robustBufferAccess` with a buffer descriptor type's update-after-bind feature where the
-    /// description does not report `robustBufferAccessUpdateAfterBind`
-    /// (VUID-VkDeviceCreateInfo-robustBufferAccess-10247), `robustBufferAccess2` without
-    /// `robustBufferAccess` (VUID-VkPhysicalDeviceRobustness2FeaturesKHR-robustBufferAccess2-04000),
-    /// or `multiviewTessellationShader` without `multiview`
-    /// (VUID-VkPhysicalDeviceMultiviewFeatures-multiviewTessellationShader-00581).
+    /// `multiviewTessellationShader` without `multiview`
+    /// (VUID-VkPhysicalDeviceMultiviewFeatures-multiviewTessellationShader-00581), or
+    /// `multiviewGeometryShader` without it
+    /// (VUID-VkPhysicalDeviceMultiviewFeatures-multiviewGeometryShader-00580).
     pub fn with_enabled(mut self, enabled: &EnableSet) -> Result<DeviceDescription, Error> {
         let api = self.api_version;
         if let Some(f) = enabled.features.difference(&self.features).next() {
@@ -729,10 +669,7 @@ impl DeviceDescription {
                 "does not enable {portability:?}, which the device lists"
             )));
         }
-        if let Some(rule) = co_enable_violation(
-            &enabled.features,
-            self.robust_buffer_access_update_after_bind,
-        ) {
+        if let Some(rule) = co_enable_violation(&enabled.features) {
             return Err(invalid(format!("enables {rule}")));
         }
         self.features
@@ -830,26 +767,22 @@ impl Device {
     /// [`DeviceDescription::recommended_enables`] (restricted by
     /// [`DeviceDescription::with_enabled`]) enabled at least this.
     ///
-    /// It keeps the co-enable rules as the recommendation does, under the description's
-    /// `robustBufferAccessUpdateAfterBind`: a description listing `robustBufferAccess` and buffer
-    /// update-after-bind features without it (a committed profile read whole, as the tests and the
-    /// tier table use them) states a device no consumer can create, and the set leaves out those
-    /// update-after-bind features, which no artifact needs.
+    /// It keeps the co-enable rules as the recommendation does.
     pub fn required_enables(&self) -> EnableSet {
         let f = self.profile().fields();
-        let features = co_enabled(
-            f.enabled.features.iter().copied(),
-            self.robust_buffer_access_update_after_bind(),
-        );
+        let features = co_enabled(f.enabled.features.iter().copied());
         closed(f.api_version, features.into_iter(), &f.enabled.extensions)
     }
 }
 
-/// `Device::new`'s check of the description invariants: every listed feature is exposed by the
-/// description's version or listed extensions, and every listed feature's [`FEATURE_NEEDS`]
-/// companion is listed. The rule of [`BUFFER_UPDATE_AFTER_BIND_VUID`] is not checked here: a
-/// committed profile read whole lists both sides of it on three profiles, and the profile the core
-/// derives from such a description translates exactly as from its creatable restriction.
+/// `Device::from_queries`'s check of the description invariants: every listed feature is exposed by
+/// the description's version or listed extensions, every listed feature's [`FEATURE_NEEDS`]
+/// companion is listed, and `shaderQuadControl` is listed only with `shaderMaximalReconvergence`.
+/// `VK_KHR_shader_quad_control` requires `VK_KHR_shader_maximal_reconvergence`, and a device that
+/// supports that extension supports its feature (Vulkan's "Feature Requirements"), so no device
+/// offers the one without the other; a fragment function that runs its quads whole declares
+/// `MaximallyReconvergesKHR` beside `RequireFullQuadsKHR`, as its group operations other than the
+/// quad ones reach the helpers only under that mode (`lower::simd`'s module, **Helpers**).
 pub(crate) fn check_invariants(desc: &DeviceDescription) -> Result<(), Error> {
     for &f in &desc.features {
         let x = f.exposure();
@@ -865,6 +798,13 @@ pub(crate) fn check_invariants(desc: &DeviceDescription) -> Result<(), Error> {
         .find(|(f, needs, _)| desc.has(*f) && !desc.has(*needs))
     {
         return Err(invalid(format!("lists {f:?} without {needs:?} ({vuid})")));
+    }
+    if desc.has(VkFeature::ShaderQuadControl) && !desc.has(VkFeature::ShaderMaximalReconvergence) {
+        return Err(invalid(
+            "lists ShaderQuadControl without ShaderMaximalReconvergence (VK_KHR_shader_quad_control \
+             requires VK_KHR_shader_maximal_reconvergence, whose feature its every device supports)"
+                .to_owned(),
+        ));
     }
     Ok(())
 }

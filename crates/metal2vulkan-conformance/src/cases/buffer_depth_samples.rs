@@ -1,22 +1,22 @@
 //! A buffer copied into every sample of a multisample depth or stencil texture, and copied back
-//! out: ported from `runtime_lane::buffer_depth_samples`.
+//! out.
 //!
-//! The lane's Metal answer was a **rule**, not a table — "each copy unit of the buffer lands in its
+//! Metal's answer here is a **rule**, not a table — "each copy unit of the buffer lands in its
 //! sample by the layout measured for colour, texel `(x, y)` sample `s` at
 //! `offset + y * bytesPerRow + (x * n + s) * bpp`, the samples outside a region keep the clear, and
-//! the copy back out returns the buffer bit for bit" — written down from a probe on an **Apple M4**,
-//! a machine this round does not have. Every call on the path is public: a render pass that clears
-//! and draws nothing, `copyFromBuffer:toTexture:` into the depth or stencil aspect, a dispatch that
-//! reads every sample, and `copyFromTexture:toBuffer:` back. So record mode **runs** these cases on
-//! the oracle and the rule becomes Metal's own numbers on this M3 Max, re-takeable whenever
-//! anybody asks. Nothing is carried from the dead M4.
+//! the copy back out returns the buffer bit for bit" — measured by a probe on an **Apple M4**.
+//! Every call on the path is public: a render pass that clears and draws nothing,
+//! `copyFromBuffer:toTexture:` into the depth or stencil aspect, a dispatch that reads every
+//! sample, and `copyFromTexture:toBuffer:` back. So record mode **runs** these cases on the oracle,
+//! and the recordings hold Metal's own numbers on an Apple M3 Max, macOS 27.0.1. Nothing is
+//! carried.
 //!
 //! **One case per row**, as the multisample fill family does, so a sample count the venue does not
 //! render stops that row alone and the suite counts it
 //! [`LacksFeature`](crate::verdict::Verdict::LacksFeature) rather than leaving it uncompared.
-//! lavapipe does not render 2 samples, which Vulkan leaves optional, and the lane's own loop prints
-//! a line and carries on. It also keeps every recording far under the 512 KiB the plan allows: the
-//! largest row is an 80 x 80 texture at 4 samples, whose two reads are 100 KiB each.
+//! lavapipe does not render 2 samples, which Vulkan leaves optional. It also keeps every recording
+//! far under the suite's 512 KiB ceiling: the largest row is an 80 x 80 texture at 4 samples, whose
+//! two reads are 100 KiB each.
 //!
 //! The first row is the consumer's screensaver's copy (`Depth32Float` 54 x 54 at 4 samples, whole,
 //! `bytesPerRow` 864) and the second its login window's at HiDPI (80 x 80, `bytesPerRow` 1280);
@@ -31,9 +31,9 @@
 //!
 //! A `Depth32Float` row's buffer opens with 16 edge words — signed zeros, the smallest and largest
 //! denormals, 1 and the float after it, 2, -1, both infinities, three NaN payloads, the largest
-//! float — because the question the lane asks is whether anything on the path quietens, flushes or
-//! clamps one. Recording Metal's answer to that is the point: a device that changes such a value
-//! announces it, and the announcement is then held to the recorded fact rather than to prose.
+//! float — because the question is whether anything on the path quietens, flushes or clamps one.
+//! Recording Metal's answer to that is the point: a device that changes such a value announces it,
+//! and the announcement is then held to the recorded fact rather than to prose.
 //!
 //! Nothing here faults a GPU, hangs one or trips a watchdog: one command buffer a row, a clear that
 //! draws nothing, two blits and one dispatch of a thread a sample.
@@ -48,7 +48,7 @@ use crate::work::{Clear, Plane, Resource, Step, TextureSpec, Work};
 /// multisample fill family reads too, so one shader answers both.
 const KERNELS: &str = "rt6_samples";
 
-/// The depth and the stencil the pass clears to before the copy, as the lane's probe cleared them.
+/// The depth and the stencil the pass clears to before the copy, as the probe cleared them.
 const CLEAR_DEPTH: f64 = 0.25;
 const CLEAR_STENCIL: u32 = 0x5a;
 
@@ -124,8 +124,8 @@ const fn part(name: &'static str, format: u32) -> Row {
 /// The rows: the stencil aspect at both sample counts and over a region inside the texture, and
 /// the 16-bit depth aspect at both sample counts.
 ///
-/// The two `Depth16Unorm` rows are **open gaps of ours**, each with a `known-gaps.tsv` row: Metal
-/// copies the buffer into the 16-bit aspect and back, and we refuse the copy in
+/// The two `Depth16Unorm` rows are **open gaps of ours**, each with a `known-gaps-rt.tsv` row:
+/// Metal copies the buffer into the 16-bit aspect and back, and we refuse the copy in
 /// (`RuntimeGap::MultisampledBufferCopy`, on a device without `maintenance8` or carrying the
 /// measured copy defect). A refusal of something plain Metal does is a bug of ours by the owner's
 /// standing rule, so the rows stay here and stay red in the ledger's own way: the run prints them
@@ -142,8 +142,7 @@ const fn part(name: &'static str, format: u32) -> Row {
 ///   denormals, every NaN payload, both infinities, -1, 1, the float after 1, 2 and the largest
 ///   float all come back unchanged, and the samples outside a region keep the clear. Ours differs
 ///   at **one element of all four rows** — copy unit 1, the edge value **-0**, which Metal keeps
-///   and we answer as +0 — and the runtime announces `drawn-depth-copy`, which names exactly that.
-///   It is an announced difference, but the suite has no way to say it: an
+///   and we answer as +0. The suite has no way to allow that alone: an
 ///   [`Allowance`](crate::allowance::Allowance) covers a **site**, and loosening a 46,656-byte site
 ///   to tolerate four bytes would throw away the comparison that makes the row worth having. A
 ///   per-element allowance on a bytes site is what these rows are waiting for.
@@ -179,10 +178,10 @@ impl Row {
 
     /// The buffer's bytes: a word a copy unit, cut to the unit's own bytes.
     ///
-    /// A `Depth32Float` row opens with [`EDGES`] and goes on with distinct normal values in
-    /// `(0, 0.18]`, which the lane measured every path to copy exactly. A stencil's and a 16-bit
-    /// depth's units are distinct numbers of their own width, so a unit that landed in another
-    /// sample is visible.
+    /// A `Depth32Float` row opens with [`EDGES`] and goes on with distinct normal values in `(0,
+    /// 0.18]`, which every path was measured to copy exactly. A stencil's and a 16-bit depth's
+    /// units are distinct numbers of their own width, so a unit that landed in another sample is
+    /// visible.
     fn input(&self) -> Vec<u8> {
         let unit = self.unit_bytes();
         (0..self.units())
@@ -370,17 +369,6 @@ impl Case for BufferDepthSamples {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the notices
-        // site alone: every value of this family still compares against Metal's exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09), where it fired for all 5 rows of the family
-        // and each row was divergent on that field and nothing else (replay-nvidia.log).
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

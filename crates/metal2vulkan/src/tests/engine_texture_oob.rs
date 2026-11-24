@@ -15,12 +15,13 @@
 //! Each kernel reads (or writes) `p[i]` per thread and must compute Metal's result in both
 //! scheduling orders on every profile class:
 //!
-//! - `robustImageAccess2` (or `robustBufferAccess2` for a texel buffer): the device reads Metal's
-//!   texel and discards the write; the interpreter's image models that ([`Image::robust`]).
-//! - `robustImageAccess` alone: the shader checks its reads (the device's out-of-bounds texel is
-//!   not Metal's; the interpreter's poisons it) and the device discards writes.
-//! - no robustness for the resource (`robustBufferAccess` alone for a texel buffer): the shader
-//!   checks reads and guards writes; the interpreter traps any access outside the image.
+//! - `robustImageAccess2`, for an image: the device reads Metal's texel and discards the write;
+//!   the interpreter's image models that ([`Image::robust`]).
+//! - `robustImageAccess` alone, for an image: the shader checks its reads (the device's
+//!   out-of-bounds texel is not Metal's; the interpreter's poisons it) and the device discards
+//!   writes.
+//! - no image robustness, and every texel buffer: the shader checks reads and guards writes; the
+//!   interpreter traps any access outside the image.
 //!
 //! Where the shader checks a read whose alpha it observes, the alpha comes from the
 //! `OutOfBoundsAlpha` specialization, run with both values.
@@ -30,27 +31,22 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{BindState, Dispatch, ResourceClass, TextureFacts, UsedResource, WriteSource};
-use crate::budget::Budget;
-use crate::device::profile::{Containment, DeviceProfile, GuestIsolation, Robustness};
+use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
-use crate::device::{ContainmentPolicy, Device, DeviceDescription, DevicePolicy};
+use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{Capability, Error, Feature, LowerFamily, Unsupported};
-use crate::library::Library;
 use crate::lower::select::{LowerInputs, Plan};
-use crate::metal::{PixelFormat, TextureType};
+use crate::metal::PixelFormat;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::lower_inputs::{StorageImageChoice, StorageImageClass};
 use crate::pipeline::sym::{
-    Axis, HandleClass, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
-    SyntheticBinding,
+    PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
 };
 use crate::pipeline::testing::{
-    compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module,
-    typed_module_with, AssembleError,
+    compile, engine_dir, link_and_validate, llvm_assemble, typed_module, typed_module_with,
+    AssembleError,
 };
-use crate::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, StageSource};
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
@@ -1131,7 +1127,7 @@ fn device(stem: &str, drop: &[VkFeature]) -> Device {
     for f in drop {
         desc.features.remove(f);
     }
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// Every committed profile, one with `robustImageAccess` but not `robustImageAccess2`, and two
@@ -1142,12 +1138,7 @@ fn profiles() -> Vec<(String, DeviceProfile)> {
         "moltenvk-m3 robust1".into(),
         without("moltenvk-m3", &[VkFeature::RobustImageAccess2]),
     ));
-    let all = [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ];
+    let all = [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2];
     for stem in ["moltenvk-m3", "lavapipe"] {
         out.push((format!("{stem} unrobust"), without(stem, &all)));
     }
@@ -1167,15 +1158,14 @@ enum Class {
 
 fn class(p: &DeviceProfile, buffer: bool) -> Class {
     let f = p.fields();
-    let Containment::On { robust } = f.containment else {
-        panic!("containment off")
-    };
-    match (buffer, robust) {
-        (true, Robustness::Rba2) => Class::Device,
-        (true, _) => Class::Shader,
-        (false, _) if f.images.robust_image_access2 => Class::Device,
-        (false, _) if f.images.robust_image_access => Class::ShaderReads,
-        (false, _) => Class::Shader,
+    if buffer {
+        Class::Shader
+    } else if f.images.robust_image_access2 {
+        Class::Device
+    } else if f.images.robust_image_access {
+        Class::ShaderReads
+    } else {
+        Class::Shader
     }
 }
 
@@ -1210,10 +1200,7 @@ const TEXTURE: SlotRef = SlotRef {
 /// texture's level count is `levels` (a storage texture's read at a level reads it).
 fn resources(plan: &Plan, p: &[[u32; 4]], out: usize, levels: u32) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -1221,8 +1208,6 @@ fn resources(plan: &Plan, p: &[[u32; 4]], out: usize, levels: u32) -> Resources 
                 push[offset as usize..offset as usize + 4].copy_from_slice(&levels.to_le_bytes());
             }
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             // 0: no channel narrower than the written word, every integer lane as written (the
             // interpreter's images hold words; the kernels write in-range values).
             (PushField::TextureIntegerChannels(_), PushLoc::Push { .. }) => {}
@@ -1777,8 +1762,8 @@ fn sample_storage_depth_and_half_reads_out_of_bounds_are_zero() {
     }
 }
 
-/// A texel buffer read is out of bounds past its last texel, also where `robustBufferAccess`
-/// (whose out-of-bounds texel may be any value of the buffer) is the only robustness.
+/// A texel buffer read is out of bounds past its last texel: the shader checks it on every
+/// profile.
 #[test]
 fn texel_buffer_reads_out_of_bounds_are_zero() {
     let Some(bc) = assemble() else {
@@ -1797,13 +1782,7 @@ fn texel_buffer_reads_out_of_bounds_are_zero() {
         ],
     };
     let ran = case.check(&bc);
-    assert_eq!(ran, [Class::Device, Class::Shader]);
-    // `robustBufferAccess` alone is the shader's check.
-    let vk12 = profiles()
-        .into_iter()
-        .find(|(s, _)| s == "vk12-floor")
-        .expect("vk12-floor");
-    assert_eq!(class(&vk12.1, true), Class::Shader);
+    assert_eq!(ran, [Class::Shader]);
 }
 
 /// Run a write kernel over `rows` on every profile: the texture's texels other than `written`
@@ -1869,8 +1848,7 @@ fn cube_array_writes_out_of_bounds_are_dropped() {
     assert!(ran.contains(&Class::Device), "{ran:?}");
 }
 
-/// A texel buffer write past its last texel writes nothing, also where `robustBufferAccess`
-/// (which may write the value anywhere in the buffer) is the only robustness.
+/// A texel buffer write past its last texel writes nothing: the shader guards it on every profile.
 #[test]
 fn texel_buffer_writes_out_of_bounds_are_dropped() {
     let Some(bc) = assemble() else {
@@ -1885,7 +1863,7 @@ fn texel_buffer_writes_out_of_bounds_are_dropped() {
         &rows,
         (0, 0, 0, [4, 0, 0]),
     );
-    assert_eq!(ran, [Class::Device, Class::Shader]);
+    assert_eq!(ran, [Class::Shader]);
 }
 
 /// A thread that writes a texel out of bounds and then reads that location reads Metal's zero
@@ -1967,38 +1945,31 @@ fn a_read_where_its_thread_wrote_out_of_bounds_is_zero() {
         }
         ran.sort();
         ran.dedup();
-        let want: &[Class] = if buffer {
-            &[Class::Device, Class::Shader]
-        } else {
-            &ALL
-        };
+        let want: &[Class] = if buffer { &[Class::Shader] } else { &ALL };
         assert_eq!(ran, want, "{entry}");
     }
 }
 
 /// Only a slot the device is left both an out-of-bounds store and an out-of-bounds load of is
-/// `Volatile`: never a slot the function only writes or only reads, and never without containment,
-/// where nothing out of bounds is defined. A texture atomic alone is both where image robustness
-/// discards it unguarded : the atomic-only `fwd_atomic`, declared `R32Uint` as atomics need, is
-/// `Volatile` on every profile with `robustImageAccess` (`roadmap-2022`, `swiftshader`) and on none
-/// without (`vk12-floor`), where the shader guards it.
+/// `Volatile`: never a slot the function only writes or only reads. A texture atomic alone is both
+/// where image robustness discards it unguarded: the atomic-only `fwd_atomic`, declared `R32Uint`
+/// as atomics need, is `Volatile` on every profile with `robustImageAccess` (`runtime-floor`) and
+/// on none without (`runtime-floor` without image robustness, below the runtime's floor), where the
+/// shader guards it.
 #[test]
 fn only_a_slot_left_both_a_store_and_a_load_is_volatile() {
     let Some(bc) = assemble_text("texture_forward", FORWARD) else {
         return;
     };
-    let unsafe_off = DevicePolicy {
-        containment: ContainmentPolicy::UnsafeOff,
-        isolation: GuestIsolation::Off,
-        ..Default::default()
-    };
     let mut all = profiles();
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        all.push((
-            format!("{stem} unsafe-off"),
-            profile(stem, unsafe_off).expect("profile"),
-        ));
-    }
+    const NO_IMAGE_ROBUSTNESS: &str = "runtime-floor without image robustness";
+    all.push((
+        NO_IMAGE_ROBUSTNESS.into(),
+        without(
+            "runtime-floor",
+            &[VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2],
+        ),
+    ));
     let mut atomic_inputs = LowerInputs::new();
     atomic_inputs.storage_images.insert(
         TEXTURE,
@@ -2007,7 +1978,6 @@ fn only_a_slot_left_both_a_store_and_a_load_is_volatile() {
     let mut volatile = 0;
     let mut atomic: BTreeMap<String, bool> = BTreeMap::new();
     for (stem, p) in all {
-        let off = !matches!(p.fields().containment, Containment::On { .. });
         for (entry, buffer) in [
             ("fwd_rw", false),
             ("fwd_buffer", true),
@@ -2028,12 +1998,11 @@ fn only_a_slot_left_both_a_store_and_a_load_is_volatile() {
                 };
                 plan
             };
-            let want = !off
-                && match entry {
-                    "fwd_rw" | "fwd_buffer" => class(&p, buffer) == Class::Device,
-                    "fwd_atomic" => p.fields().images.robust_image_access,
-                    _ => false,
-                };
+            let want = match entry {
+                "fwd_rw" | "fwd_buffer" => class(&p, buffer) == Class::Device,
+                "fwd_atomic" => p.fields().images.robust_image_access,
+                _ => false,
+            };
             let got = plan.families.texture.slots[&0].volatile;
             assert_eq!(got, want, "{stem}: {entry}");
             volatile += usize::from(want);
@@ -2043,11 +2012,7 @@ fn only_a_slot_left_both_a_store_and_a_load_is_volatile() {
         }
     }
     assert!(volatile > 0);
-    for (stem, want) in [
-        ("roadmap-2022", true),
-        ("swiftshader", true),
-        ("vk12-floor", false),
-    ] {
+    for (stem, want) in [("runtime-floor", true), (NO_IMAGE_ROBUSTNESS, false)] {
         assert_eq!(atomic.get(stem), Some(&want), "fwd_atomic on {stem}");
     }
 }
@@ -2082,205 +2047,6 @@ fn only_an_observed_alpha_is_specialized() {
         };
         assert_eq!(facts, want.iter().collect::<Vec<_>>(), "{entry}");
     }
-}
-
-/// An argument-buffer texture's format is the resident texture's, which the binder states per
-/// handle-table entry, its out-of-bounds-alpha flag: a heap read the shader checks whose alpha it
-/// observes reads Metal's out-of-bounds alpha from the entry its handle names. End to end on the
-/// interpreter, the binder's table bytes for two resident textures (an `R32Float`, whose missing
-/// alpha Metal reads as 1, and an `RGBA32Float`), the emitted search, and reads in and past the
-/// texture; a missed id reads the null texture's zero. Where the device's robustness is Metal's
-/// texel the search stays the element's alone.
-#[test]
-fn a_heap_read_takes_its_out_of_bounds_alpha_from_its_table_entry() {
-    let bc = match llvm_assemble(&engine_dir().join("handles.ll")) {
-        Ok(b) => b,
-        Err(AssembleError::Missing(why)) => {
-            eprintln!("SKIPPED: {why}");
-            return;
-        }
-        Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected handles.ll: {why}"),
-    };
-    const NO_ALPHA: u64 = 0x0000_0001_0000_0010;
-    const ALPHA: u64 = 0x0000_0001_0000_0020;
-    const MISSED: u64 = 0x0000_0002_0000_0000;
-    let entry = "argument_buffer_read";
-    let unrobust = [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ];
-    let devices = [
-        ("moltenvk-m3", device("moltenvk-m3", &[])),
-        (
-            "moltenvk-m3 robust1",
-            device("moltenvk-m3", &[VkFeature::RobustImageAccess2]),
-        ),
-        ("moltenvk-m3 unrobust", device("moltenvk-m3", &unrobust)),
-        ("roadmap-2022", device("roadmap-2022", &[])),
-    ];
-    let mut ran = Vec::new();
-    for (stem, dev) in devices {
-        let lib = Library::from_air(&bc).expect("library");
-        let f = lib.function(entry).expect("entry");
-        let desc =
-            ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
-        let pipe = match dev.compile_compute_pipeline(&desc, &Budget::standard()) {
-            Ok(p) => p,
-            Err(Error::Unsupported(u)) if u.feature == Feature::ArgumentBufferTextures => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        // Members: token 1 (element 1), then token 2 (element 2).
-        let used = |token, pf, id| {
-            let mut u = UsedResource::new(
-                ResourceClass::Texture(TextureFacts::new(TextureType::Type2D, pf)),
-                token,
-            );
-            u.resource_id = Some(id);
-            u
-        };
-        let state = BindState {
-            used_resources: vec![
-                used(1, PixelFormat::R32Float, NO_ALPHA),
-                used(2, PixelFormat::RGBA32Float, ALPHA),
-            ],
-            ..Default::default()
-        };
-        let bplan = pipe.plan(&dev, &state.shape()).expect("plan");
-        let dispatch = Dispatch::Threadgroups {
-            groups: [4, 1, 1],
-            threads_per_group: [1, 1, 1],
-        };
-        let cmds = bplan
-            .instantiate_dispatch(&state, &dispatch)
-            .expect("dispatch");
-        let (set, binding) = bplan
-            .descriptors
-            .iter()
-            .find_map(|d| {
-                matches!(d.source, WriteSource::HandleTable { .. }).then_some((d.set, d.binding))
-            })
-            .expect("a handle table");
-        let table = cmds
-            .descriptor_bytes
-            .iter()
-            .find(|b| (b.set, b.binding) == (set, binding))
-            .expect("table bytes")
-            .bytes
-            .clone();
-
-        let (plan, m) = typed_module(&bc, entry, dev.profile()).expect("module");
-        let class = class(dev.profile(), false);
-        assert_eq!(
-            plan.families.access.heap_alpha,
-            class != Class::Device,
-            "{stem}: the search carries the flag only where the shader checks the read"
-        );
-        let heap = plan
-            .families
-            .texture
-            .heap
-            .values()
-            .find_map(|h| h.class)
-            .expect("a heap class");
-        let slot = ResourceSlot {
-            stage: Stage::Kernel,
-            kind: ResourceKind::Heap(HandleClass::Image(heap)),
-            index: 0,
-        };
-        // Element 0 is the class's neutral; 1 views the `R32Float` texture (lanes 1 and 2 read 0,
-        // lane 3 reads 1 through its view), 2 the `RGBA32Float` one. Each is 2 x 1.
-        let element = |e: u32, extent: [u32; 3], texel: &dyn Fn(u32) -> [u32; 4], alpha: u32| {
-            let mut img = Image::new(slot, extent, 1, 1, 1).at_element(e);
-            for (x, t) in img.texels.iter_mut().enumerate() {
-                *t = texel(x as u32);
-            }
-            img.robust = robust(class, alpha);
-            img
-        };
-        let images = vec![
-            element(0, [1, 1, 1], &|_| [0; 4], 0),
-            element(
-                1,
-                [2, 1, 1],
-                &|x| [fl(3.0 + x as f32), 0, 0, fl(1.0)],
-                fl(1.0),
-            ),
-            element(
-                2,
-                [2, 1, 1],
-                &|x| [fl(5.0 + x as f32), fl(6.0), fl(7.0), fl(8.0)],
-                0,
-            ),
-        ];
-        for (id, inside, outside) in [
-            (
-                NO_ALPHA,
-                [[fl(3.0), 0, 0, fl(1.0)], [fl(4.0), 0, 0, fl(1.0)]],
-                [0, 0, 0, fl(1.0)],
-            ),
-            (
-                ALPHA,
-                [
-                    [fl(5.0), fl(6.0), fl(7.0), fl(8.0)],
-                    [fl(6.0), fl(6.0), fl(7.0), fl(8.0)],
-                ],
-                [0; 4],
-            ),
-            (MISSED, [[0; 4], [0; 4]], [0; 4]),
-        ] {
-            let mut spec = BTreeMap::new();
-            for axis in [Axis::X, Axis::Y, Axis::Z] {
-                spec.insert(SpecKey::LocalSize(axis), 1);
-            }
-            spec.insert(SpecKey::FlatLocalSize, 1);
-            let buffer = |kind, bytes| Buffer {
-                slot: Some(ResourceSlot {
-                    stage: Stage::Kernel,
-                    kind,
-                    index: 0,
-                }),
-                address: None,
-                bytes,
-            };
-            let mut out = buffer(ResourceKind::Buffer, vec![0xAB; 4 * 16]);
-            if let Some(s) = out.slot.as_mut() {
-                s.index = 1;
-            }
-            let res = Resources {
-                buffers: vec![
-                    buffer(ResourceKind::Buffer, id.to_le_bytes().to_vec()),
-                    out,
-                    buffer(
-                        ResourceKind::Synthetic(SyntheticBinding::HandleTable),
-                        table.clone(),
-                    ),
-                ],
-                push: vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)],
-                spec,
-            };
-            for order in [Order::Forward, Order::Reverse] {
-                let cfg = Config {
-                    workgroups: [4, 1, 1],
-                    order,
-                    ..Config::default()
-                };
-                let (o, _) = run_with_images(&m, &cfg, res.clone(), images.clone())
-                    .unwrap_or_else(|e| panic!("{stem}: {id:#x}: {e:?}"));
-                // Threads 0 and 1 read in bounds, 2 and 3 past the texture's width.
-                let want: Vec<u8> = [inside[0], inside[1], outside, outside]
-                    .iter()
-                    .flat_map(|t| Out::Vec4.bytes(*t))
-                    .collect();
-                assert_eq!(o.buffers[1], want, "{stem}: id {id:#x}, {order:?}");
-            }
-        }
-        ran.push(class);
-    }
-    ran.sort();
-    ran.dedup();
-    assert_eq!(ran, ALL);
 }
 
 /// [`EDGE_READS`] with `edge_2d`'s read edited by hand to take 16-bit coordinates and offset

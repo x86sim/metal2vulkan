@@ -20,28 +20,19 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{
-    BindState, BoundBuffer, BoundTexture, ImageSource, PlanDiagnostic, StageTable, TextureFacts,
-    WriteSource,
-};
-use crate::budget::{Budget, SPIRV_WORDS};
+use crate::budget::SPIRV_WORDS;
 use crate::device::DevicePolicy;
-use crate::device::{Device, DeviceDescription};
-use crate::library::{FunctionConstantValues, Library};
+use crate::library::FunctionConstantValues;
 use crate::lower::select::{LowerInputs, Plan};
-use crate::metal::{self, PixelFormat, TextureType};
+use crate::metal::PixelFormat;
 use crate::pipeline::artifact::PrecisionNote;
-use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
+use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::sym::{
-    Axis, ResourceKind, ResourceSlot, SampledType, SlotClass, SlotRef, SpecKey, Stage,
-};
+use crate::pipeline::sym::{ResourceKind, ResourceSlot, SampledType, SlotClass, SlotRef, Stage};
 use crate::pipeline::testing::{
     device_nan_bits, link_and_validate, llvm_assemble, meter, profile, typed_module_with,
     AssembleError,
 };
-use crate::pipeline::StageSource;
-use crate::pipeline::{ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor};
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::{GlobalKind, TypedModule};
 
@@ -114,18 +105,6 @@ impl Ty {
     }
 }
 
-/// How the kernel accesses `texture2d` slot 0 at its thread's texel `gid`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Access {
-    /// `t.read(gid)` of an `access::read` texture.
-    Read,
-    /// `t.sample(s, coord)` through a nearest constexpr sampler at the texel's centre.
-    Sample,
-    /// `t.gather(s, coord)` (component 0) through a nearest constexpr sampler at the texel's
-    /// centre.
-    Gather,
-}
-
 /// The words of a nearest constexpr sampler of normalized coordinates, every axis clamped to
 /// its edge, no mip filter (`engine_srgb_decode`'s `sampler_words(0, 0, false)`).
 fn nearest_words() -> u64 {
@@ -134,51 +113,19 @@ fn nearest_words() -> u64 {
     BASE | edge | edge << 3 | edge << 6
 }
 
-/// A kernel accessing slot 0 as `access` with `ty` texels at thread `gid` (a 16 x 16 grid),
-/// storing the texel to `out[gid.x + 16 gid.y]` (buffer 0).
-fn kernel(access: Access, ty: Ty) -> String {
+/// A kernel reading slot 0 (an `access::read` texture) with `ty` texels at thread `gid` (a 16 x 16
+/// grid), storing the texel to `out[gid.x + 16 gid.y]` (buffer 0).
+fn kernel(ty: Ty) -> String {
     let (texel, vec4, size, suffix) = ty.spelling();
     let out_ty = format!("{texel}4");
-    let (tex_access, call, decl) = match access {
-        Access::Read => (
-            "read",
-            format!(
-                "%rs = call ptr addrspace(2) @air.get_read_sampler()\n  %r = call {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1) %t, ptr addrspace(2) %rs, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)"
-            ),
-            format!(
-                "declare ptr addrspace(2) @air.get_read_sampler()\ndeclare {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)"
-            ),
-        ),
-        Access::Sample => (
-            "sample",
-            format!(
-                "%r = call {{ {vec4}, i8 }} @air.sample_texture_2d.{suffix}(ptr addrspace(1) %t, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.0, float 0.0, i32 0)"
-            ),
-            format!(
-                "declare {{ {vec4}, i8 }} @air.sample_texture_2d.{suffix}(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)"
-            ),
-        ),
-        Access::Gather => (
-            "sample",
-            format!(
-                "%r = call {{ {vec4}, i8 }} @air.gather_texture_2d.{suffix}(ptr addrspace(1) %t, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i32 0, i32 0)"
-            ),
-            format!(
-                "declare {{ {vec4}, i8 }} @air.gather_texture_2d.{suffix}(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)"
-            ),
-        ),
-    };
-    let (state, states, state_md) = match access {
-        Access::Read => (String::new(), "", ""),
-        Access::Sample | Access::Gather => (
-            format!(
-                "@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {}, i64 0], align 8\n\n",
-                nearest_words()
-            ),
-            "!air.sampler_states = !{!6}\n",
-            "!6 = !{!\"air.sampler_state\", ptr addrspace(2) @__air_sampler_state}\n",
-        ),
-    };
+    let tex_access = "read";
+    let call = format!(
+        "%rs = call ptr addrspace(2) @air.get_read_sampler()\n  %r = call {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1) %t, ptr addrspace(2) %rs, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)"
+    );
+    let decl = format!(
+        "declare ptr addrspace(2) @air.get_read_sampler()\ndeclare {{ {vec4}, i8 }} @air.read_texture_2d.{suffix}(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)"
+    );
+    let (state, states, state_md) = (String::new(), "", "");
     format!(
         r#"{state}define void @k(ptr addrspace(1) %t, ptr addrspace(1) %out, <2 x i32> %gid) {{
   %x = extractelement <2 x i32> %gid, i64 0
@@ -222,8 +169,7 @@ fn inputs(bound: Option<SampledType>) -> LowerInputs {
     i
 }
 
-/// Compile the kernel `bc` under `inputs` on `p`, check that the plan's word estimate bounds the
-/// emission, and validate the linked module.
+/// Compile the kernel `bc` under `inputs` on `p` and validate the linked module.
 fn validate(
     bc: &[u8],
     inputs: &LowerInputs,
@@ -232,16 +178,8 @@ fn validate(
 ) {
     let consts = FunctionConstantValues::defaults();
     let entry = EntryRef::Name("k");
-    let plan = plan_bitcode(bc, entry, &consts, p, inputs, &mut meter())
-        .unwrap_or_else(|e| panic!("{what}: {e}"));
     let a = compile_bitcode(bc, entry, &consts, p, inputs, &mut meter(), SPIRV_WORDS)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
-    let words = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= words,
-        "{what}: estimate {} < emitted {words}",
-        plan.estimate.words
-    );
     link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: {e}"));
 }
 
@@ -286,10 +224,7 @@ fn resource(m: &TypedModule) -> ResourceSlot {
 /// per texel.
 fn resources(plan: &Plan, bytes: u32) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     let out = Buffer {
         slot: Some(ResourceSlot {
@@ -343,9 +278,8 @@ fn run(
 /// Every read through a slot of another class gives the words the slot of the texture's own
 /// class gives, a `half` result their low 16 bits: Metal's rule. A `ushort` result of an integer
 /// texture is the low 16 bits too, of a float texture the `half` read's bits. Where the module
-/// widens a `half` from its bits by the device and records `PrecisionNote::NativeNanEncoding` or
-/// requires `VkProperty::MetalNanMoves` (both profiles here, which have `shaderFloat16`;
-/// `device_nan_bits`), a `half` result's NaN is the device's widening's, which the interpreter is
+/// widens a `half` from its bits by the device and records `PrecisionNote::NativeNanEncoding`
+/// (both profiles here, which have `shaderFloat16`; `device_nan_bits`), a `half` result's NaN is the device's widening's, which the interpreter is
 /// not, so a NaN pattern need only come back a NaN.
 #[test]
 fn accesses_through_another_class_are_the_native_words() {
@@ -367,25 +301,22 @@ fn accesses_through_another_class_are_the_native_words() {
         .map(|stem| {
             (
                 stem,
-                profile(stem, DevicePolicy::default()).expect("profile"),
+                profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile"),
             )
         })
         .collect();
     let mut checked = 0;
-    // The interpreter models no sample or gather: theirs compile and validate in
-    // `a_texture_of_another_class_joins_the_variant`, and run on the GPU lanes.
-    let access = Access::Read;
     for (ty, class) in pairs {
         // A `ushort` result of a float texture is the `half` result's bits.
         let native = match (ty, class) {
             (Ty::Ushort, S::Float) => Ty::Half,
             _ => Ty::of(class),
         };
-        let name = format!("{access:?} {ty:?} over {class:?}");
-        let Some(cross) = assemble(&name, &kernel(access, ty)) else {
+        let name = format!("Read {ty:?} over {class:?}");
+        let Some(cross) = assemble(&name, &kernel(ty)) else {
             return;
         };
-        let Some(own) = assemble(&name, &kernel(access, native)) else {
+        let Some(own) = assemble(&name, &kernel(native)) else {
             return;
         };
         for (stem, p) in &profiles {
@@ -431,237 +362,6 @@ fn accesses_through_another_class_are_the_native_words() {
         }
     }
     assert_eq!(checked, 10 * 2);
-}
-
-fn devices() -> Vec<(String, Device)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles");
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(&dir).expect("profiles") {
-        let path = e.expect("entry").path();
-        if path.extension().is_none_or(|x| x != "json") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let text = std::fs::read_to_string(&path).expect("profile");
-        let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        out.push((
-            stem,
-            Device::new(desc, DevicePolicy::default()).expect("device"),
-        ));
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
-}
-
-/// The kernel compiled into a compute pipeline under `inputs`.
-fn pipeline(dev: &Device, bc: &[u8], inputs: &LowerInputs) -> ComputePipeline {
-    let lib = Library::from_air(bc).expect("library");
-    let f = lib.function("k").expect("function");
-    let compiled = dev
-        .compile_function(&FunctionDescriptor::new(f), inputs, &Budget::standard())
-        .expect("compile");
-    dev.compile_compute_pipeline(
-        &ComputePipelineDescriptor::new(StageSource::Compiled(compiled)),
-        &Budget::standard(),
-    )
-    .expect("pipeline")
-}
-
-/// A kernel's state: texture slot 0 bound in `pf` (shader read), buffer 0.
-fn state(pf: PixelFormat) -> BindState {
-    let mut t = StageTable::default();
-    let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-    facts.usage = metal::TextureUsage::SHADER_READ;
-    t.textures.insert(
-        0,
-        BoundTexture::Texture {
-            facts,
-            resource_id: None,
-        },
-    );
-    t.buffers.insert(
-        0,
-        BoundBuffer::Buffer {
-            length: 65536,
-            offset: 0,
-            gpu_address: 0x1_0000,
-            device_address: None,
-            attribute_stride: None,
-        },
-    );
-    let mut s = BindState::default();
-    s.stages.insert(Stage::Kernel, t);
-    s
-}
-
-/// The view format of slot 0's image among a plan's writes, a combined binding's included.
-fn view_format(plan: &crate::bind::BindingPlan) -> Option<crate::vk::Format> {
-    plan.descriptors.iter().find_map(|d| match &d.source {
-        WriteSource::Texture { view, .. } => Some(view.format),
-        WriteSource::CombinedImageSampler {
-            image: ImageSource::Texture { view, .. },
-            ..
-        } => Some(view.format),
-        _ => None,
-    })
-}
-
-/// A slot whose compile states `CrossClassReads` bound to a texture of another class joins the
-/// plan's variant, with the texture's class; the variant's plan states the same key and views
-/// the texture's own format. An integer slot over an 8-bit sRGB texture joins the sRGB variant
-/// too, whose raw codes its float reads decode: its gather views the raw format, as a `float`
-/// slot's gather of the texture does, on a device that does not sample through Metal's own
-/// sampler, whose gather is the table's decode (Metal's uint gather of an `RGBA8Unorm_sRGB` texture
-/// is its float gather's bits, the table's decode, 240 of 240 on an M4 and an M3). On every
-/// committed profile.
-#[test]
-fn a_texture_of_another_class_joins_the_variant() {
-    use SampledType as S;
-    let cases = [
-        (Access::Read, Ty::Float, PixelFormat::R32Uint, S::Uint),
-        (Access::Read, Ty::Half, PixelFormat::RGBA8Sint, S::Sint),
-        (Access::Read, Ty::Int, PixelFormat::RGBA16Uint, S::Uint),
-        (Access::Read, Ty::Uint, PixelFormat::RGBA8Unorm, S::Float),
-        (Access::Sample, Ty::Float, PixelFormat::RGBA8Uint, S::Uint),
-        (Access::Sample, Ty::Int, PixelFormat::RGBA16Float, S::Float),
-        (
-            Access::Sample,
-            Ty::Ushort,
-            PixelFormat::RGBA8Unorm,
-            S::Float,
-        ),
-        (Access::Read, Ty::Ushort, PixelFormat::RGBA16Sint, S::Sint),
-        (
-            Access::Gather,
-            Ty::Uint,
-            PixelFormat::RGBA8UnormSRGB,
-            S::Float,
-        ),
-        (
-            Access::Gather,
-            Ty::Uint,
-            PixelFormat::RG8UnormSRGB,
-            S::Float,
-        ),
-    ];
-    let mut planned = 0;
-    for (access, ty, pf, class) in cases {
-        let name = format!("{access:?} {ty:?} over {pf:?}");
-        let Some(bc) = assemble(&name, &kernel(access, ty)) else {
-            return;
-        };
-        for (stem, dev) in devices() {
-            let what = format!("{name} on {stem}");
-            let plain = pipeline(&dev, &bc, &LowerInputs::new());
-            assert!(
-                plain
-                    .dependencies
-                    .iter()
-                    .any(|d| d.fact == RuntimeFact::CrossClassReads { slot: TEXTURE }),
-                "{what}: no CrossClassReads"
-            );
-            let shape = state(pf).shape();
-            let plan = match plain.plan(&dev, &shape) {
-                Ok(plan) => plan,
-                // A device that cannot sample the format refuses it for the format.
-                Err(crate::error::BindError::Unsupported(u)) => {
-                    eprintln!("{what}: {u:?}");
-                    continue;
-                }
-                Err(e) => panic!("{what}: {e}"),
-            };
-            assert_eq!(
-                plan.variant.cross_class,
-                BTreeMap::from([(TEXTURE, class)]),
-                "{what}"
-            );
-            // Only a format the device holds as its UNORM twin joins the sRGB variant.
-            let twin = crate::metal::texel_format::srgb_twin_on(pf, dev.profile());
-            assert_eq!(
-                plan.variant.srgb_textures.contains(&TEXTURE),
-                twin,
-                "{what}"
-            );
-            let key = plan.variant.lowering_inputs(Stage::Kernel);
-            assert_eq!(key.cross_class, plan.variant.cross_class, "{what}");
-            validate(&bc, &key, dev.profile(), &what);
-            let variant = pipeline(&dev, &bc, &key);
-            let again = variant.plan(&dev, &shape).expect("variant plan");
-            assert_eq!(again.variant, plan.variant, "{what}");
-            assert!(
-                again.diagnostics.is_empty(),
-                "{what}: {:?}",
-                again.diagnostics
-            );
-            let view = view_format(&again).unwrap_or_else(|| panic!("{what}: no view"));
-            // Every access views the texture's own format, an sRGB one's decoding its codes; a
-            // format held as its UNORM twin, the twin's.
-            let usages = [crate::device::FormatUsage::SampledImage].into();
-            let held = match twin {
-                true => crate::metal::format::srgb_raw_twin(pf).expect("a twin"),
-                false => pf,
-            };
-            let want = crate::metal::format::vk_format(held, &usages, dev.profile())
-                .expect("the format")
-                .format;
-            assert_eq!(view, want, "{what}");
-            planned += 1;
-            // A texture of the declared class leaves the variant.
-            let same = match ty {
-                Ty::Float | Ty::Half => PixelFormat::RGBA8Unorm,
-                Ty::Int => PixelFormat::RGBA8Sint,
-                _ => PixelFormat::RGBA8Uint,
-            };
-            let other = variant.plan(&dev, &state(same).shape()).expect("plan");
-            assert!(other.variant.cross_class.is_empty(), "{what}");
-        }
-    }
-    assert!(planned > 0);
-}
-
-/// A slot read with a `uint` result over a texture of a depth format, whose read in another
-/// class the binder does not take (`metal::texel_format::crosses_classes`), binds the slot's
-/// neutral, which the plan reports as `CrossClassNeutral`, and asks for no variant. On every
-/// committed profile that samples the format.
-#[test]
-fn an_unanswered_result_binds_the_neutral_and_says_so() {
-    let Some(bc) = assemble("uint over depth", &kernel(Access::Read, Ty::Uint)) else {
-        return;
-    };
-    let mut planned = 0;
-    for (stem, dev) in devices() {
-        let plain = pipeline(&dev, &bc, &LowerInputs::new());
-        assert!(
-            plain
-                .dependencies
-                .iter()
-                .any(|d| d.fact == RuntimeFact::CrossClassReads { slot: TEXTURE }),
-            "{stem}"
-        );
-        let plan = match plain.plan(&dev, &state(PixelFormat::Depth32Float).shape()) {
-            Ok(plan) => plan,
-            Err(crate::error::BindError::Unsupported(u)) => {
-                eprintln!("{stem}: {u:?}");
-                continue;
-            }
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        assert!(plan.variant.cross_class.is_empty(), "{stem}");
-        assert!(
-            plan.diagnostics.iter().any(
-                |d| matches!(d, PlanDiagnostic::CrossClassNeutral { slot, .. } if *slot == TEXTURE)
-            ),
-            "{stem}: {:?}",
-            plan.diagnostics
-        );
-        assert_eq!(view_format(&plan), None, "{stem}");
-        planned += 1;
-    }
-    assert!(planned > 0);
 }
 
 /// What a kernel does with the `texture2d<T>` its argument buffer holds.
@@ -773,8 +473,8 @@ fn held_classes(a: &crate::library::FunctionArtifact) -> Vec<SampledType> {
 
 /// A read and a query of a texture an argument buffer holds, through each declared type, read a
 /// member of another numeric class in its own class: on every committed profile with a sampled
-/// heap, the module declares the sampled class of every numeric type, stays inside the plan's word
-/// estimate, passes L3 and states `RuntimeFact::HeapCrossClassNeutral` for the formats it does not
+/// heap, the module declares the sampled class of every numeric type, passes L3 and states
+/// `RuntimeFact::HeapCrossClassNeutral` for the formats it does not
 /// take alone (not `every_member`). A sample through the argument buffer, and a `ushort` read
 /// (whose query still crosses), have no answer for any such member: they state the fact for every
 /// member of their class, which the planner reports and the runtime announces.
@@ -846,8 +546,8 @@ fn a_texture_an_argument_buffer_holds_is_read_in_its_own_class() {
 
 /// A `half` read of a texture an argument buffer holds merges its class arms as the texel's `half`
 /// bits (`emit::read_crossed`), widened once after the merge: on every committed profile with a
-/// sampled heap, the module merges a vector of four `u32`s and merges no texel struct, stays inside
-/// the plan's word estimate and passes L3. A member of another class then keeps its words' low 16
+/// sampled heap, the module merges a vector of four `u32`s and merges no texel struct, and passes
+/// L3. A member of another class then keeps its words' low 16
 /// bits wherever the value is stored unchanged, where a merge of each arm's widened `half` selected
 /// against a null handle's zero is a move Metal's compiler does not fold back to the bits (on the
 /// Apple M3 Max a NaN's bits became `0x7E00`). A `float` read, which widens nothing, still merges
@@ -1040,7 +740,7 @@ fn integer_writes_saturate_to_the_bound_formats_channels() {
         .map(|stem| {
             (
                 stem,
-                profile(stem, DevicePolicy::default()).expect("profile"),
+                profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile"),
             )
         })
         .collect();
@@ -1098,10 +798,7 @@ fn integer_writes_saturate_to_the_bound_formats_channels() {
                 }
                 assert_eq!(words, usize::from(!declares), "{what}: the slot's word");
                 let mut spec = BTreeMap::new();
-                for axis in [Axis::X, Axis::Y, Axis::Z] {
-                    spec.insert(SpecKey::LocalSize(axis), 1);
-                }
-                spec.insert(SpecKey::FlatLocalSize, 1);
+                spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
                 let res = Resources {
                     buffers: vec![Buffer {
                         slot: Some(ResourceSlot {
@@ -1147,13 +844,11 @@ fn integer_writes_saturate_to_the_bound_formats_channels() {
 /// An `int` or `uint` write into a texture of the float class in a half-float or small-float
 /// format stores the `float` of each lane's bits as written: the device's store converts it, as
 /// it converts every `float` write, where Metal's integer store rounds to nearest even, so the
-/// module records `PrecisionNote::DeviceColorConversion` (and requires no
-/// `VkProperty::MetalHalfStorageWrites`, whose rounding is Metal's `float` write's). A 32-bit
+/// module records `PrecisionNote::DeviceColorConversion`. A 32-bit
 /// float format's needs no conversion, and records nothing. On the interpreter the image holds the
 /// written `f32` itself.
 #[test]
 fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
-    use crate::device::requirements::VkProperty;
     use crate::pipeline::lower_inputs::{StorageImageChoice, StorageImageClass};
     use crate::vk::Format as F;
     let cases = [
@@ -1164,7 +859,7 @@ fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
     ];
     let mut checked = 0;
     for stem in ["lavapipe", "moltenvk-m3"] {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for (ty, format, narrow) in cases {
             let what = format!("write {ty:?} over {format:?} on {stem}");
             let Some(bc) = assemble(&what, &write_kernel(ty)) else {
@@ -1194,12 +889,6 @@ fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
                 "{what}: {:?}",
                 a.precision
             );
-            assert!(
-                !a.requirements
-                    .properties
-                    .contains(&VkProperty::MetalHalfStorageWrites),
-                "{what}"
-            );
             let (plan, m) =
                 typed_module_with(&bc, "k", &p, &inputs).unwrap_or_else(|e| panic!("{what}: {e}"));
             let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
@@ -1208,10 +897,7 @@ fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
                 .flat_map(|n| (0..4).flat_map(move |c| lane(n, c).to_le_bytes()))
                 .collect();
             let mut spec = BTreeMap::new();
-            for axis in [Axis::X, Axis::Y, Axis::Z] {
-                spec.insert(SpecKey::LocalSize(axis), 1);
-            }
-            spec.insert(SpecKey::FlatLocalSize, 1);
+            spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
             let res = Resources {
                 buffers: vec![Buffer {
                     slot: Some(ResourceSlot {
@@ -1247,165 +933,4 @@ fn integer_writes_into_narrow_floats_take_the_devices_conversion() {
         }
     }
     assert_eq!(checked, 8);
-}
-
-/// A kernel's state for [`write_kernel`]: texture slot 0 bound in `pf` (shader write), buffer 0.
-fn write_state(pf: PixelFormat) -> BindState {
-    let mut s = state(pf);
-    if let Some(t) = s.stages.get_mut(&Stage::Kernel) {
-        let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-        facts.usage = metal::TextureUsage::SHADER_WRITE;
-        t.textures.insert(
-            0,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-    }
-    s
-}
-
-/// Through the device's binder: a write kernel's plan over a texture of each integer format, its
-/// variant's compile, the dispatch's push bytes and specialization, run on the interpreter, stores
-/// Metal's saturated words, whether the slot declares the format (a device without formatless
-/// storage writes, or a texture of another class) or reads the binder's
-/// `PushField::TextureIntegerChannels` word. On every committed profile that writes the format.
-#[test]
-fn the_binder_saturates_each_bound_formats_channels() {
-    use crate::bind::Dispatch;
-    use PixelFormat as P;
-    let cases = [
-        (Ty::Uint, P::RGBA8Uint),
-        (Ty::Int, P::RGBA16Sint),
-        (Ty::Uint, P::RGB10A2Uint),
-        (Ty::Uint, P::R32Uint),
-        (Ty::Ushort, P::R8Uint),
-        (Ty::Int, P::RGBA8Uint),
-    ];
-    let (mut worded, mut declared) = (0, 0);
-    for (ty, pf) in cases {
-        let name = format!("bound write {ty:?} over {pf:?}");
-        let Some(bc) = assemble(&name, &write_kernel(ty)) else {
-            return;
-        };
-        let sixteen = matches!(ty, Ty::Ushort | Ty::Short);
-        let format = crate::metal::format::direct_format(pf).expect("format");
-        let signed = format.block().expect("block").color == Some(crate::vk::NumericFormat::Sint);
-        let bits = crate::metal::format::integer_channel_bits(format).expect("integer");
-        let lane = |n: u32, c: usize| match sixteen {
-            true => u32::from(HALVES[(n as usize * 4 + c) * 5 % HALVES.len()]),
-            false => WORDS[(n as usize * 4 + c) * 5 % WORDS.len()],
-        };
-        let src: Vec<u8> = (0..SIDE * SIDE)
-            .flat_map(|n| (0..4).map(move |c| (n, c)))
-            .flat_map(|(n, c)| match sixteen {
-                true => (lane(n, c) as u16).to_le_bytes().to_vec(),
-                false => lane(n, c).to_le_bytes().to_vec(),
-            })
-            .collect();
-        for (stem, dev) in devices() {
-            let what = format!("{name} on {stem}");
-            let s = write_state(pf);
-            // A device that declares every storage image's format compiles the slot only under
-            // a plan's choice.
-            let lib = Library::from_air(&bc).expect("library");
-            let f = FunctionDescriptor::new(lib.function("k").expect("function"));
-            let budget = Budget::standard();
-            if let Err(e) = dev.compile_function(&f, &LowerInputs::new(), &budget) {
-                eprintln!("{what}: {e}");
-                continue;
-            }
-            let plain = pipeline(&dev, &bc, &LowerInputs::new());
-            let plan = match plain.plan(&dev, &s.shape()) {
-                Ok(plan) => plan,
-                Err(crate::error::BindError::Unsupported(u)) => {
-                    eprintln!("{what}: {u:?}");
-                    continue;
-                }
-                Err(e) => panic!("{what}: {e}"),
-            };
-            let key = plan.variant.lowering_inputs(Stage::Kernel);
-            let pipe = pipeline(&dev, &bc, &key);
-            let plan = pipe.plan(&dev, &s.shape()).expect("variant plan");
-            let reads_word = pipe
-                .dependencies
-                .iter()
-                .any(|d| d.fact == RuntimeFact::StorageTextureIntegerChannels { slot: TEXTURE });
-            match reads_word {
-                true => worded += 1,
-                false => declared += 1,
-            }
-            let cmds = plan
-                .instantiate_dispatch(
-                    &s,
-                    &Dispatch::Threadgroups {
-                        groups: [SIDE, SIDE, 1],
-                        threads_per_group: [1, 1, 1],
-                    },
-                )
-                .expect("instantiate");
-            let region = &cmds.regions[0];
-            let mut push = Vec::new();
-            if let Some(w) = region.push_constants.first() {
-                push = vec![0u8; w.offset as usize + w.bytes.len()];
-                push[w.offset as usize..].copy_from_slice(&w.bytes);
-            }
-            let ids: BTreeMap<u32, SpecKey> = pipe
-                .stage
-                .specialization
-                .constants
-                .iter()
-                .map(|c| (c.id, c.key))
-                .collect();
-            let mut spec = BTreeMap::new();
-            for e in &region.specialization.entries {
-                let at = e.offset as usize;
-                let mut v = [0u8; 8];
-                v[..e.size as usize]
-                    .copy_from_slice(&region.specialization.data[at..at + e.size as usize]);
-                spec.insert(ids[&e.constant_id], u64::from_le_bytes(v));
-            }
-            for placement in &pipe.interface.push {
-                spec.extend(placement.pushed_values(&push));
-            }
-            let (_, m) = typed_module_with(&bc, "k", dev.profile(), &key)
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let res = Resources {
-                buffers: vec![Buffer {
-                    slot: Some(ResourceSlot {
-                        stage: Stage::Kernel,
-                        kind: ResourceKind::Buffer,
-                        index: 0,
-                    }),
-                    address: None,
-                    bytes: src.clone(),
-                }],
-                push,
-                spec,
-            };
-            let img = Image::new(resource(&m), [SIDE, SIDE, 1], 1, 1, 1);
-            let cfg = Config {
-                workgroups: [SIDE, SIDE, 1],
-                ..Config::default()
-            };
-            let (_, images) = run_with_images(&m, &cfg, res, vec![img])
-                .unwrap_or_else(|e| panic!("{what}: interpreter: {e:?}"));
-            let img = images.into_iter().next().expect("image");
-            for n in 0..SIDE * SIDE {
-                let at = img.index(0, 0, 0, [n % SIDE, n / SIDE, 0]).expect("texel");
-                for (c, b) in bits.iter().enumerate() {
-                    let want = metal_store(lane(n, c), sixteen, *b, signed);
-                    assert_eq!(
-                        img.texels[at][c],
-                        want,
-                        "{what}: texel {n} lane {c}: {:#x}",
-                        lane(n, c)
-                    );
-                }
-            }
-        }
-    }
-    println!("integer channels: {worded} plans read the word, {declared} declare the format");
-    assert!(worded > 0 && declared > 0, "{worded} {declared}");
 }

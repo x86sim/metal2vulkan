@@ -18,8 +18,8 @@
 //!
 //! A single-plane target's codes are blitted out. A two-plane target's plane 0 is blitted as its
 //! words, and its alpha plane is recorded as the `float4` Metal's own `xr_two_planes`'s
-//! `xr2p_read_float` reads back — the whole read rather than the lane's rounded alpha byte, since
-//! the read is Metal's answer and the rounding is the lane's way of meeting a probe digest.
+//! `xr2p_read_float` reads back — the whole read rather than a rounded alpha byte, since the read
+//! is Metal's answer.
 //!
 //! The target generator is the probe's own, rebuilt here, and `the_targets_are_the_probes` checks it
 //! against all eight digests the probe printed. Note that it is a **different** xorshift from the
@@ -31,6 +31,7 @@
 
 use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Bindings, Case, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::recording::ShaderRef;
 use crate::render::{
     Blend, ColorState, Dispatch, PassColor, Plane, ReadAt, RenderPass, RenderPipelineSpec,
@@ -38,7 +39,6 @@ use crate::render::{
 };
 use crate::transcript::{Node, Observed, Sites, Value};
 use metal2vulkan::metal::BlendFactor;
-use metal2vulkan_runtime::Degradation;
 
 use super::extended_range_targets::{
     fixture, fixture_inputs, half_bytes, not_read, program, read_layout, shader_refs, shape,
@@ -134,8 +134,8 @@ fn alpha_values(alpha: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// One blend the lane sweeps: its name and the destination factor, under source factor one, added,
-/// for color and alpha alike.
+/// One blend the family sweeps: its name and the destination factor, under source factor one,
+/// added, for color and alpha alike.
 const BLENDS: [(&str, BlendFactor); 3] = [
     ("one-zero", BlendFactor::Zero),
     ("add", BlendFactor::One),
@@ -151,7 +151,7 @@ pub struct ExtendedRangeBlend {
     blend_name: &'static str,
 }
 
-/// Every pairing of a format with a blend, as the lane sweeps them.
+/// Every pairing of a format with a blend, in a fixed order.
 pub fn all() -> Vec<ExtendedRangeBlend> {
     // The names are written out rather than built, so a case's recording file is named by something
     // a reader can grep for.
@@ -240,43 +240,9 @@ impl Case for ExtendedRangeBlend {
         // device that blends as Metal does shows as announced with nothing differing -- which is
         // what this M3 Max and lavapipe both show -- and one that does not shows the code. The
         // allowance fails the case if the notice stops firing, so it cannot outlive its reason.
-        //
-        // The pass loads and stores an extended-range colour attachment, so its draw announces
-        // `extended-range-bits-kept`: the device's store keeps the bits the codes leave unused in
-        // the texels the draw does not write, where Metal's pass makes them canonical. The
-        // difference it names cannot reach this case: the draw is one full-screen triangle over
-        // the whole 128 x 64 target under every channel, so it writes every texel, and every
-        // stored code compares exactly. So this is a declaration of what our side announced and
-        // not a tolerance -- no code is loosened.
-        //
-        // The function blends the `half4` fill into the extended-range target in the shader, in
-        // the device's arithmetic, so every row announces `extended-range-blend-source`, a native
-        // note the suite declares for every case (`crate::replay::NATIVE_NOTES`); the codes still
-        // compare exactly, and a site the device's arithmetic moves is a known gap.
-        // `extended-range-blends-stored-codes` is deliberately **not** named here: it fired on no
-        // venue, and an allowance no run justified is a claim without evidence. A venue that
-        // needs it adds it with the run that shows it.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 18 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        std::iter::once(crate::replay::shared_memory_notice())
-            .chain(
-                [
-                    Degradation::HalfOutputFastMathBlend,
-                    Degradation::ExtendedRangeBitsKept,
-                ]
-                .into_iter()
-                .map(|kind| crate::replay::notice_allowance(kind.code())),
-            )
-            .collect()
+        vec![crate::replay::notice_allowance(
+            Degradation::HalfOutputFastMathBlend.code(),
+        )]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

@@ -1,26 +1,19 @@
 //! The suite's case set.
 //!
-//! Two seed families proved the loop end to end, chosen to be as unlike each other as the first
-//! increment allowed: one compares the bytes a compute pass wrote, the other a typed answer a
-//! getter gives.
-//!
-//! Most of the rest are ports of the runtime lanes whose expectation is already a transcript of a
-//! Metal probe's printed lines, which is what made them the first batch. Where Metal's whole path
-//! is public, record mode **runs** the probe rather than copying it: the mesh draws, the mesh draws
-//! behind a barrier, and the mesh draws of an indirect command buffer's own-state commands. Where
-//! it is not, the case carries our own measurement and forbids re-recording: the texture fills,
-//! whose `fillTexture:` is Apple SPI, and an indirect command's read-back through private getters.
-//! The reason is always the *call*, never the pixel format a case names.
+//! Where Metal's whole path is public, record mode **runs** the case on Metal: the mesh draws, the
+//! mesh draws behind a barrier, and the mesh draws of an indirect command buffer's own-state
+//! commands among them. Where it is not, the case carries our own measurement and forbids
+//! re-recording: the texture fills, whose `fillTexture:` is Apple SPI, and an indirect command's
+//! read-back through private getters. The reason is always the *call*, never the pixel format a
+//! case names.
 //!
 //! [`rate_maps`] is the family where Metal's own API validation layer and plain Metal disagree,
 //! and it is what exercises the recording's second oracle ([`crate::validated`]).
 //!
-//! Two families are ports of lanes that held **no Metal value at all** — a rule, or a list in a
-//! module's prose — and whose values this round measured on the oracle for the first time:
-//! [`texture_accesses`], where Metal's render-pipeline reflection states each texture slot's
-//! access, and [`textures`], where every uncompressed colour format's texture answers what a fresh
-//! level 0 reads, what a host round trip gives back, and whether the bytes between the rows stayed
-//! as they were.
+//! [`texture_accesses`] records each texture slot's access as Metal's render-pipeline reflection
+//! states it, and [`textures`] what every uncompressed colour format's texture answers: what a
+//! fresh level 0 reads, what a host round trip gives back, and whether the bytes between the rows
+//! stayed as they were.
 //!
 //! No case here can fault a GPU, hang it, trip its watchdog or end Metal's process.
 //!
@@ -48,12 +41,14 @@ pub mod argument_encoders;
 pub mod astc_textures;
 pub mod attribute_formats;
 pub mod attribute_strides;
+pub mod bicubic_texel_classes;
 pub mod binary_archives;
 pub mod blend_interactions;
 pub mod blend_sweeps;
 pub mod blit_encoder_commands;
 pub mod blit_indirect_commands;
 pub mod border_swizzles;
+pub mod buffer_bind_off_alignment;
 pub mod buffer_blits;
 pub mod buffer_depth_samples;
 pub mod buffer_tails;
@@ -73,6 +68,7 @@ pub mod compute_heap_residency;
 pub mod compute_pipeline_descriptors;
 pub mod compute_render_chains;
 pub mod compute_threadgroups;
+pub mod copy_out_strides;
 pub mod denormal_word_fetches;
 pub mod depth_resolve_pairs;
 pub mod depth_stencil_space;
@@ -91,6 +87,7 @@ pub mod extended_range_planes;
 pub mod extended_range_targets;
 pub mod extended_range_two_planes;
 pub mod extended_swizzles;
+pub mod fence_orders;
 pub mod fetch_ordered;
 pub mod format_copies;
 pub mod format_footprints;
@@ -98,6 +95,7 @@ pub mod fragment_imageblock_reflection;
 pub mod frame_chains;
 pub mod fresh_contents;
 pub mod function_bindings;
+pub mod function_constants_half3;
 pub mod function_facts;
 pub mod half_output_blends;
 pub mod half_read_nans;
@@ -109,9 +107,11 @@ pub mod heap_facts;
 pub mod heap_metal_sizes;
 pub mod host_detach;
 pub mod host_page_writes;
+pub mod imageblock_sizes;
 pub mod indirect_command_depth;
 pub mod indirect_commands;
 pub mod indirect_private_types;
+pub mod indirect_ranges;
 pub mod int_attributes;
 pub mod layered_targets;
 pub mod level_sizes;
@@ -123,6 +123,7 @@ pub mod mesh_draws;
 pub mod mesh_partial_barriers;
 pub mod mesh_pipeline_descriptors;
 pub mod mesh_pipeline_reflection;
+pub mod nan_integer_conversions;
 pub mod nearest_positions;
 pub mod norm_storage_writes;
 pub mod padded_blends;
@@ -144,23 +145,27 @@ pub mod pixel_samplers;
 pub mod primitive_type_crossings;
 pub mod pvrtc_cpu_order;
 pub mod pvrtc_rows;
+pub mod quad_helpers;
 pub mod rate_map_degenerate_forms;
 pub mod rate_map_sweeps;
 pub mod rate_maps;
 pub mod read_through;
 pub mod read_write_tiers;
+pub mod reconvergence;
 pub mod render_chains;
 pub mod render_depth_stencil_state;
 pub mod render_draw_forms;
 pub mod render_pass_descriptors;
 pub mod render_residency;
 pub mod render_state;
+pub mod resolve_then_load;
 pub mod resource_facts;
 pub mod rgb10a2_srgb;
 pub mod rotated_planes;
 pub mod rotated_targets;
 pub mod sample_fills;
 pub mod sample_positions;
+pub mod sampler_bind_clamps;
 pub mod sampler_crossings;
 pub mod sampler_filtering;
 pub mod scheduled_handlers;
@@ -168,6 +173,7 @@ pub mod shader_stencil;
 pub mod shared_creator_formats;
 pub mod shared_events;
 pub mod shared_exponent_storage;
+pub mod signed_remainders;
 pub mod simdgroup_lockstep;
 pub mod snorm_tile_store;
 pub mod sparse_heaps;
@@ -179,8 +185,10 @@ pub mod stage_in_unread;
 pub mod stencil_resolve_pairs;
 pub mod stencil_resolved_sample;
 pub mod surface_fills;
+pub mod surface_textures;
 pub mod swizzled_storage;
 pub mod tessellation_crossings;
+pub mod tessellation_rendered;
 pub mod tessellation_sweeps;
 pub mod texel_swizzles;
 pub mod texture_accesses;
@@ -188,8 +196,10 @@ pub mod texture_buffer_fills;
 pub mod texture_buffer_tails;
 pub mod texture_descriptor_pairs;
 pub mod texture_fills;
+pub mod texture_view_casts;
 pub mod texture_views;
 pub mod textures;
+pub mod threadgroup_start;
 pub mod tile_pipeline_descriptors;
 pub mod tile_pipeline_reflection;
 pub mod tile_threadgroups;
@@ -197,9 +207,13 @@ pub mod topology_classes;
 pub mod two_plane_copies;
 pub mod two_plane_heap_blits;
 pub mod two_plane_samples;
+pub mod vector_word_phases;
 pub mod vertex_attribute_strides;
+pub mod vertex_constant_step;
 pub mod vertex_fetch_reach;
 pub mod vertex_formats;
+pub mod vertex_step_rate;
+pub mod viewport_cuts;
 pub mod visibility;
 pub mod visible_tables;
 pub mod wide_int_attributes;
@@ -219,9 +233,11 @@ pub fn all() -> Vec<Box<dyn Case>> {
     cases.push(Box::new(indirect_private_types::private_type_getters()));
     cases.extend(indirect_command_depth::boxed());
     cases.extend(indirect_commands::boxed());
+    cases.extend(indirect_ranges::boxed());
     for case in math_routines::all() {
         cases.push(Box::new(case));
     }
+    cases.push(Box::new(signed_remainders::case()));
     cases.push(Box::new(stage_in_regions::stage_in_region_clamps()));
     for case in compressed_decode::all() {
         cases.push(Box::new(case));
@@ -319,6 +335,7 @@ pub fn all() -> Vec<Box<dyn Case>> {
     for case in format_copies::all() {
         cases.push(Box::new(case));
     }
+    cases.push(Box::new(copy_out_strides::CopyOutStrides));
     for case in nearest_positions::all() {
         cases.push(Box::new(case));
     }
@@ -326,6 +343,12 @@ pub fn all() -> Vec<Box<dyn Case>> {
         cases.push(Box::new(case));
     }
     for case in discard_hoist::all() {
+        cases.push(Box::new(case));
+    }
+    for case in reconvergence::all() {
+        cases.push(Box::new(case));
+    }
+    for case in quad_helpers::all() {
         cases.push(Box::new(case));
     }
     for case in int_attributes::all() {
@@ -339,6 +362,9 @@ pub fn all() -> Vec<Box<dyn Case>> {
     }
     cases.extend(tessellation_sweeps::boxed());
     cases.extend(tessellation_crossings::boxed());
+    for case in tessellation_rendered::all() {
+        cases.push(Box::new(case));
+    }
     for case in attribute_formats::all() {
         cases.push(Box::new(case));
     }
@@ -439,6 +465,8 @@ pub fn all() -> Vec<Box<dyn Case>> {
     cases.push(Box::new(mesh_commands::own_state_commands()));
     cases.push(Box::new(mesh_commands::unordered_draws()));
     cases.push(Box::new(surface_fills::over_planes_and_buffers()));
+    cases.extend(surface_textures::all());
+    cases.extend(texture_view_casts::all());
     for case in rate_maps::all() {
         cases.push(Box::new(case));
     }
@@ -511,6 +539,11 @@ pub fn all() -> Vec<Box<dyn Case>> {
             .into_iter()
             .map(|case| Box::new(case) as Box<dyn Case>),
     );
+    cases.extend(
+        fence_orders::all()
+            .into_iter()
+            .map(|case| Box::new(case) as Box<dyn Case>),
+    );
     cases.push(Box::new(scheduled_handlers::handler_order()));
     cases.extend(chroma_pairs::all());
     cases.extend(ycbcr_textures::all());
@@ -525,6 +558,8 @@ pub fn all() -> Vec<Box<dyn Case>> {
     cases.extend(attribute_strides::all());
     cases.extend(vertex_attribute_strides::all());
     cases.extend(vertex_fetch_reach::all());
+    cases.extend(vertex_constant_step::all());
+    cases.extend(vertex_step_rate::all());
     cases.extend(stage_in_unread::all());
     cases.extend(blit_indirect_commands::all());
     cases.push(Box::new(compute_heap_residency::heap_residency()));
@@ -580,6 +615,7 @@ pub fn all() -> Vec<Box<dyn Case>> {
     for case in sampler_filtering::all() {
         cases.push(Box::new(case));
     }
+    cases.extend(sampler_bind_clamps::all());
     cases.extend(sampler_crossings::boxed());
     cases.extend(render_chains::boxed());
     cases.extend(compute_render_chains::boxed());
@@ -596,11 +632,22 @@ pub fn all() -> Vec<Box<dyn Case>> {
     cases.extend(pass_attachment_pairs::all());
     cases.extend(pass_bound_pairs::all());
     cases.extend(pass_sequence_actions::all());
+    cases.extend(resolve_then_load::all());
     cases.extend(pass_start_reads::all());
     cases.extend(render_residency::all());
     cases.extend(frame_chains::boxed());
     cases.extend(shared_creator_formats::all());
     cases.extend(read_write_tiers::all());
+    for case in vector_word_phases::all() {
+        cases.push(Box::new(case));
+    }
+    cases.push(Box::new(buffer_bind_off_alignment::BufferBindOffAlignment));
+    cases.push(Box::new(threadgroup_start::ThreadgroupStart));
+    cases.push(Box::new(imageblock_sizes::ImageblockSizes));
+    cases.push(Box::new(nan_integer_conversions::NanIntegerConversions));
+    cases.push(Box::new(function_constants_half3::FunctionConstantsHalf3));
+    cases.push(Box::new(bicubic_texel_classes::BicubicTexelClasses));
+    cases.extend(viewport_cuts::all());
     cases
 }
 

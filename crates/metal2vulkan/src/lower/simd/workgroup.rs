@@ -25,20 +25,21 @@
 //! partially occupied, as in Metal). A kernel with an operation in any other block is emitted
 //! predicated ([`super::divergent`]): every invocation executes the operation, and the invocations
 //! that do not execute it in the source publish an inactive flag beside their words
-//! (`EmitCx::active`), so the active lanes are the lanes below `N` whose flag is set; a source lane
-//! past `N` reads zero bits, and so does one below `N` that is not active (a multiply-add's cell
-//! reads zero), reductions and prefix sums fold only active lanes (in the tree forms an inactive
-//! lane takes part with the operation's identity, `-0` for a float sum, and in a float min or max,
-//! which is idempotent, with the first active lane's operand instead, so no NaN reaches `NMin` or
-//! `NMax`), and votes, `is_first`, `broadcast_first`, and the quad's first lane and mask read the
-//! active lanes' word. [`vote`] decides whether any invocation of the workgroup is still in a
-//! predicated loop. In workgroup-uniform blocks:
+//! (`EmitCx::active`), so the active lanes are the lanes below `N` whose flag is set; a read of a
+//! source lane that is not active (past `N`, or below it with its flag clear) reads the calling
+//! lane's words ([`Emu::read`]), reductions and prefix sums fold only active lanes (in the tree
+//! forms an inactive lane takes part with the operation's identity, `-0` for a float sum, and in a
+//! float min or max, which is idempotent, with the first active lane's operand instead, so no NaN
+//! reaches `NMin` or `NMax`), and votes, `is_first`, `broadcast_first`, and the quad's first lane
+//! and mask read the active lanes' word. [`vote`] decides whether any invocation of the workgroup
+//! is still in a predicated loop. In workgroup-uniform blocks:
 //!
 //! - shuffles and broadcasts read their source lane's words; a source outside the threadgroup (a
-//!   lane of a partial simdgroup past `N`, whose value Metal leaves undefined) reads all-zero
-//!   bits, Metal's answer ([`Emu::read_lane`], which amends the calling-lane rule), so no read uses
-//!   words no lane wrote; relative shuffles keep Metal's rule of reading the calling lane where the
-//!   source leaves the simdgroup or quad;
+//!   lane of a partial simdgroup past `N`) reads the calling lane's words ([`Emu::read`]), so no
+//!   read uses words no lane wrote; what it reads there is unspecified, since a thread reads only
+//!   from an active thread (MSL 4.1 section 6.10.2), and the value is not promised; relative
+//!   shuffles keep Metal's rule of reading the calling lane where the source leaves the simdgroup
+//!   or quad;
 //! - simdgroup reductions combine the lanes below `N` in a tree of five exchange rounds
 //!   (`tree_fold`): exact for integers, a narrow float sum rounded after each addition, and a float
 //!   sum's association order the tree's (`ReductionOrder` is recorded as in every tier); prefix
@@ -49,9 +50,9 @@
 //!   `is_first` is lane 0 (always below `N`), and `quad_active_threads_mask` the quad's lanes below
 //!   `N`;
 //! - the simdgroup-matrix and AGX multiply-adds publish their four `f32` cells once and read
-//!   them for every step (`matrix::tile_mad`); a lane past `N` takes part with zero cells, as
-//!   does, in a divergent block, a lane that is not live ([`Emu::read_cell`], which amends this
-//!   item's calling-lane rule for the multiply-adds);
+//!   them for every step (`matrix::tile_mad`) through the same rule: a lane past `N`, or in a
+//!   divergent block one that is not live, is read through the calling lane, and the product is
+//!   promised only where the whole simdgroup takes part (MSL 4.1 section 2.4);
 //! - a simdgroup barrier is a workgroup barrier with the Metal flags' memories, which orders a
 //!   superset of the simdgroup's threads; a simdgroup-scope fence orders at workgroup scope for
 //!   the same reason (`sync::barrier`).
@@ -70,9 +71,10 @@
 //! **Reconvergence**. The emulated operations exchange through workgroup memory between workgroup
 //! barriers in workgroup-uniform control flow (predicated where the source diverges), so no result
 //! depends on how subgroups reconverge: an entry whose only tangled instructions are emulated ones
-//! declares no reconvergence mode and records `Reconvergence::Guaranteed`.
+//! declares no reconvergence mode, not even in a re-entered loop (`super::reentry`), and records
+//! `Reconvergence::Guaranteed`.
 
-use crate::air::intrinsics::{GroupOp, GroupScope, MemFlags};
+use crate::air::intrinsics::{GroupOp, MemFlags};
 use crate::air::ir::ValueId;
 use crate::budget::Meter;
 use crate::error::{Error, Feature, LowerFamily, Unsupported};
@@ -87,6 +89,7 @@ use crate::memory::arena::MIN_ARENA_BYTES;
 use crate::memory::leaf::Coherence;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::sym::{SpecKey, Stage};
+use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::{BResult, BuildError, Dangling};
 use crate::spirv::ids::{ConstId, DemoteTy, GlobalId, TypeId, Value as SValue};
@@ -98,8 +101,7 @@ use crate::spirv::ir::{
 use super::agx::AgxStrategy;
 use super::divergent;
 use super::group::{
-    bin_k, fill_source, k, minus_zero_unless, nth, post, pre, quad_tree, zero_cell, Exchange, Lane,
-    SIMD_WIDTH,
+    bin_k, fill_source, k, minus_zero_unless, nth, post, pre, quad_tree, Exchange, Lane, SIMD_WIDTH,
 };
 use super::matrix::MatrixStrategy;
 use super::uniform::Uniformity;
@@ -157,7 +159,7 @@ fn exchange_words(s: &Strategy) -> Option<u32> {
 
 /// The words one lane publishes for strategy `s` in a divergent block of a predicated kernel: its
 /// values and its active flag, which every group operation reads (a vote's lanes, a shuffle's
-/// source, the first active lane) and a multiply-add's cell reads ([`Emu::read_cell`]). A barrier
+/// source, the first active lane) and a multiply-add's cell reads ([`Emu::read`]). A barrier
 /// publishes nothing.
 fn predicated_words(s: &Strategy) -> Option<u32> {
     match s {
@@ -179,117 +181,6 @@ fn emulated_site(s: &Strategy) -> bool {
     }
 }
 
-/// The SPIR-V words one scratch read of a value of `w` words emits: the source clamp, per word its
-/// address, access chain, and load, and the value's reassembly.
-fn read_words(w: u32) -> u32 {
-    48 + 40 * w
-}
-
-/// The SPIR-V words of one of [`tree_fold`]'s or [`tree_scan`]'s rounds on a value of `v` words:
-/// the published words, the two barriers, the source lane, its read, the lane-order selects of a
-/// float min or max, the combining step, and the select that keeps the partial where the partner
-/// holds no contribution.
-fn tree_round_words(v: u32, g: &GroupPlan) -> u32 {
-    48 * v + read_words(v) + 128 + narrow::round_words(g.form)
-}
-
-/// The SPIR-V words of [`Emu::gather_bits`] of `conds` words and the closing barrier: the clears,
-/// three barriers, the lane's bit, and per word its select, atomic `Or`, and load.
-fn gather_words(conds: u32) -> u32 {
-    96 + 96 * conds
-}
-
-/// The SPIR-V words the emulated tier adds to strategy `s`'s own estimate: the stores of the
-/// published words and the two barriers, and per read of another lane's value the scratch read with
-/// its combining step; a simdgroup reduction is five tree rounds, a prefix sum or product six (a
-/// float's exclusive sum and an exclusive product shift first), and a vote or ballot one
-/// `Emu::gather_bits`. The subgroup instructions the estimate counted are not emitted, so this
-/// over-counts.
-pub fn extra_words(s: &Strategy) -> u32 {
-    let Some(w) = exchange_words(s) else {
-        return 0;
-    };
-    let publish = 48 * w + 48;
-    let reads = match s {
-        Strategy::Simd(SimdStrategy::Group(g)) => {
-            use GroupOp as G;
-            let v = moved(g).map_or(0, form_words);
-            let step = read_words(v) + 64 + narrow::round_words(g.form);
-            let rounds = SIMD_WIDTH.trailing_zeros();
-            match (g.scope, g.op) {
-                (GroupScope::Quad, G::IsFirst | G::ActiveThreadsMask)
-                | (GroupScope::Simdgroup, G::IsFirst) => 64,
-                (GroupScope::Simdgroup, G::All | G::Any | G::Ballot | G::ActiveThreadsMask)
-                | (GroupScope::Quad, G::All | G::Any | G::Ballot) => gather_words(2),
-                (
-                    GroupScope::Simdgroup,
-                    G::PrefixInclusiveSum
-                    | G::PrefixExclusiveSum
-                    | G::PrefixInclusiveProduct
-                    | G::PrefixExclusiveProduct,
-                ) => (rounds + 1) * tree_round_words(v, g),
-                (
-                    GroupScope::Simdgroup,
-                    G::Sum | G::Product | G::Min | G::Max | G::And | G::Or | G::Xor,
-                ) => rounds * tree_round_words(v, g),
-                (
-                    GroupScope::Quad,
-                    G::Sum
-                    | G::Product
-                    | G::Min
-                    | G::Max
-                    | G::And
-                    | G::Or
-                    | G::Xor
-                    | G::PrefixInclusiveSum
-                    | G::PrefixExclusiveSum
-                    | G::PrefixInclusiveProduct
-                    | G::PrefixExclusiveProduct,
-                ) => 4 * step,
-                (_, G::ShuffleAndFillUp | G::ShuffleAndFillDown) => 2 * step,
-                _ => step,
-            }
-        }
-        _ => TILE_READS * (read_words(1) + CELL_SELECT_WORDS),
-    };
-    publish + reads
-}
-
-/// The SPIR-V words the emulated tier adds to strategy `s` in a divergent block of a predicated
-/// kernel: besides [`extra_words`], the published active flag and the active-lane select of each
-/// value, the active-lane word of `is_first` and `broadcast_first` and of the votes, and, for a
-/// quad's other operations, which read its lanes one by one, the read of each lane's flag; for a
-/// multiply-add, per cell read the source lane's flag.
-pub fn predicated_extra_words(s: &Strategy) -> u32 {
-    let base = extra_words(s);
-    match s {
-        Strategy::Simd(SimdStrategy::Group(g)) => {
-            let votes = matches!(g.op, GroupOp::All | GroupOp::Any);
-            let flags = if g.scope == GroupScope::Quad && !votes {
-                SIMD_WIDTH * (read_words(1) + 64)
-            } else {
-                gather_words(1)
-            };
-            base.saturating_mul(2)
-                .saturating_add(flags)
-                .saturating_add(96)
-        }
-        Strategy::Simd(
-            SimdStrategy::Matrix(MatrixStrategy::Mac(_))
-            | SimdStrategy::Agx(AgxStrategy::MatMad(_)),
-        ) => base.saturating_add(TILE_READS * read_words(1)),
-        _ => base,
-    }
-}
-
-/// The cell reads of a multiply-add ([`extra_words`]): per step `k` of the (at most) eight, the
-/// `a` cell and two `b` cells, each with the select of a zero cell (`CELL_SELECT_WORDS`).
-const TILE_READS: u32 = 8 * 3;
-
-/// The SPIR-V words of the select of a zero cell where a multiply-add's source lane does not
-/// take part, and its constant ([`Emu::read_cell`]).
-const CELL_SELECT_WORDS: u32 = 16;
-
 /// The scratch bytes one simdgroup of a function publishing `words` per lane takes
 /// (`4 · words · 32`).
 pub fn bytes_per_simdgroup(words: u32) -> u64 {
@@ -298,8 +189,8 @@ pub fn bytes_per_simdgroup(words: u32) -> u64 {
 
 /// The threadgroup memory beside the scratch when the module's arena, whose static part is
 /// `arena` (`None`: no arena is declared), holds `regions` more bytes of specialized
-/// `[[threadgroup(n)]]` regions: the arena's `u32` array, whole words and at least
-/// `MIN_ARENA_BYTES` (`memory::arena`).
+/// `[[threadgroup(n)]]` regions: the arena's `u32` array, whole words and at least 32 bytes
+/// (`MIN_ARENA_BYTES`).
 pub fn arena_bytes(arena: Option<u32>, regions: u64) -> u64 {
     match arena {
         Some(s) => (u64::from(s).saturating_add(regions))
@@ -313,12 +204,13 @@ pub fn arena_bytes(arena: Option<u32>, regions: u64) -> u64 {
 /// are all in workgroup-uniform control flow exchanges; any other is planned predicated
 /// (`divergent::plan`, which adds the values its guards separate to the block-crossing values
 /// `cross`; a matrix or AGX multiply-add in a divergent block publishes its live flag, and reads a
-/// lane that is not active as zero cells). The static arena with one simdgroup's scratch must fit
-/// `maxComputeSharedMemorySize` (else `ThreadgroupMemorySize`). A function that exchanges values
-/// sets the plan's exchange width and depends on `RuntimeFact::SimdgroupEmulation`. An entry whose
-/// only tangled instructions are emulated sites and threadgroup barriers the lockstep pass placed
-/// keeps no reconvergence mode. `given` is the body's uniformity when the caller already holds it
-/// (`simd::partly_live`, which keeps its ledger bytes); otherwise it is computed and released here.
+/// lane that is not active through the calling lane). The static arena with one simdgroup's
+/// scratch must fit `maxComputeSharedMemorySize` (else `ThreadgroupMemorySize`). A function that
+/// exchanges values sets the plan's exchange width and depends on
+/// `RuntimeFact::SimdgroupEmulation`. An entry whose only tangled instructions are emulated sites
+/// and threadgroup barriers the lockstep pass placed keeps no reconvergence mode. `given` is the
+/// body's uniformity when the caller already holds it (`simd::partly_live`, which keeps its ledger
+/// bytes); otherwise it is computed and released here.
 ///
 /// A refusal changes nothing of `cx` or `cross`, so a kernel the emulated tier refuses can take
 /// another tier (`simd::widest_pin`'s).
@@ -417,8 +309,10 @@ pub fn check(
     if !other_tangled {
         cx.families.simd.mode = ReconvergenceMode::None;
         cx.families.simd.implementation_defined = false;
+        cx.families.simd.reentry = None;
     }
     cx.families.simd.exchange_words = words;
+    cx.families.simd.guarded_barriers = crate::lower::access::identity(cx.profile);
     cx.families.simd.predication = predication;
     if let Some(fact) = fact {
         cx.facts.insert(fact);
@@ -455,13 +349,18 @@ fn divergent_site(
     None
 }
 
-/// The emulated tier's module-scope objects: the threadgroup's thread count and the scratch.
+/// The emulated tier's module-scope objects: the threadgroup's thread count, the scratch, and the
+/// condition its barriers run under.
 #[derive(Clone, Copy, Debug)]
 pub struct Declared {
     /// `sx·sy·sz`, an `OpSpecConstantOp`.
     pub threads: ConstId,
     /// The scratch array, when the function exchanges values.
     pub scratch: Option<GlobalId>,
+    /// `1 < sx·sy·sz`, an `OpSpecConstantOp`, where the plan guards the tier's barriers
+    /// (`SimdPlan::guarded_barriers`) and the function exchanges values: each exchange and vote
+    /// barrier runs only where it holds, a branch the specialization decides.
+    pub several: Option<ConstId>,
 }
 
 fn u32_ty(mb: &mut ModuleBuilder) -> BResult<TypeId> {
@@ -482,9 +381,15 @@ fn konst(mb: &mut ModuleBuilder, v: u32) -> BResult<ConstId> {
 /// Declare the thread count and, for a function that exchanges `words` per lane, the scratch
 /// in `Workgroup` memory: one slot per lane of `(N + 31) & ~31`, a `u32` or, for more than one
 /// word, a `u32[words]`, so a word's pointer is one access chain at the lane and the constant
-/// word with no slot arithmetic. The local-size constants are the dispatch family's for the `stage`
-/// (`SpecKey::dispatch_keys`, default 1).
-pub fn declare(mb: &mut ModuleBuilder, stage: Stage, words: u32) -> BResult<Declared> {
+/// word with no slot arithmetic; with `guarded` the condition `1 < N` its barriers run under. The
+/// local-size constants are the dispatch family's for the `stage` (`SpecKey::dispatch_keys`,
+/// default 1).
+pub fn declare(
+    mb: &mut ModuleBuilder,
+    stage: Stage,
+    words: u32,
+    guarded: bool,
+) -> BResult<Declared> {
     let u32_ = u32_ty(mb)?;
     let [sx, sy, sz] = SpecKey::dispatch_keys(stage)
         .local
@@ -495,8 +400,16 @@ pub fn declare(mb: &mut ModuleBuilder, stage: Stage, words: u32) -> BResult<Decl
         return Ok(Declared {
             threads,
             scratch: None,
+            several: None,
         });
     }
+    let several = if guarded {
+        let one = konst(mb, 1)?;
+        let bool_ = mb.ty(Type::Bool)?;
+        Some(mb.spec_op(SpecOp::ULessThan, bool_, &[one, threads])?)
+    } else {
+        None
+    };
     let up = konst(mb, SIMD_WIDTH - 1)?;
     let mask = konst(mb, !(SIMD_WIDTH - 1))?;
     let padded = mb.spec_op(SpecOp::IAdd, u32_, &[threads, up])?;
@@ -520,6 +433,7 @@ pub fn declare(mb: &mut ModuleBuilder, stage: Stage, words: u32) -> BResult<Decl
     Ok(Declared {
         threads,
         scratch: Some(scratch),
+        several,
     })
 }
 
@@ -537,6 +451,8 @@ pub struct Emu {
     /// exchange publishes after its values: a lane whose flag is clear is inactive. `None`: every
     /// lane inside the threadgroup is active.
     active: Option<SValue>,
+    /// `1 < N`, where the plan guards the tier's barriers ([`Declared::several`]).
+    several: Option<SValue>,
 }
 
 /// Words published by [`Emu::publish`]: each value's first word and type, and the index in
@@ -552,12 +468,17 @@ pub(super) fn emu(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<
         return Err(cx.fail("the emulated simdgroup tier is not declared"));
     };
     let n = fb.module().const_value(d.threads)?;
+    let several = match d.several {
+        Some(c) => Some(fb.module().const_value(c)?),
+        None => None,
+    };
     let flags = MemFlags {
         threadgroup: true,
         ..MemFlags::default()
     };
     Ok(Emu {
         n,
+        several,
         scratch: d.scratch,
         stride: cx.plan.families.simd.exchange_words,
         coherence: memory_model::coherence(cx.plan),
@@ -590,26 +511,27 @@ pub fn vote(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, live: SValue) -> 
         let zero = k(fb, 0)?;
         let one = k(fb, 1)?;
         let p = fb.module().global_value(word)?;
-        return vote_at(fb, p, sem, live, (zero, one));
+        return vote_at(fb, p, (sem, None), live, (zero, one));
     }
     let e = emu(cx, fb)?;
     let zero = k(fb, 0)?;
     let one = k(fb, 1)?;
     let p = e.word_ptr(fb, zero, 0)?;
-    vote_at(fb, p, e.sem, live, (zero, one))
+    vote_at(fb, p, (e.sem, e.several), live, (zero, one))
 }
 
-/// [`vote`] in the word at `p`, with workgroup barriers of semantics `sem`.
+/// [`vote`] in the word at `p`, with workgroup barriers of semantics `sem`, each under `several`
+/// where it is given ([`guarded_barrier`]).
 fn vote_at(
     fb: &mut FunctionBuilder<'_>,
     p: SValue,
-    sem: Semantics,
+    (sem, several): (Semantics, Option<SValue>),
     live: SValue,
     (zero, one): (SValue, SValue),
 ) -> BResult<SValue> {
     let relaxed = Semantics::RELAXED;
     fb.atomic_store(p, Scope::Workgroup, relaxed, zero)?;
-    fb.control_barrier(Scope::Workgroup, Scope::Workgroup, sem)?;
+    guarded_barrier(fb, sem, several)?;
     let bit = fb.select(live, one, zero)?;
     fb.atomic(
         crate::spirv::ir::AtomicOp::Or,
@@ -618,10 +540,29 @@ fn vote_at(
         relaxed,
         bit,
     )?;
-    fb.control_barrier(Scope::Workgroup, Scope::Workgroup, sem)?;
+    guarded_barrier(fb, sem, several)?;
     let x = fb.atomic_load(p, Scope::Workgroup, relaxed)?;
-    fb.control_barrier(Scope::Workgroup, Scope::Workgroup, sem)?;
+    guarded_barrier(fb, sem, several)?;
     fb.binary(BinOp::INotEqual, x, zero)
+}
+
+/// A workgroup barrier of semantics `sem`, and with `several` (`1 < N`, a specialization
+/// constant, so workgroup uniform) only where it holds: one thread orders its own accesses in
+/// program order, and a threadgroup of one executes no barrier.
+fn guarded_barrier(
+    fb: &mut FunctionBuilder<'_>,
+    sem: Semantics,
+    several: Option<SValue>,
+) -> BResult<()> {
+    let Some(several) = several else {
+        return fb.control_barrier(Scope::Workgroup, Scope::Workgroup, sem);
+    };
+    let then: ArmFn<'_, ()> = Box::new(move |fb, _| {
+        fb.control_barrier(Scope::Workgroup, Scope::Workgroup, sem)?;
+        Ok(ArmEnd::FallThrough(Vec::new()))
+    });
+    fb.if_(&mut (), several, then, None)?;
+    Ok(())
 }
 
 /// Declare the workgroup word a predicated kernel outside the emulated tier votes in.
@@ -631,9 +572,10 @@ pub fn declare_vote(mb: &mut ModuleBuilder) -> BResult<GlobalId> {
 }
 
 impl Emu {
-    /// A workgroup barrier over the scratch.
+    /// A workgroup barrier over the scratch, where the plan guards it only in a threadgroup of
+    /// more than one thread ([`guarded_barrier`]).
     pub fn barrier(&self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
-        fb.control_barrier(Scope::Workgroup, Scope::Workgroup, self.sem)
+        guarded_barrier(fb, self.sem, self.several)
     }
 
     /// A pointer to word `i` of lane `lane`'s slot: the slot's element `i` ([`declare`]).
@@ -763,8 +705,11 @@ impl Emu {
     }
 
     /// Value `i` of `p` as lane `src` published it; a lane outside the threadgroup or inactive
-    /// reads the calling lane's. The reductions read through it and keep only active lanes'
-    /// values; a shuffle reads through [`Emu::read_lane`].
+    /// reads the calling lane's. Every read of another lane goes through it: a shuffle's, a
+    /// multiply-add's cells (`matrix::tile_mad`), and the reductions', which keep only active
+    /// lanes' values. What a shuffle or a multiply-add reads in place of a lane that is not active
+    /// is unspecified: a thread reads only from an active thread (MSL 4.1 section 6.10.2), and the
+    /// value is not promised.
     pub fn read(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -774,48 +719,6 @@ impl Emu {
         src: SValue,
     ) -> BResult<SValue> {
         self.read_on(fb, lin, p, i, src).map(|(x, _)| x)
-    }
-
-    /// Value `i` of `p` as a shuffle reads it from lane `src`. A lane past the thread count does
-    /// not exist, and reads all-zero bits ([`zero_cell`]): Metal's answer, deterministic across
-    /// runs, inputs, and threadgroup shapes, where it leaves the value undefined. That amends the
-    /// calling-lane rule; it is measured for every move. A lane below the thread count that is not
-    /// active in a divergent block reads all-zero bits too: Metal's answer for every move, whether
-    /// the value was computed before the branch or inside it (amending the calling-lane
-    /// refinement).
-    pub fn read_lane(
-        &self,
-        fb: &mut FunctionBuilder<'_>,
-        lin: SValue,
-        p: &Published,
-        i: usize,
-        src: SValue,
-    ) -> BResult<SValue> {
-        let (first, ty) = p.layout.get(i).copied().ok_or_else(dangling)?;
-        let (at, on) = self.source(fb, lin, p, src)?;
-        let x = self.load_value(fb, at, first, ty)?;
-        let zero = zero_cell(fb, x)?;
-        fb.select(on, x, zero)
-    }
-
-    /// A multiply-add's cell `i` of `p` as lane `src` published it (`matrix::tile_mad`). A lane
-    /// that is not active takes part with a zero cell: one outside the threadgroup, and, in a
-    /// divergent block, one that is not live. Metal leaves a partial or partly live simdgroup's
-    /// product undefined; its answer, deterministic across runs, inputs, and dispatch shapes, is
-    /// the product with those lanes' cells zero, whatever they hold (measured for the matrix form;
-    /// the AGX form shares the rule unmeasured). The zero is `+0`, Metal's sign. That amends the
-    /// calling-lane rule, which [`Emu::read`] keeps, for the multiply-adds.
-    pub fn read_cell(
-        &self,
-        fb: &mut FunctionBuilder<'_>,
-        lin: SValue,
-        p: &Published,
-        i: usize,
-        src: SValue,
-    ) -> BResult<SValue> {
-        let (x, on) = self.read_on(fb, lin, p, i, src)?;
-        let zero = zero_cell(fb, x)?;
-        fb.select(on, x, zero)
     }
 
     /// Value `i` of `p` as lane `src` published it (the calling lane's where `src` is outside the
@@ -988,28 +891,12 @@ fn one(fb: &mut FunctionBuilder<'_>, ln: &Lane, v: SValue, src: SValue) -> BResu
     Ok(x)
 }
 
-/// `v` published, read by a shuffle from lane `src` ([`Emu::read_lane`]: a lane past the thread
-/// count reads all-zero bits), and the exchange closed.
-fn shuffled(
-    fb: &mut FunctionBuilder<'_>,
-    ln: &Lane,
-    e: &Emu,
-    v: SValue,
-    src: SValue,
-) -> BResult<SValue> {
-    let ex = ln.exchange(fb, &[v])?;
-    let x = e.read_lane(fb, ln.l, published(&ex)?, 0, src)?;
-    ln.close(fb, ex)?;
-    Ok(x)
-}
-
 /// A shuffle-and-fill of `g`'s scope (`group::fill_source`): the data and the fill published, each
-/// read from the source lane (one past the thread count reads all-zero bits), and the data taken
-/// where the source is inside the segment.
+/// read from the source lane ([`Emu::read`]), and the data taken where the source is inside the
+/// segment.
 fn shift_and_fill(
     fb: &mut FunctionBuilder<'_>,
     ln: &Lane,
-    e: &Emu,
     g: &GroupPlan,
     a: &[SValue],
 ) -> BResult<SValue> {
@@ -1017,9 +904,8 @@ fn shift_and_fill(
     let up = g.op == GroupOp::ShuffleAndFillUp;
     let (src, inside) = fill_source(fb, ln, g, up, d, modulo)?;
     let ex = ln.exchange(fb, &[data, fill])?;
-    let p = published(&ex)?;
-    let x = e.read_lane(fb, ln.l, p, 0, src)?;
-    let y = e.read_lane(fb, ln.l, p, 1, src)?;
+    let x = ln.read(fb, &ex, 0, src)?;
+    let y = ln.read(fb, &ex, 1, src)?;
     ln.close(fb, ex)?;
     fb.select(inside, x, y)
 }
@@ -1439,12 +1325,12 @@ pub(super) fn simd_op(
         G::Broadcast | G::Shuffle => {
             let i = bin_k(fb, BinOp::BitwiseAnd, nth(a, 1)?, last)?;
             let src = fb.binary(BinOp::BitwiseOr, base, i)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleXor => {
             let mask = bin_k(fb, BinOp::BitwiseAnd, nth(a, 1)?, last)?;
             let src = fb.binary(BinOp::BitwiseXor, lin, mask)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         // The source is at or below the calling lane, which exists: never past the thread
         // count.
@@ -1462,21 +1348,21 @@ pub(super) fn simd_op(
             let ok = fb.binary(BinOp::ULessThan, t, w)?;
             let from = fb.binary(BinOp::IAdd, lin, d)?;
             let src = fb.select(ok, from, lin)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleRotateDown => {
             let t = fb.binary(BinOp::IAdd, m, nth(a, 1)?)?;
             let t = bin_k(fb, BinOp::BitwiseAnd, t, last)?;
             let src = fb.binary(BinOp::BitwiseOr, base, t)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleRotateUp => {
             let t = fb.binary(BinOp::ISub, m, nth(a, 1)?)?;
             let t = bin_k(fb, BinOp::BitwiseAnd, t, last)?;
             let src = fb.binary(BinOp::BitwiseOr, base, t)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
-        G::ShuffleAndFillUp | G::ShuffleAndFillDown => shift_and_fill(fb, ln, e, g, a),
+        G::ShuffleAndFillUp | G::ShuffleAndFillDown => shift_and_fill(fb, ln, g, a),
         // In a divergent block the first active lane (none: the calling lane, which is not
         // live); else every lane of the simdgroup below the thread count is active and lane 0 is
         // the first.
@@ -1571,12 +1457,12 @@ pub(super) fn quad_op(
         G::Broadcast | G::Shuffle => {
             let i = operand(fb)?;
             let src = fb.binary(BinOp::BitwiseOr, qbase, i)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleXor => {
             let mask = operand(fb)?;
             let src = fb.binary(BinOp::BitwiseXor, lin, mask)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         // At or below the calling lane: never past the thread count.
         G::ShuffleUp => {
@@ -1593,21 +1479,21 @@ pub(super) fn quad_op(
             let ok = fb.binary(BinOp::ULessThan, t, four)?;
             let from = fb.binary(BinOp::IAdd, lin, d)?;
             let src = fb.select(ok, from, lin)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleRotateDown => {
             let t = fb.binary(BinOp::IAdd, q, nth(a, 1)?)?;
             let t = bin_k(fb, BinOp::BitwiseAnd, t, 3)?;
             let src = fb.binary(BinOp::BitwiseOr, qbase, t)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
         G::ShuffleRotateUp => {
             let t = fb.binary(BinOp::ISub, q, nth(a, 1)?)?;
             let t = bin_k(fb, BinOp::BitwiseAnd, t, 3)?;
             let src = fb.binary(BinOp::BitwiseOr, qbase, t)?;
-            shuffled(fb, ln, e, v()?, src)
+            one(fb, ln, v()?, src)
         }
-        G::ShuffleAndFillUp | G::ShuffleAndFillDown => shift_and_fill(fb, ln, e, g, a),
+        G::ShuffleAndFillUp | G::ShuffleAndFillDown => shift_and_fill(fb, ln, g, a),
         // In a divergent block the quad's first active lane by the published flags (none: the
         // calling lane, which is then not live, reads its own); else the quad's first lane, which
         // is below the thread count, as the calling lane is.
@@ -1683,6 +1569,7 @@ pub(super) fn quad_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::air::intrinsics::GroupScope;
     use crate::lower::arith::legal::{FloatFmt, Held};
 
     /// A lane publishes one word per lane of each value it moves: the predicate of a vote or
@@ -1697,6 +1584,7 @@ mod tests {
             arith: None,
             konst: None,
             quad_instructions: true,
+            helpers: false,
         };
         let half4 = Held::Float(FloatFmt::Half);
         let u32_ = Held::Int {

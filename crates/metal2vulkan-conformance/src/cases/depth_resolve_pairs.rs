@@ -83,7 +83,7 @@
 //!
 //! - **A non-resolving store action beside a resolve texture.** `Store` or `DontCare` with
 //!   `resolveTexture` set is measured to resolve nothing and leave the texture untouched
-//!   (`metal2vulkan_runtime`'s `resolve.rs`, a probe on an M4), and it is also a shape **Metal's
+//!   (a probe on an M4), and it is also a shape **Metal's
 //!   API validation stops**. The suite's record mode runs a validated leg beside the plain one, so
 //!   a case here would be one keystroke from an assertion that ends the process, and this family
 //!   does not find out by trying. It stays a runtime-lane fact.
@@ -104,7 +104,6 @@
 //! the target and the suite counts the case
 //! [`LacksFeature`](crate::verdict::Verdict::LacksFeature) rather than leaving it uncompared.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -115,9 +114,9 @@ use crate::render::{
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::{MultisampleDepthResolveFilter, StoreAction};
 use metal2vulkan::metal::state::DepthStencilDescriptor;
 use metal2vulkan::metal::{CompareFunction, PixelFormat, PrimitiveType};
-use metal2vulkan_runtime::{Degradation, MultisampleDepthResolveFilter, StoreAction};
 
 /// The owned fixture: the fullscreen triangle at buffer 0's depth, and the fragment whose sample
 /// mask is buffer 0's.
@@ -258,10 +257,9 @@ fn cell(at: usize) -> ScissorBox {
 ///
 /// `MTLTextureUsageShaderRead` beside the render-target usage, and not a detail: a device with no
 /// `MIN` or `MAX` depth resolve mode, and one that resolves a combined format's aspects one at a
-/// time, reads the attachment's samples through a sampled view
-/// (`metal2vulkan_runtime`'s `depth_stencil_resolve.rs`), and an attachment Metal made without the
-/// usage is a texture that path cannot take. The usage is therefore part of what the case means on
-/// every venue, not something the side may choose.
+/// time, reads the attachment's samples through a sampled view, and an attachment Metal made
+/// without the usage is a texture that path cannot take. The usage is therefore part of what the
+/// case means on every venue, not something the side may choose.
 fn depth_target(samples: u32) -> TargetSpec {
     TargetSpec::read(DEPTH_FORMAT, [SIDE; 2]).multisampled(samples)
 }
@@ -331,7 +329,6 @@ fn filter_name(filter: MultisampleDepthResolveFilter) -> &'static str {
         MultisampleDepthResolveFilter::Sample0 => "MTLMultisampleDepthResolveFilterSample0",
         MultisampleDepthResolveFilter::Min => "MTLMultisampleDepthResolveFilterMin",
         MultisampleDepthResolveFilter::Max => "MTLMultisampleDepthResolveFilterMax",
-        _ => "MTLMultisampleDepthResolveFilterUnknown",
     }
 }
 
@@ -480,24 +477,6 @@ impl Case for DepthFilters {
 
     fn record_runs(&self) -> u32 {
         RUNS
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // No value is loosened: every resolved depth Metal leaves is a depth we must leave. What is
-        // declared is the notice set, because a device without a `MIN` or `MAX` depth resolve mode
-        // reaches Metal's answer through a draw after the pass rather than through the store, and
-        // the runtime announces that. On MoltenVK the modes are the device's and nothing fires; on
-        // a device that lacks them the notice is what says the exact path ran.
-        // One more, a declaration at the notices site that touches no resolved depth: a device
-        // without unified memory holds the `Shared` buffer each row reads its answer back through
-        // in system memory (`crate::replay::shared_memory_notice`). Measured on the RTX 5080
-        // Laptop (615.71.09), where both rows announced it with the case declaring it nowhere
-        // (replay-nvidia.log).
-        vec![
-            crate::replay::notice_allowance(Degradation::ShaderResolve.code()),
-            crate::replay::notice_allowance(Degradation::DontCareStore.code()),
-            crate::replay::shared_memory_notice(),
-        ]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -855,9 +834,8 @@ mod tests {
         for case in all() {
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
-            // The declared allowances loosen no value: each names a notice and nothing else.
-            // The resolve and the `DontCare` store, and the venue's memory model.
-            assert_eq!(case.allowances().len(), 3);
+            // No value is loosened and no notice is declared.
+            assert!(case.allowances().is_empty(), "{}", case.name());
         }
     }
 

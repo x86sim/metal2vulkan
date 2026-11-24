@@ -1,4 +1,5 @@
 use super::*;
+use crate::requirement::ToolingRequirement;
 
 #[test]
 fn command_buffer_literals_participate_in_identity_and_validate_resources() {
@@ -93,50 +94,63 @@ fn command_buffer_literals_participate_in_identity_and_validate_resources() {
         .unwrap_err()
         .iter()
         .any(|error| error.contains("owns an undeclared buffer")));
-    // The Metal oracle and the old-engine candidate supply command-buffer handles, so the shared
-    // gate admits the literal. The engine candidate maps a command buffer as its record
-    // storage, an argument-buffer buffer whose address its owner holds, and refuses one whose owner
-    // is not bound with a typed executor reason.
+    // The Metal oracle supplies command-buffer handles, so the shared gate admits the literal; the
+    // engine candidate refuses a buffer of compute commands, the runtime's limit, before it maps
+    // the case.
     assert!(crate::executor_contract::require_case(&case, "test").is_ok());
-    assert_engine_refuses(&case, "without its owner buffer");
-    case.command_buffers[0].buffer_binding = case.buffers[0].binding;
-    let mapped = crate::candidate::engine::compute_case(&case, &kernel_interface()).unwrap();
-    let key = (case.buffers[0].binding, 0);
-    assert!(mapped.objects.is_empty());
+    assert_engine_refuses(&case, ToolingRequirement::IndirectComputeCommands);
+}
+
+/// The engine candidate refuses `case` by `requirement` alone, before it maps the case.
+fn assert_engine_refuses(case: &AuthoredCase, requirement: ToolingRequirement) {
     assert_eq!(
-        mapped.command_buffers,
-        std::collections::BTreeMap::from([(key, case.command_buffers[0].clone())])
-    );
-    let mut records = vec![0; case.command_buffers[0].record_storage_bytes().unwrap()];
-    case.command_buffers[0]
-        .initialize_records(&mut records)
-        .unwrap();
-    assert_eq!(
-        mapped.argument_buffer_buffers,
-        std::collections::BTreeMap::from([(key, records)])
+        crate::candidate::engine::compute_case(case).err(),
+        Some(crate::check::admission::NotSupported::Requirements(
+            [requirement].into()
+        ))
     );
 }
 
-/// The AIR-layer interface of a kernel without parameters.
-fn kernel_interface() -> crate::check::interface::AirInterface {
-    crate::check::interface::AirInterface::synthetic(
-        metal2vulkan_air::abi::Stage::Kernel {
-            max_total_threads: None,
-            work_group_size: None,
+/// A command buffer of the one shape the runtime builds (indexed draws alone that inherit the
+/// pipeline state and bind their own buffers, none host-encoded) carries `indirect_indexed_draws`
+/// alone (`executor_contract::tests::engine_case_families_follow_the_case_literals` holds each
+/// departure from the shape to its runtime limit), which the checker cannot evidence and the
+/// engine candidate refuses typed.
+#[test]
+fn the_runtime_s_command_shape_is_a_typed_gap_of_the_engine_candidate() {
+    use crate::case::indirect_commands::{CommandBufferResource, CommandDescriptor, RenderDraws};
+    use crate::executor_contract::{case_requirements, evidence_gap};
+    use ToolingRequirement as R;
+    let mut case = example();
+    case.command_buffers.push(CommandBufferResource {
+        buffer_binding: case.buffers[0].binding,
+        field_offset: 0,
+        capacity: 1,
+        execution_range: [0, 1],
+        inherit_pipeline_state: true,
+        inherit_buffers: false,
+        descriptor: CommandDescriptor::Render {
+            draws: RenderDraws {
+                primitives: false,
+                indexed: true,
+                ..RenderDraws::default()
+            },
+            max_vertex_buffer_bind_count: 1,
+            max_fragment_buffer_bind_count: 0,
+            max_object_buffer_bind_count: 0,
+            max_mesh_buffer_bind_count: 0,
+            support_dynamic_attribute_stride: false,
         },
-        vec![],
-        vec![],
-        vec![],
-    )
-}
-
-fn assert_engine_refuses(case: &AuthoredCase, what: &str) {
-    match crate::candidate::engine::compute_case(case, &kernel_interface()) {
-        Err(crate::check::admission::NotSupported::NotImplemented(detail)) => {
-            assert!(detail.contains(what), "{detail}")
-        }
-        other => panic!("expected a typed not-implemented refusal, got {other:?}"),
-    }
+        commands: vec![],
+        execute: None,
+    });
+    let requirements = case_requirements(&case);
+    assert_eq!(requirements, [R::IndirectIndexedDraws].into());
+    assert_eq!(
+        evidence_gap(&requirements).as_deref(),
+        Some("engine_candidate: indirect_indexed_draws (the candidate is stopped)")
+    );
+    assert_engine_refuses(&case, R::IndirectIndexedDraws);
 }
 
 #[test]
@@ -177,15 +191,9 @@ fn pipeline_handles_require_unique_tokens_and_hash_the_template() {
         .any(|error| error.contains("tokens must be nonzero and unique")));
     case.pipeline_states[0].token = 1;
     assert!(crate::executor_contract::require_case(&case, "test").is_ok());
-    // The engine candidate maps a pipeline state as its authored token in its owner, the
-    // word a command's pipeline field records, and refuses one whose owner is not bound.
-    let mapped = crate::candidate::engine::compute_case(&case, &kernel_interface()).unwrap();
-    assert_eq!(
-        mapped.objects.into_iter().collect::<Vec<_>>(),
-        [((case.buffers[0].binding, 0), 1)]
-    );
-    case.pipeline_states[0].buffer_binding = u32::MAX;
-    assert_engine_refuses(&case, "without its owner buffer");
+    // The engine candidate refuses a pipeline state an argument buffer holds, the runtime's
+    // limit, before it maps the case.
+    assert_engine_refuses(&case, ToolingRequirement::ArgumentBufferPipelineState);
 }
 
 /// What the host encodes and executes: a case without it keeps its identity, one with it changes
@@ -1487,19 +1495,6 @@ fn executed_command_buffers_run_in_identity_order() {
         case.computed_case_id().unwrap()
     );
     assert_eq!(keys(&reversed), keys(&case));
-    // The candidate's map iterates the same keys in the same order.
-    for listing in [&case, &reversed] {
-        let mapped = crate::candidate::engine::compute_case(listing, &kernel_interface()).unwrap();
-        assert_eq!(
-            mapped
-                .command_buffers
-                .iter()
-                .filter(|(_, resource)| resource.execute.is_some())
-                .map(|(&key, _)| key)
-                .collect::<Vec<_>>(),
-            keys(&case)
-        );
-    }
 }
 
 /// A render descriptor of mesh draws: its draw kinds and object and mesh counts serialize only

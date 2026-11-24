@@ -22,7 +22,7 @@ use crate::device::profile::DeviceProfile;
 use crate::device::DevicePolicy;
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, device_nan_bits, link_and_validate, llvm_assemble, profile, typed_module,
     AssembleError,
@@ -30,12 +30,12 @@ use crate::pipeline::testing::{
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, SubgroupSize};
 use crate::spirv::ir::{StorageClass, TypedModule};
 
-const PROFILES: [&str; 3] = ["moltenvk-m3", "vk12-floor", "lavapipe"];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "runtime-floor", "lavapipe"];
 
 const DATALAYOUT: &str = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32";
 
 fn p(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn assemble(name: &str, body: &str) -> Option<Vec<u8>> {
@@ -130,10 +130,7 @@ fn out_slot() -> ResourceSlot {
 /// Output buffer 0 of 128 zero words and 64 threads.
 fn resources(plan: &Plan) -> Resources {
     let mut s = BTreeMap::new();
-    s.insert(SpecKey::LocalSize(Axis::X), 64);
-    s.insert(SpecKey::LocalSize(Axis::Y), 1);
-    s.insert(SpecKey::LocalSize(Axis::Z), 1);
-    s.insert(SpecKey::FlatLocalSize, 64);
+    s.extend(crate::pipeline::threadgroup_constants([64, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -179,8 +176,7 @@ fn run_both(m: &TypedModule, res: &Resources) -> Vec<u32> {
 }
 
 /// Whether entry `entry` of `bc` on `prof` reads a `half` from its bits by the device's widening
-/// (`PrecisionNote::NativeNanEncoding`, or `VkProperty::MetalNanMoves` on a device the interpreter
-/// is not: `device_nan_bits`), whose reinterpretation of a NaN's bits is the device's.
+/// (`PrecisionNote::NativeNanEncoding`, `device_nan_bits`), whose reinterpretation of a NaN's bits is the device's.
 fn native_halves(bc: &[u8], entry: &str, prof: &DeviceProfile) -> bool {
     device_nan_bits(&compile(bc, entry, prof).expect("compile"))
 }
@@ -232,8 +228,8 @@ fn a_half_threadgroup_array_is_a_typed_workgroup_object() {
         assert_eq!(local.typed.len(), 1, "{stem}");
         let census = plan.census();
         for name in [
-            "access.threadgroup.typed_store.clamped",
-            "access.threadgroup.typed_load.clamped",
+            "access.threadgroup.typed_store",
+            "access.threadgroup.typed_load",
         ] {
             assert!(census.contains_key(name), "{stem}: {name} in {census:?}");
         }
@@ -326,7 +322,7 @@ fn the_array_stays_in_the_arena_where_the_structure_does_not_allow_a_typed_objec
             assert!(local.typed.is_empty(), "{what}");
             let census = plan.census();
             assert!(
-                census.contains_key("access.threadgroup.store.checked"),
+                census.contains_key("access.threadgroup.store"),
                 "{what}: {census:?}"
             );
             let want: Vec<u32> = (0..64u32).map(|t| pattern(63 - t)).collect();

@@ -33,6 +33,7 @@
 //! without a strategy, an operand without a value) is recorded as an internal invariant error in
 //! the emitter and surfaced by [`emit_module`] in place of the builder error that aborted the walk.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -47,20 +48,19 @@ use crate::lower::{
     access, arith, dispatch, fragment, mesh, raytracing, sampler, simd, stage_io, sync,
     tessellation, texture,
 };
+use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
 use crate::pipeline::sym::{PushField, SlotRef, Stage};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::dead::{remove_dead_keeping, Offer};
 use crate::spirv::error::{BResult, BuildError, Dangling};
-use crate::spirv::ids::{
-    BlockId as SBlockId, ConstId, DemoteTy, FuncId, GlobalId, TypeId, Value as SValue, VarId,
-};
+use crate::spirv::ids::{BlockId as SBlockId, DemoteTy, GlobalId, TypeId, Value as SValue, VarId};
 use crate::spirv::ir::{
     BinOp, ConstBits, Constant, ConvOp, ExecMode, ExecModel, MemAccess, PushMember, Type,
-    TypedModule,
+    TypedModule, ValueOrigin,
 };
-use crate::structurize::emit::{CodeEmitter, StructVars};
+use crate::structurize::emit::{CodeEmitter, Poll, StructVars};
 use crate::structurize::promote::promote_single_store;
 
 fn invariant(detail: impl Into<String>) -> Error {
@@ -99,12 +99,7 @@ pub struct Declared {
 /// Declare the plan's module-scope objects: the access family's views, the push block, then
 /// every other family's objects.
 fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
-    // Before any instruction: every multiply the device must round on its own takes the
-    // profile's form.
-    mb.product_form(plan.families.arith.product);
-    // And every narrow integer's mask the driver's form.
-    mb.set_mask_form(plan.families.arith.mask);
-    // And every `half` rounding's quantize the device's form.
+    // Before any instruction: every `half` rounding's quantize the device's form.
     mb.set_quantize_form(plan.families.arith.quantize);
     mb.set_native_half(plan.families.arith.native_half);
     mb.set_native_half_nans(plan.families.arith.native_half_nans);
@@ -143,6 +138,10 @@ fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
         };
         d.push.push(mb.push_member(f.field, ty, offset)?);
     }
+    // The floor's tail word, above every placed field (`PushPlacement::tail_word`).
+    if let Some(at) = plan.push.tail_word {
+        d.push.push(mb.push_member(PushField::TailWord, u32_, at)?);
+    }
     if !d.push.is_empty() {
         d.push_global = Some(mb.push_global()?);
     }
@@ -174,8 +173,9 @@ pub struct EmitCx<'a> {
     env: Vec<Option<SValue>>,
     /// The values bound in `env` since the block opened, so opening the next block clears them.
     bound: Vec<ValueId>,
-    /// Invocation-invariant values emitted since the block opened or in the function's entry
-    /// block, each with the SPIR-V block it was emitted in ([`Invariant`]).
+    /// Invocation-invariant values emitted since the block opened, in the function's entry block
+    /// or in the block the entry hooks end in, each with the SPIR-V block it was emitted in
+    /// ([`Invariant`]).
     memo: Vec<(Invariant, SValue, SBlockId)>,
     /// The SPIR-V blocks the open block's top-level code ran through, in order: a value emitted
     /// in one of them dominates everything the block emits after it.
@@ -183,6 +183,12 @@ pub struct EmitCx<'a> {
     /// The function's entry block: a value emitted there dominates every block, so its memo
     /// entries outlive the block that emitted them.
     entry_block: Option<SBlockId>,
+    /// The block the entry hooks end in, where the walk of the body starts: it dominates every
+    /// block of the body, so its memo entries outlive the block that emitted them too. It is the
+    /// entry block but where a hook closed a construct there: a dispatch past its grid
+    /// (`dispatch::emit_entry`) returns from an arm, and the hooks after it, the sink's address
+    /// among them (`access::dynamic::emit_entry`), run in its merge.
+    hooks_block: Option<SBlockId>,
     /// While a workgroup synchronization of a predicated walk is emitted, the calling invocation's
     /// live flag: a lane that is not live takes part with null operands. `None`: every invocation
     /// executing the synchronization is live.
@@ -201,10 +207,6 @@ pub struct EmitCx<'a> {
     /// profile, so emission records it as it emits the store (`memory::leaf::store`), and the
     /// artifact reports a read of each such slot ([`Emitted::merged`]).
     pub(crate) merged: BTreeSet<usize>,
-    /// The function whose first block computed the constants it reads as data, with each
-    /// constant's local value there (`specialized::emit_entry`), for
-    /// `TypedModule::localize_specs` once the module is finalized.
-    pub(crate) localized: Option<(FuncId, Vec<(ConstId, SValue)>)>,
     fault: Option<Error>,
     /// The sampling routines the function's samples call, each defined at its first call
     /// (`sampler::routine`).
@@ -218,11 +220,9 @@ pub struct EmitCx<'a> {
     /// `stage_io::emit_draw_entry` finds before the body and before any other hook reads it
     /// (`stage_io::StageIoPlan::merged_fragment`), defined in the function's straight-line entry.
     pub(crate) merged_fragment_table: Option<SValue>,
-    /// The texel of each storage-form color attachment a fragment function reads, by Metal
-    /// color index, at the invocation's pixel (and sample), which `fragment::emit_entry` reads
-    /// before the body: defined in the function's straight-line entry, inside the interlock, so
-    /// every use of the color in a later block takes the one texel (`fragment::fetch::value`).
-    pub(crate) fetched: Vec<(u32, SValue)>,
+    /// The quad votes and lanes the open SPIR-V block's fragment quad operations made, which its
+    /// later ones share (`simd::QuadSeen`).
+    pub(crate) quad: Rc<RefCell<crate::lower::simd::QuadSeen>>,
 }
 
 /// A value that is the same wherever an invocation computes it, so a block computes it once, and
@@ -236,6 +236,9 @@ enum Invariant {
     /// A fragment function's tile's first word in the pass's tile memory buffer
     /// (`access::tile_memory::base`), computed at entry (`access::tile_memory::emit_entry`).
     TileBase,
+    /// A kernel's slot of the runtime's private arena, placed as a pointer to its words
+    /// ([`EmitCx::arena_slot`]), in the function's first block.
+    ArenaSlot,
     /// The table word of the argument buffer's sampler of a handle, tested for a cubic filter
     /// (`sampler::emit`'s reach test): an operation through the same handle where an earlier test
     /// dominates it ran that test on the same sampler, so it needs none of its own.
@@ -249,6 +252,13 @@ enum Invariant {
     /// The root table's sink address (`access::dynamic::read_sink_host`), read at entry
     /// (`access::dynamic::emit_entry`): the root table is read-only to the dispatch.
     SinkHost,
+    /// A checked slot's `PushField::SlotBounds` split ([`EmitCx::slot_bounds`]): its buffer's
+    /// bytes before the bind offset (`false`) or its length (`true`).
+    Bounds(SlotRef, bool),
+    /// A checked slot's limit for accesses of a size in bytes ([`EmitCx::slot_limit`]).
+    Limit(SlotRef, u32),
+    /// A 16-byte line of the function's parameter block ([`EmitCx::block_line`]).
+    BlockLine(u32),
 }
 
 impl<'a> EmitCx<'a> {
@@ -266,16 +276,16 @@ impl<'a> EmitCx<'a> {
             memo: Vec::new(),
             spine: Vec::new(),
             entry_block: None,
+            hooks_block: None,
             live: None,
             active: None,
             entry_live: None,
             merged: BTreeSet::new(),
-            localized: None,
             fault: None,
             sampling: Default::default(),
             merged_draw: None,
             merged_fragment_table: None,
-            fetched: Vec::new(),
+            quad: Default::default(),
         }
     }
 
@@ -297,16 +307,36 @@ impl<'a> EmitCx<'a> {
     }
 
     /// The value of `key` emitted earlier where it dominates the open SPIR-V block: in that
-    /// block, in a block of the open block's spine, or in the function's entry block.
+    /// block, in a block of the open block's spine, in the function's entry block, or in the
+    /// block the entry hooks end in.
     fn recall(&self, fb: &FunctionBuilder<'_>, key: Invariant) -> Option<SValue> {
         let here = fb.current_block()?;
         self.memo
             .iter()
             .find(|(k, _, _)| *k == key)
-            .filter(|(_, _, at)| {
-                *at == here || Some(*at) == self.entry_block || self.spine.contains(at)
-            })
+            .filter(|(_, _, at)| *at == here || self.dominates_body(*at) || self.spine.contains(at))
             .map(|(_, v, _)| *v)
+    }
+
+    /// Whether block `at` dominates every block of the body: the function's entry block, or the
+    /// block the entry hooks end in.
+    fn dominates_body(&self, at: SBlockId) -> bool {
+        Some(at) == self.entry_block || Some(at) == self.hooks_block
+    }
+
+    /// Record the function's entry block before the entry hooks run: a hook that runs after one
+    /// closed a construct (the floor's tail guard) recalls what the first block holds, a push
+    /// field [`EmitCx::load_push_fields`] loaded there, rather than loading it again where the
+    /// hooks stand.
+    fn begin_hooks(&mut self, fb: &FunctionBuilder<'_>) -> BResult<()> {
+        self.entry_block = fb.entry_block();
+        Ok(())
+    }
+
+    /// Record the open block as the one the entry hooks end in, where the walk starts.
+    fn end_hooks(&mut self, fb: &FunctionBuilder<'_>) -> BResult<()> {
+        self.hooks_block = fb.current_block();
+        Ok(())
     }
 
     /// Record `v` as the value of `key` in the open SPIR-V block (replacing an entry that does
@@ -318,6 +348,18 @@ impl<'a> EmitCx<'a> {
         match self.memo.iter_mut().find(|(k, _, _)| *k == key) {
             Some(e) => *e = (key, v, here),
             None => self.memo.push((key, v, here)),
+        }
+    }
+
+    /// Record `v`, made in the function's entry block, as the value of `key` there, so every
+    /// block recalls it.
+    fn remember_at_entry(&mut self, fb: &FunctionBuilder<'_>, key: Invariant, v: SValue) {
+        let Some(entry) = fb.entry_block() else {
+            return;
+        };
+        match self.memo.iter_mut().find(|(k, _, _)| *k == key) {
+            Some(e) => *e = (key, v, entry),
+            None => self.memo.push((key, v, entry)),
         }
     }
 
@@ -374,6 +416,48 @@ impl<'a> EmitCx<'a> {
         Ok(v)
     }
 
+    /// The invocation's slot of the runtime's memory that holds the kernel's private arena, placed:
+    /// a `PhysicalStorageBuffer` pointer to its words, a runtime array of `u32` at the slot's
+    /// device address (`dispatch::KernelDecl::arena_slot`, of the pushed
+    /// `PushField::PrivateArenaAddress` and the slot's bytes, `RuntimeFact::PrivateArena`), so
+    /// an access of a word is an access chain from it (`memory::arena::ArenaMem::ptr`). Made once
+    /// in the function's first block, wherever it is first asked for: its operands are that push
+    /// field, which [`EmitCx::load_push_fields`] loads there, the invocation's built-ins and
+    /// constants, so it dominates every access of the arena. Made where it is asked for, it would
+    /// be made again in every block of the body: `dispatch::emit_entry` asks after the floor's
+    /// tail guard closed a construct, and later hooks may close more before the walk.
+    pub(crate) fn arena_slot(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
+        if let Some(v) = self.recall(fb, Invariant::ArenaSlot) {
+            return Ok(v);
+        }
+        let slot_bytes = self.plan.facts.iter().find_map(|f| match *f {
+            RuntimeFact::PrivateArena { slot_bytes } => Some(slot_bytes),
+            _ => None,
+        });
+        let Some(slot_bytes) = slot_bytes else {
+            return Err(self.fail("a private arena in device memory without its slot's bytes"));
+        };
+        let decl: &Declared = self.decl;
+        let Some(kernel) = decl.families.dispatch.kernel.as_ref() else {
+            return Err(self.fail("a private arena in device memory without its kernel"));
+        };
+        let v = fb.in_entry_block(|fb| {
+            let arena = self.push_field(fb, PushField::PrivateArenaAddress)?;
+            let slot = kernel.arena_slot(fb, arena, slot_bytes)?;
+            let u32_ = fb.module().ty(Type::Int {
+                width: 32,
+                signed: false,
+            })?;
+            let words = fb.module().ty(Type::RuntimeArray {
+                elem: u32_,
+                stride: Some(4),
+            })?;
+            fb.device_place(slot, words)
+        })?;
+        self.remember_at_entry(fb, Invariant::ArenaSlot, v);
+        Ok(v)
+    }
+
     /// An indexed capture form's raw index, read once where it dominates:
     /// `stage_io::emit_draw_entry` reads it in the function's first block, which dominates every block of the function, the
     /// merge of the restart test it then closes included.
@@ -414,7 +498,7 @@ impl<'a> EmitCx<'a> {
     }
 
     /// The root table's sink address, read once where it dominates: `access::dynamic::emit_entry`
-    /// reads it in the function's first block, so no wide access reads the table for it.
+    /// reads it in the block the entry hooks end in, so no wide access reads the table for it.
     pub(crate) fn sink_host(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
         if let Some(v) = self.recall(fb, Invariant::SinkHost) {
             return Ok(v);
@@ -428,12 +512,186 @@ impl<'a> EmitCx<'a> {
     /// block, where it dominates every block. Where the body first reads a field never moves its
     /// load, so a read that canonicalization deletes cannot make the others load it again; a placed
     /// field no instruction reads leaves with the other unused values (`spirv::dead`).
+    ///
+    /// The fields read from their push members load first, then the tail folds into them
+    /// ([`EmitCx::fold_tail`]), then the spilled fields and those the function derives, which may
+    /// read through the folded values (the parameter block's address, a slot table's).
     fn load_push_fields(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
         let plan: &Plan = self.plan;
-        for placed in &plan.push.fields {
-            self.push_field(fb, placed.field)?;
+        let member = |s: &Self, field: PushField| {
+            !s.derives(field) && s.decl.push.iter().any(|m| m.field == field)
+        };
+        for read in [true, false] {
+            for placed in &plan.push.fields {
+                if member(self, placed.field) != read {
+                    continue;
+                }
+                match placed.field {
+                    PushField::SlotBounds(slot) => {
+                        self.slot_bounds(fb, slot)?;
+                    }
+                    field => {
+                        self.push_field(fb, field)?;
+                    }
+                }
+            }
+            if read {
+                self.fold_tail(fb)?;
+            }
         }
         Ok(())
+    }
+
+    /// Where the plan's placement ends with a tail (`lower::push::tail`): read it from the push
+    /// block, test whether it holds the value the consumer never pushes there
+    /// ([`crate::lower::push::tail_never_pushed`]), and make each other field read from its push
+    /// member, as the function's every use recalls it, the member's value where the test fails and
+    /// the null of its type where it holds ([`crate::lower::push::fold_never_pushed`]): the tail's
+    /// read lives while any other push read does, and no branch makes the body depend on it. A
+    /// tail field the function reads from its member is the load [`EmitCx::load_push_fields`] made
+    /// in this block, so the member is loaded once; the tail word, and a field the function
+    /// derives elsewhere, are loaded here. A tail field of the function's own folds into the
+    /// others alone: its own uses need no select to read it.
+    fn fold_tail(&mut self, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
+        let Some(field) = crate::lower::push::tail(&self.plan.push) else {
+            return Ok(());
+        };
+        let member = (self.decl.push.iter()).find(|m| m.field == field);
+        let (Some(member), Some(push)) = (member, self.decl.push_global) else {
+            return Err(self.fail("a placed tail the push block does not hold"));
+        };
+        let value = match field != PushField::TailWord && !self.derives(field) {
+            true => self.push_field(fb, field)?,
+            false => Self::load_member(fb, push, member.index)?,
+        };
+        let Some(never) = crate::lower::push::tail_never_pushed(fb, value, field)? else {
+            return Ok(());
+        };
+        let plan: &Plan = self.plan;
+        for placed in &plan.push.fields {
+            let other = placed.field;
+            if other == field
+                || self.derives(other)
+                || !self.decl.push.iter().any(|m| m.field == other)
+            {
+                continue;
+            }
+            let keys = match other {
+                PushField::SlotBounds(slot) => vec![
+                    Invariant::Push(other),
+                    Invariant::Bounds(slot, false),
+                    Invariant::Bounds(slot, true),
+                ],
+                _ => vec![Invariant::Push(other)],
+            };
+            for key in keys {
+                let Some(v) = self.recall(fb, key) else {
+                    return Err(self.fail("a pushed field not loaded before the tail folds"));
+                };
+                let folded = crate::lower::push::fold_never_pushed(fb, never, v)?;
+                self.remember(fb, key, folded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checked slot `slot`'s bounds (`PushField::SlotBounds`), split: its buffer's bytes before
+    /// the bind offset and its length, each a `u32`, where they dominate the open block.
+    /// [`EmitCx::load_push_fields`] splits them in the function's first block, so a checked
+    /// access adds no extract of its own.
+    pub(crate) fn slot_bounds(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        slot: SlotRef,
+    ) -> BResult<(SValue, SValue)> {
+        let (before, length) = (
+            Invariant::Bounds(slot, false),
+            Invariant::Bounds(slot, true),
+        );
+        if let (Some(b), Some(l)) = (self.recall(fb, before), self.recall(fb, length)) {
+            return Ok((b, l));
+        }
+        let bounds = self.push_field(fb, PushField::SlotBounds(slot))?;
+        let b = fb.composite_extract(bounds, &[0])?;
+        let l = fb.composite_extract(bounds, &[1])?;
+        self.remember(fb, before, b);
+        self.remember(fb, length, l);
+        Ok((b, l))
+    }
+
+    /// Checked slot `slot`'s buffer bytes before the bind offset and its limit for `n`-byte
+    /// accesses (`psb::limit`), where they dominate the open block: the pair an access checks
+    /// with (`psb::in_buffer`). The limit is made once per slot and size, in the function's first
+    /// block where the bounds are split there ([`EmitCx::load_push_fields`]), so every checked
+    /// access of that size anywhere in the function adds one add and one compare.
+    pub(crate) fn slot_limit(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        slot: SlotRef,
+        n: u32,
+    ) -> BResult<(SValue, SValue)> {
+        let (before, length) = self.slot_bounds(fb, slot)?;
+        let key = Invariant::Limit(slot, n);
+        if let Some(limit) = self.recall(fb, key) {
+            return Ok((before, limit));
+        }
+        let entry = fb.entry_block();
+        let at_entry = matches!(fb.origin(length)?, ValueOrigin::Inst(b) if Some(b) == entry);
+        let limit = match at_entry && fb.current_block() != entry {
+            true => {
+                let limit = fb.in_entry_block(|fb| access::psb::limit(fb, length, n))?;
+                self.remember_at_entry(fb, key, limit);
+                limit
+            }
+            false => {
+                let limit = access::psb::limit(fb, length, n)?;
+                self.remember(fb, key, limit);
+                limit
+            }
+        };
+        Ok((before, limit))
+    }
+
+    /// Line `line` of the function's parameter block at device address `block`
+    /// (`access::table::read_line`), read once where it dominates the open block:
+    /// [`EmitCx::load_push_fields`] reads every spilled field in the function's first block, so
+    /// the fields that share a line share one 16-byte load.
+    pub(crate) fn block_line(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        block: SValue,
+        line: u32,
+    ) -> BResult<SValue> {
+        let key = Invariant::BlockLine(line);
+        if let Some(v) = self.recall(fb, key) {
+            return Ok(v);
+        }
+        let v = access::table::read_line(fb, block, line)?;
+        self.remember(fb, key, v);
+        Ok(v)
+    }
+
+    /// Whether the function derives push field `field` from something other than its own
+    /// member or `ArgumentTable` entry ([`EmitCx::load_push_field`]). A device-replay variant
+    /// reads a slot's Metal address from its root entry, and its dispatch region from the region
+    /// record of its command and region; a flat variant reads its grid from its dispatch's region
+    /// record, and a folded variant its region and group counts; a merged draw's functions read
+    /// their command's slot tables.
+    fn derives(&self, field: PushField) -> bool {
+        let flat = self
+            .plan
+            .dispatch
+            .as_ref()
+            .is_some_and(|d| d.flat_grid || d.folded_groups);
+        let families = &self.plan.families;
+        match field {
+            PushField::RootTableAddress => {
+                families.stage_io.merged.is_some() || families.stage_io.merged_fragment.is_some()
+            }
+            PushField::SlotGuestBase(_) => families.access.replay,
+            PushField::DispatchRegion => families.access.replay || flat,
+            _ => false,
+        }
     }
 
     /// Load push field `field` in the open block.
@@ -442,38 +700,23 @@ impl<'a> EmitCx<'a> {
         fb: &mut FunctionBuilder<'_>,
         field: PushField,
     ) -> BResult<SValue> {
-        // A device-replay variant reads a slot's Metal address from its root entry, and its
-        // dispatch region from the region record of its command and region; a flat variant reads
-        // its grid from its dispatch's region record, and a folded variant its region and group
-        // counts.
-        let flat = self
-            .plan
-            .dispatch
-            .as_ref()
-            .is_some_and(|d| d.flat_grid || d.folded_groups);
-        match field {
-            // A merged draw's vertex function reads its command's slot table.
-            PushField::RootTableAddress if self.plan.families.stage_io.merged.is_some() => {
-                return match self.merged_draw {
-                    Some(m) => Ok(m.table),
-                    None => Err(self.fail("a merged draw's slot table read before its entry")),
-                };
-            }
-            // A merged draw's fragment function reads its command's fragment slot table.
-            PushField::RootTableAddress
-                if self.plan.families.stage_io.merged_fragment.is_some() =>
-            {
-                return self.merged_fragment_table.ok_or_else(|| {
+        if self.derives(field) {
+            return match field {
+                // A merged draw's vertex function reads its command's slot table.
+                PushField::RootTableAddress if self.plan.families.stage_io.merged.is_some() => {
+                    match self.merged_draw {
+                        Some(m) => Ok(m.table),
+                        None => Err(self.fail("a merged draw's slot table read before its entry")),
+                    }
+                }
+                // A merged draw's fragment function reads its command's fragment slot table.
+                PushField::RootTableAddress => self.merged_fragment_table.ok_or_else(|| {
                     self.fail("a merged draw's fragment slot table read before its entry")
-                });
-            }
-            PushField::SlotGuestBase(slot) if self.plan.families.access.replay => {
-                return access::replay_guest_base(self, fb, slot)
-            }
-            PushField::DispatchRegion if self.plan.families.access.replay || flat => {
-                return access::replay_region(self, fb)
-            }
-            _ => {}
+                }),
+                PushField::SlotGuestBase(slot) => access::replay_guest_base(self, fb, slot),
+                PushField::DispatchRegion => access::replay_region(self, fb),
+                _ => Err(self.fail("a derived push field without its source")),
+            };
         }
         let member = self.decl.push.iter().find(|m| m.field == field).copied();
         let (Some(member), Some(g)) = (member, self.decl.push_global) else {
@@ -481,8 +724,13 @@ impl<'a> EmitCx<'a> {
             // access family declares and reads.
             return access::table_field(self, fb, field);
         };
-        let base = fb.module().global_value(g)?;
-        let index = fb.u32_const(member.index)?;
+        Self::load_member(fb, g, member.index)
+    }
+
+    /// Load member `index` of push block `push` in the open block.
+    fn load_member(fb: &mut FunctionBuilder<'_>, push: GlobalId, index: u32) -> BResult<SValue> {
+        let base = fb.module().global_value(push)?;
+        let index = fb.u32_const(index)?;
         let index = fb.module().const_value(index)?;
         let ptr = fb.access_chain(base, &[index])?;
         fb.load(ptr, MemAccess::default())
@@ -573,10 +821,10 @@ impl<'a> EmitCx<'a> {
             }
         }
         self.spine.truncate(spine);
-        let entry = self.entry_block;
+        let (entry, hooks) = (self.entry_block, self.hooks_block);
         let kept = &self.spine;
         self.memo
-            .retain(|(_, _, at)| Some(*at) == entry || kept.contains(at));
+            .retain(|(_, _, at)| Some(*at) == entry || Some(*at) == hooks || kept.contains(at));
     }
 }
 
@@ -696,16 +944,16 @@ impl<'a> Emitter<'a> {
                 memo: Vec::new(),
                 spine: Vec::new(),
                 entry_block: None,
+                hooks_block: None,
                 live: None,
                 active: None,
                 entry_live: None,
                 merged: BTreeSet::new(),
-                localized: None,
                 fault: None,
                 sampling: Default::default(),
                 merged_draw: None,
                 merged_fragment_table: None,
-                fetched: Vec::new(),
+                quad: Default::default(),
             },
             vars: None,
             phis,
@@ -916,6 +1164,7 @@ impl<'a> Emitter<'a> {
         first: bool,
         last: bool,
         vars: &StructVars,
+        poll: &mut Poll<'_>,
     ) -> BResult<()> {
         let phis = first
             && self
@@ -938,6 +1187,7 @@ impl<'a> Emitter<'a> {
                 for (id, v) in seg {
                     em.ensure_operands(fb, id)?;
                     em.inst(fb, id, v, vars)?;
+                    poll.count(fb)?;
                 }
                 if last {
                     em.copies(b, fb, vars, true)?;
@@ -1079,9 +1329,10 @@ impl<'a> Emitter<'a> {
 impl CodeEmitter for Emitter<'_> {
     fn var_type(&mut self, ty: &DemoteTy, m: &mut ModuleBuilder) -> BResult<TypeId> {
         let found = match ty {
-            DemoteTy::FatPtr { .. } | DemoteTy::ArenaOffset | DemoteTy::HandleIndex => {
-                access::spirv_type(m, ty)?
-            }
+            DemoteTy::FatPtr { .. }
+            | DemoteTy::Address
+            | DemoteTy::ArenaOffset
+            | DemoteTy::HandleIndex => access::spirv_type(m, ty)?,
             _ => arith::spirv_type(m, ty)?,
         };
         match found {
@@ -1097,7 +1348,12 @@ impl CodeEmitter for Emitter<'_> {
         Ok(())
     }
 
-    fn block(&mut self, b: crate::air::ir::BlockId, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
+    fn block(
+        &mut self,
+        b: crate::air::ir::BlockId,
+        fb: &mut FunctionBuilder<'_>,
+        poll: &mut Poll<'_>,
+    ) -> BResult<()> {
         let vars = self.vars()?;
         if self.cx.entry_block.is_none() {
             self.cx.entry_block = fb.entry_block();
@@ -1132,6 +1388,7 @@ impl CodeEmitter for Emitter<'_> {
                 return Err(self.cx.fail(format!("{id:?} is out of range")));
             };
             self.inst(fb, id, v, &vars)?;
+            poll.count(fb)?;
         }
         self.copies(b, fb, &vars, false)
     }
@@ -1184,9 +1441,10 @@ impl CodeEmitter for Emitter<'_> {
         b: crate::air::ir::BlockId,
         live: Option<SValue>,
         fb: &mut FunctionBuilder<'_>,
+        poll: &mut Poll<'_>,
     ) -> BResult<()> {
         let Some(live) = live else {
-            return self.block(b, fb);
+            return self.block(b, fb, poll);
         };
         let vars = self.vars()?;
         if self.cx.entry_block.is_none() {
@@ -1223,12 +1481,13 @@ impl CodeEmitter for Emitter<'_> {
                 seg.push((id, v));
                 continue;
             }
-            self.segment(b, fb, live, &seg, first, false, &vars)?;
+            self.segment(b, fb, live, &seg, first, false, &vars, poll)?;
             seg.clear();
             first = false;
             self.sync_inst(fb, id, v, live, uniform, &vars)?;
+            poll.count(fb)?;
         }
-        self.segment(b, fb, live, &seg, first, true, &vars)
+        self.segment(b, fb, live, &seg, first, true, &vars, poll)
     }
 
     fn vote(&mut self, live: SValue, fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
@@ -1312,7 +1571,7 @@ impl CodeEmitter for Emitter<'_> {
 
     fn on_return(&mut self, v: Option<ValueId>, fb: &mut FunctionBuilder<'_>) -> BResult<()> {
         stage_io::emit_return(&mut self.cx, fb, v)?;
-        fragment::emit_return(&mut self.cx, fb, v)
+        fragment::emit_return(&mut self.cx, fb)
     }
 }
 
@@ -1323,6 +1582,9 @@ pub struct Emitted {
     /// The buffer slots a store merged a partial word into through the sub-word store's atomics:
     /// the module reads each of them, whatever the function's own accesses are.
     pub merged: BTreeSet<SlotRef>,
+    /// The ledger bytes charged for the module as its builder grew: they go when serialization
+    /// consumes it.
+    pub held: usize,
 }
 
 /// Structurize and emit `e` under `plan` into a finalized module with P9 applied.
@@ -1333,12 +1595,15 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
         .and_then(|f| f.body.as_ref())
         .ok_or_else(|| invariant("the entry function has no body"))?;
     let view = EntryView::new(e, body, plan);
-    let structured = crate::structurize::structurize(&view, m)?;
+    let structured = m.weighted(crate::pipeline::compile::weights::STRUCTURIZE, |m| {
+        crate::structurize::structurize(&view, m)
+    })?;
     let mut mb = ModuleBuilder::new();
-    let emitted = (|| -> Result<(TypedModule, Vec<Offer>, BTreeSet<SlotRef>), Error> {
+    let emitted = (|| -> Result<(TypedModule, Vec<Offer>, BTreeSet<SlotRef>, usize), Error> {
         let decl = declare(&mut mb, plan)?;
-        // The builder is charged as it grows: the declarations here, the walk's growth by
-        // `structurize::emit` after each block, and what the walk left once it returns.
+        // The builder is charged as it grows: the declarations here, the entry hooks' code
+        // before the walk, the walk's growth by `structurize::emit` as it emits, and what the
+        // walk left once it returns.
         let mut held = Growth::default();
         held.charge_to(mb.footprint(), m)?;
         let mut em = Emitter::new(e, body, plan, &decl);
@@ -1354,12 +1619,12 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
             // The entry hook: what must happen before any instruction of the body (the pulled
             // vertex fetch) or must not depend on where the body first uses it (a push field; a
             // dispatch builtin parameter) is emitted in the function's first block, ahead of
-            // the walk. The simdgroup lane counted at entry comes first, ahead of any branch
-            // the other hooks emit, where every invocation of the simdgroup is active.
-            let r = crate::lower::simd::emit_entry(&mut em.cx, &mut fb)
+            // the walk.
+            let r = em
+                .cx
+                .begin_hooks(&fb)
+                // The push fields, the floor's tail folded into them (`EmitCx::fold_tail`).
                 .and_then(|()| em.cx.load_push_fields(&mut fb))
-                // The bound values the function reads as data, right after their fields.
-                .and_then(|()| crate::lower::specialized::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| dispatch::emit_entry(&mut em.cx, &mut fb))
                 // What the invocation draws (a merged draw's command and its slot tables) before
                 // any hook reads a slot table.
@@ -1368,7 +1633,12 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
                 .and_then(|()| stage_io::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| tessellation::emit_entry(&mut em.cx, &mut fb))
                 .and_then(|()| fragment::emit_entry(&mut em.cx, &mut fb))
+                .and_then(|()| em.cx.end_hooks(&fb))
                 .map_err(Error::from)
+                .and_then(|()| {
+                    held.charge_to(fb.module().footprint(), m)
+                        .map_err(Error::from)
+                })
                 .and_then(|()| crate::structurize::emit::emit(&structured, &mut fb, &mut em, m));
             match r {
                 Ok(_) => fb.finish().map_err(Error::from),
@@ -1402,15 +1672,6 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
             (_, Some(fault)) => return Err(fault.clone()),
             (r, None) => r?,
         };
-        // An emulated post-tessellation vertex function's wrapper: the tessellator's point for
-        // the vertex it draws, and the function's patch inputs.
-        let func = match (
-            tessellation::wrap_entry(&mut wrapper, &mut mb, func),
-            &wrapper.fault,
-        ) {
-            (_, Some(fault)) => return Err(fault.clone()),
-            (r, None) => r?,
-        };
         let merged = em
             .cx
             .merged
@@ -1426,22 +1687,12 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
         let func = fragment::wrap_entry(&mut mb, plan, &decl.families, func)?;
         let model = match plan.stage {
             Stage::Kernel => ExecModel::GLCompute,
-            // A post-tessellation vertex function, but one emulated on a device without
-            // `tessellationShader`, a plain vertex entry.
-            Stage::Vertex
-                if plan
-                    .families
-                    .tessellation
-                    .eval
-                    .as_ref()
-                    .is_some_and(|e| e.emulated.is_none()) =>
-            {
+            // A post-tessellation vertex function.
+            Stage::Vertex if plan.families.tessellation.eval.is_some() => {
                 ExecModel::TessellationEvaluation
             }
             Stage::Vertex => ExecModel::Vertex,
             Stage::Fragment => ExecModel::Fragment,
-            // An emulated object or mesh function is a compute entry.
-            Stage::Object | Stage::Mesh if plan.families.mesh.emulated => ExecModel::GLCompute,
             Stage::Object => ExecModel::TaskEXT,
             Stage::Mesh => ExecModel::MeshEXT,
         };
@@ -1451,17 +1702,12 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
         mb.subgroup(plan.subgroup);
         // The lowering's offers outlive the builder; charged until weighed.
         let offers = mb.offers().to_vec();
-        let mut module = mb.finalize()?;
-        // Every read of a constant the function reads as data takes its local value, and the
-        // constants nothing else reads leave.
-        if let Some((body, local)) = &em.cx.localized {
-            module.localize_specs(*body, local)?;
-        }
+        let module = mb.finalize()?;
         m.charge(std::mem::size_of_val(offers.as_slice()))?;
-        Ok((module, offers, merged))
+        Ok((module, offers, merged, held.charged()))
     })();
     structured.release(m);
-    let (mut module, offers, merged) = emitted?;
+    let (mut module, offers, merged, held) = emitted?;
     promote_single_store(&mut module, m)?;
     // What no instruction reads leaves the module, after P9 turned its loads into copies, and the
     // offers that make it smaller are taken.
@@ -1473,7 +1719,11 @@ pub fn emit_module(e: &Entry, plan: &Plan, m: &mut Meter) -> Result<Emitted, Err
     if plan.families.arith.controls {
         crate::spirv::half_hold::hold(&mut module, m)?;
     }
-    Ok(Emitted { module, merged })
+    Ok(Emitted {
+        module,
+        merged,
+        held,
+    })
 }
 
 #[cfg(test)]

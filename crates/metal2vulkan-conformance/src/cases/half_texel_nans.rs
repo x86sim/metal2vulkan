@@ -6,8 +6,8 @@
 //! texel hands back its own bits — sign, payload and signalling bit kept, so `0x7c01` stays
 //! `0x7c01` — while a 32-bit float texel's NaN, a small float's (`RG11B10Float`) and every filtered
 //! sample's come back as `0x7e00`. `RGB9E5Float` decodes every code to a finite value, so no lane of
-//! it is a NaN at all. That is what `runtime_lane::half_texel_nans` measured on plain Metal, and
-//! these recordings are what hold the implementation to it.
+//! it is a NaN at all. That is what plain Metal answers, and these recordings are what hold the
+//! implementation to it.
 //!
 //! One case per format, so a format a venue honestly lacks a readable or filterable texture of is
 //! that venue's gap ([`crate::verdict::Verdict::LacksFeature`]) at its own row.
@@ -29,15 +29,13 @@
 //! bytes by construction and a difference between those two columns cannot be a difference of
 //! input.
 //!
-//! **What recording the three accesses together found, which the lane could not say.** One source
-//! value in the whole sweep makes them disagree: a 32-bit float texel holding the largest finite
-//! `float` (`0x7f7fffff`) comes back as `0x7c00`, the infinity of its sign, through both `read()`s
-//! and as `0x7bff`, the largest `half`, through the nearest sample. The lane allowed either value
-//! for a lane past `half`'s range -- its own words are "infinity of its sign, or 65504 where the
-//! device's conversion rounds toward zero" -- but it compared one access at a time, so it never
-//! said that Metal itself answers both, on the same texel, in the same kernel. Nothing else in the
-//! sweep separates a fetch from a nearest sample on this chip, which the cross-check below asserts
-//! rather than observes.
+//! **What recording the three accesses together found.** One source value in the whole sweep makes
+//! them disagree: a 32-bit float texel holding the largest finite `float` (`0x7f7fffff`) comes back
+//! as `0x7c00`, the infinity of its sign, through both `read()`s and as `0x7bff`, the largest
+//! `half`, through the nearest sample. So Metal itself answers both bounds of a native conversion
+//! past `half`'s range (the infinity of its sign, or 65504 where the conversion rounds toward
+//! zero), on the same texel, in the same kernel. Nothing else in the sweep separates a fetch from a
+//! nearest sample on this chip, which the cross-check below asserts rather than observes.
 //!
 //! **Where our side differs from Metal, measured over every word.** On this round's MoltenVK
 //! (Apple M3 Max, API 1.2) the three 16-bit float formats are `divergent` and the other five are
@@ -52,7 +50,7 @@
 //! 515 texels -- and no finite, zero, denormal or infinite texel differs anywhere.
 //!
 //! **Where the payload goes.** Our `half` access reads the image as a `vec4` of `f32` and converts
-//! it (`lower::texture::half`, through `narrow::round_texel`), and this chip's decode of a 16-bit
+//! it (`narrow::round_texel`), and this chip's decode of a 16-bit
 //! float texel into `f32` canonicalizes the NaN, so the sign and the payload are gone before the
 //! conversion sees them -- which is why all twelve codes, of both signs, collapse onto one value,
 //! and why the `widened` column, where Metal canonicalizes too, is exact. Metal's `texture2d<half>`
@@ -68,13 +66,11 @@
 //!
 //! That stays `divergent` rather than being loosened: `device-nan-encoding`'s own definition says
 //! validation derives no tolerance from it, so a tolerance here would be the suite overruling the
-//! contract under test. `known-gaps.tsv` carries the nine rows.
+//! contract under test. `known-gaps-rt.tsv` carries the nine rows.
 //!
-//! The lane's four filtered accesses — a linear sample at the centre, a linear sample a quarter
-//! texel right of it, a gather, and the same through the runtime sampler at slot 0 — ran on the
-//! lane's own generated AIR, and no committed fixture stores a `half` result's raw bits through one
-//! of them. They are not ported; the module docs of `runtime_lane::half_texel_nans` record that
-//! plain Metal answered `0x7e00` for every one of their NaN lanes.
+//! No committed fixture stores a `half` result's raw bits through a filtered access (a linear
+//! sample at the centre, a linear sample a quarter texel right of it, a gather, or the same through
+//! the runtime sampler at slot 0), so those four are not cases here.
 //!
 //! Every word of the output holds [`BLANK`] before the dispatch, so a word the kernel did not reach
 //! is a recorded value rather than whatever the allocator left, and the five columns together cover
@@ -83,7 +79,6 @@
 //! Nothing here can fault a GPU: one compute pass, one texture, one thread a texel inside it, no
 //! loop and no coordinate outside the texture.
 
-use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, Bindings, Case, Failure, Input, MetalSource, Side, TextureRole, TextureSpec,
 };
@@ -115,7 +110,7 @@ const LANE_BYTES: usize = 48;
 /// The byte every output word holds before the dispatch.
 pub const BLANK: u8 = 0xab;
 
-/// The halves of the 16-bit float formats, in the lane's own order: quiet and signalling NaNs of
+/// The halves of the 16-bit float formats, in order: quiet and signalling NaNs of
 /// both signs and both payload edges, then the infinities, the denormals, the zeros and the
 /// normals.
 const V: [u16; 24] = [
@@ -186,7 +181,7 @@ pub struct HalfTexelNans {
     kind: Kind,
 }
 
-/// Every format the lane reads: the three 16-bit float widths, the three 32-bit float widths, and
+/// Every format the case reads: the three 16-bit float widths, the three 32-bit float widths, and
 /// the two packed ones.
 pub fn all() -> Vec<HalfTexelNans> {
     let case = |name, format, channels, kind| HalfTexelNans {
@@ -285,12 +280,12 @@ impl HalfTexelNans {
     }
 }
 
-/// `RG11B10Float`'s texel `index`, as the lane packs one.
+/// `RG11B10Float`'s texel `index`.
 fn small_float(index: usize) -> u32 {
     R11[index % 12] | R11[(index + 5) % 12] << 11 | B10[(index + 3) % 12] << 22
 }
 
-/// `RGB9E5Float`'s texel `index`, as the lane packs one.
+/// `RGB9E5Float`'s texel `index`.
 fn shared_exponent(index: usize) -> u32 {
     let at = index as u32;
     let (red, green, blue) = ((at * 37) & 511, (at * 101 + 7) & 511, (at * 13 + 300) & 511);
@@ -347,28 +342,6 @@ impl Case for HalfTexelNans {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // The device's NaN encoding of a `half` result of a float texel (`device-nan-encoding`) is
-        // its own answer, which the suite declares for every case (`crate::replay::NATIVE_NOTES`),
-        // and nothing loosens a stored half: the note's own definition in `pipeline/artifact.rs`
-        // ends "Validation derives no tolerance from it", so a tolerance written from it would be
-        // this suite overruling the contract it exists to test. The three 16-bit float formats are
-        // therefore left **divergent** on this round's MoltenVK, with the measured difference in
-        // the module docs above.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 8 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -479,8 +452,7 @@ mod tests {
     /// What channel `channel` of texel `index` holds, as far as a NaN goes: the NaN's bits in the
     /// format's own encoding, or `None` where the channel is not a NaN.
     ///
-    /// This is `runtime_lane::half_texel_nans`'s own `class`, restated so the cross-check below has
-    /// the lane's rule to hold Metal's recording to.
+    /// The cross-check below holds Metal's recording to this rule.
     fn nan_bits(case: &HalfTexelNans, index: usize, channel: usize) -> Option<u32> {
         if channel >= case.channels {
             return None;
@@ -517,10 +489,10 @@ mod tests {
     /// The `half` word Metal's rule gives channel `channel` of texel `index` for a one-texel
     /// access, or `None` where the rule names no exact word.
     ///
-    /// The rule is the lane's: a 16-bit float texel's NaN keeps its own bits; every other NaN is
-    /// `0x7e00`; a missing green or blue reads 0 and a missing alpha 1. A finite channel of a
-    /// format whose conversion to `half` the lane never pinned has no exact word here, and the
-    /// cross-check only asks that it is not a NaN.
+    /// The rule: a 16-bit float texel's NaN keeps its own bits; every other NaN is `0x7e00`; a
+    /// missing green or blue reads 0 and a missing alpha 1. A finite channel of a format whose
+    /// conversion to `half` the rule does not pin has no exact word here, and the cross-check only
+    /// asks that it is not a NaN.
     fn metal_half(case: &HalfTexelNans, index: usize, channel: usize) -> Option<u16> {
         if channel >= case.channels {
             return Some(if channel == 3 { 0x3c00 } else { 0x0000 });
@@ -632,25 +604,22 @@ mod tests {
         assert!(E5.contains(&31));
     }
 
-    /// Metal's recorded `half` words are the rule the lane measured: a 16-bit float texel's NaN
-    /// keeps its bits, every other NaN is `0x7e00`, and `RGB9E5Float` holds no NaN at all.
+    /// Metal's recorded `half` words are the rule: a 16-bit float texel's NaN keeps its bits, every
+    /// other NaN is `0x7e00`, and `RGB9E5Float` holds no NaN at all.
     ///
-    /// This is the cross-check the port exists for. The lane holds its rule in a function and
-    /// asserts a live device against it, which says nothing on a host with no Metal; here the rule
-    /// is held against Metal's own recorded answer, so a release that changes Metal's conversion
-    /// shows as the texel that moved.
+    /// The rule is held against Metal's own recorded answer, so a release that changes Metal's
+    /// conversion shows as the texel that moved.
     ///
-    /// It also pins the one place the three accesses **disagree**, which recording them found:
-    /// a 32-bit float texel beyond `half`'s range reads as the infinity of its sign through the
-    /// two `read()`s and as 65504 through the nearest sample. The lane allowed either value
-    /// without saying which access gave which, because it only ever compared one access at a time.
-    /// So the accesses are compared here where the rule names a word and the disagreement is
+    /// It also pins the one place the three accesses **disagree**, which recording them found: a
+    /// 32-bit float texel beyond `half`'s range reads as the infinity of its sign through the two
+    /// `read()`s and as 65504 through the nearest sample. Either is a bound of a native conversion,
+    /// so the accesses are compared here where the rule names a word and the disagreement is
     /// counted where it does not, rather than asserted away in either direction.
     #[test]
-    fn metals_recorded_halves_are_the_rule_the_lane_measured() {
+    fn metals_recorded_halves_are_the_measured_rule() {
         for case in all() {
             let Ok(recording) = crate::recording::read(case.name()) else {
-                // A case recorded in a later commit of this batch.
+                // A case with no recording.
                 continue;
             };
             let answer = recording
@@ -698,15 +667,15 @@ mod tests {
                                 assert_eq!(
                                     lanes[at], want,
                                     "{} {access} texel {index} channel {channel}: Metal recorded \
-                                     {:#06x}, the lane's rule is {want:#06x}",
+                                     {:#06x}, the rule is {want:#06x}",
                                     case.name, lanes[at]
                                 );
                             }
                         }
-                        // A channel the lane pinned no word for: every access must still answer
+                        // A channel the rule pins no word for: every access must still answer
                         // something that is not a NaN, and a value beyond `half`'s range must be
                         // the infinity of its sign or the largest half of its sign -- the two
-                        // answers the lane recorded as the bound of a native conversion.
+                        // bounds of a native conversion.
                         None => {
                             for (access, lanes) in ACCESS_SITES.iter().zip(&halves) {
                                 let got = lanes[at];

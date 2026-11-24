@@ -21,7 +21,7 @@ use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::{Error, Needs};
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, typed_module, AssembleError,
 };
@@ -47,15 +47,10 @@ fn unrobust(stem: &str) -> DeviceProfile {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    for f in [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ] {
+    for f in [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2] {
         desc.features.remove(&f);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -89,16 +84,11 @@ fn module(bc: &[u8], entry: &str, stem: &str, p: &DeviceProfile) -> Option<(Plan
 /// Resources of a dispatch of 1x1x1 threadgroups, `[[buffer(i)]]` holding `init[i]`.
 fn resources(plan: &Plan, init: &[Vec<u8>]) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }

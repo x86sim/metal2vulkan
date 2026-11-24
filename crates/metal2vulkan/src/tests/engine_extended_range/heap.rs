@@ -4,13 +4,13 @@
 //! handle's class index names.
 //!
 //! - On every committed profile with a sampled heap, a `float` or `half` read declares the float
-//!   class and its unsigned integer twin, defines the decode routine once, stays inside the
-//!   plan's word estimate, and passes L3; a query alone declares the twin and no routine.
+//!   class and its unsigned integer twin, defines the decode routine once, and passes L3; a
+//!   query alone declares the twin and no routine.
 //! - A read of an unsigned integer heap group declares no twin and no routine, its query its own
 //!   class's; it declares the float class, which holds a member of a float format that it reads in
 //!   that member's own class.
-//! - The device lane `runtime_lane::heap_extended_reads` compares such reads and queries through
-//!   an argument buffer with the same texture's through a slot, bit for bit, on each venue.
+//! - A device's reads and queries through an argument buffer are the same texture's through a
+//!   slot, bit for bit, where measured.
 //! - A sample or gather through a constexpr sampler without a mip filter or anisotropy declares the
 //!   twin and the routine and states no `RuntimeFact::HeapRawSamples`; a `half` gather and a
 //!   runtime sampler's sample declare them and state the fact; a mip-filtered sampler's sample
@@ -124,7 +124,7 @@ fn sampled_2d(ty: SampledType) -> impl Fn(&ImageHandleClass) -> bool {
 }
 
 /// Each use on every committed profile with a sampled heap (the others refuse the argument
-/// buffer's texture): the classes it declares, the routine, the word estimate, and L3.
+/// buffer's texture): the classes it declares, the routine, and L3.
 #[test]
 fn heap_reads_reach_a_raw_member_through_the_unsigned_twin() {
     let consts = FunctionConstantValues::defaults();
@@ -153,14 +153,6 @@ fn heap_reads_reach_a_raw_member_through_the_unsigned_twin() {
                 })) => continue,
                 Err(e) => panic!("{what}: {e}"),
             };
-            let plan = plan_bitcode(&bc, entry, &consts, &p, &inputs, &mut meter())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let words = a.module.words.len() as u64;
-            assert!(
-                plan.estimate.words >= words,
-                "{what}: estimate {} < emitted {words}",
-                plan.estimate.words
-            );
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
             let classes = heap_classes(&a);
             let float = classes
@@ -299,7 +291,7 @@ define void @k(ptr addrspace(1) %out, ptr addrspace(2) %m, {param}i32 %gid) {{
 /// group's unsigned integer class (`sampler::heap_raw`), on every committed profile with a
 /// sampled heap: a constexpr sampler's nearest or linear sample, `float` or `half`, and its
 /// `float` gather declare the twin, define the decode routine, state no
-/// `RuntimeFact::HeapRawSamples`, stay inside the plan's word estimate, and pass L3; a `half`
+/// `RuntimeFact::HeapRawSamples`, and pass L3; a `half`
 /// gather (its non-bfloat forms not measured) and a sample through a runtime sampler slot
 /// declare the twin too and state the fact (with no slot, and naming slot 0); a sample through a
 /// mip-filtered constexpr sampler declares no twin and states the fact with no slot.
@@ -341,14 +333,6 @@ fn heap_samples_reach_a_raw_member_through_the_unsigned_twin() {
                 })) => continue,
                 Err(e) => panic!("{what}: {e}"),
             };
-            let plan = plan_bitcode(&bc, entry, &consts, &p, &inputs, &mut meter())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            let words = a.module.words.len() as u64;
-            assert!(
-                plan.estimate.words >= words,
-                "{what}: estimate {} < emitted {words}",
-                plan.estimate.words
-            );
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
             let classes = heap_classes(&a);
             let uint = classes
@@ -575,400 +559,52 @@ fn a_heap_sample_s_filter_note_follows_the_raw_texture_and_the_bound_sampler_wor
     }
 }
 
-/// A heap `float` read's `DevicePackConversion` holds where its command can name a texture the heap
-/// holds by its raw texels alone: on every committed profile with a sampled heap, a plan of its
-/// pipeline gives `SpecKey::HeapRawTextures` bit 1 exactly where a texture the command makes
-/// resident is such a texture (`BGRA10_XR`, `RGBA16Bfloat`, beside an `RGBA8Unorm` one too), bit 2
-/// where it is of a form the function filters (`BGRA10_XR`, not `RGBA16Bfloat`), and 0 where it
-/// makes none or only `RGBA8Unorm` or `RGBA16Float` ones resident; the stage's note holds under the
-/// plan's values exactly where bit 1 is set (`StageModule::precision_notes_bound`), and under no
-/// known value (a reading of the module alone). The stage declares the key as a constant (default
-/// 3, every raw arm live), which gates its raw arms (`lower::texture::heap_raw_form`), and the
-/// pipeline's key carries the plan's value, so a command that can name no raw texture compiles
-/// none of them.
-#[test]
-fn a_heap_decode_s_note_holds_where_its_command_can_name_a_raw_texture() {
-    use crate::bind::{ResourceClass, UsedResource};
-    use crate::cache::SpecializationKey;
-    use crate::pipeline::PrecisionNote;
-    let note = PrecisionNote::DevicePackConversion;
-    let key = SpecKey::HeapRawTextures(Stage::Kernel);
-    let Some(bc) = assemble("heap_note_plan", &kernel(Use::Float)) else {
-        return;
-    };
-    // A command making `formats` resident, at IDs of their own.
-    let state = |formats: &[PixelFormat]| BindState {
-        used_resources: (formats.iter().zip(1u32..))
-            .map(|(&pf, token)| {
-                let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-                facts.usage = metal::TextureUsage::SHADER_READ;
-                let mut u = UsedResource::new(ResourceClass::Texture(facts), token);
-                u.resource_id = Some(0x0000_0001_0000_0000 | u64::from(token) << 4);
-                u
-            })
-            .collect(),
-        ..Default::default()
-    };
-    // The formats, and the key's value: 1 a raw texture, 2 one of a form the function filters.
-    let cases: [(&[PixelFormat], u64); 6] = [
-        (&[PixelFormat::BGRA10XR], 3),
-        (&[PixelFormat::RGBA16Bfloat], 1),
-        (&[PixelFormat::RGBA8Unorm, PixelFormat::BGRA10XR], 3),
-        (&[], 0),
-        (&[PixelFormat::RGBA8Unorm], 0),
-        (&[PixelFormat::RGBA16Float], 0),
-    ];
-    let mut planned = 0;
-    for (stem, dev) in devices() {
-        let lib = Library::from_air(&bc).expect("library");
-        let f = lib.function("k").expect("function");
-        let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
-        let p = match dev.compile_compute_pipeline(&d, &Budget::standard()) {
-            Ok(p) => p,
-            Err(crate::error::Error::Unsupported(Unsupported {
-                feature: Feature::ArgumentBufferTextures,
-                ..
-            })) => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        assert!(
-            (p.stage)
-                .precision_notes_under(&SpecializationKey::new())
-                .contains(&note),
-            "{stem}: {:?}",
-            p.stage.precision_notes
-        );
-        let constant = (p.stage.specialization.constants.iter())
-            .find(|c| c.key == key)
-            .unwrap_or_else(|| panic!("{stem}: no {key:?} constant"));
-        assert_eq!(constant.default, 3, "{stem}");
-        for (formats, value) in cases {
-            let what = format!("{formats:?} on {stem}");
-            let plan = p
-                .plan(&dev, &state(formats).shape())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert_eq!(plan.specialized_value(key), Some(value), "{what}");
-            let entry = (plan.specialization.entries.iter())
-                .find(|e| e.constant_id == constant.id)
-                .unwrap_or_else(|| panic!("{what}: the key does not carry {key:?}"));
-            let at = entry.offset as usize;
-            let given = &plan.specialization.data[at..at + entry.size as usize];
-            assert_eq!(given.first().copied().map(u64::from), Some(value), "{what}");
-            let held = (p.stage)
-                .precision_notes_bound(&plan.specialization, &|k| plan.specialized_value(k))
-                .contains(&note);
-            assert_eq!(held, value & 1 == 1, "{what}");
-            planned += 1;
-        }
-    }
-    assert!(planned > 0, "no committed profile has the sampled heap");
-}
-
-/// A heap linear sample's `BicubicFilterArithmetic` holds where its command can name a texture the
-/// heap holds by its raw texels in a form the function filters: on every committed profile with a
-/// sampled heap, under the plan's values (`StageModule::precision_notes_bound`) of a constexpr
-/// linear sample's pipeline, it holds where the command makes a `BGRA10_XR` texture resident
-/// (`SpecKey::HeapRawTextures` 3, beside an `RGBA8Unorm` one too), and not where it makes an
-/// `RGBA16Bfloat` one alone resident (1: its sample reads the nearest texel), nor where it makes
-/// none or an `RGBA8Unorm` one alone resident (0: the device's own sample); the stage's decode note
-/// holds wherever a raw texture is resident.
-#[test]
-fn a_heap_sample_s_filter_note_holds_where_its_command_can_name_a_filtered_raw_texture() {
-    use crate::bind::{ResourceClass, UsedResource};
-    use crate::pipeline::PrecisionNote;
-    let filter = PrecisionNote::BicubicFilterArithmetic;
-    let pack = PrecisionNote::DevicePackConversion;
-    let key = SpecKey::HeapRawTextures(Stage::Kernel);
-    let Some(bc) = assemble(
-        "heap_filter_plan",
-        &sampling_kernel(Sampling::Sample(words(true, false))),
-    ) else {
-        return;
-    };
-    // A command making `formats` resident, at IDs of their own.
-    let state = |formats: &[PixelFormat]| BindState {
-        used_resources: (formats.iter().zip(1u32..))
-            .map(|(&pf, token)| {
-                let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-                facts.usage = metal::TextureUsage::SHADER_READ;
-                let mut u = UsedResource::new(ResourceClass::Texture(facts), token);
-                u.resource_id = Some(0x0000_0001_0000_0000 | u64::from(token) << 4);
-                u
-            })
-            .collect(),
-        ..Default::default()
-    };
-    // The formats, the key's value, and whether the filter's note holds.
-    let cases: [(&[PixelFormat], u64, bool); 5] = [
-        (&[PixelFormat::BGRA10XR], 3, true),
-        (&[PixelFormat::RGBA8Unorm, PixelFormat::BGRA10XR], 3, true),
-        (&[PixelFormat::RGBA16Bfloat], 1, false),
-        (&[PixelFormat::RGBA8Unorm], 0, false),
-        (&[], 0, false),
-    ];
-    let mut planned = 0;
-    for (stem, dev) in devices() {
-        let lib = Library::from_air(&bc).expect("library");
-        let f = lib.function("k").expect("function");
-        let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
-        let p = match dev.compile_compute_pipeline(&d, &Budget::standard()) {
-            Ok(p) => p,
-            Err(crate::error::Error::Unsupported(Unsupported {
-                feature: Feature::ArgumentBufferTextures,
-                ..
-            })) => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        for (formats, value, filtered) in cases {
-            let what = format!("{formats:?} on {stem}");
-            let plan = p
-                .plan(&dev, &state(formats).shape())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert_eq!(plan.specialized_value(key), Some(value), "{what}");
-            let notes = (p.stage)
-                .precision_notes_bound(&plan.specialization, &|k| plan.specialized_value(k));
-            assert_eq!(notes.contains(&filter), filtered, "{what}: {notes:?}");
-            assert_eq!(notes.contains(&pack), value != 0, "{what}: {notes:?}");
-            planned += 1;
-        }
-    }
-    assert!(planned > 0, "no committed profile has the sampled heap");
-}
-
-/// Synthetic AIR written for this test: kernel `k` writes buffer 0's `half4` at lane `gid` (its
-/// bits) to texel `(gid, 0)` of the `texture2d<half, write>` its argument buffer (buffer 2) holds.
-const HALF_WRITE: &str = r#"define void @k(ptr addrspace(1) %v, ptr addrspace(2) %held, i32 %gid) {
-entry:
-  %i = zext i32 %gid to i64
-  %p = getelementptr <4 x i16>, ptr addrspace(1) %v, i64 %i
-  %w = load <4 x i16>, ptr addrspace(1) %p, align 8
-  %h = bitcast <4 x i16> %w to <4 x half>
-  %at = insertelement <2 x i32> zeroinitializer, i32 %gid, i64 0
-  %t = load ptr addrspace(1), ptr addrspace(2) %held, align 8
-  tail call void @air.write_texture_2d.v4f16(ptr addrspace(1) %t, <2 x i32> %at, <4 x half> %h, i32 0, i32 2)
-  ret void
-}
-
-declare void @air.write_texture_2d.v4f16(ptr addrspace(1), <2 x i32>, <4 x half>, i32, i32)
-
-!air.kernel = !{!0}
-!air.version = !{!20}
-!air.language_version = !{!21}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ushort4", !"air.arg_name", !"v"}
-!4 = !{i32 1, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Held", !"air.arg_name", !"held"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-!6 = !{i32 0, i32 8, i32 0, !"texture2d<half, write>", !"t", !"air.indirect_argument", !7}
-!7 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"t"}
-!20 = !{i32 2, i32 8, i32 0}
-!21 = !{!"Metal", i32 4, i32 0, i32 0}
-"#;
-
-/// A `half` write through an argument buffer records `PrecisionNote::DeviceNanEncoding` under the
-/// families of the textures its handles can name (`SpecKey::HeapNanFamilies`): on every committed
-/// profile with a heap, one clause for each family whose stored NaN is the device's there (a
-/// 16-bit float format without `DriverDeviation::MetalHalfTexelWrites`, a 32-bit one without
-/// `DriverDeviation::MetalNanMoves`, a packed small float one without
-/// `DriverDeviation::MetalSmallFloatNans`, and a float format of none of those), each family the
-/// profile takes requiring its property. A plan gives the key from the command's resident textures
-/// (`R16Float` 1, `RGBA32Float` 2, `RG11B10Float` 4, `RGBA8Unorm` and `R32Uint` 0), and the note
-/// holds under the plan's values exactly where a resident texture is of a family of a clause:
-/// on `moltenvk-m3`, which takes the 32-bit and small float deviations, an `RGBA32Float` or
-/// `RG11B10Float` texture alone holds none.
-#[test]
-fn a_heap_half_write_s_nan_note_follows_the_families_its_command_can_name() {
-    use crate::bind::{ResourceClass, UsedResource};
-    use crate::device::requirements::VkProperty;
-    use crate::error::DriverDeviation as D;
-    use crate::pipeline::{PrecisionNote, SpecClause};
-    let note = PrecisionNote::DeviceNanEncoding;
-    let key = SpecKey::HeapNanFamilies(Stage::Kernel);
-    let Some(bc) = assemble("heap_half_write", HALF_WRITE) else {
-        return;
-    };
-    // Each family's bit, and the deviation and property under which its stored NaN is Metal's.
-    let families = [
-        (
-            1,
-            Some((D::MetalHalfTexelWrites, VkProperty::MetalHalfTexelWrites)),
-        ),
-        (2, Some((D::MetalNanMoves, VkProperty::MetalNanMoves))),
-        (
-            4,
-            Some((D::MetalSmallFloatNans, VkProperty::MetalSmallFloatNans)),
-        ),
-        (8, None),
-    ];
-    // The families of the note's clauses: each a test of the key's own bit.
-    let noted = |specialized: &[crate::pipeline::SpecializedNote]| -> u32 {
-        let when: Vec<&SpecClause> = specialized
-            .iter()
-            .filter(|n| n.note == note)
-            .flat_map(|n| &n.when)
-            .collect();
-        when.iter().fold(0, |bits, c| match &c.all[..] {
-            [t] if t.key == key && t.mask == t.bits && t.equal => bits | t.bits,
-            _ => panic!("a clause past the families: {c:?}"),
-        })
-    };
-    let consts = FunctionConstantValues::defaults();
-    let entry = EntryRef::Name("k");
-    let mut compiled = 0;
-    let mut quiet = 0;
-    for (stem, p) in committed_profiles().expect("profiles") {
-        let a = match compile_bitcode(
-            &bc,
-            entry,
-            &consts,
-            &p,
-            &LowerInputs::new(),
-            &mut meter(),
-            SPIRV_WORDS,
-        ) {
-            Ok(a) => a,
-            Err(Error::Unsupported(Unsupported {
-                feature: Feature::ArgumentBufferTextures,
-                ..
-            })) => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        let bits = noted(&a.specialized);
-        for (bit, measured) in families {
-            let takes = measured.is_some_and(|(d, _)| p.takes_driver_deviation(d));
-            assert_eq!(bits & bit != 0, !takes, "{stem}: family {bit}: {bits}");
-            if let Some((_, property)) = measured {
-                assert_eq!(
-                    a.requirements.properties.contains(&property),
-                    takes,
-                    "{stem}: {property:?}"
-                );
-            }
-        }
-        assert_eq!(a.precision.contains(&note), bits != 0, "{stem}");
-        quiet += usize::from(bits & 6 == 0);
-        compiled += 1;
-    }
-    assert!(compiled > 0, "no committed profile has the heap");
-    assert!(
-        quiet > 0,
-        "no committed profile stores a 32-bit or small float NaN as Metal does"
-    );
-    // A command making `formats` resident, at IDs of their own.
-    let state = |formats: &[PixelFormat]| BindState {
-        used_resources: (formats.iter().zip(1u32..))
-            .map(|(&pf, token)| {
-                let mut facts = TextureFacts::new(TextureType::Type2D, pf);
-                facts.usage = metal::TextureUsage::SHADER_READ;
-                let mut u = UsedResource::new(ResourceClass::Texture(facts), token);
-                u.resource_id = Some(0x0000_0001_0000_0000 | u64::from(token) << 4);
-                u
-            })
-            .collect(),
-        ..Default::default()
-    };
-    let cases: [(&[PixelFormat], u64); 7] = [
-        (&[PixelFormat::R16Float], 1),
-        (&[PixelFormat::RGBA32Float], 2),
-        (&[PixelFormat::RG11B10Float], 4),
-        (&[PixelFormat::RGBA8Unorm], 0),
-        (&[PixelFormat::R32Uint], 0),
-        (&[PixelFormat::RGBA32Float, PixelFormat::RGBA8Unorm], 2),
-        (&[], 0),
-    ];
-    let mut planned = 0;
-    for (stem, dev) in devices() {
-        let lib = Library::from_air(&bc).expect("library");
-        let f = lib.function("k").expect("function");
-        let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
-        let p = match dev.compile_compute_pipeline(&d, &Budget::standard()) {
-            Ok(p) => p,
-            Err(crate::error::Error::Unsupported(Unsupported {
-                feature: Feature::ArgumentBufferTextures,
-                ..
-            })) => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        let bits = u64::from(noted(&p.stage.specialized_notes));
-        for (formats, value) in cases {
-            let what = format!("{formats:?} on {stem}");
-            let plan = p
-                .plan(&dev, &state(formats).shape())
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert_eq!(plan.specialized_value(key), Some(value), "{what}");
-            let held = (p.stage)
-                .precision_notes_bound(&plan.specialization, &|k| plan.specialized_value(k))
-                .contains(&note);
-            assert_eq!(held, value & bits != 0, "{what}: noted families {bits}");
-            planned += 1;
-        }
-    }
-    assert!(planned > 0, "no profile has the heap");
-}
-
 /// A `half` read, nearest sample or gather of a texture an argument buffer holds rounds its texel
 /// through the device's conversion of the texel's `f32` value (`narrow::round_texel`): the
 /// fetched texel's, merged with the decode routine's texel of a form a heap reads. On
-/// `moltenvk-m3`, which takes `DriverDeviation::MetalHalfConversion`, the module records no
-/// `NativeHalfConversion` for it and requires `VkProperty::MetalHalfConversion`, and it records
-/// `HalfTexelConversion`, which states a heap element's `half` against Metal's; without the
-/// deviation (the same profile with it dropped) it records the note and requires nothing. A
-/// linear sample's filter sum is computed by the device's arithmetic and rounded by
-/// `narrow::round`, which keeps the note on both.
+/// `moltenvk-m3` the module records `NativeHalfConversion` for it and `HalfTexelConversion`, which
+/// states a heap element's `half` against Metal's. A linear sample's filter sum is computed by the
+/// device's arithmetic and rounded by `narrow::round`, which records the note too.
 #[test]
-fn heap_half_texels_round_by_the_measured_conversion() {
-    use crate::device::requirements::VkProperty;
-    use crate::error::DriverDeviation;
+fn heap_half_texels_round_by_the_device_s_conversion() {
     use crate::pipeline::PrecisionNote;
     let consts = FunctionConstantValues::defaults();
     let entry = EntryRef::Name("k");
     let inputs = LowerInputs::new();
-    // (what, the kernel, whether every rounding is a texel's).
     let cases = [
-        ("read", kernel(Use::Half), true),
+        ("read", kernel(Use::Half)),
         (
             "nearest sample",
             sampling_kernel(Sampling::HalfSample(words(false, false))),
-            true,
         ),
         (
             "gather",
             sampling_kernel(Sampling::HalfGather(words(false, false))),
-            true,
         ),
         (
             "linear sample",
             sampling_kernel(Sampling::HalfSample(words(true, false))),
-            false,
         ),
     ];
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(&path).expect("profile");
-    for (name, source, texels) in &cases {
+    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
+    let p = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
+        .expect("device")
+        .profile()
+        .clone();
+    for (name, source) in &cases {
         let Some(bc) = assemble("heap_half", source) else {
             return;
         };
-        for taken in [true, false] {
-            let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-            let p = Device::with_deviation(
-                desc,
-                DevicePolicy::default(),
-                DriverDeviation::MetalHalfConversion,
-                taken,
-            )
-            .expect("device")
-            .profile()
-            .clone();
-            let what = format!("{name}, the deviation taken: {taken}");
+        {
+            let what = name.to_string();
             let a = compile_bitcode(&bc, entry, &consts, &p, &inputs, &mut meter(), SPIRV_WORDS)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            let exempt = taken && *texels;
-            assert_eq!(
+            assert!(
                 a.precision.contains(&PrecisionNote::NativeHalfConversion),
-                !exempt,
                 "{what}: {:?}",
                 a.precision
             );
@@ -976,13 +612,6 @@ fn heap_half_texels_round_by_the_measured_conversion() {
                 a.precision.contains(&PrecisionNote::HalfTexelConversion),
                 "{what}: {:?}",
                 a.precision
-            );
-            assert_eq!(
-                a.requirements
-                    .properties
-                    .contains(&VkProperty::MetalHalfConversion),
-                exempt,
-                "{what}"
             );
         }
     }

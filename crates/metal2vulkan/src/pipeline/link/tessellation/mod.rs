@@ -24,7 +24,10 @@
 //!   partitions (`InvalidDescriptor(MaxTessellationFactor)` otherwise), and at most the device's
 //!   `maxTessellationGenerationLevel` (`Unsupported{Tessellation; Limit}`);
 //! - a pipeline of vertex amplification above 1 (multiview) with tessellation stages needs
-//!   `multiviewTessellationShader` (`Unsupported{VertexAmplification; Feature}` without it).
+//!   `multiviewTessellationShader` (`Unsupported{VertexAmplification; Feature}` without it);
+//! - under the identity domains, whose control stage reads the factors through their address
+//!   ([`control`]'s address form), a control-point index type is not implemented
+//!   (`Unsupported{Tessellation; NotImplemented}`).
 //!
 //! Link numbers the factor buffer (`SyntheticBinding::TessellationFactors`), the patch index
 //! buffer (`SyntheticBinding::PatchIndices`), and, for a pipeline with a control-point index
@@ -32,9 +35,16 @@
 //! buffers of the control stage ([`ControlPlan::slots`]), among set 0's bindings and places the control stage's push range
 //! ([`control::PUSH_BYTES`]) at the first 4-byte-aligned offset no other stage's range covers
 //! ([`push_offset`]), within `maxPushConstantsSize` (`Unsupported{Tessellation; Limit}`
-//! otherwise). A fragment function that reads `[[primitive_id]]` behind the evaluation stage is
+//! otherwise): 0, as the post-tessellation vertex function's window starts past those bytes
+//! (`push::TESSELLATION_BASE`) and its fragment function's behind it, so the range fits beside
+//! theirs on every device the floor admits. A fragment function that reads `[[primitive_id]]` behind the evaluation stage is
 //! not implemented ([`check_fragment`]): Vulkan's primitive id there counts patches, and what
 //! Metal's is for a tessellated triangle has not been read.
+//!
+//! In the address form the control stage binds no buffer: link numbers none for it, places its
+//! push range ([`control::Control::push_bytes`]) 8-aligned for the address, and states its push
+//! fields in the pipeline's interface as a vertex-stage placement ([`ControlPlan::placement`]), as
+//! a function's own fields are stated.
 
 pub mod control;
 
@@ -45,22 +55,22 @@ use std::collections::BTreeMap;
 
 use crate::budget::Meter;
 use crate::device::requirements::{Requirements, VkFeature, VkLimit};
-use crate::device::{DeviceProfile, DriverWorkaround};
-use crate::error::{
-    Capability, DescriptorError, Error, Feature, LowerFamily, RuntimeInput, Unsupported,
-};
+use crate::device::DeviceProfile;
+use crate::error::{Capability, DescriptorError, Error, Feature, LowerFamily, Unsupported};
 use crate::lower::stage_io::fetch::encoding;
 use crate::metal::{TessellationControlPointIndexType, TessellationPartitionMode as Partition};
 use crate::pipeline::artifact::{
     PrecisionNote, Reconvergence, SpecializationLayout, StageModule, StrategyCensus,
 };
 use crate::pipeline::descriptor::{TessellationDescriptor, VertexDescriptor};
-use crate::pipeline::graphics::{EmulatedTessellation, TessellationState};
-use crate::pipeline::interface::{StageInterface, TessellationStage};
+use crate::pipeline::graphics::TessellationState;
+use crate::pipeline::interface::{
+    PlacedField, PushLoc, PushPlacement, StageInterface, TessellationStage,
+};
 use crate::pipeline::layout::PushConstantRange;
 use crate::pipeline::lower_inputs::{VertexFetch, VertexFetchProjection};
 use crate::pipeline::stage_io::{IoNumeric, StageBuiltin};
-use crate::pipeline::sym::ResourceSlot;
+use crate::pipeline::sym::{ResourceSlot, Stage};
 use crate::pipeline::vertex::{PulledAttribute, VertexInputState, VertexStride};
 use crate::spirv::serialize::{SymbolTable, ENTRY_NAME};
 use crate::vk;
@@ -154,6 +164,9 @@ pub fn vertex_input_state(
 pub struct ControlPlan {
     pub desc: TessellationDescriptor,
     pub stage: TessellationStage,
+    /// Whether the control stage reads the factors through their address (the identity
+    /// domains' form).
+    pub addressed: bool,
 }
 
 impl ControlPlan {
@@ -169,12 +182,53 @@ impl ControlPlan {
             push_offset,
             control_points: self.stage.control_points,
             index_type: self.desc.control_point_index_type,
+            addressed: self.addressed,
         }
     }
 
+    /// Bytes and alignment of the control stage's push range.
+    pub fn push_bytes(&self) -> (u32, u32) {
+        Control::push_bytes(
+            self.addressed,
+            self.desc.factor_step_function,
+            self.desc.factor_scale_enabled,
+        )
+    }
+
+    /// The address form's push fields at `push_offset`, as the pipeline interface's placement of
+    /// a vertex-stage range (the control stage belongs to Metal's vertex stage); `None` in the
+    /// bound form, whose fields its consumer writes from the pipeline's `TessellationState`.
+    pub fn placement(&self, push_offset: u32) -> Option<PushPlacement> {
+        if !self.addressed {
+            return None;
+        }
+        let fields = control::address_fields(
+            self.desc.factor_step_function,
+            self.desc.factor_scale_enabled,
+        );
+        Some(PushPlacement {
+            stage: Stage::Vertex,
+            fields: (fields.into_iter())
+                .map(|(field, at)| PlacedField {
+                    field,
+                    loc: PushLoc::Push {
+                        offset: push_offset + at,
+                    },
+                    size: crate::lower::push::shape(field).size(),
+                })
+                .collect(),
+            push_range: Some((push_offset, self.push_bytes().0)),
+            argument_table_size: 0,
+            tail_word: None,
+        })
+    }
+
     /// The control stage's binding symbols: the factor and patch index buffers, and the
-    /// control-point index buffer for a control-point index type.
+    /// control-point index buffer for a control-point index type; none in the address form.
     pub fn slots(&self) -> Vec<ResourceSlot> {
+        if self.addressed {
+            return Vec::new();
+        }
         let mut slots = vec![control::FACTOR_SLOT, control::PATCH_INDEX_SLOT];
         if self.desc.control_point_index_type != TessellationControlPointIndexType::None {
             slots.push(control::CONTROL_POINT_INDEX_SLOT);
@@ -205,6 +259,10 @@ pub fn control_plan(
     p: &DeviceProfile,
 ) -> Result<ControlPlan, Error> {
     let desc = checked(desc)?;
+    let addressed = crate::lower::access::identity(p);
+    if addressed && desc.control_point_index_type != TessellationControlPointIndexType::None {
+        return Err(Unsupported::not_implemented(Feature::Tessellation).into());
+    }
     let max = desc.max_tessellation_factor;
     let f = p.fields();
     let level = f.limits.max_tessellation_generation_level;
@@ -231,7 +289,11 @@ pub fn control_plan(
         )
         .into());
     }
-    Ok(ControlPlan { desc, stage })
+    Ok(ControlPlan {
+        desc,
+        stage,
+        addressed,
+    })
 }
 
 /// The descriptor's tessellation state `desc` (`None`: Metal's defaults), held to Metal's rules: a
@@ -255,27 +317,6 @@ fn checked(desc: Option<&TessellationDescriptor>) -> Result<TessellationDescript
         ));
     }
     Ok(desc)
-}
-
-/// The emulated tessellation state of a pipeline whose evaluation stage `stage` was compiled for
-/// a device without `tessellationShader` (`TessellationStage::emulated`): the descriptor's
-/// tessellation state `desc` (`None`: Metal's defaults), held to Metal's rules as
-/// [`control_plan`] holds it, but not to the device's tessellation limits (the emulation uses no
-/// tessellation stage), and the state the stage baked in (`NeedsInput(TessellationDescriptor)`
-/// otherwise: compiled for another state, the function draws another tessellation).
-pub fn emulated_state(
-    desc: Option<&TessellationDescriptor>,
-    stage: TessellationStage,
-) -> Result<EmulatedTessellation, Error> {
-    let desc = checked(desc)?;
-    if stage.emulated != Some(desc) {
-        return Err(Error::NeedsInput(RuntimeInput::TessellationDescriptor));
-    }
-    Ok(EmulatedTessellation {
-        domain: stage.domain,
-        control_points: stage.control_points,
-        descriptor: desc,
-    })
 }
 
 /// A fragment stage `fs` behind an evaluation stage: one that reads `[[primitive_id]]`, from the
@@ -333,17 +374,13 @@ pub fn push_offset(
 }
 
 /// Note what control stage `c` takes without a Metal observation ([`Control::notes`]) on the
-/// pipeline's evaluation stage among `modules`, and, on profile `p` whose tessellator is not
-/// Apple's (`DriverWorkaround::TessellatorNotMetals`), the device's triangle order
-/// (`PrecisionNote::TessellationTriangleOrder`): its output is what the readings change, and the
-/// synthesized stages are no function's module (a census leaves them out).
-pub fn note_evaluation_stage(c: &Control, p: &DeviceProfile, modules: &mut [StageModule]) {
+/// pipeline's evaluation stage among `modules`, and the device's triangle order
+/// (`PrecisionNote::TessellationTriangleOrder`, on every device: no Vulkan query tells Apple's
+/// tessellator apart): its output is what the readings change, and the synthesized stages are no
+/// function's module (a census leaves them out).
+pub fn note_evaluation_stage(c: &Control, modules: &mut [StageModule]) {
     let mut notes = c.notes();
-    if p.workarounds()
-        .contains(&DriverWorkaround::TessellatorNotMetals)
-    {
-        notes.push(PrecisionNote::TessellationTriangleOrder);
-    }
+    notes.push(PrecisionNote::TessellationTriangleOrder);
     for m in modules
         .iter_mut()
         .filter(|m| m.stage == vk::ShaderStage::TESSELLATION_EVALUATION)
@@ -375,7 +412,7 @@ pub fn synthesized_stages(
     let mut out = Vec::with_capacity(modules.len());
     for (module, stage) in modules {
         let stats = crate::spirv::verify::verify(&module, p, m)?;
-        let module = crate::spirv::serialize::serialize_for(module, p)?;
+        let module = crate::spirv::serialize::serialize(module)?;
         let words = crate::spirv::serialize::relocate(&module, table)?;
         out.push((
             StageModule {
@@ -392,8 +429,6 @@ pub fn synthesized_stages(
                 rounded_colors: Vec::new(),
                 specialized_notes: Vec::new(),
                 own_pixel_textures: Vec::new(),
-                snapshot_textures: Vec::new(),
-                snapshot_refusals: Vec::new(),
                 level_reads: Vec::new(),
                 private_bytes: 0,
                 stats,

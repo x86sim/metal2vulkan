@@ -5,8 +5,8 @@
 //! and data type declare, and every specialization constant its size and default. The module's
 //! user interface variables must be exactly the ones its stage-IO interface ([`StageIo`]) lists, in
 //! the listed direction and with the listed type (`StageIo::declared_type`: an extended-range color
-//! output's is the raw texel's), so link numbers every `Location` key from that one contract; an
-//! emulated mesh function's outputs are records instead. Nothing here reads a name.
+//! output's is the raw texel's), so link numbers every `Location` key from that one contract.
+//! Nothing here reads a name.
 
 use std::collections::BTreeMap;
 
@@ -62,11 +62,7 @@ pub fn stage_symbols(m: &TypedModule, io: &StageIo) -> Result<StageSymbols, Erro
                     (ExecModel::MeshEXT, IoDir::Output, Type::Array { elem, .. }) => *elem,
                     _ => g.pointee,
                 };
-                let width = match io.half_outputs.contains(key) {
-                    true => 16,
-                    false => 32,
-                };
-                if !io_type_matches(m, pointee, *ty, width)? {
+                if !io_type_matches(m, pointee, *ty)? {
                     return Err(invariant("a user interface variable of another type"));
                 }
                 declared += 1;
@@ -77,22 +73,10 @@ pub fn stage_symbols(m: &TypedModule, io: &StageIo) -> Result<StageSymbols, Erro
             | GlobalKind::FixedIo { .. } => {}
         }
     }
-    // A compute entry's listed outputs are an emulated mesh function's: it writes them to its
-    // records binding and declares no interface variable for them.
-    let records = m.entry().model == ExecModel::GLCompute && !outputs.is_empty();
-    let listed = inputs.len() + if records { 0 } else { outputs.len() };
-    if declared != listed {
+    if declared != inputs.len() + outputs.len() {
         return Err(invariant(
             "an interface variable the module does not declare",
         ));
-    }
-    if records
-        && !out
-            .descriptors
-            .iter()
-            .any(|d| d.slot == crate::lower::mesh::RECORDS_SLOT)
-    {
-        return Err(invariant("a compute entry's outputs without its records"));
     }
     for d in m.decls() {
         if let Decl::Const(c) = d {
@@ -127,21 +111,15 @@ fn invariant(detail: &str) -> Error {
 
 /// Whether data type `ty` is the scalar or vector `want` declares (32-bit `float` or
 /// unsigned-integer lanes; signed-integer lanes for a color output to a signed-integer
-/// attachment), its `float` lanes `float_width` bits wide (16 for one of
-/// `StageIo::half_outputs`).
-fn io_type_matches(
-    m: &TypedModule,
-    ty: TypeId,
-    want: IoType,
-    float_width: u8,
-) -> Result<bool, Error> {
+/// attachment), its `float` lanes 32 bits wide.
+fn io_type_matches(m: &TypedModule, ty: TypeId, want: IoType) -> Result<bool, Error> {
     let types = m.types();
     let (elem, lanes) = match types.get(ty)? {
         Type::Vector { elem, len } => (*elem, *len),
         _ => (ty, 1),
     };
     let numeric = match types.get(elem)? {
-        Type::Float { width } if *width == float_width => IoNumeric::Float,
+        Type::Float { width: 32 } => IoNumeric::Float,
         Type::Int {
             width: 32,
             signed: false,

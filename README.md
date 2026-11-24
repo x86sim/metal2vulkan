@@ -13,14 +13,14 @@ of a Vulkan device.
 
 | Crate | Directory | What it is |
 |---|---|---|
-| `metal2vulkan` | [`crates/metal2vulkan`](crates/metal2vulkan) | The translator. A Metal-shaped API (device, library, pipeline descriptors, binding plans) that compiles compute, render, tessellation, tile and mesh pipelines for a described Vulkan device: SPIR-V per stage, one pipeline layout, fixed-function state, and per-draw descriptor writes and push constants. The `cli` feature builds the `metal2vulkan` command. |
-| `metal2vulkan-runtime` | [`crates/metal2vulkan-runtime`](crates/metal2vulkan-runtime) | The Metal API on Vulkan: devices, command queues and buffers, encoders, buffers, textures, heaps, pipeline states and events, run on a Vulkan device through `ash`. It uses only the translator's public API. |
+| `metal2vulkan` | [`crates/metal2vulkan`](crates/metal2vulkan) | The translator. A Metal-shaped API (device, library, pipeline descriptors) that compiles compute, render, tessellation, tile and mesh pipelines for a described Vulkan device: SPIR-V per stage, one pipeline layout, fixed-function state, and the interface a consumer binds each draw and dispatch by. The `cli` feature builds the `metal2vulkan` command. |
+| `metal2vulkan-runtime` | [`crates/metal2vulkan-runtime`](crates/metal2vulkan-runtime) | The Metal API on Vulkan, with one path for every device: devices, memory blocks and buffers, textures, sampler states, command queues, command buffers and events, encoders and pipeline states, run on a Vulkan device through `ash`. It uses only the translator's public API. |
 | `metal2vulkan-air` | [`crates/metal2vulkan-air`](crates/metal2vulkan-air) | The AIR front end: the metallib container, the bitcode reader, a typed IR, AIR's metadata ABI, intrinsics and canonicalization. For tools that read AIR without translating it. |
 | `metal2vulkan-validation` | [`crates/metal2vulkan-validation`](crates/metal2vulkan-validation) | Not published. Authored cases run on Metal and on Vulkan and compared, and bounded audits over a private corpus. |
 | `metal2vulkan-devtools` | [`crates/metal2vulkan-devtools`](crates/metal2vulkan-devtools) | Not published. The external-tool runner and fixture assemblers the tests share. |
 
 The three published crates share one version and are released together; `metal2vulkan` pins
-`metal2vulkan-air` exactly.
+`metal2vulkan-air` exactly, and `metal2vulkan-runtime` pins `metal2vulkan` exactly.
 
 What the translator promises:
 
@@ -29,9 +29,7 @@ What the translator promises:
 - **Recorded differences.** Where a pipeline gives a near-equivalent of Metal's answer, its
   artifact records a precision note, and the runtime announces it once with a stable code.
 - **The GPU's native arithmetic.** Where the device has a native form (its maths, rounding,
-  conversions and sampler), that form gives the answer, its difference from Metal's recorded; the
-  runtime's speed-for-accuracy choices default to the fast form, each with an opt-in exact switch
-  ([docs/FAST-PATHS.md](docs/FAST-PATHS.md)).
+  conversions and sampler), that form gives the answer, its difference from Metal's recorded.
 - **Bounded work.** Every compile runs under a deadline, a cancellation token and deterministic
   work and memory caps.
 
@@ -55,7 +53,7 @@ Features of `metal2vulkan`, none needed by the library:
 - `cli`: the `metal2vulkan` command (enables `serde`).
 
 Requirements: Rust 1.98 or newer. The libraries run no external tool. The runtime opens the Vulkan
-loader at run time and needs a Vulkan 1.2 device.
+loader at run time and needs a Vulkan 1.3 device with what its README's Floor lists.
 
 ## Command line
 
@@ -81,11 +79,16 @@ metal2vulkan kernel.ll kernel.spv --profile device.json --emit-meta kernel.json
 
 - `--profile` is required: the crate ships no device description. Any Khronos profiles JSON works;
   [`crates/metal2vulkan-validation/profiles/`](crates/metal2vulkan-validation/profiles) has
-  examples, from a bare Vulkan 1.2 device to desktop GPUs and MoltenVK.
+  examples, from a bare Vulkan 1.2 device to desktop GPUs and MoltenVK. A profile compiles under
+  the runtime's policy (`DevicePolicy::default()`, the identity pointer and handle domains), so a
+  profile without `bufferDeviceAddress` and `shaderInt64` is refused. `--device FILE` takes its
+  place with a device description and policy as JSON (`{"description": ..., "policy": ...}`),
+  which is how a runtime's compile device is reproduced: metal2vulkan-runtime's is the
+  description restricted to the features it enables, under that policy.
 - Without `--function` it compiles the library's only kernel or vertex function. A kernel with
   `--color-format` compiles as a tile pipeline. A post-tessellation vertex function adds
-  `.tesc.spv` and `.tese.spv` modules on a device with `tessellationShader`; on one without, it is
-  the `.vert.spv` module itself, which draws the tessellator's triangles.
+  `.tesc.spv` and `.tese.spv` modules; on a device without `tessellationShader` it answers
+  `FALLBACK`, naming the feature.
 - A vertex function that returns no value, with no `--fragment`, compiles with rasterization
   disabled, the one pipeline Metal makes of it.
 - A compile that needs a pipeline input fails naming it and the option that supplies it:
@@ -97,7 +100,7 @@ metal2vulkan kernel.ll kernel.spv --profile device.json --emit-meta kernel.json
   `METAL2VULKAN_SPIRV_VAL`.
 - Success prints a line with `PASS` and exits 0. Failure prints `metal2vulkan: FALLBACK (<why>)`,
   writes nothing, and exits 2; a failure after the inputs are read also writes a repro bundle
-  under `$TMPDIR/metal2vulkan-repros` (or `METAL2VULKAN_REPRO_DIR`).
+  under `$TMPDIR/metal2vulkan-repros` (or `METAL2VULKAN_REPRO_DIR`), whose `repro.sh` replays it.
 - `metal2vulkan --help` lists every option.
 
 ## Library
@@ -112,13 +115,13 @@ use metal2vulkan::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, Stag
 use metal2vulkan::Budget;
 
 let description = DeviceDescription::from_khronos_json(&profile_json, None)?;
-let device = Device::new(description, DevicePolicy::default())?;
+let device = Device::from_queries(description, DevicePolicy::default())?;
 let library = Library::parse(&metallib_bytes)?;
 let kernel = FunctionDescriptor::new(library.function("my_kernel")?);
 let descriptor = ComputePipelineDescriptor::new(StageSource::Function(kernel));
 let pipeline = device.compile_compute_pipeline(&descriptor, &Budget::standard())?;
 // pipeline.stage.spirv, pipeline.layout, pipeline.interface: create the Vulkan objects from these,
-// then pipeline.plan(...) and plan.instantiate_dispatch(...) per dispatch.
+// and bind each dispatch by the interface, as metal2vulkan-runtime does.
 ```
 
 [docs/API.md](docs/API.md) walks the whole flow on a runnable example,
@@ -134,11 +137,10 @@ For the runtime, start at [its README](crates/metal2vulkan-runtime/README.md).
 
 | Document | Read it when |
 |---|---|
-| [docs/API.md](docs/API.md) | You use the translator's API: devices, libraries, pipelines, binding, caching, errors; and the runtime's degrade notices |
+| [docs/API.md](docs/API.md) | You use the translator's API: devices, libraries, pipelines, binding, caching, errors; and the runtime's precision notes |
 | [Runtime README](crates/metal2vulkan-runtime/README.md) | You use the Metal API on Vulkan |
 | [docs/HOWTO.md](docs/HOWTO.md) | You integrate: tools, caching, failures, isolation, the runtime's shader cache |
-| [docs/RUNTIME-PORTING.md](docs/RUNTIME-PORTING.md) | You port Metal calls (Objective-C or metal-rs) to the runtime |
-| [docs/FAST-PATHS.md](docs/FAST-PATHS.md) | You need every speed-for-accuracy default and its exact switch |
+| [docs/RESOURCE-ID.md](docs/RESOURCE-ID.md) | You compute a texture's or sampler's `gpuResourceID` on the guest's side |
 | [docs/METAL-COVERAGE.md](docs/METAL-COVERAGE.md) | You ask whether a Metal API item is covered |
 | [docs/REFUSALS.md](docs/REFUSALS.md) | You ask what Metal accepts that the code refuses |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | You change the translator |

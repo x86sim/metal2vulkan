@@ -1,28 +1,24 @@
 //! `ARGB8Unorm` render targets against `RGBA8Unorm` ones: the bytes Metal stores, masked and
 //! blended.
 //!
-//! # What the lane this ports was actually checking
+//! # What the cases ask
 //!
-//! The runtime lane `rotated_targets` says Metal stores, masks and blends `ARGB8Unorm` as
-//! `RGBA8Unorm` with the bytes rotated, alpha first. It then checks that claim by drawing into an
-//! `ARGB8Unorm` target **of ours** and comparing it with an `RGBA8Unorm` target **of ours**, rotated
-//! — so its expectation is our own arithmetic on both sides of the equals sign. A blend of ours that
-//! stored the wrong code in *both* formats passes it. The rotation rule came from a Metal probe, but
-//! the stored codes never did.
-//!
-//! So this port does not carry the rule. It asks Metal the question directly: the same destination
-//! texels and the same drawn values into a target of each format, and **both formats' bytes
-//! recorded from Metal**. The recording then holds Metal's own `ARGB8Unorm` codes, our side is
-//! compared against those rather than against itself, and the rotation claim is a relation between
-//! two recorded Metal facts instead of an assertion in a doc comment.
+//! Metal stores, masks and blends `ARGB8Unorm` as `RGBA8Unorm` with the bytes rotated, alpha first.
+//! A check that compared an `ARGB8Unorm` target of ours with an `RGBA8Unorm` target of ours would
+//! hold our own arithmetic on both sides, and a blend of ours that stored the wrong code in *both*
+//! formats would pass it. So the cases ask Metal directly: the same destination texels and the same
+//! drawn values into a target of each format, and **both formats' bytes recorded from Metal**. The
+//! recording holds Metal's own `ARGB8Unorm` codes, our side is compared against those, and the
+//! rotation is a relation between two recorded Metal facts instead of an assertion in a doc
+//! comment.
 //!
 //! # What this measured on the oracle
 //!
 //! Metal renders format 84 on this M3 Max: the pipeline is made, the pass completes, and the texels
 //! read back. Over 64 texels of pseudo-random destinations and tie-heavy drawn values, unblended
 //! and under straight alpha, every `ARGB8Unorm` texel held the `RGBA8Unorm` texel's bytes rotated,
-//! byte for byte (`probes/rotated_tiles_and_argb.m`). The cases below widen that to the lane's
-//! thirteen write-mask and blend states over 8,192 texels and record both legs.
+//! byte for byte (`probes/rotated_tiles_and_argb.m`). The cases below widen that to thirteen
+//! write-mask and blend states over 8,192 texels and record both legs.
 //!
 //! # The shape
 //!
@@ -43,6 +39,7 @@
 
 use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::recording::ShaderRef;
 use crate::render::{
     Blend, BlendColorChannels, ColorState, PassColor, Plane, ReadAt, RenderPass,
@@ -50,7 +47,6 @@ use crate::render::{
 };
 use crate::transcript::{Node, Observed, Sites, Value};
 use metal2vulkan::metal::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat};
-use metal2vulkan_runtime::Degradation;
 
 use super::extended_range_targets::{
     fixture, fixture_inputs, not_read, program, shader_refs, shape, VERTEX,
@@ -71,7 +67,7 @@ const FILLS: &str = "rt6_samples";
 /// the code the host put there.
 const FILL_FLOAT: &str = "rt6_fill_rgba32float";
 
-/// The blend colour every pass sets, the lane's own, which a `BlendAlpha` factor reads.
+/// The blend colour every pass sets, which a `BlendAlpha` factor reads.
 const BLEND_COLOR: [f32; 4] = [0.2, 0.4, 0.6, 0.8];
 
 /// The two formats each case draws into: Metal's `RGBA8Unorm` and the `ARGB8Unorm` that is said to
@@ -81,8 +77,8 @@ const FORMATS: [(&str, PixelFormat); 2] = [
     ("argb8", PixelFormat::ARGB8Unorm),
 ];
 
-/// The lane's xorshift64*: it stores the shifted state and multiplies without storing the product.
-/// Written out so the values are the lane's own rather than a library's.
+/// An xorshift64*: it stores the shifted state and multiplies without storing the product.
+/// Written out so the values are fixed rather than a library's.
 struct Rng(u64);
 
 impl Rng {
@@ -112,7 +108,7 @@ impl Rng {
     }
 }
 
-/// The drawn `float4`s, from the lane's seed 85: each channel a code's value (6 in 10), a tie at
+/// The drawn `float4`s, from seed 85: each channel a code's value (6 in 10), a tie at
 /// half a code (2 in 10), a value in `[0, 1]` off the codes (1 in 10), or one of -0.25, 1.25, -0
 /// and 1 (1 in 10).
 ///
@@ -142,7 +138,7 @@ fn float_bytes() -> Vec<u8> {
         .collect()
 }
 
-/// The `RGBA8Unorm` texels each target holds before its draw, from the lane's seed 8585.
+/// The `RGBA8Unorm` texels each target holds before its draw, from seed 8585.
 fn destinations() -> Vec<[u8; 4]> {
     let mut generator = Rng::new(8585);
     (0..COUNT)
@@ -182,22 +178,7 @@ struct State {
     blend: Option<[(BlendFactor, BlendFactor, BlendOperation); 2]>,
 }
 
-impl State {
-    /// Whether a colour factor of the state's blend reads the destination alpha, which no Vulkan
-    /// factor reads from the rotated image ([`destination_alpha`]).
-    fn reads_destination_alpha_in_color(&self) -> bool {
-        self.blend.is_some_and(|[(source, destination, _), _]| {
-            [source, destination].iter().any(|f| {
-                matches!(
-                    f,
-                    BlendFactor::DestinationAlpha | BlendFactor::OneMinusDestinationAlpha
-                )
-            })
-        })
-    }
-}
-
-/// The thirteen states the lane sweeps: every write mask and blend it measured, in its order.
+/// The thirteen states the family sweeps: every write mask and blend, in order.
 fn states() -> Vec<State> {
     use BlendFactor as F;
     use BlendOperation as O;
@@ -319,7 +300,7 @@ pub struct RotatedTarget {
     state: State,
 }
 
-/// Every state the lane sweeps, and the one blend Metal answers that we refuse.
+/// Every state the family sweeps, and the one blend Metal answers that we refuse.
 pub fn all() -> Vec<Box<dyn Case>> {
     let mut cases: Vec<Box<dyn Case>> = Vec::new();
     for state in states() {
@@ -356,6 +337,22 @@ impl RotatedTarget {
     /// The target: shared, because its destination codes go in through `replaceRegion:`.
     fn target(format: PixelFormat) -> TargetSpec {
         TargetSpec::read(format, [WIDTH, HEIGHT]).shared()
+    }
+
+    /// Whether the state's blend is not exact by construction on the rotated target, the
+    /// translator's rule for `PrecisionNote::RotatedBlendRounding`: a blend but a minimum or a
+    /// maximum of the colour, which takes no factor, and one whose four factors are all `Zero` or
+    /// `One`.
+    fn rounds(&self) -> bool {
+        use BlendFactor as F;
+        self.state
+            .blend
+            .is_some_and(|[(sr, dr, rgb), (sa, da, _)]| {
+                !matches!(rgb, BlendOperation::Min | BlendOperation::Max)
+                    && ![sr, dr, sa, da]
+                        .iter()
+                        .all(|f| matches!(f, F::Zero | F::One))
+            })
     }
 }
 
@@ -500,39 +497,18 @@ impl Case for RotatedTarget {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // One allowance, and it loosens **no texel**: the notice the venue's own memory model
-        // provokes. The buffer each case reads its target back through is `Shared`, which a
-        // device with no unified memory keeps in system memory because that is the only memory
-        // both sides can reach.
-        //
-        // Every state stores through the device's own conversion of the channels it writes, blended
-        // or not (`PrecisionNote::DeviceColorConversion`), a native note the suite declares for
-        // every case ([`crate::replay::NATIVE_NOTES`]), so the case names no notice of its own.
-        //
-        // **No tolerance on any texel, deliberately.** On lavapipe the blended states store a code
-        // one apart from Metal's, and that is exactly the shape `DeviceColorConversion` describes
-        // -- but the note's own definition ends "validation derives no tolerance and no explanation
-        // from it: a difference stays a mismatch for review". Loosening a texel here would be this
-        // suite overruling that, so the blended states stay divergent on lavapipe and are a
-        // per-venue divergence to carry, not a tolerance to write.
-        //
-        // The state whose colour factor reads the destination alpha ([`destination_alpha`]) has
-        // the fragment function read its texel. A venue that orders that read through the pixel
-        // interlock may render the pass into a scratch image (`fetch-through-scratch`, MoltenVK
-        // here), a performance notice that loosens the notices site alone, as `fetch_ordered`'s
-        // does.
-        let mut allowances = vec![crate::replay::shared_memory_notice()];
-        if self.state.reads_destination_alpha_in_color() {
-            allowances.push(crate::replay::notice_allowance(
-                Degradation::FetchThroughScratch.code(),
-            ));
-        }
-        allowances
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shader_refs(FILLS, &[VERTEX, FILL_FLOAT])
+    }
+
+    fn allowances(&self) -> Vec<Allowance> {
+        // A blend not exact by construction announces its rounding on the `ARGB8Unorm` target
+        // (`rotated-blend-rounding`). A declaration of the notices site alone: every texel
+        // compares exactly.
+        (self.rounds())
+            .then(|| crate::replay::notice_allowance(Degradation::RotatedBlendRounding.code()))
+            .into_iter()
+            .collect()
     }
 
     fn inputs(&self) -> Result<Vec<Input>, String> {
@@ -590,10 +566,10 @@ impl Case for RotatedTarget {
 ///
 /// Our runtime holds the format in an `R8G8B8A8_UNORM` image of the rotated bytes, so the image's
 /// alpha channel is Metal's blue. A colour factor that reads Metal's destination alpha would have
-/// to read the image's *red*, and no Vulkan blend factor does. So the fragment function reads the
-/// texel itself (framebuffer fetch: through the pixel interlock, or a rasterization-order input
-/// attachment), rotates it into Metal's order and computes Metal's 8-bit unorm blend. A device that
-/// orders that read in neither form refuses the pipeline. Metal runs the draw.
+/// to read the image's *red*, and no Vulkan blend factor does. So the fragment function would read
+/// the texel itself (framebuffer fetch), rotate it into Metal's order and compute Metal's 8-bit
+/// unorm blend. That form is not built, so the translator refuses the pipeline on every device.
+/// Metal runs the draw.
 ///
 /// It is its own case so its route, and anything that route does differently, is one case's rows
 /// of the ledger rather than folded into the thirteen states. Metal's leg records normally: the

@@ -31,13 +31,13 @@ fn fixture() -> Option<Vec<u8>> {
     }
 }
 
-const PROFILES: [&str; 3] = ["lavapipe", "amd-rdna3-radv", "moltenvk-m3"];
+const PROFILES: [&str; 3] = ["lavapipe", "amd-780m-radv", "moltenvk-m3"];
 
 /// Kernel `entry`'s pipeline on profile `stem`.
 fn compiled(library: &Library, stem: &str, entry: &str) -> Result<(), Error> {
-    let dev = Device::new(
+    let dev = Device::from_queries(
         description(stem).expect("committed description"),
-        DevicePolicy::default(),
+        DevicePolicy::RESIDENT_TABLES,
     )
     .expect("device");
     let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(
@@ -50,7 +50,7 @@ fn compiled(library: &Library, stem: &str, entry: &str) -> Result<(), Error> {
 /// Kernel `entry` of `bc` as the compile specializes it for profile `stem`, printed: the module a
 /// refusal's location names an instruction of.
 fn specialized(bc: &[u8], stem: &str, entry: &str) -> String {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
+    let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let none = FunctionConstantValues::defaults();
     match specialized_entry(bc, entry, &p, &none, &[], &mut meter()) {
         Ok(e) => print(&e.module),

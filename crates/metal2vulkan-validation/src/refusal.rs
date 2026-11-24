@@ -17,7 +17,7 @@
 use crate::c1::reviewed::GapClass;
 use crate::candidate::engine::artifact::ExecutedArtifact;
 use crate::check::admission::NotSupported;
-use crate::observation::{validate_hash, Backend, CaseTiming};
+use crate::observation::{validate_hash, CaseTiming};
 use serde::{Deserialize, Serialize};
 
 /// What a refusal says is missing.
@@ -101,7 +101,7 @@ impl Refusal {
             }
             NotSupported::Bind(_)
             | NotSupported::NotEnabled(_)
-            | NotSupported::Uncontained(_)
+            | NotSupported::Uncontained { .. }
             | NotSupported::Restriction { .. } => (RefusalClass::Device, None),
             NotSupported::NotImplemented(_) | NotSupported::Requirements(_) => {
                 (RefusalClass::Executor, None)
@@ -151,11 +151,10 @@ pub struct RefusalObservation {
     /// The engine's fingerprint of the opened device's profile under this product, as a row
     /// carries it.
     pub translator_fingerprint: String,
-    pub backend: Backend,
-    /// The engine slot (`ENV@engine`, `+robustness-off` for that leg).
+    /// The engine slot (`ENV@engine`, `ENV@engine@P` restricted to profile `P`).
     pub environment_id: String,
     /// The opened device's facts, as a row records them: the device and driver, the layers, the
-    /// leg, the profile and its fingerprint.
+    /// robustness features, the profile and its fingerprint.
     pub environment: serde_json::Value,
     pub executor_abi: String,
     pub refusal: Refusal,
@@ -174,8 +173,8 @@ pub struct RefusalObservation {
 }
 
 impl RefusalObservation {
-    /// Well-formed hashes, an engine slot and an executor ABI, an environment object whose
-    /// robustness leg is the slot's, and a well-formed refusal.
+    /// Well-formed hashes, an engine slot and an executor ABI, an environment object, and a
+    /// well-formed refusal.
     pub fn validate_content(&self) -> Result<(), String> {
         for (field, value) in [
             ("case_id", &self.case_id),
@@ -196,20 +195,6 @@ impl RefusalObservation {
         }
         if !self.environment.is_object() {
             return Err("refusal environment must be a JSON object".into());
-        }
-        let leg = self
-            .environment
-            .get("robustness")
-            .and_then(|robustness| robustness.get("leg"))
-            .cloned()
-            .and_then(|leg| serde_json::from_value::<crate::coverage::Leg>(leg).ok())
-            .ok_or("the refusal environment's robustness names no leg")?;
-        let off_slot = crate::candidate::engine::is_robustness_off_slot(&self.environment_id);
-        if off_slot != (leg == crate::coverage::Leg::RobustnessOff) {
-            return Err(format!(
-                "the refusal ran in robustness leg {leg:?}, but is stored in slot {:?}",
-                self.environment_id
-            ));
         }
         if let Some(artifact) = &self.artifact {
             artifact.validate()?;

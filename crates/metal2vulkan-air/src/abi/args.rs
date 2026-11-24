@@ -5,14 +5,14 @@
 //! set of attributes and requires some of them.
 
 use super::keys::{Key, BUFFER_ACCESS, TEXTURE_ACCESS};
-use super::md::{kept_bytes, saw_str, Ops, Site, Tok};
+use super::md::{diag, kept_bytes, saw_str, Ops, Site, Tok};
 use super::structs::Structs;
 use super::{
     AbiInt, AccelerationStructureKind, Access, ArgTypeInfo, BufferArg, Builtin, ControlPointField,
-    DepthQualifier, ImageblockArg, ImageblockKind, IndirectArg, Interpolation, MeshField,
-    MeshFieldRole, MeshOutputs, MeshTopology, ObjectArg, OutputBinding, OutputRole, ParamBinding,
-    ParamRole, PatchInput, Predicate, Sampling, Slot, Stage, StructRef, TextureArg, UserKey,
-    Varying,
+    DepthQualifier, GlobalBinding, ImageblockArg, ImageblockKind, IndirectArg, Interpolation,
+    MeshField, MeshFieldRole, MeshOutputs, MeshTopology, ObjectArg, OutputBinding, OutputRole,
+    ParamBinding, ParamRole, PatchInput, Predicate, Sampling, Slot, Stage, StructRef, TextureArg,
+    UserKey, Varying,
 };
 use crate::bitcode::PointeeTable;
 use crate::budget::Meter;
@@ -343,19 +343,28 @@ impl<'m> Cx<'m, '_> {
         })
     }
 
-    /// Decode the argument node of an MSL 3.2 program-scope binding of `global`: a parameter
-    /// node whose index is -1, whose pointer (a buffer's) is the global's value. The stage is
-    /// checked by the entry that reads it (`canon::global_binding`).
+    /// Decode the node of `global`'s program-scope binding: a parameter node whose index is -1 (it
+    /// binds no parameter), with no predicate and no `air.arg_unused`. A buffer node that states no
+    /// address space takes that of the pointer the global holds.
     pub(super) fn global_binding(
         &mut self,
         id: MdId,
         global: GlobalId,
-    ) -> Result<ParamBinding, Error> {
-        let node = self.node(id, Context::Input, &DiagName::new("air.global_binding"))?;
-        let pointer = self
-            .m
+    ) -> Result<GlobalBinding, Error> {
+        let m = self.m;
+        let name = m
             .global(global)
-            .and_then(|g| match self.m.types().get(g.value_ty) {
+            .and_then(|g| m.symbols().get(g.name))
+            .unwrap_or_default();
+        let node = self.node(id, Context::Input, &diag(name))?;
+        if node.index != Some(u32::MAX) || node.predicate.is_some() || node.attrs.unused {
+            return Err(node
+                .site
+                .err(AbiError::BadValue, Some("air.global_binding")));
+        }
+        let pointer = m
+            .global(global)
+            .and_then(|g| match m.types().get(g.value_ty) {
                 Some(Type::Ptr { space }) => Some(*space),
                 _ => None,
             });
@@ -367,11 +376,9 @@ impl<'m> Cx<'m, '_> {
             pointer,
             MemberSpace::Unstated,
         )?;
-        Ok(ParamBinding {
-            param: node.index.unwrap_or(u32::MAX),
+        Ok(GlobalBinding {
+            global,
             role,
-            unused: node.attrs.unused,
-            predicate: node.predicate,
             ty: node.attrs.ty(),
             name: node.attrs.name.clone(),
         })
@@ -1204,7 +1211,7 @@ fn stage_bit(stage: &Stage) -> u8 {
 /// grid builtins as kernels do, except the dispatch and stage-in ones, and a mesh function its
 /// vertex amplification's id and count (the VFX framework's particle meshes take
 /// `[[amplification_id]]` under a function constant).
-pub(crate) fn input_in_stage(role: &ParamRole, stage: &Stage) -> bool {
+fn input_in_stage(role: &ParamRole, stage: &Stage) -> bool {
     let stages = match role {
         ParamRole::Buffer(_)
         | ParamRole::ArgumentBuffer(_)

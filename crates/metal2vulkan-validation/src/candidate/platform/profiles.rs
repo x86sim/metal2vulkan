@@ -4,8 +4,10 @@
 //! ([`restrict_devices_to`], from its `--profiles-layer P` argument). A restricted context stacks
 //! the profiles layer below the validation layer, configured through `VK_EXT_layer_settings` with
 //! the committed file, so the device reports P and the validation layer checks against it; the ICD
-//! still executes as itself. Before its device is created the context checks, each failure a
-//! [`RestrictionError`]:
+//! still executes as itself. A run through the runtime, which makes its own instance, sets the same
+//! settings through the variables the layer reads ([`ProfilesSettings::environment`]) and makes the
+//! same checks (`runtime_restriction`). Before its device is created the context checks, each
+//! failure a [`RestrictionError`]:
 //!
 //! - the device as it is (read through the layer with its emulation off) has every capability P
 //!   states ([`exceeds`]): the layer reports P's value whether or not the device has it, so it
@@ -29,7 +31,6 @@
 use ash::vk;
 use metal2vulkan::device::ApiVersion;
 use metal2vulkan::device::{DeviceDescription, Independence};
-use metal2vulkan_runtime::{LayerSetting, LayerSettingValue};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::ffi::{c_char, CStr, CString};
@@ -204,9 +205,8 @@ impl ProfileRestriction {
     /// read at it ([`check_within`], [`check_restricted`]), and the context's feature chain links
     /// what is core at it (`enables::Available::at`), so the context translates for the profile the
     /// product reads, which reads a profile at its own version: read at an earlier one, a Vulkan
-    /// 1.3 document drops each feature and member only that version's core states (`roadmap-2022`
-    /// moves its translation key and ten golden cells). A profile at Vulkan 1.2 runs at 1.2, as
-    /// every restricted context did before.
+    /// 1.3 document drops each feature and member only that version's core states. A profile at
+    /// Vulkan 1.2 runs at 1.2.
     pub fn context_version(&self) -> ApiVersion {
         self.description.api_version.max(ApiVersion::V1_2)
     }
@@ -219,11 +219,8 @@ impl ProfileRestriction {
     /// ([`ProfileRestriction::requirements_only`]) states only what its profile requires: the
     /// product reads a member it omits as its version's guarantee, or as none, and a feature its
     /// version requires as present, while the layer reports the device's own value for an omitted
-    /// member (of a structure the context queries) and an omitted feature as absent. Under
-    /// `lunarg-desktop-baseline-2023` as extracted, the RTX 5080's context
-    /// found `shaderSubgroupExtendedTypes` absent and the five `VK_EXT_subgroup_size_control` and
-    /// `VK_EXT_vertex_attribute_divisor` properties the document lists the extensions of but does
-    /// not state at the device's values. Its regeneration now states every such member
+    /// member (of a structure the context queries) and an omitted feature as absent. Its
+    /// regeneration states every such member
     /// ([`ProfileRestriction::completed_for_layer`]), at the profile's own version, which the
     /// context runs at ([`ProfileRestriction::context_version`]); one that does not is refused.
     pub fn presentation_gap(&self) -> Option<String> {
@@ -310,8 +307,8 @@ pub(super) fn current_restriction() -> Option<&'static ProfileRestriction> {
     RESTRICTION.get_or_init(|| None).as_ref()
 }
 
-/// The committed profile of [`current_restriction`]: what an engine device worker must
-/// restrict its own contexts to before it opens a device.
+/// The committed profile of [`current_restriction`]: what an engine device worker restricts the
+/// runtime's device to (`runtime_restriction`).
 pub fn requested_restriction() -> Option<String> {
     current_restriction().map(|restriction| restriction.stem.clone())
 }
@@ -328,6 +325,10 @@ pub(super) enum ProfilesLayer<'a> {
     /// emulation on.
     PassThrough,
 }
+
+/// The prefix of the variables the profiles layer's settings library reads, one per setting
+/// ([`ProfilesSettings::environment`]).
+pub(super) const PROFILES_VARIABLE_PREFIX: &str = "VK_KHRONOS_PROFILES_";
 
 /// One `VkLayerSettingEXT` value list, owned.
 enum SettingValues {
@@ -392,9 +393,11 @@ impl ProfilesSettings {
                     // member P states with the device's in both directions. With its failure path
                     // on, enumeration failed under `gate-lavapipe` on the device it was captured
                     // from, after warning, among others, that the stated `deviceType` and
-                    // `driverID` read as 0. So it neither fails nor reports.
+                    // `driverID` read as 0. So it neither fails nor reports: its reports go to
+                    // the null device, not to the standard output a device worker reports on.
                     (c"debug_fail_on_error", SettingValues::Bool(vk::FALSE)),
-                    (c"debug_reports", strings(&[])),
+                    (c"debug_actions", strings(&[c"DEBUG_ACTION_FILE_BIT"])),
+                    (c"debug_filename", strings(&[c"/dev/null"])),
                     portability,
                 ];
                 // An empty list is left out rather than passed as a setting with no values.
@@ -407,19 +410,27 @@ impl ProfilesSettings {
         Ok(ProfilesSettings { values })
     }
 
-    /// The settings as a runtime device's options take them (`DeviceOptions::layer_settings`),
-    /// owned.
-    pub(super) fn runtime_settings(&self) -> Vec<LayerSetting> {
+    /// The settings as the variables the layer's settings library reads when an instance is made
+    /// (`VK_KHRONOS_PROFILES_<SETTING>`): a flag as `true` or `false`, a list joined by commas.
+    /// Every setting holds at least one value, so no variable is empty, which the library would
+    /// read as unset.
+    pub(super) fn environment(&self) -> Vec<(String, String)> {
         self.values
             .iter()
             .map(|(name, values)| {
+                let variable = format!(
+                    "{PROFILES_VARIABLE_PREFIX}{}",
+                    name.to_string_lossy().to_uppercase()
+                );
                 let value = match values {
-                    SettingValues::Bool(value) => LayerSettingValue::Bool(*value == vk::TRUE),
-                    SettingValues::Strings { owned, .. } => {
-                        LayerSettingValue::Strings(owned.clone())
-                    }
+                    SettingValues::Bool(value) => (*value == vk::TRUE).to_string(),
+                    SettingValues::Strings { owned, .. } => owned
+                        .iter()
+                        .map(|value| value.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(","),
                 };
-                LayerSetting::new(PROFILES_LAYER.to_owned(), (*name).to_owned(), value)
+                (variable, value)
             })
             .collect()
     }
@@ -439,9 +450,9 @@ impl ProfilesSettings {
                         setting.value_count = 1;
                         setting.p_values = std::ptr::from_ref(value).cast();
                     }
-                    SettingValues::Strings { pointers, .. } => {
+                    SettingValues::Strings { owned, pointers } => {
                         setting = setting.ty(vk::LayerSettingTypeEXT::STRING);
-                        setting.value_count = pointers.len() as u32;
+                        setting.value_count = owned.len() as u32;
                         setting.p_values = pointers.as_ptr().cast();
                     }
                 }
@@ -716,7 +727,10 @@ fn identity_differences(
 }
 
 /// `description`'s capability members as JSON: everything but its identity, its sets (features
-/// and extensions), and its format table, which are compared typed.
+/// and extensions), and its format table, which are compared typed, and the workarounds measured
+/// on the device (`DeviceDescription::measured`, the runtime's view check's cost facts), which
+/// are no capability: as the driver's measured deviations (`KEPT`'s note), they follow the
+/// device they were measured on.
 fn capability_members(description: &DeviceDescription) -> Value {
     let mut value = serde_json::to_value(description).expect("a description serializes");
     if let Some(object) = value.as_object_mut() {
@@ -730,6 +744,7 @@ fn capability_members(description: &DeviceDescription) -> Value {
             "extensions",
             "features",
             "formats",
+            "measured",
         ] {
             object.remove(key);
         }
@@ -946,7 +961,6 @@ fn bound(path: &[String]) -> Option<Bound> {
         ["float_controls", "denorm_independence" | "rounding_independence"] => Bound::Independence,
         ["filter_minmax_single_component_formats"
         | "rgba4_opaque_black_swizzled"
-        | "robust_buffer_access_update_after_bind"
         | "khr_format_feature_flags2"] => Bound::Implies,
         ["generated_commands"] => Bound::Present,
         ["generated_commands", "max_indirect_pipeline_count"
@@ -972,11 +986,9 @@ fn limit_bound(name: &str) -> Option<Bound> {
         | "early_fragment_multisample_coverage_after_sample_counting"
         | "sub_pixel_precision_bits" => Bound::Execution,
         "min_texel_offset" | "min_texel_gather_offset" => Bound::AtLeast,
-        "supports_non_zero_first_instance"
-        | "independent_resolve_none"
-        | "independent_resolve"
-        | "variable_sample_locations"
-        | "provoking_vertex_mode_per_pipeline" => Bound::Implies,
+        "supports_non_zero_first_instance" | "independent_resolve_none" | "independent_resolve" => {
+            Bound::Implies
+        }
         "framebuffer_color_sample_counts"
         | "framebuffer_depth_sample_counts"
         | "framebuffer_integer_color_sample_counts"
@@ -984,8 +996,7 @@ fn limit_bound(name: &str) -> Option<Bound> {
         | "framebuffer_no_attachments_sample_counts"
         | "storage_image_sample_counts"
         | "supported_depth_resolve_modes"
-        | "supported_stencil_resolve_modes"
-        | "sample_location_sample_counts" => Bound::Flags,
+        | "supported_stencil_resolve_modes" => Bound::Flags,
         name if name.starts_with("max_") && name.ends_with("_bits") => Bound::FloatAtMost,
         name if name.starts_with("min_") && name.ends_with("_alignment") => Bound::AtLeast,
         name if name.starts_with("max_") => Bound::AtMost,

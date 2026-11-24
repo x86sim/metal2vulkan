@@ -2,7 +2,7 @@
 //!
 //! Every validation path that compiles an engine pipeline for a device (L4 driver acceptance,
 //! `corpus-pipeline`, and the engine candidate executor behind
-//! `corpus-vulkan`/`corpus-moltenvk`) compiles in a killable child
+//! `corpus-vulkan`) compiles in a killable child
 //! process, never in the process that holds the Vulkan device. [`compile_compute`],
 //! [`compile_compute_request`], and [`compile_render_request`] run one child per pipeline
 //! through [`super::run_json`], so the 20-second
@@ -26,16 +26,14 @@
 //! 4. The child writes the pipeline's cache artifact bytes (`PipelineArtifact::to_bytes`) to the
 //!    file the parent names in [`ARTIFACT_FILE`], a chunk at a time (`PipelineArtifact::write_to`),
 //!    so reporting holds little beside the pipeline: a constant blob the ledger admits is never
-//!    encoded whole in memory, let alone as base64. It reports the artifact's length with the table
-//!    handles of each request function's linked functions ([`crate::acceptance::LinkedHandles`]),
-//!    together with the SHA-256 of the input bytes it decoded and its product fingerprint. The
+//!    encoded whole in memory, let alone as base64. It reports the artifact's length with the
+//!    SHA-256 of the input bytes it decoded and its product fingerprint. The
 //!    parent requires that digest to be its own input's and that fingerprint to be its own (an
 //!    executable rebuilt since the parent started is another compiler, whose pipeline the parent's
 //!    observations would misattribute), requires the file to hold the reported length, decodes the
 //!    bytes with `PipelineArtifact::from_bytes` for the kind it asked for against its own `Device`
 //!    (so bytes of another profile are `WrongDevice`, and stale, corrupt, or other-kind bytes are
-//!    refused), requires the handles to answer its request (`PipelineRequest::check_handles`), and
-//!    re-checks the deadline after decoding.
+//!    refused), and re-checks the deadline after decoding.
 //! 5. A typed product refusal comes back as its [`Outcome`] (deterministic), a library whose
 //!    source gives no bitcode as the row's outcome (`BitcodeError::attempt`), and pipeline
 //!    inputs the tool does not build for the function as [`NotCompiled::Unmodelled`]; a stop at
@@ -51,8 +49,7 @@
 use super::alloc;
 use super::{run_json, Measured, ProcessFailure, WorkerFailure, DEADLINE};
 use crate::acceptance::{
-    compile_pipeline, AcceptancePipeline, CompiledRequest, LinkedHandles, PipelineCompileError,
-    PipelineRequest,
+    compile_pipeline, AcceptancePipeline, PipelineCompileError, PipelineRequest,
 };
 use crate::engine::{bounded_detail, Outcome, RowSource};
 use crate::hash::sha256_bytes;
@@ -78,10 +75,18 @@ pub const ARTIFACT_FILE: &str = "M2V_COMPILE_WORKER_ARTIFACT";
 
 /// The executable that serves compile workers: a validation binary that calls
 /// [`serve_if_requested`] first in `main` and installs
-/// [`CountingAllocator`](super::alloc::CountingAllocator) as its global allocator.
+/// [`CountingAllocator`](super::alloc::CountingAllocator) as its global allocator, or this crate's
+/// lib test binary, which installs it too (`alloc::tests`) and serves through a fixture test
+/// (`CompileWorker::lib_tests`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileWorker {
     program: PathBuf,
+    /// The arguments before the worker's own: none for a binary, which reads its worker argument
+    /// first; the lib test binary's selection of its fixture test.
+    selection: Vec<String>,
+    /// The variables the worker starts with: none for a binary; the fixture's role for the lib
+    /// test binary.
+    environment: Vec<(String, String)>,
 }
 
 impl CompileWorker {
@@ -97,15 +102,70 @@ impl CompileWorker {
     pub fn program(program: impl Into<PathBuf>) -> CompileWorker {
         CompileWorker {
             program: program.into(),
+            selection: Vec::new(),
+            environment: Vec::new(),
         }
+    }
+
+    /// This crate's lib test binary, the running one, serving each compile through its fixture
+    /// test ([`LIB_TESTS_FIXTURE`]) as a binary serves it: in a child of its own process group,
+    /// under the deadline, the process-group RSS limit and the allocator budget, its scratch
+    /// removed. Any selection that runs the lib's tests holds it, where a `--lib` build builds no
+    /// package binary.
+    #[cfg(test)]
+    pub(crate) fn lib_tests() -> Result<CompileWorker, String> {
+        CompileWorker::lib_tests_as(LIB_TESTS_SERVE)
+    }
+
+    /// [`CompileWorker::lib_tests`], its fixture serving `role` ([`LIB_TESTS_ROLE`]). The test
+    /// harness parses the binary's arguments, so the selection runs the fixture alone and ends
+    /// with `--`: the worker argument after it is a filter that names no test. The harness's
+    /// terse output prints one line before the test runs and none of the test's name, so the
+    /// worker's report stays the last line of its stdout (`worker::run_json`).
+    #[cfg(test)]
+    fn lib_tests_as(role: &str) -> Result<CompileWorker, String> {
+        let program = std::env::current_exe()
+            .map_err(|error| format!("resolve the lib test binary: {error}"))?;
+        Ok(CompileWorker {
+            program,
+            selection: ["--exact", LIB_TESTS_FIXTURE, "--nocapture", "--quiet", "--"]
+                .map(String::from)
+                .to_vec(),
+            environment: vec![(LIB_TESTS_ROLE.to_string(), role.to_string())],
+        })
     }
 
     /// A command that starts the worker's executable, before its worker argument: also the
     /// engine device worker's (`super::device`), which every tool that runs cases serves.
     pub(crate) fn command(&self) -> Command {
-        Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command.args(&self.selection).envs(
+            self.environment
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        );
+        command
     }
 }
+
+/// The lib test binary's compile worker fixture ([`CompileWorker::lib_tests`]).
+#[cfg(test)]
+const LIB_TESTS_FIXTURE: &str = "worker::compile::tests::compile_worker_fixture";
+
+/// The variable that makes [`LIB_TESTS_FIXTURE`] a compile worker child, naming what it serves:
+/// [`LIB_TESTS_SERVE`], or one of its limit probes.
+#[cfg(test)]
+const LIB_TESTS_ROLE: &str = "M2V_TEST_COMPILE_WORKER";
+
+/// [`LIB_TESTS_ROLE`]'s value for a compile.
+#[cfg(test)]
+const LIB_TESTS_SERVE: &str = "serve";
+
+/// The stack [`LIB_TESTS_FIXTURE`] serves on: a binary serves on its main thread, whose stack is
+/// 8 MiB (Linux's default stack limit; macOS's main thread), where the harness runs a test on a
+/// 2-MiB thread.
+#[cfg(test)]
+const LIB_TESTS_STACK: usize = 8 << 20;
 
 /// The device a worker compiles for: the description and policy the child rebuilds it from, and
 /// the parent's `Device` built from exactly that pair, against which the artifact is decoded.
@@ -117,12 +177,12 @@ pub struct WorkerDevice {
 }
 
 impl WorkerDevice {
-    /// Derive the `Device` of `description` under `policy` (`Device::new`'s refusals are its own).
+    /// Derive the `Device` of `description` under `policy` (`Device::from_queries`'s refusals are its own).
     pub fn new(
         description: DeviceDescription,
         policy: DevicePolicy,
     ) -> Result<WorkerDevice, Error> {
-        let device = Device::new(description.clone(), policy)?;
+        let device = Device::from_queries(description.clone(), policy)?;
         Ok(WorkerDevice {
             description,
             policy,
@@ -157,19 +217,11 @@ pub enum NotCompiled {
     Unmodelled(crate::acceptance::row::Unmodelled),
 }
 
-/// A pipeline a worker compiled, with the table handles of the functions each of its request's
-/// functions links ([`CompiledRequest::handles`]).
-#[derive(Debug)]
-pub struct Compiled<P> {
-    pub pipeline: P,
-    pub handles: Vec<LinkedHandles>,
-}
-
 /// What one worker compile returned.
 #[derive(Debug)]
 pub struct WorkerCompile<P> {
     /// The pipeline, or why none was built.
-    pub result: Result<Compiled<P>, NotCompiled>,
+    pub result: Result<P, NotCompiled>,
     /// Peak live heap bytes the compile allocated in the worker (its counting allocator).
     pub allocator_peak: Option<u64>,
     /// From preparing the input through decoding the artifact, and the group's peak RSS.
@@ -192,7 +244,7 @@ pub fn compile_compute(
     compile(worker, device, std::slice::from_ref(library), &request)
 }
 
-/// Compile `request`, a compute pipeline's (`PipelineRequest::BoundCompute`, or an L4 kernel row's
+/// Compile `request`, a compute pipeline's (`PipelineRequest::Kernel`, or an L4 kernel row's
 /// `PipelineRequest::Row`), from `libraries` as [`PipelineRequest::libraries`] orders them (the
 /// kernel's, then those of the functions it links) for `device`, in a killable worker.
 pub fn compile_compute_request(
@@ -205,8 +257,8 @@ pub fn compile_compute_request(
 }
 
 /// Compile `request`, a render pipeline's (`PipelineRequest::VertexDraw` from the Metal oracle's
-/// descriptor template, `PipelineRequest::Draw` of a case and its generated companion, either with
-/// the bind shape's inputs, or an L4 vertex or fragment row's `PipelineRequest::Row`), from
+/// descriptor template, `PipelineRequest::Draw` of a case and its generated companion, or an L4
+/// vertex or fragment row's `PipelineRequest::Row`), from
 /// `libraries` as [`PipelineRequest::libraries`] orders them (the stage libraries, then those of
 /// the functions each links) for `device`, in a killable worker: a case and its companion compile
 /// in one child, under one deadline and one limit.
@@ -244,12 +296,8 @@ struct CompileOutput {
 #[derive(Debug, Serialize, Deserialize)]
 enum CompileResult {
     /// The length of the pipeline's cache artifact (`PipelineArtifact::to_bytes`), which the
-    /// worker wrote to its [`ARTIFACT_FILE`], and the table handles of each request function's
-    /// linked functions ([`CompiledRequest::handles`]).
-    Compiled {
-        artifact_bytes: u64,
-        handles: Vec<LinkedHandles>,
-    },
+    /// worker wrote to its [`ARTIFACT_FILE`].
+    Compiled { artifact_bytes: u64 },
     /// The product refused or failed, or a library gave no bitcode: its typed outcome and a
     /// bounded detail.
     NotCompiled { outcome: Outcome, detail: String },
@@ -273,7 +321,7 @@ fn compile<P: PipelineArtifact>(
     compile_in(command, device, libraries, request)
 }
 
-/// [`compile`] in the worker `command` starts (the tests' limit probes start this test binary).
+/// [`compile`] in the worker `command` starts.
 fn compile_in<P: PipelineArtifact>(
     mut command: Command,
     device: &WorkerDevice,
@@ -300,7 +348,7 @@ fn compile_in<P: PipelineArtifact>(
     let output = run.result;
     // The artifact, when the worker reports one; the scratch directory goes once it is read.
     let artifact = match &output.result {
-        CompileResult::Compiled { artifact_bytes, .. } => {
+        CompileResult::Compiled { artifact_bytes } => {
             read_artifact(&artifact_path, *artifact_bytes)
                 .map_err(|error| WorkerFailure::Output(error, measured(run.elapsed)))?
         }
@@ -315,15 +363,7 @@ fn compile_in<P: PipelineArtifact>(
     );
     // The pipeline holds what it decoded (its blob included), so the bytes go now.
     drop(artifact);
-    let result = accepted
-        .and_then(|result| match result {
-            Ok(compiled) => request
-                .check_handles(&compiled.handles)
-                .map(|()| Ok(compiled))
-                .map_err(|error| format!("the compile worker's result: {error}")),
-            Err(refused) => Ok(Err(refused)),
-        })
-        .map_err(|error| WorkerFailure::Output(error, measured(run.elapsed)))?;
+    let result = accepted.map_err(|error| WorkerFailure::Output(error, measured(run.elapsed)))?;
     let measured = measured(run.elapsed);
     // The deadline covers decoding the result (worker recipe step 3): late is a timeout.
     if measured.elapsed > DEADLINE {
@@ -382,7 +422,7 @@ fn compile_input<'a>(
     }
 }
 
-/// The pipeline of `output` (with its handles) if this product compiled it, it answers the input
+/// The pipeline of `output` if this product compiled it, it answers the input
 /// of digest `input_sha256`, and its `artifact` (the bytes the worker wrote) is as long as the
 /// worker reported and loads for `device` as the kind `P`; an `Err` names why the result cannot
 /// be used.
@@ -391,7 +431,7 @@ fn accept<P: PipelineArtifact>(
     artifact: &[u8],
     input_sha256: &str,
     device: &Device,
-) -> Result<Result<Compiled<P>, NotCompiled>, String> {
+) -> Result<Result<P, NotCompiled>, String> {
     if output.product_fingerprint != TRANSLATOR_FINGERPRINT {
         return Err(format!(
             "the compile worker runs product {} and this process product \
@@ -410,10 +450,7 @@ fn accept<P: PipelineArtifact>(
             Ok(Err(NotCompiled::Product(outcome.clone(), detail.clone())))
         }
         CompileResult::Unmodelled { reason } => Ok(Err(NotCompiled::Unmodelled(reason.clone()))),
-        CompileResult::Compiled {
-            artifact_bytes,
-            handles,
-        } => {
+        CompileResult::Compiled { artifact_bytes } => {
             if u64::try_from(artifact.len()).ok() != Some(*artifact_bytes) {
                 return Err(format!(
                     "the compile worker reported a {artifact_bytes}-byte artifact and wrote {} bytes",
@@ -421,12 +458,7 @@ fn accept<P: PipelineArtifact>(
                 ));
             }
             P::from_bytes(artifact, device)
-                .map(|pipeline| {
-                    Ok(Compiled {
-                        pipeline,
-                        handles: handles.clone(),
-                    })
-                })
+                .map(Ok)
                 .map_err(artifact_refused)
         }
     }
@@ -521,7 +553,7 @@ fn serve(
             }
         }
     }
-    let device = match Device::new(decoded.description, decoded.policy) {
+    let device = match Device::from_queries(decoded.description, decoded.policy) {
         Ok(device) => device,
         Err(error) => return Ok(output(not_compiled(&error), None)),
     };
@@ -534,7 +566,7 @@ fn serve(
         )
     });
     let result = match compiled {
-        Ok(CompiledRequest { pipeline, handles }) => {
+        Ok(pipeline) => {
             let mut out = Counted {
                 out: artifact,
                 bytes: 0,
@@ -547,7 +579,6 @@ fn serve(
             .map_err(|error| format!("write the compile worker's artifact: {error}"))?;
             CompileResult::Compiled {
                 artifact_bytes: out.bytes,
-                handles,
             }
         }
         Err(PipelineCompileError::Product(error)) => not_compiled(&error),
@@ -578,7 +609,6 @@ mod tests {
     use super::*;
     use crate::acceptance::RequestFunction;
     use crate::worker::MEMORY_LIMIT_BYTES;
-    use metal2vulkan::bind::BindShape;
     use metal2vulkan_devtools::{engine_dir, llvm_assemble, AssembleError};
 
     fn fixture(name: &str) -> Option<Vec<u8>> {
@@ -655,11 +685,8 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
         let pipeline = accept::<ComputePipeline>(&output, &artifact, &digest, device.device())
             .unwrap()
-            .unwrap()
-            .pipeline;
-        let expected = compile_pipeline(&[&bitcode], &request, device.device(), None)
-            .unwrap()
-            .pipeline;
+            .unwrap();
+        let expected = compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap();
         let AcceptancePipeline::Compute(expected) = expected else {
             panic!("a kernel compiles to a compute pipeline");
         };
@@ -677,7 +704,6 @@ mod tests {
         let request = PipelineRequest::Row {
             entry: "stage_io_vertex_position".into(),
             stage: crate::acceptance::RowStage::Vertex,
-            projection: crate::acceptance::Projection::Derived,
             constants: Default::default(),
         };
         let (bytes, digest) = input(&device, &stage_io, request.clone());
@@ -686,12 +712,9 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
         let pipeline = accept::<RenderPipeline>(&output, &artifact, &digest, device.device())
             .unwrap()
-            .unwrap()
-            .pipeline;
+            .unwrap();
         let AcceptancePipeline::Render(expected) =
-            compile_pipeline(&[&stage_io], &request, device.device(), None)
-                .unwrap()
-                .pipeline
+            compile_pipeline(&[&stage_io], &request, device.device(), None).unwrap()
         else {
             panic!("a vertex function compiles to a vertex-only render pipeline");
         };
@@ -700,103 +723,6 @@ mod tests {
         let refused =
             accept::<ComputePipeline>(&output, &artifact, &digest, device.device()).unwrap_err();
         assert!(refused.contains("artifact"), "{refused}");
-    }
-
-    /// A kernel with a storage texture crosses the exchange with the bind shape it is compiled
-    /// for: the worker answers the texture's format input from the shape, and its pipeline is the
-    /// one compiled in process, whose plan of that shape asks for exactly the inputs it was
-    /// compiled with.
-    #[test]
-    fn a_bound_compute_request_crosses_the_exchange_with_its_shape() {
-        use crate::candidate::engine::{compute_shape, variants, ComputeCase, ComputeOutput};
-        let Some(bitcode) = fixture("texture_ops.ll") else {
-            return;
-        };
-        // SwiftShader reads storage images only with a format, so the texture needs its input.
-        let device = worker_device("swiftshader");
-        let case = ComputeCase {
-            out_of_bounds: Vec::new(),
-            creation_bound: crate::budgets::PIPELINE_CREATION_CEILING,
-            entry: "read_write_fence".into(),
-            constants: FunctionConstantValues::defaults(),
-            buffers: Default::default(),
-            rate_maps: Default::default(),
-            argument_buffer_buffers: Default::default(),
-            argument_buffer_rate_maps: Default::default(),
-            argument_buffer_textures: Default::default(),
-            argument_buffer_samplers: Default::default(),
-            objects: Default::default(),
-            command_buffers: Default::default(),
-            textures: [(
-                0,
-                crate::literal::LiteralTexture {
-                    binding: 0,
-                    role: crate::case::ResourceRole::InOut,
-                    texture_type: crate::case::TextureType::D2,
-                    format: crate::case::TextureFormat::Rgba32Uint,
-                    dimensions: [2, 2, 1],
-                    sample_count: 1,
-                    bytes: vec![0; 64],
-                    sparse: None,
-                    mip_levels: 1,
-                },
-            )]
-            .into(),
-            samplers: Default::default(),
-            function_tables: Default::default(),
-            acceleration_structures: Default::default(),
-            threadgroup_lengths: Default::default(),
-            imageblock: None,
-            tile: None,
-            stage_input: None,
-            stage_in_region: None,
-            attribute_strides: Default::default(),
-            dispatch: metal2vulkan::bind::Dispatch::Threads {
-                threads: [2, 2, 1],
-                threads_per_group: [1, 1, 1],
-            },
-            output: ComputeOutput::None,
-        };
-        let shape = compute_shape(&case, false).unwrap();
-        let request = PipelineRequest::BoundCompute {
-            function: RequestFunction::new(case.entry.as_str(), case.constants.clone()),
-            shape: shape.clone(),
-            dispatch: None,
-            stage_input: None,
-            tile: None,
-            replay: false,
-        };
-        let (bytes, digest) = input(&device, &bitcode, request.clone());
-        let (output, artifact) = served(&bytes, Instant::now()).unwrap();
-        let output: CompileOutput =
-            serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
-        let pipeline = accept::<ComputePipeline>(&output, &artifact, &digest, device.device())
-            .unwrap()
-            .unwrap()
-            .pipeline;
-        let AcceptancePipeline::Compute(expected) =
-            compile_pipeline(&[&bitcode], &request, device.device(), None)
-                .unwrap()
-                .pipeline
-        else {
-            panic!("a kernel compiles to a compute pipeline");
-        };
-        assert_eq!(pipeline, *expected);
-        let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
-        let function =
-            metal2vulkan::pipeline::FunctionDescriptor::new(library.function(&case.entry).unwrap());
-        let (_, inputs) = variants::compile_compute_for_shape(
-            device.device(),
-            &function,
-            &shape,
-            None,
-            None,
-            &metal2vulkan::Budget::standard(),
-        )
-        .unwrap();
-        assert!(!inputs.storage_images.is_empty(), "{inputs:?}");
-        let plan = pipeline.plan(device.device(), &shape).unwrap();
-        assert!(variants::compiled_for(&inputs, &plan.variant));
     }
 
     /// The narrow-attribute vertex case's draw crosses the exchange with the Metal oracle's
@@ -821,7 +747,6 @@ mod tests {
             &crate::check::interface::tests::vertex_buffers_at(&[0]),
             crate::candidate::engine::graphics::tests::WITHOUT_SLICE,
             None,
-            None,
         )
         .unwrap();
         let template = render_template(&case);
@@ -833,8 +758,6 @@ mod tests {
                 case.vertex.constants.clone(),
             ),
             template,
-            shape: Some(crate::candidate::engine::graphics::render_shape(&case, false).unwrap()),
-            form: crate::candidate::engine::variants::DrawForm::Bound,
         };
         let (bytes, digest) = input(&device, &bitcode, request.clone());
         let (output, artifact) = served(&bytes, Instant::now()).unwrap();
@@ -842,12 +765,9 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
         let pipeline = accept::<RenderPipeline>(&output, &artifact, &digest, device.device())
             .unwrap()
-            .unwrap()
-            .pipeline;
+            .unwrap();
         let AcceptancePipeline::Render(expected) =
-            compile_pipeline(&[&bitcode], &request, device.device(), None)
-                .unwrap()
-                .pipeline
+            compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap()
         else {
             panic!("a vertex draw compiles to a render pipeline");
         };
@@ -897,7 +817,6 @@ mod tests {
                 FunctionConstantValues::defaults(),
             ),
             template,
-            shape: None,
         };
         let device = worker_device("lavapipe");
         let libraries = [vertex.as_slice(), fragment.as_slice()];
@@ -907,12 +826,9 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&output).unwrap()).unwrap();
         let pipeline = accept::<RenderPipeline>(&output, &artifact, &digest, device.device())
             .unwrap()
-            .unwrap()
-            .pipeline;
+            .unwrap();
         let AcceptancePipeline::Render(expected) =
-            compile_pipeline(&libraries, &request, device.device(), None)
-                .unwrap()
-                .pipeline
+            compile_pipeline(&libraries, &request, device.device(), None).unwrap()
         else {
             panic!("a draw compiles to a render pipeline");
         };
@@ -927,9 +843,8 @@ mod tests {
     }
 
     /// A kernel's linked libraries cross the exchange after its own: the worker links the functions
-    /// the request names from them into the pipeline the in-process public API compiles, and
-    /// returns the product's table handles of those functions with it; an input without one of them
-    /// is the exchange's error, not a compile.
+    /// the request names from them into the pipeline the in-process public API compiles; an input
+    /// without one of them is the exchange's error, not a compile.
     #[test]
     fn a_linking_request_crosses_the_exchange_with_its_linked_libraries() {
         use crate::acceptance::LinkedLibrary;
@@ -940,7 +855,7 @@ mod tests {
             return;
         };
         let device = worker_device("lavapipe");
-        let request = PipelineRequest::BoundCompute {
+        let request = PipelineRequest::Kernel {
             function: RequestFunction {
                 entry: "linked_visible_caller".into(),
                 constants: FunctionConstantValues::defaults(),
@@ -953,11 +868,7 @@ mod tests {
                     },
                 ],
             },
-            shape: BindShape::default(),
-            dispatch: None,
-            stage_input: None,
-            tile: None,
-            replay: false,
+            threads_per_threadgroup: [32, 1, 1],
         };
         let libraries = [caller.as_slice(), functions.as_slice(), caller.as_slice()];
         let (bytes, digest) = libraries_input(&device, &libraries, request.clone());
@@ -968,12 +879,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let expected = compile_pipeline(&libraries, &request, device.device(), None).unwrap();
-        let AcceptancePipeline::Compute(pipeline) = &expected.pipeline else {
+        let AcceptancePipeline::Compute(pipeline) = &expected else {
             panic!("a kernel compiles to a compute pipeline");
         };
-        assert_eq!(&compiled.pipeline, &**pipeline);
-        assert_eq!(compiled.handles, expected.handles);
-        request.check_handles(&compiled.handles).unwrap();
+        assert_eq!(&compiled, &**pipeline);
 
         let (bytes, _) = libraries_input(&device, &libraries[..2], request);
         let refused = served(&bytes, Instant::now()).unwrap_err();
@@ -985,7 +894,7 @@ mod tests {
         let Some(bitcode) = fixture("store_const.ll") else {
             return;
         };
-        let device = worker_device("vk12-floor");
+        let device = worker_device("runtime-floor");
         for (source, entry, label) in [
             (bitcode.as_slice(), "no_such_entry", "invalid_descriptor"),
             (b"not bitcode".as_slice(), "main", "invalid_input"),
@@ -1117,12 +1026,9 @@ mod tests {
         let (output, artifact) = served(&bytes, Instant::now()).unwrap();
         let pipeline = accept::<ComputePipeline>(&output, &artifact, &digest, device.device())
             .unwrap()
-            .unwrap()
-            .pipeline;
+            .unwrap();
         let AcceptancePipeline::Compute(expected) =
-            compile_pipeline(&[&bitcode], &request, device.device(), None)
-                .unwrap()
-                .pipeline
+            compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap()
         else {
             panic!("a kernel compiles to a compute pipeline");
         };
@@ -1155,7 +1061,6 @@ mod tests {
             PipelineRequest::Row {
                 entry: "v".into(),
                 stage: crate::acceptance::RowStage::Vertex,
-                projection: crate::acceptance::Projection::Derived,
                 constants: Default::default(),
             },
         );
@@ -1211,15 +1116,12 @@ mod tests {
         }
     }
 
-    /// The variable that makes [`compile_worker_fixture`] a compile worker child, naming the
-    /// [`Probe`] it serves.
-    const PROBE: &str = "M2V_TEST_COMPILE_WORKER_PROBE";
-
     /// The compile path's limit probes: test-only requests a compile worker child serves in place
-    /// of a compile, each breaching one limit of the boundary. The child is this test binary
-    /// running [`compile_worker_fixture`], which counts its allocations (`alloc::tests` installs
-    /// the counting allocator), through the worker's own process (`worker::serve_process`); the
-    /// parent is [`compile_in`], as every tool's compile.
+    /// of a compile, each breaching one limit of the boundary. The child is the worker the lib's
+    /// device tests compile through (`CompileWorker::lib_tests`), this test binary running
+    /// [`compile_worker_fixture`], which counts its allocations (`alloc::tests` installs the
+    /// counting allocator), through the worker's own process (`worker::serve_process`); the
+    /// parent is [`compile`], as every tool's compile.
     #[derive(Clone, Copy, Debug)]
     enum Probe {
         /// Never answer: the deadline stops the worker.
@@ -1280,44 +1182,94 @@ mod tests {
         }
     }
 
-    /// A compile worker child when [`PROBE`] names a probe (the parent tests below start it);
-    /// otherwise nothing.
+    /// The lib test binary's compile worker child ([`CompileWorker::lib_tests`]) when
+    /// [`LIB_TESTS_ROLE`] is set: a compile ([`LIB_TESTS_SERVE`]), or the [`Probe`] it names,
+    /// served as a binary serves one ([`serve_if_requested`]) on a stack of a binary's main
+    /// thread ([`LIB_TESTS_STACK`]); otherwise nothing. It serves the compile worker alone: the
+    /// worker argument its parent passed is its last.
     #[test]
     fn compile_worker_fixture() {
-        let Some(probe) = std::env::var(PROBE)
-            .ok()
-            .and_then(|name| Probe::ALL.into_iter().find(|probe| probe.name() == name))
-        else {
+        let Ok(role) = std::env::var(LIB_TESTS_ROLE) else {
             return;
         };
-        let counting = alloc::installed() && !matches!(probe, Probe::Uncounted);
-        std::process::exit(crate::worker::serve_process(
-            "engine compile worker",
-            counting,
-            |input, started| probe.serve(input, started),
-        ));
+        assert_eq!(
+            std::env::args().next_back().as_deref(),
+            Some(WORKER_ARG),
+            "the lib test binary serves only the compile worker"
+        );
+        let probe = Probe::ALL.into_iter().find(|probe| probe.name() == role);
+        assert!(
+            probe.is_some() || role == LIB_TESTS_SERVE,
+            "{LIB_TESTS_ROLE} names no role: {role}"
+        );
+        let counting = alloc::installed() && !matches!(probe, Some(Probe::Uncounted));
+        let served = std::thread::Builder::new()
+            .stack_size(LIB_TESTS_STACK)
+            .spawn(move || {
+                crate::worker::serve_process("engine compile worker", counting, |input, started| {
+                    match probe {
+                        Some(probe) => probe.serve(input, started),
+                        None => serve_to_artifact_file(input, started),
+                    }
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        std::process::exit(served);
     }
 
-    /// Compile through a worker child that serves `probe`, as a tool compiles a kernel.
+    /// Compile through a worker child that serves `probe`, as a tool compiles a kernel: the lib
+    /// tests' worker ([`CompileWorker::lib_tests`]) serving it in place of a compile.
     fn compile_probe(probe: Probe) -> Result<WorkerCompile<ComputePipeline>, WorkerFailure> {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "worker::compile::tests::compile_worker_fixture",
-                "--nocapture",
-            ])
-            .env(PROBE, probe.name());
         let request = PipelineRequest::Compute {
             entry: "main".into(),
             constants: FunctionConstantValues::defaults(),
         };
-        compile_in(
-            command,
-            &worker_device("vk12-floor"),
+        compile(
+            &CompileWorker::lib_tests_as(&probe.name()).unwrap(),
+            &worker_device("runtime-floor"),
             &[crate::acceptance::retained(b"bitcode")],
             &request,
         )
+    }
+
+    /// The lib tests' worker ([`CompileWorker::lib_tests`]), the one their device tests compile
+    /// through, returns across the process boundary the pipeline the public API compiles in
+    /// process, with its counting allocator's peaks, as every binary that serves the worker does
+    /// (`tests/integration/compile_worker.rs`, through `corpus-pipeline`).
+    #[test]
+    fn the_lib_tests_worker_returns_the_pipeline_the_public_api_compiles() {
+        let Some(bitcode) = fixture("store_const.ll") else {
+            return;
+        };
+        let device = worker_device("moltenvk-m3");
+        let request = PipelineRequest::Compute {
+            entry: "store_const".into(),
+            constants: FunctionConstantValues::defaults(),
+        };
+        let AcceptancePipeline::Compute(expected) =
+            compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap()
+        else {
+            panic!("a kernel compiles to a compute pipeline");
+        };
+        let compiled = compile_compute(
+            &CompileWorker::lib_tests().unwrap(),
+            &device,
+            &crate::acceptance::retained(&bitcode),
+            "store_const",
+            &FunctionConstantValues::defaults(),
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.message()));
+        let pipeline = compiled.result.unwrap();
+        assert_eq!(pipeline, *expected);
+        assert!(compiled.allocator_peak.is_some_and(|peak| peak > 0));
+        assert!(compiled.measured.elapsed < DEADLINE);
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(compiled.measured.peak_resident_bytes.is_some());
+        }
+        let process_peak = compiled.measured.allocator_peak_bytes;
+        assert!(process_peak.is_some_and(|peak| peak >= compiled.allocator_peak.unwrap()));
     }
 
     /// A compile worker that never answers is stopped at the 20-second deadline, measured, and

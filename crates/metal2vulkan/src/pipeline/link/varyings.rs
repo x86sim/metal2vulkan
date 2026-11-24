@@ -17,28 +17,17 @@
 //!   stage writes, is `NeedsInput(ViewportIndex)`. The raw render target slice index
 //!   (`IoRole::RenderTargetArrayIndex`) is the same for `[[render_target_array_index]]`
 //!   (`LoweringInputs::render_target_array_index_varying`, `NeedsInput(RenderTargetArrayIndex)`),
-//!   which a vertex function writes in every variant, the one without `Layer` included. The window
-//!   depth (`IoRole::WindowDepth`) is such a varying too, read without perspective: a fragment
-//!   function that reads it was compiled for a draw whose vertex function writes it
-//!   (`LoweringInputs::window_depth_varying`), and one linked with another vertex function is
-//!   `NeedsInput(FramebufferFetch)`.
+//!   which a vertex function writes in every variant, the one without `Layer` included.
 //!   The primitive ID (`IoRole::PrimitiveId`) is such a varying, read flat: a fragment function
-//!   compiled for a device that cannot declare a fragment `PrimitiveId`, or for an emulated
-//!   post-tessellation vertex function, reads its `[[primitive_id]]` from it, and its pipeline's
+//!   compiled for a device that cannot declare a fragment `PrimitiveId` reads its
+//!   `[[primitive_id]]` from it, and its pipeline's
 //!   vertex function writes it, compiled under `LoweringInputs::primitive_id_varying`
 //!   (`NeedsInput(PrimitiveId)` otherwise, and for a fragment function that reads Vulkan's
 //!   `PrimitiveId` behind a vertex function that writes the varying). A mesh function writes none,
 //!   so a mesh render pipeline whose fragment function reads it is refused as needing
 //!   `geometryShader` or `tessellationShader`.
-//! - **Barycentric weights** (`IoRole::Barycentric`), which a fragment function compiled for a
-//!   device without `fragmentShaderBarycentric` reads and the pipeline's synthesized geometry
-//!   stage writes (`link::geometry`), no vertex function: each takes one whole location after
-//!   every vertex output's, below `maxFragmentInputComponents / 4`, and is never packed. A
-//!   fragment function alone numbers them with its other inputs.
 //! - **Mesh outputs**, per vertex and per primitive alike, are numbered densely in output order,
-//!   one location each at component 0, within `maxMeshOutputComponents / 4` locations
-//!   (`maxVertexOutputComponents / 4` for an emulated mesh function's, which its pipeline's
-//!   synthesized vertex stage writes). In a mesh render pipeline each fragment input takes the
+//!   one location each at component 0, within `maxMeshOutputComponents / 4` locations. In a mesh render pipeline each fragment input takes the
 //!   number of the mesh output of its key and type (`UnmatchedVarying` without one), below
 //!   `maxFragmentInputComponents / 4`; the raw indices follow the vertex rule above. The fragment
 //!   function reads per primitive exactly the inputs whose keys the mesh function writes per
@@ -141,9 +130,6 @@ fn check_roles(stage: Stage, io: &StageIo) -> Result<(), Error> {
                             ..
                         } | IoRole::ViewportIndex
                             | IoRole::RenderTargetArrayIndex
-                            | IoRole::WindowDepth
-                            | IoRole::SelectedLayer
-                            | IoRole::SelectedViewport
                             | IoRole::PrimitiveId
                             | IoRole::MergedCommand
                     )
@@ -159,8 +145,6 @@ fn check_roles(stage: Stage, io: &StageIo) -> Result<(), Error> {
                             ..
                         } | IoRole::ViewportIndex
                             | IoRole::RenderTargetArrayIndex
-                            | IoRole::WindowDepth
-                            | IoRole::Barycentric { .. }
                             | IoRole::PrimitiveId
                             | IoRole::MergedCommand
                     )
@@ -203,21 +187,13 @@ fn check_raw_indices(v: &StageIo, f: &StageIo) -> Result<(), Error> {
             return Err(Error::NeedsInput(input));
         }
     }
-    // The window depth: compiled for a draw whose vertex function writes it.
-    let writes = v.outputs.iter().any(|x| x.role == IoRole::WindowDepth);
-    let reads = f.inputs.iter().any(|x| x.role == IoRole::WindowDepth);
-    if reads && !writes {
-        return Err(Error::NeedsInput(RuntimeInput::FramebufferFetch));
-    }
     Ok(())
 }
 
 /// The fragment function reads `[[primitive_id]]` from its varying (`IoRole::PrimitiveId`)
 /// exactly where the vertex function `vertex` writes it (see the module docs): a vertex function
 /// compiled without `LoweringInputs::primitive_id_varying` behind one that reads it, and one that
-/// writes it (an emulated post-tessellation vertex function, behind which Vulkan's `PrimitiveId`
-/// counts the tessellator's triangles) behind one that reads Vulkan's `PrimitiveId`, are
-/// `NeedsInput(PrimitiveId)`; a fragment function linked alone reads it as any other input. A mesh
+/// writes it behind one that reads Vulkan's `PrimitiveId`, are `NeedsInput(PrimitiveId)`; a fragment function linked alone reads it as any other input. A mesh
 /// function writes none, and a mesh render pipeline whose fragment function reads the varying is
 /// refused as needing a device that declares a fragment `PrimitiveId`.
 fn check_primitive_id(
@@ -350,17 +326,13 @@ pub fn assign(stages: &[&FunctionArtifact], p: &DeviceProfile) -> Result<Locatio
     let mut vertex: Option<&StageIo> = None;
     let mut fragment: Option<&StageIo> = None;
     let mut mesh: Option<&StageIo> = None;
-    let mut emulated_mesh = false;
     for a in stages {
         let io = &a.interface.io;
         check_roles(a.interface.stage, io)?;
         match a.interface.stage {
             Stage::Vertex => vertex = Some(io),
             Stage::Fragment => fragment = Some(io),
-            Stage::Mesh => {
-                mesh = Some(io);
-                emulated_mesh = a.interface.mesh_records.is_some();
-            }
+            Stage::Mesh => mesh = Some(io),
             Stage::Kernel | Stage::Object => {}
         }
     }
@@ -376,18 +348,13 @@ pub fn assign(stages: &[&FunctionArtifact], p: &DeviceProfile) -> Result<Locatio
     let mut table = Locations::new();
     if let Some(m) = mesh {
         let need = m.outputs.len() as u64;
-        let (limit, available) = match emulated_mesh {
-            true => (
-                VkLimit::MaxVertexOutputComponents,
-                l.max_vertex_output_components,
-            ),
-            false => (
-                VkLimit::MaxMeshOutputComponents,
-                l.mesh.max_mesh_output_components,
-            ),
-        };
+        let available = l.mesh.max_mesh_output_components;
         if need.saturating_mul(4) > u64::from(available) {
-            return Err(limit_error(limit, need, available));
+            return Err(limit_error(
+                VkLimit::MaxMeshOutputComponents,
+                need,
+                available,
+            ));
         }
         for (n, x) in m.outputs.iter().enumerate() {
             table.insert(x.key.clone(), (n as u32, 0));
@@ -449,29 +416,8 @@ pub fn assign(stages: &[&FunctionArtifact], p: &DeviceProfile) -> Result<Locatio
             }
         }
     };
-    let mut next = placed.iter().map(|at| at.0 + 1).max().unwrap_or(0);
     for (v, at) in varyings.iter().zip(placed) {
         table.insert(v.key.clone(), at);
-    }
-    // The barycentric weights a synthesized geometry stage writes: whole locations after the
-    // vertex outputs', which a fragment function alone numbered with its other inputs.
-    if vertex.is_some() {
-        let mut weights = false;
-        for x in fragment.into_iter().flat_map(|f| &f.inputs) {
-            if matches!(x.role, IoRole::Barycentric { .. }) {
-                table.insert(x.key.clone(), (next, 0));
-                next += 1;
-                weights = true;
-            }
-        }
-        if weights && u64::from(next).saturating_mul(4) > u64::from(l.max_fragment_input_components)
-        {
-            return Err(limit_error(
-                VkLimit::MaxFragmentInputComponents,
-                u64::from(next),
-                l.max_fragment_input_components,
-            ));
-        }
     }
     Ok(table)
 }
@@ -485,31 +431,17 @@ fn varyings<'a>(
 ) -> Result<Vec<Varying<'a>>, Error> {
     let interpolation = |x: &crate::pipeline::stage_io::IoVariable| match &x.role {
         IoRole::Varying { interpolation, .. } => *interpolation,
-        // A fragment input: a raw index is read flat. A selected index, which only the
-        // synthesized geometry stage reads, is a flat integer too.
+        // A fragment input: a raw index is read flat.
         IoRole::ViewportIndex
         | IoRole::RenderTargetArrayIndex
-        | IoRole::SelectedLayer
-        | IoRole::SelectedViewport
         | IoRole::PrimitiveId
         | IoRole::MergedCommand => Some(Interpolation::Flat),
-        // The window depth is read without perspective, at the centre and at a sample.
-        IoRole::WindowDepth => Some(Interpolation::Smooth {
-            sampling: crate::pipeline::stage_io::Sampling::Center,
-            perspective: false,
-        }),
-        IoRole::Barycentric { perspective } => Some(Interpolation::Smooth {
-            sampling: crate::pipeline::stage_io::Sampling::Center,
-            perspective: *perspective,
-        }),
         IoRole::Attribute { .. } | IoRole::Color { .. } | IoRole::PrimitiveVarying { .. } => None,
     };
-    // The barycentric weights are the synthesized geometry stage's, no vertex output's.
     let reads: BTreeMap<&VaryingKey, (IoType, Option<Interpolation>)> = fragment
         .map(|f| {
             f.inputs
                 .iter()
-                .filter(|x| !matches!(x.role, IoRole::Barycentric { .. }))
                 .map(|x| (&x.key, (x.ty, interpolation(x))))
                 .collect()
         })

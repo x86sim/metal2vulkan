@@ -5,6 +5,9 @@
 //! `--cfg m2v_cpu_icd` (a CPU Vulkan ICD such as lavapipe). They are cfgs, not features, because
 //! the ordinary gate builds with `--all-features`.
 
+// The Metal oracle's compile deadline, which runs its tools through the corpus worker's process
+// groups: absent on Windows, as the worker is.
+#[cfg(not(windows))]
 pub mod compile;
 mod device_type;
 pub mod tripwire;
@@ -46,13 +49,13 @@ mod tests {
     }
 
     /// Every device open goes through one of the functions that check the hang tripwire first:
-    /// validation's Vulkan context, the Metal platform, the device validation makes through the
-    /// runtime (`candidate::runtime_case::open_device`, which the runtime lane and the executor's
-    /// runtime path share), and the present tests' own device, which the runtime adopts. A new raw
-    /// open anywhere else in the crate fails here, before it can run.
+    /// validation's Vulkan context, the Metal platform, and the runtime's device in the player
+    /// and in the replay tests, each after the tripwire check in its own file. A new raw open
+    /// anywhere else in the crate fails here, before it can run, and so does a runtime open
+    /// ahead of its check.
     #[test]
     fn device_opens_exist_only_behind_the_tripwire_check() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = metal2vulkan_devtools::validation_dir();
         let mut files = Vec::new();
         rust_sources(&root.join("src"), &mut files);
         rust_sources(&root.join("tests"), &mut files);
@@ -63,27 +66,34 @@ mod tests {
             concat!(".create_", "instance("),
             concat!(".enumerate_", "physical_devices("),
             concat!(".create_", "device("),
-            // The runtime's own device creation (`metal2vulkan_runtime`).
-            concat!("::system_", "default"),
-            concat!("Device::", "all"),
+            // The runtime's device creation (`metal2vulkan_runtime`).
+            concat!("metal2vulkan_runtime::Device", "::new("),
         ];
         let allowed: &[(&str, &str, usize)] = &[
             ("src/candidate/platform/device.rs", opens[2], 1),
             ("src/candidate/platform/device.rs", opens[3], 1),
             ("src/candidate/platform/device.rs", opens[4], 1),
             ("src/metal/platform.rs", opens[0], 1),
-            ("src/candidate/runtime_case.rs", opens[5], 1),
-            ("src/candidate/runtime_case.rs", opens[6], 1),
-            // The present tests' own device, which the runtime adopts.
-            ("src/runtime_lane/presenting.rs", opens[2], 1),
-            ("src/runtime_lane/presenting.rs", opens[3], 1),
-            ("src/runtime_lane/presenting.rs", opens[4], 1),
+            // The runtime's device: the player's and the replay tests'.
+            ("src/bin/command-replay.rs", opens[5], 1),
+            ("src/replay/rt_replay.rs", opens[5], 1),
+            // The runtime's device: the engine executor's run through it.
+            ("src/candidate/platform/runtime.rs", opens[5], 1),
         ];
+        let checked = concat!("refuse_if", "_tripped(");
+        for (file, open, _) in allowed.iter().filter(|(_, open, _)| *open == opens[5]) {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            let check = text.find(checked);
+            assert!(
+                check.is_some_and(|at| text.find(open).is_some_and(|open| at < open)),
+                "{file} opens the runtime's device without the hang tripwire check before it"
+            );
+        }
         let mut found = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
             let relative = file
-                .strip_prefix(root)
+                .strip_prefix(&root)
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -109,7 +119,7 @@ mod tests {
     /// unbounded one anywhere in the crate fails here.
     #[test]
     fn metal_compilations_run_under_the_compile_deadline() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = metal2vulkan_devtools::validation_dir();
         let mut files = Vec::new();
         rust_sources(&root.join("src"), &mut files);
         rust_sources(&root.join("tests"), &mut files);
@@ -149,7 +159,7 @@ mod tests {
     /// supervises its process group.
     #[test]
     fn xcrun_runs_only_under_the_compile_deadline() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = metal2vulkan_devtools::validation_dir();
         let mut files = Vec::new();
         rust_sources(&root.join("src"), &mut files);
         rust_sources(&root.join("tests"), &mut files);
@@ -176,7 +186,7 @@ mod tests {
     /// wait anywhere else in the crate (sources, tests, binaries) fails here.
     #[test]
     fn device_waits_exist_only_in_the_bounded_wait_module() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = metal2vulkan_devtools::validation_dir();
         let mut files = Vec::new();
         rust_sources(&root.join("src"), &mut files);
         rust_sources(&root.join("tests"), &mut files);

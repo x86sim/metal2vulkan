@@ -6,17 +6,15 @@
 //!   `[[position]]`'s x and y as `floor(FragCoord.xy) + 0.5` and, where the device has
 //!   interpolation functions, each center varying through `InterpolateAtOffset` at offset 0, the
 //!   pixel center Metal reads in every invocation, at sample rate or not. The pipeline then
-//!   requires `VkProperty::InterpolateAtOffsetCentered`, and on a portability-subset device
-//!   `shaderSampleRateInterpolationFunctions`. A device that reads center varyings at the pixel
-//!   center itself, as Metal does (`VkProperty::MetalCenterVaryings`, the MoltenVK captures), reads
-//!   them as they are, and the pipeline requires that property instead. A center varying read at
-//!   sample rate elsewhere is refused naming what the device lacks of those: on a MoltenVK release
-//!   not measured with that read, whose `InterpolateAtOffset` reads off the center (its driver's),
-//!   the property.
-//! - A function that writes memory, which Metal runs once per covered sample, runs under the
-//!   pipeline's sample shading (`GraphicsState::sample_shading`, needing `sampleRateShading`).
-//! - A per-sample function (that one, or one that reads `[[sample_id]]` or a sample-qualified
-//!   varying) reads what has no pixel form under sample shading (`[[position]]`'s z and w, a
+//!   requires `VkProperty::InterpolateAtOffsetCentered`, which every device holds, and on a
+//!   portability-subset device `shaderSampleRateInterpolationFunctions`. A center varying read at
+//!   sample rate on a device without those interpolation functions is refused naming them.
+//! - A function that writes memory runs as the device runs it, at pixel rate where nothing else
+//!   makes it per-sample, and its fragment stage notes `PrecisionNote::DeviceFragmentRuns` at four
+//!   samples: Apple's GPUs were measured to run it once per covered sample, and documented Metal
+//!   names no count.
+//! - A per-sample function (one that reads `[[sample_id]]` or a sample-qualified varying) reads
+//!   what has no pixel form under sample shading (`[[position]]`'s z and w, a
 //!   centroid varying) where Vulkan evaluates it for its sample, and notes
 //!   `PrecisionNote::MultisamplePosition`, as Metal accepts it.
 //! - At one sample every function compiles as without multisampling.
@@ -27,18 +25,17 @@
 //!   plan sets to its sample count (the owned fixture `engine/spc_num_samples`).
 //!
 //! Every pipeline that compiles passes L3 (`spirv-val` and requirements within the profile) for
-//! each stage module; on `moltenvk-m3` as a device whose `InterpolateAtOffset` reads from the
-//! center the multisampled fragment modules also convert to MSL and compile as MoltenVK's do
+//! each stage module; on `moltenvk-m3` the multisampled fragment modules also convert to MSL and
+//! compile as MoltenVK's do
 //! (`spirv-cross` and `xcrun metal`, compile only). `llvm-as` assembles the fixtures; a missing
 //! tool skips visibly. No GPU is used.
 
 use std::path::Path;
 
-use crate::bind::BindState;
 use crate::budget::Budget;
 use crate::device::requirements::{VkExtension, VkFeature, VkProperty};
-use crate::device::{Device, DeviceDescription, DevicePolicy, DriverWorkaround};
-use crate::error::{Capability, Error, Feature, LowerFamily, Needs, Unsupported};
+use crate::device::{Device, DeviceDescription, DevicePolicy};
+use crate::error::{Capability, Error, Feature, Unsupported};
 use crate::library::Library;
 use crate::metal::{PixelFormat, VertexFormat};
 use crate::pipeline::artifact::PrecisionNote;
@@ -46,14 +43,10 @@ use crate::pipeline::descriptor::{
     ColorAttachmentDescriptor, FunctionDescriptor, RenderPipelineDescriptor, StageSource,
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
-use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::lower_inputs::LoweringInputs;
-use crate::pipeline::sym::SpecKey;
-use crate::pipeline::testing::{
-    compile, engine_dir, llvm_assemble, moltenvk_msl_compile, AssembleError, Scratch,
-};
+use crate::pipeline::testing::{engine_dir, llvm_assemble, moltenvk_msl_compile, AssembleError};
 use crate::pipeline::RenderPipeline;
-use crate::spirv::testing::{check_words_valid, MOLTENVK_CAPTURES};
+use crate::spirv::testing::check_words_valid;
 
 const VERTEX: &str = "multisample_vertex";
 const CENTER: &str = "multisample_center_at_sample";
@@ -208,12 +201,20 @@ fn noted(p: &RenderPipeline) -> bool {
         .contains(&PrecisionNote::MultisamplePosition)
 }
 
+/// Whether the fragment module of `p` notes `DeviceFragmentRuns`.
+fn noted_runs(p: &RenderPipeline) -> bool {
+    p.stages
+        .iter()
+        .find(|m| m.stage == crate::vk::ShaderStage::FRAGMENT)
+        .expect("fragment stage")
+        .precision_notes
+        .contains(&PrecisionNote::DeviceFragmentRuns)
+}
+
 /// The refusal of a per-sample function's center varying on a device that lacks `needs`.
 fn needs_pixel_form(needs: Vec<Capability>) -> Error {
     Unsupported::needs_any_of(Feature::SampleRateShading, vec![needs]).into()
 }
-
-const CENTERED: Capability = Capability::Property(VkProperty::InterpolateAtOffsetCentered);
 
 /// Whether `dev` has the pixel form of a center varying: interpolation functions whose
 /// `InterpolateAtOffset` reads from the center.
@@ -235,49 +236,24 @@ pub(super) fn pixel_form(dev: &Device) -> bool {
             .contains(&VkProperty::InterpolateAtOffsetCentered)
 }
 
-/// `moltenvk-m3` as a device whose `InterpolateAtOffset` reads from the center, as GLSL.std.450
-/// states: with a driver other than MoltenVK's, which has none of MoltenVK's measured deviations.
-fn centered_moltenvk() -> DeviceDescription {
-    let mut desc = description("moltenvk-m3");
-    desc.driver_id = None;
-    desc
-}
-
-/// `moltenvk-m3` as the Apple8 family under macOS 27 (`deviceID` 0x1B00_0208), a GPU no row of
-/// MoltenVK's center varyings names: its `InterpolateAtOffset` reads off the center (the
-/// driver's), and it does not take `DriverDeviation::MetalCenterVaryings`.
-fn unmeasured_moltenvk() -> DeviceDescription {
-    let mut desc = description("moltenvk-m3");
-    desc.device_id = 0x1B00_0208;
-    desc
-}
-
-/// Whether `dev` reads center varyings at the pixel center itself, as Metal does.
-pub(super) fn reads_center_at_pixel(dev: &Device) -> bool {
-    dev.profile()
-        .fields()
-        .enabled
-        .properties
-        .contains(&VkProperty::MetalCenterVaryings)
-}
-
 /// Every function at one and four samples on every committed profile: what compiles passes L3,
 /// reads the pixel center where Metal does, and what is refused is refused for its reason. A
-/// per-sample center varying compiles on every profile with `sampleRateShading`: through
-/// `InterpolateAtOffset` at offset 0 where that reads from the center, and as it is on the
-/// MoltenVK captures ([`MOLTENVK_CAPTURES`]), whose `InterpolateAtOffset` reads off the center
-/// and whose driver reads the varying at the pixel center itself. A per-sample `[[position]]` z
+/// per-sample center varying compiles on every profile with `sampleRateShading`, through
+/// `InterpolateAtOffset` at offset 0, which every device reads from the center. A per-sample
+/// `[[position]]` z
 /// and w, or centroid varying, compiles on every profile with `sampleRateShading` too, noting
-/// `MultisamplePosition`.
+/// `MultisamplePosition`. The function that writes memory compiles at pixel rate on every profile
+/// with fragment stores, its center varying read at the pixel where the device has the form, and
+/// notes `DeviceFragmentRuns` at four samples only.
 #[test]
 fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
     let Some(lib) = fixture() else { return };
     let mut checked = 0usize;
     let mut unformed = 0usize;
-    let mut biased = Vec::new();
-    let mut by_device_profiles = Vec::new();
+    let mut writers = 0usize;
     for stem in stems() {
-        let dev = Device::new(description(&stem), DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(description(&stem), DevicePolicy::RESIDENT_TABLES)
+            .expect("device");
         let fields = dev.profile().fields();
         let rate = fields.fragment.sample_rate_shading;
         let stores = fields.leaf.fragment_stores_and_atomics;
@@ -285,17 +261,13 @@ fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
             .enabled
             .extensions
             .contains(&VkExtension::KhrPortabilitySubset);
-        let centered = fields
-            .enabled
-            .properties
-            .contains(&VkProperty::InterpolateAtOffsetCentered);
-        if !centered {
-            biased.push(stem.clone());
-        }
-        let by_device = reads_center_at_pixel(&dev);
-        if by_device {
-            by_device_profiles.push(stem.clone());
-        }
+        assert!(
+            fields
+                .enabled
+                .properties
+                .contains(&VkProperty::InterpolateAtOffsetCentered),
+            "{stem}"
+        );
         for fragment in [CENTER, DEPTH, SAMPLED, CENTROID, COUNTER] {
             let sample_rate = fragment != COUNTER;
             let what = format!("{stem} {fragment}");
@@ -328,50 +300,33 @@ fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
                 !ext_insts(fragment_words(&one)).contains(&INTERPOLATE_AT_OFFSET),
                 "{what} at 1"
             );
+            assert!(!noted_runs(&one), "{what} at 1");
             let four = dev.compile_render_pipeline(&render(&lib, fragment, 4), &Budget::standard());
             match (fragment, four) {
                 (_, Err(Error::Unsupported(u))) if u.feature == Feature::RasterSampleCount => {
                     eprintln!("{what}: four samples are not a framebuffer sample count");
                 }
-                (CENTER | SAMPLED | COUNTER, Err(e)) if !centered && !by_device => {
-                    assert_eq!(e, needs_pixel_form(vec![CENTERED]), "{what}");
-                }
-                (CENTER | SAMPLED | COUNTER, Ok(p)) => {
-                    assert!(centered || by_device, "{what}");
+                (CENTER | SAMPLED, Ok(p)) => {
                     validate(&p, &dev, &what);
-                    // The device's own read is the pixel form where it reads center varyings at
-                    // the pixel center; elsewhere `InterpolateAtOffset` at offset 0 is.
+                    // `InterpolateAtOffset` at offset 0 is the pixel form.
                     let ext = ext_insts(fragment_words(&p));
-                    assert_eq!(
-                        ext.contains(&INTERPOLATE_AT_OFFSET),
-                        !by_device,
-                        "{what}: {ext:?}"
-                    );
+                    assert!(ext.contains(&INTERPOLATE_AT_OFFSET), "{what}: {ext:?}");
                     assert_eq!(ext.contains(&FLOOR), fragment != SAMPLED, "{what}: {ext:?}");
                     assert_eq!(
                         p.requirements
                             .features
                             .contains(&VkFeature::ShaderSampleRateInterpolationFunctions),
-                        portability && !by_device,
+                        portability,
                         "{what}"
                     );
-                    assert_eq!(
+                    assert!(
                         p.requirements
                             .properties
                             .contains(&VkProperty::InterpolateAtOffsetCentered),
-                        !by_device,
                         "{what}"
                     );
-                    assert_eq!(
-                        p.requirements
-                            .properties
-                            .contains(&VkProperty::MetalCenterVaryings),
-                        by_device,
-                        "{what}"
-                    );
-                    // Only the function that writes memory runs under the pipeline's sample
-                    // shading, which needs `sampleRateShading`.
-                    assert_eq!(p.graphics.sample_shading, fragment == COUNTER, "{what}");
+                    // Per sample through its input, which needs `sampleRateShading`.
+                    assert!(!noted_runs(&p), "{what}");
                     assert!(
                         p.requirements
                             .features
@@ -387,8 +342,8 @@ fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
                     assert!(noted(&p), "{what}");
                     let ext = ext_insts(fragment_words(&p));
                     assert!(!ext.contains(&INTERPOLATE_AT_OFFSET), "{what}: {ext:?}");
-                    // `[[sample_id]]` turns sample shading on itself; the pipeline does not.
-                    assert!(!p.graphics.sample_shading, "{what}");
+                    // `[[sample_id]]` turns sample shading on itself.
+                    assert!(!noted_runs(&p), "{what}");
                     assert!(
                         p.requirements
                             .features
@@ -397,15 +352,20 @@ fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
                     );
                     unformed += 1;
                 }
-                (COUNTER, Err(e)) => assert_eq!(
-                    e,
-                    Unsupported::needs(
-                        Feature::SampleRateShading,
-                        Capability::Feature(VkFeature::SampleRateShading)
-                    )
-                    .into(),
-                    "{what}"
-                ),
+                // The function that writes memory runs as the device runs it, at pixel rate, and
+                // reads its position and center varying as a pixel-rate function does.
+                (COUNTER, Ok(p)) => {
+                    validate(&p, &dev, &what);
+                    let ext = ext_insts(fragment_words(&p));
+                    assert!(ext.contains(&FLOOR), "{what}: {ext:?}");
+                    assert_eq!(
+                        ext.contains(&INTERPOLATE_AT_OFFSET),
+                        pixel_form(&dev),
+                        "{what}: {ext:?}"
+                    );
+                    assert!(noted_runs(&p), "{what}");
+                    writers += 1;
+                }
                 (_, other) => panic!("{what} at 4: {other:?}"),
             }
         }
@@ -418,31 +378,28 @@ fn multisampled_fragments_read_the_pixel_center_or_are_refused() {
         unformed > 0,
         "no profile compiled a per-sample read without a pixel form"
     );
-    assert_eq!(biased, MOLTENVK_CAPTURES);
-    assert_eq!(by_device_profiles, MOLTENVK_CAPTURES);
+    assert!(
+        writers > 0,
+        "no profile compiled the memory writer at four samples"
+    );
 }
 
 /// A pixel-rate function of a multisampled pipeline reads its center varyings at the pixel center
 /// too, where the device has the pixel form: Vulkan evaluates an undecorated input at an
 /// implementation-defined position in the pixel, Metal at its center. `stage_io_fragment` at four
 /// samples reads them through `InterpolateAtOffset` on every committed profile with interpolation
-/// functions and a centered offset, requiring the property, and as they are on each MoltenVK
-/// capture ([`MOLTENVK_CAPTURES`]), whose driver reads them at the pixel center itself, requiring
-/// `VkProperty::MetalCenterVaryings`; at one sample nowhere. (`roadmap-2022` and `vk12-floor` lack
-/// the pipeline's depth format.) The three lavapipe profiles refuse it at four
-/// samples: the function reads `[[sample_mask]]`, which lavapipe splits.
+/// functions, requiring the centered offset's property; at one sample nowhere. (`roadmap-2022` and
+/// `vk12-floor` lack the pipeline's depth format.)
 #[test]
 fn a_pixel_rate_center_varying_reads_the_pixel_center_where_the_device_has_the_form() {
     let Some(lib) = library("stage_io") else {
         return;
     };
-    let defect = DriverWorkaround::ClippedTrianglesSplitPixelFragments;
     let mut with_form = 0usize;
     let mut without_form = Vec::new();
-    let mut by_device_form = Vec::new();
-    let mut refused_split = Vec::new();
     for stem in stems() {
-        let dev = Device::new(description(&stem), DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(description(&stem), DevicePolicy::RESIDENT_TABLES)
+            .expect("device");
         for samples in [1, 4] {
             let what = format!("{stem} at {samples}");
             let p = match dev
@@ -453,18 +410,6 @@ fn a_pixel_rate_center_varying_reads_the_pixel_center_where_the_device_has_the_f
                     if samples == 1 || u.feature == Feature::RasterSampleCount =>
                 {
                     eprintln!("{what}: {u}");
-                    break;
-                }
-                Err(Error::Unsupported(u))
-                    if samples == 4
-                        && u.feature == Feature::PixelCoverage
-                        && u.needs == Needs::DriverDefect(defect) =>
-                {
-                    assert!(
-                        dev.profile().fields().workarounds.contains(&defect),
-                        "{what}"
-                    );
-                    refused_split.push(stem.clone());
                     break;
                 }
                 other => other.unwrap_or_else(|e| panic!("{what}: {e}")),
@@ -483,22 +428,11 @@ fn a_pixel_rate_center_varying_reads_the_pixel_center_where_the_device_has_the_f
                 form,
                 "{what}"
             );
-            let by_device = samples == 4 && reads_center_at_pixel(&dev);
-            assert_eq!(
-                p.requirements
-                    .properties
-                    .contains(&VkProperty::MetalCenterVaryings),
-                by_device,
-                "{what}"
-            );
-            // A pixel-rate function runs without sample shading.
-            assert!(!p.graphics.sample_shading, "{what}");
+            // A pixel-rate function that writes no memory runs as Metal's does.
+            assert!(!noted_runs(&p), "{what}");
             with_form += usize::from(form);
             if samples == 4 && !form {
                 without_form.push(stem.clone());
-            }
-            if by_device {
-                by_device_form.push(stem.clone());
             }
         }
     }
@@ -506,21 +440,15 @@ fn a_pixel_rate_center_varying_reads_the_pixel_center_where_the_device_has_the_f
         with_form > 0,
         "no profile read a pixel-rate center varying at the pixel"
     );
-    assert_eq!(without_form, MOLTENVK_CAPTURES);
-    assert_eq!(by_device_form, MOLTENVK_CAPTURES);
-    assert_eq!(
-        refused_split,
-        ["gate-lavapipe", "gate-lavapipe-x86_64", "lavapipe"]
-    );
+    assert_eq!(without_form, Vec::<String>::new());
 }
 
 /// A pixel-rate fragment function of a multisampled pipeline that reads a value Vulkan evaluates
 /// at an implementation-defined position in the fragment notes `MultisamplePosition`:
 /// `stage_io_fragment` reads `[[position]]`'s z and a centroid varying, beside a center varying it
-/// reads at the pixel through `InterpolateAtOffset` (`amd-780m-radv`) or as it is, which its driver
-/// reads at the pixel center (`moltenvk-m3`). The same pipeline at one sample, and the multisampled
-/// per-sample pipelines that read only through the pixel forms, note nothing. (lavapipe has the
-/// form too, but refuses this pipeline at four samples: the function reads `[[sample_mask]]`.)
+/// reads at the pixel through `InterpolateAtOffset` (`moltenvk-m3` and `amd-780m-radv`). The same
+/// pipeline at one sample, and the multisampled per-sample pipelines that read only through the
+/// pixel forms, note nothing.
 #[test]
 fn a_pixel_rate_read_at_an_unstated_position_is_noted() {
     let Some(lib) = fixture() else { return };
@@ -528,7 +456,8 @@ fn a_pixel_rate_read_at_an_unstated_position_is_noted() {
         return;
     };
     for stem in ["moltenvk-m3", "amd-780m-radv"] {
-        let dev = Device::new(description(stem), DevicePolicy::default()).expect("device");
+        let dev =
+            Device::from_queries(description(stem), DevicePolicy::RESIDENT_TABLES).expect("device");
         for samples in [1, 4] {
             let p = dev
                 .compile_render_pipeline(&stage_io_render(&stage_io, samples), &Budget::standard())
@@ -537,7 +466,7 @@ fn a_pixel_rate_read_at_an_unstated_position_is_noted() {
             assert_eq!(noted(&p), samples == 4, "{stem} at {samples}");
             assert_eq!(
                 ext_insts(fragment_words(&p)).contains(&INTERPOLATE_AT_OFFSET),
-                samples == 4 && stem == "amd-780m-radv",
+                samples == 4,
                 "{stem} at {samples}"
             );
         }
@@ -565,14 +494,14 @@ fn programmable_blending_beside_position_w_compiles_noted() {
     };
     let mut compiled = Vec::new();
     for stem in stems() {
-        let dev = Device::new(description(&stem), DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(description(&stem), DevicePolicy::RESIDENT_TABLES)
+            .expect("device");
         let what = format!("{stem} {FETCH_DEPTH}");
         let d = render_after(&lib, FETCH_VERTEX, FETCH_DEPTH, 4);
         match dev.compile_render_pipeline(&d, &Budget::standard()) {
             Ok(p) => {
                 validate(&p, &dev, &what);
                 assert!(noted(&p), "{what}");
-                assert!(p.graphics.reads_position_depth, "{what}");
                 compiled.push(stem);
             }
             Err(Error::Unsupported(u)) => assert!(
@@ -596,16 +525,16 @@ fn programmable_blending_beside_position_w_compiles_noted() {
 
 /// The interface states what link needs: whether the function was compiled for a multisampled
 /// pipeline, reads a center varying at the pixel, and may read `[[position]]`'s z or w (anything
-/// but an extract or a shuffle of its x and y lanes, from either shuffle operand). A center varying
-/// is read at the pixel through `InterpolateAtOffset` on lavapipe and as it is on `moltenvk-m3`,
-/// whose driver reads it at the pixel center.
+/// but an extract or a shuffle of its x and y lanes, from either shuffle operand), on lavapipe and
+/// on `moltenvk-m3`.
 #[test]
 fn the_interface_states_the_pixel_reads() {
     let Some(lib) = fixture() else { return };
     let mut multisampled = LoweringInputs::new();
     multisampled.multisampled = true;
     for stem in ["lavapipe", "moltenvk-m3"] {
-        let dev = Device::new(description(stem), DevicePolicy::default()).expect("device");
+        let dev =
+            Device::from_queries(description(stem), DevicePolicy::RESIDENT_TABLES).expect("device");
         // (function, reads z or w, reads a center varying)
         for (fragment, depth, center) in [
             (CENTER, false, true),
@@ -633,37 +562,27 @@ fn the_interface_states_the_pixel_reads() {
     }
 }
 
-/// On `moltenvk-m3` as a GPU whose driver is not measured to read center varyings at the pixel
-/// center itself, a per-sample function's center varying has a pixel form only where both a
-/// centered `InterpolateAtOffset` and the portability member allow it, and is refused naming what
-/// the device lacks of the two: as a device whose offset reads from the center the pipeline
-/// compiles, requires the member, and converts to MSL that Metal compiles; whatever the device, the
-/// pipeline of the same function at one sample compiles without either.
+/// On `moltenvk-m3`, a portability-subset device, a per-sample function's center varying has a
+/// pixel form only where the portability member allows it, and is refused naming the member: with
+/// it the pipeline compiles, requires the member and the centered offset, and converts to MSL that
+/// Metal compiles; either way, the pipeline of the same function at one sample compiles without
+/// either. The memory writer runs at pixel rate: with the member it reads its center varying
+/// through the same pixel form, and without it where the device evaluates it, noting
+/// `MultisamplePosition`, rather than being refused.
 #[test]
-fn a_center_varying_at_sample_rate_needs_a_centered_offset_and_the_interpolation_functions() {
+fn a_center_varying_at_sample_rate_needs_the_interpolation_functions() {
     let Some(lib) = fixture() else { return };
     let feature = VkFeature::ShaderSampleRateInterpolationFunctions;
-    for (biased, withheld) in [(true, false), (true, true), (false, true), (false, false)] {
-        let mut desc = if biased {
-            unmeasured_moltenvk()
-        } else {
-            centered_moltenvk()
-        };
+    for withheld in [true, false] {
+        let mut desc = description("moltenvk-m3");
         if withheld {
             assert!(desc.features.remove(&feature));
         }
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-        let mut needs = Vec::new();
-        if biased {
-            needs.push(CENTERED);
-        }
-        if withheld {
-            needs.push(Capability::Feature(feature));
-        }
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         for fragment in [CENTER, SAMPLED, COUNTER] {
-            let what = format!("{fragment} biased={biased} withheld={withheld}");
+            let what = format!("{fragment} withheld={withheld}");
             let four = dev.compile_render_pipeline(&render(&lib, fragment, 4), &Budget::standard());
-            if needs.is_empty() {
+            if !withheld {
                 let p = four.unwrap_or_else(|e| panic!("{what}: {e}"));
                 validate(&p, &dev, &what);
                 assert!(p.requirements.features.contains(&feature), "{what}");
@@ -679,10 +598,15 @@ fn a_center_varying_at_sample_rate_needs_a_centered_offset_and_the_interpolation
                     Err(AssembleError::Missing(why)) => eprintln!("SKIPPED: {why}"),
                     Err(AssembleError::Rejected(why)) => panic!("{what}: MoltenVK's MSL: {why}"),
                 }
+            } else if fragment == COUNTER {
+                let p = four.unwrap_or_else(|e| panic!("{what}: {e}"));
+                validate(&p, &dev, &what);
+                assert!(!p.requirements.features.contains(&feature), "{what}");
+                assert!(noted(&p), "{what}");
             } else {
                 assert_eq!(
                     four.map(|_| ()),
-                    Err(needs_pixel_form(needs.clone())),
+                    Err(needs_pixel_form(vec![Capability::Feature(feature)])),
                     "{what}"
                 );
             }
@@ -698,218 +622,5 @@ fn a_center_varying_at_sample_rate_needs_a_centered_offset_and_the_interpolation
                 "{what}"
             );
         }
-    }
-}
-
-/// A MoltenVK device is biased by its driver alone, as `vulkaninfo --json` describes it on a
-/// MoltenVK host, so no translation for it emits `InterpolateAtOffset` 1/16 pixel off the center.
-/// On a GPU measured to read center varyings at the pixel center itself (the M4's identity) a
-/// per-sample center varying is read as it is; on an unmeasured one (the Apple8 family) it is
-/// refused naming the property. A pixel-rate one reads as it is on either.
-#[test]
-fn a_moltenvk_device_is_biased_by_its_driver() {
-    let Some(lib) = fixture() else { return };
-    let stage_io = library("stage_io");
-    for (desc, measured) in [
-        (description("moltenvk-m3"), true),
-        (unmeasured_moltenvk(), false),
-    ] {
-        assert_eq!(desc.driver_id, Some(crate::vk::DriverId::MOLTENVK));
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-        assert!(!dev
-            .profile()
-            .fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::InterpolateAtOffsetCentered));
-        assert_eq!(reads_center_at_pixel(&dev), measured);
-        for fragment in [CENTER, SAMPLED, COUNTER] {
-            let what = format!("{fragment} measured={measured}");
-            let four = dev.compile_render_pipeline(&render(&lib, fragment, 4), &Budget::standard());
-            if measured {
-                let p = four.unwrap_or_else(|e| panic!("{what}: {e}"));
-                validate(&p, &dev, &what);
-                assert!(
-                    !ext_insts(fragment_words(&p)).contains(&INTERPOLATE_AT_OFFSET),
-                    "{what}"
-                );
-            } else {
-                assert_eq!(
-                    four.map(|_| ()),
-                    Err(needs_pixel_form(vec![CENTERED])),
-                    "{what}"
-                );
-            }
-        }
-        let Some(stage_io) = &stage_io else {
-            continue;
-        };
-        let p = dev
-            .compile_render_pipeline(&stage_io_render(stage_io, 4), &Budget::standard())
-            .expect("pixel-rate pipeline");
-        validate(&p, &dev, "stage_io at 4");
-        assert!(!ext_insts(fragment_words(&p)).contains(&INTERPOLATE_AT_OFFSET));
-    }
-}
-
-/// Where the driver reads a center varying at the pixel center itself, as Metal does (the
-/// MoltenVK captures), a per-sample function reads its center varyings as they are: the pipeline
-/// compiles at four samples with no `InterpolateAtOffset` and no interpolation function
-/// requirement, requires `VkProperty::MetalCenterVaryings` and not
-/// `InterpolateAtOffsetCentered`, compiles with the portability member withheld too, and
-/// converts to MSL that gives each center varying no interpolation qualifier (Metal's
-/// `center_perspective`) and that Metal compiles.
-#[test]
-fn a_center_varying_at_sample_rate_reads_as_it_is_where_the_driver_reads_it_at_the_pixel() {
-    let Some(lib) = fixture() else { return };
-    let feature = VkFeature::ShaderSampleRateInterpolationFunctions;
-    for stem in MOLTENVK_CAPTURES {
-        for withheld in [false, true] {
-            let mut desc = description(stem);
-            if withheld {
-                assert!(desc.features.remove(&feature), "{stem}");
-            }
-            let dev = Device::new(desc, DevicePolicy::default()).expect("device");
-            assert!(reads_center_at_pixel(&dev), "{stem}");
-            for fragment in [CENTER, SAMPLED, COUNTER] {
-                let what = format!("{stem} {fragment} withheld={withheld}");
-                let p = dev
-                    .compile_render_pipeline(&render(&lib, fragment, 4), &Budget::standard())
-                    .unwrap_or_else(|e| panic!("{what}: {e}"));
-                validate(&p, &dev, &what);
-                let words = fragment_words(&p);
-                assert!(!ext_insts(words).contains(&INTERPOLATE_AT_OFFSET), "{what}");
-                assert!(!p.requirements.features.contains(&feature), "{what}");
-                assert!(
-                    p.requirements
-                        .properties
-                        .contains(&VkProperty::MetalCenterVaryings),
-                    "{what}"
-                );
-                assert!(
-                    !p.requirements
-                        .properties
-                        .contains(&VkProperty::InterpolateAtOffsetCentered),
-                    "{what}"
-                );
-                // SPIRV-Cross states no interpolation qualifier for an undecorated input, and
-                // interpolates nothing at an offset.
-                match crate::pipeline::testing::moltenvk_msl(words) {
-                    Ok(msl) => {
-                        assert!(!msl.contains("interpolate_at_offset"), "{what}: {msl}");
-                        assert!(!msl.contains("centroid_"), "{what}: {msl}");
-                        let user = msl.lines().filter(|l| l.contains("[[user(")).count();
-                        let qualified = msl
-                            .lines()
-                            .filter(|l| l.contains("[[user(") && l.contains("perspective"))
-                            .count();
-                        assert!(user > qualified, "{what}: {msl}");
-                    }
-                    Err(AssembleError::Missing(why)) => eprintln!("SKIPPED: {why}"),
-                    Err(AssembleError::Rejected(why)) => panic!("{what}: spirv-cross: {why}"),
-                }
-                match moltenvk_msl_compile(words) {
-                    Ok(()) => {}
-                    Err(AssembleError::Missing(why)) => eprintln!("SKIPPED: {why}"),
-                    Err(AssembleError::Rejected(why)) => panic!("{what}: MoltenVK's MSL: {why}"),
-                }
-            }
-        }
-    }
-}
-
-/// The value of the planned specialization constant `key` of `p`.
-pub(super) fn planned(p: &RenderPipeline, plan: &crate::bind::BindingPlan, key: SpecKey) -> u32 {
-    let id = p
-        .stages
-        .iter()
-        .flat_map(|m| m.specialization.constants.iter())
-        .find(|c| c.key == key)
-        .unwrap_or_else(|| panic!("no {key:?} constant"))
-        .id;
-    let e = plan
-        .specialization
-        .entries
-        .iter()
-        .find(|e| e.constant_id == id)
-        .unwrap_or_else(|| panic!("no {key:?} entry"));
-    let at = e.offset as usize;
-    u32::from_le_bytes(
-        plan.specialization.data[at..at + 4]
-            .try_into()
-            .expect("4 bytes"),
-    )
-}
-
-/// `get_num_samples()` (`air.get_num_samples.i32` with operand 0, the owned fixture
-/// `engine/spc_num_samples`) reads the `SampleCount` specialization constant, default 1,
-/// and states `RuntimeFact::SampleCount`; a render pipeline's plan sets it to the pipeline's
-/// sample count, at one and at four samples. Another operand has no established meaning and is
-/// refused.
-#[test]
-fn get_num_samples_reads_the_pipeline_sample_count() {
-    let Some(ms) = fixture() else { return };
-    let path = engine_dir().join("spc_num_samples.ll");
-    let bc = match llvm_assemble(&path) {
-        Ok(b) => b,
-        Err(AssembleError::Missing(why)) => {
-            eprintln!("SKIPPED: {why}");
-            return;
-        }
-        Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected spc_num_samples.ll: {why}"),
-    };
-    let lib = Library::from_air(&bc).expect("library");
-    let mut checked = 0;
-    for stem in ["moltenvk-m3", "lavapipe"] {
-        let dev = Device::new(description(stem), DevicePolicy::default()).expect("device");
-        let a = compile(&bc, "spc_num_samples", dev.profile()).expect("spc_num_samples");
-        assert!(a.facts.contains(&RuntimeFact::SampleCount), "{stem}");
-        for samples in [1, 4] {
-            let what = format!("{stem} at {samples}");
-            let stage = |l: &Library, name: &str| {
-                StageSource::Function(FunctionDescriptor::new(l.function(name).expect("function")))
-            };
-            let mut d = RenderPipelineDescriptor::new(stage(&ms, VERTEX));
-            d.fragment = Some(stage(&lib, "spc_num_samples"));
-            d.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::R32Uint));
-            d.raster_sample_count = samples;
-            let p = match dev.compile_render_pipeline(&d, &Budget::standard()) {
-                Err(Error::Unsupported(u)) if u.feature == Feature::RasterSampleCount => {
-                    assert!(samples > 1 && stem != "moltenvk-m3", "{what}: {u:?}");
-                    eprintln!("{what}: not a framebuffer sample count of an integer attachment");
-                    continue;
-                }
-                p => p.unwrap_or_else(|e| panic!("{what}: {e}")),
-            };
-            validate(&p, &dev, &what);
-            let plan = p.plan(&dev, &BindState::default().shape()).expect("plan");
-            assert_eq!(planned(&p, &plan, SpecKey::SampleCount), samples, "{what}");
-            checked += 1;
-        }
-    }
-    assert_eq!(
-        checked, 3,
-        "moltenvk-m3 at one and four samples, lavapipe at one"
-    );
-    // The same call with operand 1.
-    let text = std::fs::read_to_string(&path).expect("fixture text");
-    let other = text.replace(
-        "@air.get_num_samples.i32(i32 0)",
-        "@air.get_num_samples.i32(i32 1)",
-    );
-    assert_ne!(other, text);
-    let scratch = Scratch::new("m2v-num-samples");
-    let dir = scratch.path();
-    let ll = dir.join("num_samples_one.ll");
-    std::fs::write(&ll, other).expect("write");
-    let bc = llvm_assemble(&ll);
-    let bc = bc.expect("assembled");
-    let p = Device::new(description("lavapipe"), DevicePolicy::default()).expect("device");
-    match compile(&bc, "spc_num_samples", p.profile()) {
-        Err(Error::Unsupported(u)) => {
-            assert_eq!(u.feature, Feature::Lowering(LowerFamily::Fragment));
-            assert_eq!(u.needs, Needs::NotImplemented);
-        }
-        other => panic!("operand 1: {:?}", other.map(|_| ())),
     }
 }

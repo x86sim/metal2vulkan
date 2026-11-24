@@ -3,18 +3,14 @@
 //! four samples, alpha to coverage off and on, on committed profiles.
 //!
 //! Vulkan specifies no algorithm for converting the alpha to a coverage mask, where Metal's
-//! coverage is its own (a 2x2 ordered dither at two and four samples, measured on an Apple M3 Max
-//! by `runtime_lane::alpha_coverage`), so a pipeline that covers by alpha
+//! coverage is its own (a 2x2 ordered dither at two and four samples, measured on an Apple M3
+//! Max), so a pipeline that covers by alpha
 //! (`GraphicsState::alpha_to_coverage`) records `PrecisionNote::DeviceAlphaCoverage` on its
-//! fragment stage, and the vertex stage records none; on a profile measured to cover as Metal
-//! does (`DriverDeviation::MetalAlphaCoverage`: `moltenvk-m3`, MoltenVK on the M3 Max's macOS 27
-//! identity) it records no note and requires `VkProperty::MetalAlphaCoverage` in its place. A
-//! pipeline without alpha to coverage records neither, and requires no such property.
+//! fragment stage on every profile, and the vertex stage records none. A pipeline without alpha
+//! to coverage records no note.
 
 use crate::budget::Budget;
-use crate::device::requirements::VkProperty;
 use crate::device::{Device, DevicePolicy};
-use crate::error::DriverDeviation;
 use crate::library::Library;
 use crate::metal::PixelFormat;
 use crate::pipeline::artifact::PrecisionNote;
@@ -35,8 +31,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 /// On each profile a pipeline that covers by alpha records `DeviceAlphaCoverage` on its fragment
-/// stage alone, but where the profile takes `MetalAlphaCoverage`, which requires the property
-/// instead; without alpha to coverage it records and requires neither (the module docs).
+/// stage alone; without alpha to coverage it records no note (the module docs).
 #[test]
 fn a_pipeline_covering_by_alpha_notes_the_device_s_coverage() {
     let Some(bc) = fixture() else { return };
@@ -53,15 +48,11 @@ fn a_pipeline_covering_by_alpha_notes_the_device_s_coverage() {
         "intel-irisxe-anv",
         "nvidia-rtx5080-laptop",
     ] {
-        let dev = Device::new(
+        let dev = Device::from_queries(
             description(stem).expect("committed description"),
-            DevicePolicy::default(),
+            DevicePolicy::RESIDENT_TABLES,
         )
         .expect("device");
-        let metal = dev
-            .profile()
-            .takes_driver_deviation(DriverDeviation::MetalAlphaCoverage);
-        assert_eq!(metal, stem == "moltenvk-m3", "{stem}");
         for samples in [1, 4] {
             for coverage in [false, true] {
                 let what = format!("{stem} {samples} samples, alpha to coverage {coverage}");
@@ -81,21 +72,12 @@ fn a_pipeline_covering_by_alpha_notes_the_device_s_coverage() {
                         stage
                             .precision_notes
                             .contains(&PrecisionNote::DeviceAlphaCoverage),
-                        fragment && coverage && !metal,
+                        fragment && coverage,
                         "{what}, {:?}: {:?}",
                         stage.stage,
                         stage.precision_notes
                     );
                 }
-                assert_eq!(
-                    pipeline
-                        .requirements
-                        .properties
-                        .contains(&VkProperty::MetalAlphaCoverage),
-                    coverage && metal,
-                    "{what}: {:?}",
-                    pipeline.requirements.properties
-                );
             }
         }
     }

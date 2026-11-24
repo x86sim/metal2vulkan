@@ -19,15 +19,6 @@ use crate::spirv::ir::{
 };
 use crate::spirv::requirements;
 
-/// How a function was started: a plain function, a routine, a texel routine, or a sampling routine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Started {
-    Plain,
-    Routine,
-    Texel,
-    Sampling,
-}
-
 /// A function under construction.
 #[derive(Clone, Debug)]
 pub(super) struct FunctionDraft {
@@ -38,12 +29,8 @@ pub(super) struct FunctionDraft {
     pub(super) vars: Vec<VarId>,
     /// Set by `FunctionBuilder::finish`.
     pub(super) fn_ty: Option<TypeId>,
-    /// Started by [`ModuleBuilder::routine`].
-    pub(super) routine: bool,
-    /// Started by [`ModuleBuilder::texel_routine`].
+    /// Started by [`ModuleBuilder::kept_routine`].
     pub(super) kept: bool,
-    /// Started by [`ModuleBuilder::sampling_routine`].
-    pub(super) sampling: bool,
 }
 
 /// A block under construction: `term` is `None` until the block is terminated.
@@ -88,8 +75,6 @@ pub struct ModuleBuilder {
     /// Every storage buffer and storage image resource is decorated `Coherent`
     /// (`ModuleBuilder::coherent_resources`).
     coherent: bool,
-    /// Storage-image resources decorated `Coherent` one by one (`ModuleBuilder::coherent`).
-    coherent_images: BTreeSet<GlobalId>,
     /// Storage-image resources decorated `Volatile` (`ModuleBuilder::volatile`).
     volatile: BTreeSet<GlobalId>,
     /// Buffer bindings whose memory nothing in the module writes (`ModuleBuilder::unwritten_buffer`).
@@ -103,16 +88,6 @@ pub struct ModuleBuilder {
     /// Every result that carries a non-uniform descriptor element (`Inst::carries_non_uniform`):
     /// decorated `NonUniform`, and refused where it would reach an undecorated operand.
     pub(super) non_uniform: BTreeSet<Value>,
-    /// The narrowings to 16 bits of the conversion pairs that round a `half` in a form measured
-    /// to answer Metal's on the devices whose driver takes `DriverDeviation::MetalHalfConversion`
-    /// (`ModuleBuilder::note_measured_rounding`). Nothing emitted depends on it: the compile
-    /// reads it to decide `PrecisionNote::NativeHalfConversion`.
-    pub(super) measured_roundings: BTreeSet<Value>,
-    /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`), whose
-    /// stored NaN the write's own notes account for (`lower::texture::half_write_nans` and
-    /// `half_storage_facts`). Nothing emitted depends on it: the compile reads it to decide
-    /// `PrecisionNote::NativeNanEncoding` (`lower::arith::narrow::moves_unfolded`).
-    pub(super) stored_texels: BTreeSet<Value>,
     /// The `Function` variables the emitter holds workgroup uniform by construction
     /// (`FunctionBuilder::note_uniform_var`). Nothing emitted depends on it: a record for the
     /// checks of `spirv::testing::barriers`, kept only where they build.
@@ -136,6 +111,16 @@ pub struct ModuleBuilder {
     /// The vector, lane value, and lane index of each narrow lane insert the lowering noted
     /// (`FunctionBuilder::note_insert`).
     pub(super) inserts: HashMap<Value, (Value, Value, u32)>,
+    /// The parts of each `OpCompositeConstruct` of a vector of `f32` lanes, the type a narrow
+    /// float is held in, by result (`FunctionBuilder::vector_parts`), so a narrow vector's bits
+    /// can be read from its parts' (`lower::arith::narrow::to_bits`). Nothing here changes the IR.
+    pub(super) vector_parts: HashMap<Value, Box<[Value]>>,
+    /// The heap bytes of [`ModuleBuilder::vector_parts`]' part lists, for
+    /// [`ModuleBuilder::footprint`].
+    pub(super) vector_part_bytes: usize,
+    /// The value and constant each 32-bit unsigned sum of a value and a constant the lowering
+    /// noted adds (`FunctionBuilder::note_sum`). Nothing here changes the IR.
+    pub(super) sums: HashMap<Value, (Value, u32)>,
     /// How each struct the builder made holds its members, and what each extract from a struct
     /// reads (`FunctionBuilder::member_source`): every `OpCompositeConstruct` and
     /// `OpCompositeInsert` of a struct type and every `OpCompositeExtract` from one, by result.
@@ -166,12 +151,6 @@ pub struct ModuleBuilder {
     /// The encode of a narrow vector computed for its lanes' stores in a block, with its offer
     /// group (`FunctionBuilder::note_encode`).
     pub(super) encodes: HashMap<(NarrowFmt, Value), (Value, BlockId, u32)>,
-    /// How a float multiply the device must round on its own is emitted
-    /// ([`ModuleBuilder::product_form`]).
-    pub(super) product_form: ProductForm,
-    /// How the lowering clears the bits above a narrow integer's width
-    /// ([`ModuleBuilder::mask_form`]).
-    mask_form: MaskForm,
     /// How the lowering rounds an `f32` to `half` ([`ModuleBuilder::quantize_form`]).
     quantize_form: QuantizeForm,
     /// Whether that rounding is the device's own rather than one measured to be Metal's
@@ -183,49 +162,6 @@ pub struct ModuleBuilder {
     /// Whether the module computes `half` under the 16-bit float controls
     /// ([`ModuleBuilder::half_controls`]).
     half_controls: bool,
-}
-
-/// How a float multiply the device must round on its own and never fuse is emitted
-/// ([`FunctionBuilder::binary_no_contraction`]), and an `f32` product by a constant with a `-0.0`
-/// component. Lowering takes it from the profile's `float` functions fact and its driver
-/// workarounds (`ArithPlan::product`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ProductForm {
-    /// `OpFMul` decorated `NoContraction`, for a device whose driver compiles the SPIR-V itself:
-    /// the device rounds the product once, keeps a `-0` product, and folds a zero factor as
-    /// Metal does (`x · 0` to `0` where the multiply carries `nsz`). It has no addend a device
-    /// could answer for a zero product.
-    #[default]
-    Multiply,
-    /// `GLSL.std.450 Fma(a, b, -0.0)` decorated `NoContraction`, for a device whose SPIR-V reaches
-    /// Metal's compiler through SPIRV-Cross (MoltenVK, the profile whose `float` functions are
-    /// Metal's): SPIRV-Cross renders a `NoContraction` `OpFMul` as `fma(l, r, 0)`, which answers
-    /// `+0` for a `-0` product, and this form as `fma(a, b, -0.0)`, which Metal's compiler treats
-    /// as Metal treats its own multiply. `a · b + (-0.0)` is `a · b` exactly whether the device
-    /// fuses it or not.
-    NegativeZeroFma,
-    /// [`ProductForm::Multiply`], but every `f32` product (`OpFMul`, `OpVectorTimesScalar`, with
-    /// or without contraction) by a constant with a `-0.0` component multiplies by `+0.0` there
-    /// and negates that component of the product: `OpFNegate`, and an `OpVectorShuffle` of the
-    /// product and its negation where only some components are `-0.0`. For a driver whose
-    /// compiler keeps one multiply for products of one value by zeros of opposite sign
-    /// (`DriverWorkaround::OppositeZeroProductsMerged`), so no product it compiles has a `-0.0`
-    /// factor beside a `+0.0` one. `-(a · +0)` is `a · (−0)` for every `a`; a NaN's sign is the
-    /// device's either way.
-    PositiveZeroFactors,
-}
-
-/// How the lowering clears the bits above a narrow integer's width `N` in a 32-bit container
-/// (`lower::arith::ops::mask`). Lowering takes it from the profile's driver workarounds
-/// (`ArithPlan::mask`). Both forms are the same bits on every device.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum MaskForm {
-    /// `OpBitwiseAnd` with `2^N - 1`.
-    #[default]
-    And,
-    /// `OpBitFieldUExtract(x, 0, N)`, for a driver whose compiler drops the mask after a signed
-    /// clamp to exactly the narrow range (`DriverWorkaround::NarrowMaskAfterSignedClamp`).
-    Extract,
 }
 
 /// How the lowering rounds an `f32` to `half` (`lower::arith::narrow`): the device's own
@@ -295,27 +231,6 @@ impl ModuleBuilder {
         ModuleBuilder::default()
     }
 
-    /// Emit every float multiply the device must round on its own, and every `f32` product by a
-    /// constant with a `-0.0` component, in `form`. Emission sets it before any instruction, from
-    /// the profile's `float` functions fact and driver workarounds; a builder that never sets it
-    /// emits [`ProductForm::Multiply`].
-    pub fn product_form(&mut self, form: ProductForm) {
-        self.product_form = form;
-    }
-
-    /// Clear the bits above a narrow integer's width in `form`. Emission sets it before any
-    /// instruction, from the profile's driver workarounds; a builder that never sets it emits
-    /// [`MaskForm::And`].
-    pub fn set_mask_form(&mut self, form: MaskForm) {
-        self.mask_form = form;
-    }
-
-    /// How the lowering clears the bits above a narrow integer's width
-    /// ([`ModuleBuilder::set_mask_form`]).
-    pub fn mask_form(&self) -> MaskForm {
-        self.mask_form
-    }
-
     /// Round an `f32` to `half` in `form`. Emission sets it before any instruction, from the
     /// profile; a builder that never sets it emits [`QuantizeForm::Device`].
     pub fn set_quantize_form(&mut self, form: QuantizeForm) {
@@ -332,19 +247,6 @@ impl ModuleBuilder {
     /// form; a builder that never sets it takes its form as Metal's.
     pub fn set_native_half(&mut self, native: bool) {
         self.native_half = native;
-    }
-
-    /// Record `narrowed`, the narrowing to 16 bits of a conversion pair that rounds a `half` in a
-    /// form measured to answer Metal's where the driver takes
-    /// `DriverDeviation::MetalHalfConversion` (`narrow::round_measured`).
-    pub fn note_measured_rounding(&mut self, narrowed: Value) {
-        self.measured_roundings.insert(narrowed);
-    }
-
-    /// Record `texel`, a texel a texture write stores, whose stored NaN the write's own notes
-    /// account for (`lower::texture::emit`).
-    pub fn note_stored_texel(&mut self, texel: Value) {
-        self.stored_texels.insert(texel);
     }
 
     /// Whether the module's `half` rounding is the device's own
@@ -427,11 +329,12 @@ impl ModuleBuilder {
                 std::mem::size_of::<(GlobalId, crate::spv::Capability)>(),
             )
             + tree_bytes(self.non_uniform.len(), std::mem::size_of::<Value>())
-            + tree_bytes(self.measured_roundings.len(), std::mem::size_of::<Value>())
-            + tree_bytes(self.stored_texels.len(), std::mem::size_of::<Value>())
             + map_bytes(&self.bits)
             + map_bytes(&self.lanes)
             + map_bytes(&self.inserts)
+            + map_bytes(&self.vector_parts)
+            + self.vector_part_bytes
+            + map_bytes(&self.sums)
             + map_bytes(&self.structs)
             + self.struct_bytes
             + map_bytes(&self.widened16)
@@ -517,11 +420,13 @@ impl ModuleBuilder {
         Ok(id)
     }
 
-    /// Declare the module's local size as the constants `x`, `y`, `z` (positive `u32` scalars, at
-    /// least one a specialization constant from [`ModuleBuilder::spec`] and the others plain, as
-    /// in the flattened `(sn, 1, 1)`): an `OpSpecConstantComposite` decorated `BuiltIn
-    /// WorkgroupSize`. Valid under Vulkan 1.2 without `maintenance4`, unlike `LocalSizeId`. A
-    /// `GLCompute` entry declared after it needs no local-size mode.
+    /// Declare the module's local size as the constants `x`, `y`, `z` (positive `u32` scalars,
+    /// each a plain constant or a specialization constant from [`ModuleBuilder::spec`] and at
+    /// least one the latter, as in the flattened `(sn, 1, 1)`): an `OpSpecConstantComposite`
+    /// decorated `BuiltIn WorkgroupSize`. An `OpSpecConstantOp` part is
+    /// [`ConstRule::WorkgroupSizeOp`](crate::spirv::error::ConstRule::WorkgroupSizeOp). Valid
+    /// under Vulkan 1.2 without `maintenance4`, unlike `LocalSizeId`. A `GLCompute` entry declared
+    /// after it needs no local-size mode.
     pub fn workgroup_size(&mut self, x: ConstId, y: ConstId, z: ConstId) -> BResult<ConstId> {
         let u32_ = self.ty(Type::Int {
             width: 32,
@@ -719,12 +624,9 @@ impl ModuleBuilder {
         init: Option<ConstId>,
     ) -> BResult<GlobalId> {
         match class {
-            StorageClass::Workgroup
-                if self.types.facts(ty)?.shape == Shape::Explicit
-                    && !self.types.facts(ty)?.block =>
-            {
-                // An explicitly laid-out `Workgroup` variable must be a `Block`
-                // (`SPV_KHR_workgroup_memory_explicit_layout`).
+            StorageClass::Workgroup if self.types.facts(ty)?.shape == Shape::Explicit => {
+                // `Workgroup` memory is implicitly laid out: an explicit layout there is
+                // `SPV_KHR_workgroup_memory_explicit_layout`, which no module needs.
                 Err(BuildError::Type(TypeRule::PointeeForClass(class)))
             }
             StorageClass::Private | StorageClass::Workgroup => {
@@ -803,6 +705,7 @@ impl ModuleBuilder {
             layout: Some(StructLayout {
                 rule,
                 block: true,
+                non_writable: false,
                 members: offsets.clone(),
             }),
         };
@@ -902,16 +805,12 @@ impl ModuleBuilder {
 
     /// Decorate builtin output `g` `Invariant`: SPIR-V's "expressions computing its value be
     /// computed invariantly with respect to other shaders computing the same expressions". Only
-    /// the `Position` output (Metal's `[[invariant]]` position), the `ClipDistance` output (a
-    /// rate-mapped pass's copies of its triangles, `pipeline::link::fan_out`) and a fragment's
-    /// per-fragment outputs, `FragDepth`, `SampleMask` and `FragStencilRefEXT` (the variants of
-    /// one render pipeline's color groups, `LoweringInputs::color_group`), can be invariant.
+    /// the `Position` output (Metal's `[[invariant]]` position) can be invariant.
     pub fn invariant(&mut self, g: GlobalId) -> BResult<()> {
         use crate::spv::BuiltIn as B;
         match self.global(g)?.kind {
             GlobalKind::BuiltIn {
-                builtin:
-                    B::Position | B::ClipDistance | B::FragDepth | B::SampleMask | B::FragStencilRefEXT,
+                builtin: B::Position,
                 dir: IoDir::Output,
             } => {
                 self.invariant.insert(g);
@@ -958,31 +857,6 @@ impl ModuleBuilder {
     /// ([`ModuleBuilder::finalize`]); its accesses carry the per-access operands instead.
     pub fn coherent_resources(&mut self) {
         self.coherent = true;
-    }
-
-    /// Decorate storage-image resource `g` `Coherent`: under the `GLSL450` memory model each access
-    /// to its texels is made available and visible at device scope, as
-    /// [`coherent_resources`](ModuleBuilder::coherent_resources) makes every shared resource's,
-    /// for one image whose accesses an ordered fragment-interlock critical section orders while
-    /// the module's other resources keep plain accesses. Only a `UniformConstant` resource whose
-    /// type is a storage image can be; the Vulkan memory model bans the decoration
-    /// ([`ModuleBuilder::finalize`]).
-    pub fn coherent(&mut self, g: GlobalId) -> BResult<()> {
-        let gv = self.global(g)?;
-        let storage = gv.class == StorageClass::UniformConstant
-            && matches!(gv.kind, GlobalKind::Resource(_))
-            && matches!(
-                self.types.get(gv.pointee)?,
-                Type::Image(ImageType {
-                    usage: ImageUsage::Storage,
-                    ..
-                })
-            );
-        if !storage {
-            return Err(BuildError::Global(GlobalRule::CoherentTarget));
-        }
-        self.coherent_images.insert(g);
-        Ok(())
     }
 
     /// Decorate storage-image resource `g` `Volatile`: under the `GLSL450` memory model every
@@ -1123,43 +997,23 @@ impl ModuleBuilder {
 
     /// Start a function returning `ret`. Its entry block is open.
     pub fn function(&mut self, ret: TypeId) -> BResult<FunctionBuilder<'_>> {
-        self.start_function(ret, Started::Plain)
+        self.start_function(ret, false)
     }
 
-    /// Start a routine returning `ret`: a function the lowering defines once and calls from
-    /// every site that needs it. Written for a profile whose driver converts every function to
-    /// one inlined at each call (`DriverWorkaround::FunctionsInlinedAtEveryCall`: MoltenVK's
-    /// SPIRV-Cross 1.4.1, which still does so), it is declared `DontInline` (`OpFunction`'s
-    /// function control), the standard SPIR-V statement that each call should stay a call; for
-    /// any other profile it takes no control ([`crate::spirv::serialize::serialize_for`]). Its
+    /// Start a kept routine returning `ret`: a function the lowering defines once and calls from
+    /// every site that needs it, declared `DontInline` (`OpFunction`'s function control) on every
+    /// serialization (`crate::spirv::serialize::serialize`), the standard SPIR-V statement that its
+    /// calls stay calls. A linear filter emulation's sum (a texel routine) and one combined
+    /// binding's sample emulation (a sampling routine) are kept routines. A driver that honours the
+    /// control (NVIDIA's) compiles it once where it would otherwise compile it again inside every
+    /// sample that calls it, which made a fragment of a few hundred emulated samples take tens of
+    /// seconds to create on an RTX 3090; one that inlines every function (Mesa's) ignores it. Its
     /// entry block is open.
-    pub fn routine(&mut self, ret: TypeId) -> BResult<FunctionBuilder<'_>> {
-        self.start_function(ret, Started::Routine)
+    pub fn kept_routine(&mut self, ret: TypeId) -> BResult<FunctionBuilder<'_>> {
+        self.start_function(ret, true)
     }
 
-    /// Start a texel routine returning `ret`: a [`routine`](Self::routine) that sums a linear
-    /// filter emulation's taps, declared `DontInline` for every profile
-    /// ([`crate::spirv::serialize::serialize_for`]). A driver that honours the control (NVIDIA's)
-    /// compiles it once where it would otherwise compile it again inside every sample that calls
-    /// it, which made a fragment of a few hundred emulated samples take tens of seconds to create
-    /// on an RTX 3090; one that inlines every function (Mesa's) ignores it. Its entry block is
-    /// open.
-    pub fn texel_routine(&mut self, ret: TypeId) -> BResult<FunctionBuilder<'_>> {
-        self.start_function(ret, Started::Texel)
-    }
-
-    /// Start a sampling routine returning `ret`: a [`routine`](Self::routine) that holds the
-    /// emulation of one combined binding's sample shape, which every sample of that shape calls
-    /// with its plain data. It is declared `DontInline` where the profile states that its driver
-    /// keeps such a call a call (`DriverWorkaround::DontInlineKeepsCalls`, a measured cost fact),
-    /// and, as every routine, where its driver inlines every function at each call
-    /// (`DriverWorkaround::FunctionsInlinedAtEveryCall`); elsewhere it takes no control
-    /// ([`crate::spirv::serialize::serialize_for`]). Its entry block is open.
-    pub fn sampling_routine(&mut self, ret: TypeId) -> BResult<FunctionBuilder<'_>> {
-        self.start_function(ret, Started::Sampling)
-    }
-
-    fn start_function(&mut self, ret: TypeId, started: Started) -> BResult<FunctionBuilder<'_>> {
+    fn start_function(&mut self, ret: TypeId, kept: bool) -> BResult<FunctionBuilder<'_>> {
         match self.types.facts(ret)?.shape {
             Shape::Plain | Shape::Implicit => {}
             Shape::NotData if matches!(self.types.get(ret)?, Type::Void) => {}
@@ -1176,9 +1030,7 @@ impl ModuleBuilder {
             blocks: vec![entry],
             vars: Vec::new(),
             fn_ty: None,
-            routine: started != Started::Plain,
-            kept: started == Started::Texel,
-            sampling: started == Started::Sampling,
+            kept,
         });
         Ok(FunctionBuilder::new(self, func, entry))
     }
@@ -1265,11 +1117,6 @@ impl ModuleBuilder {
                 {
                     return err(EntryRule::TessellationModes);
                 }
-                ExecMode::OutputVertices { n: 0 } | ExecMode::Invocations { n: 0 }
-                    if model == ExecModel::Geometry =>
-                {
-                    return err(EntryRule::GeometryModes);
-                }
                 ExecMode::OutputVertices { n: 0 } | ExecMode::OutputPrimitives { n: 0 } => {
                     return err(EntryRule::MeshModes);
                 }
@@ -1306,26 +1153,6 @@ impl ModuleBuilder {
                 }));
         if !mesh_ok {
             return err(EntryRule::MeshModes);
-        }
-        // A geometry entry states its input and output primitives and the most vertices it emits.
-        let geometry_ok = model != ExecModel::Geometry
-            || (patch_size
-                && modes.iter().any(|m| {
-                    matches!(
-                        m,
-                        ExecMode::InputPoints | ExecMode::InputLines | ExecMode::Triangles
-                    )
-                })
-                && modes.iter().any(|m| {
-                    matches!(
-                        m,
-                        ExecMode::OutputPoints
-                            | ExecMode::OutputLineStrip
-                            | ExecMode::OutputTriangleStrip
-                    )
-                }));
-        if !geometry_ok {
-            return err(EntryRule::GeometryModes);
         }
         let has_local_size = has_local_size || self.consts.workgroup_size_const().is_some();
         let workgroups = matches!(
@@ -1374,9 +1201,7 @@ impl ModuleBuilder {
                 params: d.params,
                 blocks: d.blocks,
                 vars: d.vars,
-                routine: d.routine,
                 kept: d.kept,
-                sampling: d.sampling,
             });
         }
         let mut blocks = Vec::with_capacity(self.blocks.len());
@@ -1419,15 +1244,14 @@ impl ModuleBuilder {
         if !self.volatile.is_empty() && vulkan {
             return Err(BuildError::Global(GlobalRule::VolatileTarget));
         }
-        if (self.coherent || !self.coherent_images.is_empty()) && vulkan {
+        if self.coherent && vulkan {
             return Err(BuildError::Global(GlobalRule::CoherentTarget));
         }
-        let mut coherent = if self.coherent {
+        let coherent = if self.coherent {
             shared_resources(&self.types, &self.globals)?
         } else {
             BTreeSet::new()
         };
-        coherent.extend(self.coherent_images);
         Ok(TypedModule {
             types: self.types,
             consts: self.consts,
@@ -1453,8 +1277,6 @@ impl ModuleBuilder {
             unwritten_buffers: self.unwritten_buffers,
             enabling: self.enabling,
             non_uniform: self.non_uniform,
-            measured_roundings: self.measured_roundings,
-            stored_texels: self.stored_texels,
             #[cfg(test)]
             uniform_vars: self.uniform_vars,
         })
@@ -1592,8 +1414,6 @@ fn mode_contract(m: ExecMode) -> (u8, Option<u8>, &'static [ExecModel]) {
     const WORKGROUPS: &[ExecModel] =
         &[ExecModel::GLCompute, ExecModel::TaskEXT, ExecModel::MeshEXT];
     const MESH: &[ExecModel] = &[ExecModel::MeshEXT];
-    const GEOMETRY: &[ExecModel] = &[ExecModel::Geometry];
-    const MESH_OR_GEOMETRY: &[ExecModel] = &[ExecModel::MeshEXT, ExecModel::Geometry];
     const ALL: &[ExecModel] = &[
         ExecModel::Vertex,
         ExecModel::Fragment,
@@ -1602,7 +1422,6 @@ fn mode_contract(m: ExecMode) -> (u8, Option<u8>, &'static [ExecModel]) {
         ExecModel::TessellationControl,
         ExecModel::TaskEXT,
         ExecModel::MeshEXT,
-        ExecModel::Geometry,
     ];
     // Vulkan lets either tessellation stage declare the domain, spacing, and vertex order; the
     // output patch size is the control stage's.
@@ -1610,25 +1429,15 @@ fn mode_contract(m: ExecMode) -> (u8, Option<u8>, &'static [ExecModel]) {
         ExecModel::TessellationEvaluation,
         ExecModel::TessellationControl,
     ];
-    // The triangle domain, or a geometry entry's triangle input.
-    const TRIANGLES: &[ExecModel] = &[
-        ExecModel::TessellationEvaluation,
-        ExecModel::TessellationControl,
-        ExecModel::Geometry,
-    ];
-    // The output patch size, or a mesh or geometry entry's most vertices.
-    const OUTPUT_VERTICES: &[ExecModel] = &[
-        ExecModel::TessellationControl,
-        ExecModel::MeshEXT,
-        ExecModel::Geometry,
-    ];
+    // The output patch size, or a mesh entry's most vertices.
+    const OUTPUT_VERTICES: &[ExecModel] = &[ExecModel::TessellationControl, ExecModel::MeshEXT];
     match m {
         ExecMode::OriginUpperLeft => (0, None, FRAG),
         ExecMode::EarlyFragmentTests => (1, None, FRAG),
         ExecMode::DepthReplacing => (2, None, FRAG),
         ExecMode::DepthGreater | ExecMode::DepthLess => (3, None, FRAG),
         ExecMode::StencilRefReplacing => (4, None, FRAG),
-        ExecMode::PixelInterlockOrdered | ExecMode::SampleInterlockOrdered => (5, None, FRAG),
+        ExecMode::PixelInterlockOrdered => (5, None, FRAG),
         ExecMode::LocalSize { .. } => (6, None, WORKGROUPS),
         ExecMode::DerivativeGroupLinear => (7, None, COMP),
         ExecMode::SignedZeroInfNanPreserve { width } => (9, Some(width), ALL),
@@ -1636,21 +1445,17 @@ fn mode_contract(m: ExecMode) -> (u8, Option<u8>, &'static [ExecModel]) {
         ExecMode::RoundingModeRte { width } => (10, Some(width), ALL),
         ExecMode::SubgroupUniformControlFlow => (11, None, ALL),
         ExecMode::MaximallyReconverges => (12, None, ALL),
-        ExecMode::Triangles => (13, None, TRIANGLES),
-        ExecMode::Quads => (13, None, TESS),
-        ExecMode::InputPoints | ExecMode::InputLines => (13, None, GEOMETRY),
+        ExecMode::Triangles | ExecMode::Quads => (13, None, TESS),
         ExecMode::SpacingEqual
         | ExecMode::SpacingFractionalEven
         | ExecMode::SpacingFractionalOdd => (14, None, TESS),
         ExecMode::VertexOrderCw | ExecMode::VertexOrderCcw => (15, None, TESS),
         ExecMode::OutputVertices { .. } => (16, None, OUTPUT_VERTICES),
         ExecMode::OutputPrimitives { .. } => (17, None, MESH),
-        ExecMode::OutputPoints => (18, None, MESH_OR_GEOMETRY),
-        ExecMode::OutputLines | ExecMode::OutputTriangles => (18, None, MESH),
-        ExecMode::OutputLineStrip | ExecMode::OutputTriangleStrip => (18, None, GEOMETRY),
+        ExecMode::OutputPoints | ExecMode::OutputLines | ExecMode::OutputTriangles => {
+            (18, None, MESH)
+        }
         ExecMode::RequireFullQuads => (19, None, FRAG),
-        ExecMode::PostDepthCoverage => (21, None, FRAG),
-        ExecMode::Invocations { .. } => (20, None, GEOMETRY),
     }
 }
 

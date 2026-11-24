@@ -39,12 +39,12 @@
 //!   word first, and `SlotGuestBase` is placed as a `uvec2` on every profile (the same eight
 //!   bytes).
 //!
-//! **Stored and converted pointers on Profile F** ([`PointerValue::ToInt`],
-//! [`PointerValue::StorePointer`]). Without device addresses an escaping slot root stays static
-//! (`memory::plan`), so `ptrtoint` of a static fat pointer (or of the null constant) is its
-//! Metal address as above, truncated to the integer's width (a `bool` its low bit), and a stored
-//! one is that address as an 8-byte leaf through a static-root destination (stored pointers are
-//! guest addresses). On Profile A such a pointer is wide.
+//! **Stored and converted pointers on Profile F and under the identity domains**
+//! ([`PointerValue::ToInt`], [`PointerValue::StorePointer`]). Without root entries an escaping
+//! slot root stays static (`memory::plan`), so `ptrtoint` of a static fat pointer (or of the null
+//! constant) is its Metal address as above, truncated to the integer's width (a `bool` its low
+//! bit), and a stored one is that address as an 8-byte leaf through a static-root destination
+//! (stored pointers are guest addresses). On Profile A's resident table such a pointer is wide.
 //!
 //! **Handles of the other families.** A command buffer, pipeline state, acceleration structure, or
 //! function table loaded from an argument buffer, or any access-family instruction on one, is
@@ -432,7 +432,8 @@ fn compare(
 }
 
 /// Whether stored or converted pointer `v` takes the static form here: a static fat pointer
-/// (which on Profile A never escapes), or the null constant on a profile without device addresses.
+/// (which escapes only without root entries: on Profile F and under the identity domains), or the
+/// null constant on a profile without device addresses.
 /// Every other pointer is `dynamic`'s (or refused there).
 fn static_escape(cx: &SelectCx<'_>, v: Value) -> Result<Option<Kind>, Error> {
     if !buffer_space(cx, v) {
@@ -473,7 +474,7 @@ fn address_leaf(cx: &SelectCx<'_>, ty: TypeId, align: Option<Align>) -> Result<L
 
 /// A store of pointer `val` (taking the static form) through `ptr`: a leaf store of its
 /// address through a static-root destination. A destination in the blob, an arena, or behind a
-/// wide pointer is refused (a wide one needs device addresses, which make `val` wide too).
+/// wide pointer is refused (on Profile A's resident table a wide one makes `val` wide too).
 fn store_pointer(
     cx: &mut SelectCx<'_>,
     val: Value,
@@ -490,17 +491,7 @@ fn store_pointer(
     if in_blob {
         return Err(refuse());
     }
-    for t in &targets {
-        let plan = cx
-            .memory
-            .slots
-            .get(t.slot)
-            .ok_or_else(|| cx.invariant("a target names a missing slot"))?;
-        if super::view_kind(cx.profile, plan) != super::ViewKind::Storage {
-            return Err(cx.invariant("a pointer store through a uniform view"));
-        }
-    }
-    let to = super::access_with_leaf(cx, ptr, None, leaf, targets, null, None)?;
+    let to = super::access_with_leaf(cx, ptr, None, leaf, targets, null, false)?;
     let words = !cx.profile.fields().leaf.int64;
     Ok(PointerValue::StorePointer {
         to: Box::new(to),
@@ -562,9 +553,12 @@ pub fn select(
 
 // ---- Emission ----
 
-/// The null pointer in representation `ty` (a narrow or wide fat pointer), or `None` for
-/// another representation.
+/// The null pointer in representation `ty` (a narrow or wide fat pointer, or a device address),
+/// or `None` for another representation.
 pub fn null_value(fb: &mut FunctionBuilder<'_>, ty: &DemoteTy) -> BResult<Option<SValue>> {
+    if *ty == DemoteTy::Address {
+        return super::psb::k64(fb, 0).map(Some);
+    }
     // A narrow fat pointer `(root, offset)`; a wide one `(root, at, host, size)`.
     let (width, len) = match ty {
         DemoteTy::FatPtr { wide: false } => (32, 2),
@@ -750,27 +744,77 @@ fn displacement(
     )?))
 }
 
-/// `SlotGuestBase(slot)` (a `uvec2` push field) in the address form.
+/// Buffer slot `slot`'s Metal address ([`slot_address`]) in the address form.
 fn guest_base(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     slot: SlotRef,
     words: bool,
 ) -> BResult<Address> {
-    let v = cx.push_field(fb, PushField::SlotGuestBase(slot))?;
-    if words {
-        return Ok(Address::Words(wide::split(fb, v)?));
+    if !words {
+        return Ok(Address::U64(slot_address(cx, fb, slot)?));
     }
-    Ok(Address::U64(slot_guest_base_u64(fb, v)?))
+    let v = cx.push_field(fb, PushField::SlotGuestBase(slot))?;
+    let word = wide::split(fb, v)?;
+    if !biased(cx) {
+        return Ok(Address::Words(word));
+    }
+    let bias = Pair {
+        lo: k32(fb, super::SLOT_ADDRESS_BIAS as u32)?,
+        hi: k32(fb, 0)?,
+    };
+    Ok(Address::Words(wide::add(fb, word, bias)?))
 }
 
-/// A `SlotGuestBase` field's value (a `uvec2`, low word first) as a `u64` (needs `shaderInt64`).
-pub(super) fn slot_guest_base_u64(fb: &mut FunctionBuilder<'_>, v: SValue) -> BResult<SValue> {
+/// Whether buffer slots' `SlotGuestBase` words are their Metal addresses less
+/// [`SLOT_ADDRESS_BIAS`](super::SLOT_ADDRESS_BIAS): under the identity domains, where the runtime
+/// pushes them. A replay variant reads each slot's address itself from its root entry.
+fn biased(cx: &EmitCx<'_>) -> bool {
+    cx.plan.families.access.identity && !cx.plan.families.access.replay
+}
+
+/// Buffer slot `slot`'s `SlotGuestBase` word (a `uvec2`, low word first) as a `u64` (needs
+/// `shaderInt64`).
+fn slot_word(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, slot: SlotRef) -> BResult<SValue> {
+    let v = cx.push_field(fb, PushField::SlotGuestBase(slot))?;
     let u64_ = fb.module().ty(SType::Int {
         width: 64,
         signed: false,
     })?;
     fb.convert(ConvOp::Bitcast, v, u64_)
+}
+
+/// Buffer slot `slot`'s Metal address, the bound buffer's `gpuAddress` plus the bind offset, as a
+/// `u64` (needs `shaderInt64`): its `SlotGuestBase` word, plus
+/// [`SLOT_ADDRESS_BIAS`](super::SLOT_ADDRESS_BIAS) where the word is biased ([`biased`]). What a
+/// pointer compare, a converted or stored pointer, and an access from the word below it read.
+pub(super) fn slot_address(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    slot: SlotRef,
+) -> BResult<SValue> {
+    let word = slot_word(cx, fb, slot)?;
+    if !biased(cx) {
+        return Ok(word);
+    }
+    let bias = k64(fb, super::SLOT_ADDRESS_BIAS)?;
+    fb.binary(BinOp::IAdd, word, bias)
+}
+
+/// Buffer slot `slot`'s Metal address less [`SLOT_ADDRESS_BIAS`](super::SLOT_ADDRESS_BIAS), a
+/// `u64`: its `SlotGuestBase` word where the word is biased ([`biased`]), the base an access
+/// reached from the slot's own address adds its biased offset to (`psb::prepare_direct`).
+pub(super) fn biased_slot_address(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    slot: SlotRef,
+) -> BResult<SValue> {
+    let word = slot_word(cx, fb, slot)?;
+    if biased(cx) {
+        return Ok(word);
+    }
+    let bias = k64(fb, super::SLOT_ADDRESS_BIAS)?;
+    fb.binary(BinOp::ISub, word, bias)
 }
 
 /// The start of the 2³² bytes a pointer into plan slot `slot` whose offset range the analysis

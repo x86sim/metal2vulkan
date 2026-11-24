@@ -1,8 +1,8 @@
 //! Loads of uniform views that every trip of a loop reads alike, moved out of the loop.
 //!
-//! A kernel that reads its parameters from a `constant` buffer inside a loop often reads them again
-//! on every trip, inside the branches of the loop body, because nothing told its compiler the
-//! address cannot be read out of bounds. A driver's compiler keeps such a load where it stands
+//! A kernel that reads its parameters inside a loop often reads them again on every trip, inside
+//! the branches of the loop body, because nothing told its compiler the address cannot be read out
+//! of bounds. A driver's compiler keeps such a load where it stands
 //! too: it does not move a load out of a branch. On a 1x1 convolution kernel whose outer loop
 //! read 13 such words on each of its trips, the same module with those loads in the loop's
 //! preheader ran 13% faster at 120 trips and 3.8% at 24 on an RX 7900 XTX (RADV), and 3.6% faster
@@ -15,7 +15,7 @@
 //!
 //! - **A uniform view.** The load reads, through a chain of access indices, a module-scope
 //!   `Uniform` variable that is a descriptor resource whose type is a `Block` structure:
-//!   `memory::views` declares one only for a read-only buffer slot, and no shader writes a
+//!   `lower::access::table` declares one for the spilled push fields, and no shader writes a
 //!   `Uniform` block. The load is neither volatile nor `MakePointerVisible`.
 //! - **The same address on every trip.** Every operand of its address is defined outside the loop,
 //!   or by an instruction inside it that computes its value from its operands alone (arithmetic,
@@ -30,12 +30,9 @@
 //!   write too. A loop in a function the entry calls moves loads only where the module makes no
 //!   such write at all.
 //! - **Safe to read early.** A load in the loop's header, or in a block the header leads to
-//!   unconditionally and alone ([`entry_run`]), runs whenever the loop is entered, so it moves on
-//!   every profile. A load elsewhere in the loop runs on some trips or paths only; it
-//!   moves only where the profile's containment rests on the device's robust buffer access
-//!   ([`Containment::On`] with [`Robustness::Rba`] or [`Robustness::Rba2`]), under which a read
-//!   past the bound range reads defined bytes rather than faulting, and a uniform view carries no
-//!   in-shader check that moving it could pass by.
+//!   unconditionally and alone ([`entry_run`]), runs whenever the loop is entered, so it moves. A
+//!   load elsewhere in the loop runs on some trips or paths only, and stays: no buffer robustness
+//!   is enabled to make a read the loop would not have made safe.
 //!
 //! The loops are taken innermost first, so a load leaves every loop it is the same in. The moved
 //! values are the same values, computed earlier: nothing a dispatch computes changes.
@@ -44,7 +41,6 @@
 mod tests;
 
 use crate::budget::Meter;
-use crate::device::profile::{Containment, Robustness};
 use crate::error::Error;
 use crate::spirv::ids::{BlockId, Value};
 use crate::spirv::ir::{
@@ -55,23 +51,12 @@ use crate::spirv::ir::{
 /// walk, which no measured address reaches).
 const MAX_DEPTH: u32 = 64;
 
-/// Move the loads of uniform views that are the same on every trip of their loop out of it, under
-/// `containment` (the module docs). Returns the moves made: a load counts once for each loop it
-/// leaves.
-pub fn hoist_uniform_loads(
-    m: &mut TypedModule,
-    containment: Containment,
-    meter: &mut Meter,
-) -> Result<u32, Error> {
+/// Move the loads of uniform views that are the same on every trip of their loop out of it (the
+/// module docs). Returns the moves made: a load counts once for each loop it leaves.
+pub fn hoist_uniform_loads(m: &mut TypedModule, meter: &mut Meter) -> Result<u32, Error> {
     if m.loops.is_empty() {
         return Ok(0);
     }
-    let speculate = matches!(
-        containment,
-        Containment::On {
-            robust: Robustness::Rba | Robustness::Rba2
-        }
-    );
     let writers = buffer_writers(m, meter)?;
     let any_writer = writers.iter().any(|&w| w);
     let blocks = m.blocks.len();
@@ -92,7 +77,7 @@ pub fn hoist_uniform_loads(
     for b in 0..blocks {
         scratch.place(m, BlockId::new(u32::try_from(b).unwrap_or(u32::MAX)));
     }
-    let r = hoist_loops(m, (speculate, any_writer), &writers, &mut scratch, meter);
+    let r = hoist_loops(m, any_writer, &writers, &mut scratch, meter);
     meter.release(bytes);
     let moved = r?;
     if moved > 0 {
@@ -150,11 +135,10 @@ impl Scratch {
 }
 
 /// Every loop of `m` whose preheader enters it, innermost first, each moved as the module docs
-/// say. `(speculate, any_writer)`: whether a load outside the header may move, and whether the
-/// module writes buffer memory anywhere.
+/// say. `any_writer`: whether the module writes buffer memory anywhere.
 fn hoist_loops(
     m: &mut TypedModule,
-    (speculate, any_writer): (bool, bool),
+    any_writer: bool,
     writers: &[bool],
     s: &mut Scratch,
     meter: &mut Meter,
@@ -185,7 +169,7 @@ fn hoist_loops(
         if writes_before(m, &lm, writers, s, meter)? {
             continue;
         }
-        moved = moved.saturating_add(hoist_loop(m, &lm, speculate, s, meter)?);
+        moved = moved.saturating_add(hoist_loop(m, &lm, s, meter)?);
     }
     Ok(moved)
 }
@@ -373,7 +357,6 @@ fn writes_before(
 fn hoist_loop(
     m: &mut TypedModule,
     lm: &LoopMeta,
-    speculate: bool,
     s: &mut Scratch,
     meter: &mut Meter,
 ) -> Result<u32, Error> {
@@ -394,9 +377,10 @@ fn hoist_loop(
             continue;
         };
         meter.tick(u32::try_from(block.insts.len()).unwrap_or(u32::MAX))?;
-        let early = speculate || run.contains(&b);
+        let early = run.contains(&b);
         for (i, node) in block.insts.iter().enumerate() {
-            let (Some(v), Inst::Load { .. }) = (node.result, &node.inst) else {
+            let (Some(v), Inst::Load { .. } | Inst::ImageFetch { .. }) = (node.result, &node.inst)
+            else {
                 continue;
             };
             if early && movable(m, v, s, 0) {
@@ -508,8 +492,9 @@ fn invariant(m: &TypedModule, v: Value, s: &mut Scratch, depth: u32) -> bool {
     }
 }
 
-/// Whether the body instruction defining `v` may move to the preheader: a load of a uniform view
-/// or an instruction [`pure`] admits, whose operands are all [`invariant`]. Memoized per loop.
+/// Whether the body instruction defining `v` may move to the preheader: a load of a uniform view,
+/// a fetch of a texel form's texel, or an instruction [`pure`] admits, whose operands are all
+/// [`invariant`]. Memoized per loop.
 fn movable(m: &TypedModule, v: Value, s: &mut Scratch, depth: u32) -> bool {
     let stamp = s.stamp;
     if s.seen.get(v.index()).is_some_and(|&x| x == stamp) {
@@ -568,7 +553,6 @@ fn pure(inst: &Inst) -> bool {
             | Inst::Convert { .. }
             | Inst::BitFieldInsert { .. }
             | Inst::BitFieldExtract { .. }
-            | Inst::Fma { .. }
             | Inst::CompositeConstruct { .. }
             | Inst::CompositeExtract { .. }
             | Inst::CompositeInsert { .. }
@@ -592,9 +576,10 @@ fn uniform_view(m: &TypedModule, s: &Scratch, v: Value) -> bool {
                     m.types.get(g.pointee),
                     Ok(Type::Struct { layout: Some(l), .. }) if l.block
                 );
-                return g.class == StorageClass::Uniform
-                    && matches!(g.kind, GlobalKind::Resource(_))
-                    && block;
+                return matches!(
+                    (g.class, &g.kind),
+                    (StorageClass::Uniform, GlobalKind::Resource(_))
+                ) && block;
             }
             Some(ValueOrigin::Inst(_)) => match s.node_of(m, v).map(|n| &n.inst) {
                 Some(Inst::AccessChain {

@@ -1,6 +1,13 @@
 //! Lockstep made explicit (device memory too): barriers that order the threadgroup-memory and
 //! device-memory accesses a kernel leaves to the lockstep of Apple's simdgroups.
 //!
+//! **Where it runs.** Under the resident-table domains, the old runtime's, until the cutover
+//! deletes it. Under the identity domains (`lower::access::identity`, the runtime's) no kernel
+//! is ordered ([`OrderKey::of`]'s key orders nothing): documented Metal orders the threads of a
+//! simdgroup only through barriers and atomics, and calls their conflicting accesses between
+//! barriers a data race (docs/API.md, accepted differences). The pairs are still found there, and
+//! a kernel holding one records `PrecisionNote::SimdgroupAccessOrder` (`Lockstep::unordered`).
+//!
 //! **What Metal guarantees.** The Metal Shading Language specification (4.1, §4.4.1, §5.2.3.6,
 //! §6.10) defines a simdgroup as threads that execute concurrently, and orders threadgroup
 //! memory between threads only through `threadgroup_barrier` and `simdgroup_barrier` with
@@ -105,19 +112,14 @@
 //!   in the threadgroup and the results of its collective operations are uniform too). On a
 //!   32-lane subgroup (`Direct`) it is a subgroup control barrier, which orders the invocations
 //!   of its tangle, the whole simdgroup there; in the `Emulated` tier it is a workgroup barrier.
-//! - otherwise a simdgroup barrier right before `b` that is exact only when every thread walks
-//!   it: the kernel is compiled on the `Emulated` tier, whose predicated walk takes every thread
-//!   through each barrier ([`Lockstep::emulated`]). On a device that runs a simdgroup's 32 threads
-//!   in lockstep itself (`VkProperty::SimdgroupLockstep`: MoltenVK on an Apple GPU, where the
-//!   module runs on the hardware and through the compiler the Metal kernel does), no barrier stands
-//!   there and the kernel keeps its tier: the device's lockstep orders the pair as Apple's does for
-//!   the original, the module requires the property, and [`Lockstep::device`] counts the places
-//!   (the user's decision). Where the entry reconverges maximally on 32-lane subgroups
-//!   (`shaderMaximalReconvergence` and a `Direct` or `Cluster32` tier for the barrier's class), the
-//!   barrier there is a subgroup control barrier in divergent flow, which Vulkan defines for the
-//!   invocations that run it together: the tangle maximal reconvergence makes the threads that took
-//!   the same path, the threads Apple's simdgroup runs that instruction for. It orders the pair as
-//!   lockstep does, so the kernel keeps the tier its class gives.
+//! - otherwise a simdgroup barrier right before `b` that is exact only when every thread walks it:
+//!   the kernel is compiled on the `Emulated` tier, whose predicated walk takes every thread
+//!   through each barrier ([`Lockstep::emulated`]). Where the entry reconverges maximally on
+//!   32-lane subgroups (`shaderMaximalReconvergence` and a `Direct` or `Cluster32` tier for the
+//!   barrier's class), the barrier there is a subgroup control barrier in divergent flow, which
+//!   Vulkan defines for the invocations that run it together: the tangle maximal reconvergence
+//!   makes the threads that took the same path, the threads Apple's simdgroup runs that instruction
+//!   for. It orders the pair as lockstep does, so the kernel keeps the tier its class gives.
 //!
 //! A threadgroup barrier stands for pairs the same detection clears where each simdgroup lies
 //! within one row of its threadgroup (`Lockstep::rows`'s facts) only when no other pair wants it
@@ -154,8 +156,9 @@
 //! store to one location in one instruction, and the order in which a simdgroup runs the arms of
 //! a branch its threads diverge on; neither is visible in the IR, and Metal defines neither.
 //!
-//! The analysis is metered: work per instruction, per block reached, and per pair, and its tables
-//! are charged while they live. The pair search ([`search`]) does not try a pair whose barrier is
+//! The analysis is metered: work per instruction, per block reached, and per pair, the lane checks
+//! sixteen steps to a unit (their steps are that much cheaper), and its tables are charged while
+//! they live. The pair search ([`search`]) does not try a pair whose barrier is
 //! already wanted, and stops walking where every pair beyond has its barrier, so a long
 //! barrier-free body whose pairs conflict costs about linear work in its blocks.
 
@@ -174,7 +177,6 @@ use crate::air::ir::{
 };
 use crate::air::{Entry, Lockstep};
 use crate::budget::{tree_bytes, Meter};
-use crate::device::requirements::VkProperty;
 use crate::device::subgroup::{tier, OpBits, SimdClass, Tier};
 use crate::device::DeviceProfile;
 use crate::error::{Error, InternalError, InternalKind};
@@ -182,7 +184,7 @@ use crate::graph::{LoopForest, PostDomTree};
 use crate::pipeline::sym::Stage;
 
 use super::uniform::{Among, Uniformity};
-use facts::{Access, Accesses, Addr, AddrFacts, Row, Space, Spread};
+use facts::{Access, Accesses, Addr, AddrFacts, Row, Space, Spread, LANE_STEPS_PER_UNIT};
 use search::Search;
 
 fn invariant(what: &'static str) -> Error {
@@ -231,11 +233,19 @@ struct Shape<'a> {
     us: &'a Uniformity,
     pdom: &'a PostDomTree<BlockId>,
     loops: &'a LoopForest<BlockId>,
-    /// The lane pairs `facts::Lanes::apart` compared since the search last charged them.
+    /// The lane steps `facts::Lanes::apart` took since the search last charged them.
     lanes_work: Cell<u64>,
 }
 
 impl Shape<'_> {
+    /// The whole work units of the lane steps counted since the last charge
+    /// ([`LANE_STEPS_PER_UNIT`] each), leaving the rest for the next.
+    fn lane_units(&self) -> u32 {
+        let steps = self.lanes_work.get();
+        self.lanes_work.set(steps % LANE_STEPS_PER_UNIT);
+        u32::try_from(steps / LANE_STEPS_PER_UNIT).unwrap_or(u32::MAX)
+    }
+
     /// Every thread of a simdgroup executes block `b` together.
     fn sg(&self, b: BlockId) -> bool {
         self.wg(b) || self.us.is_uniform(b)
@@ -612,47 +622,71 @@ impl Avoid {
     }
 }
 
-/// What the analysis decided: the barriers to insert, by block and position, whether one needs
-/// emulated simdgroups, and how many places the device's lockstep orders instead.
+/// What the analysis decided: the barriers to insert, by block and position, and whether one needs
+/// emulated simdgroups.
 struct Decision {
     inserts: Vec<(BlockId, u32, Order)>,
     /// The memory the inserted barriers order: the spaces whose pairs needed one.
     flags: MemFlags,
     emulated: bool,
-    device: u32,
+}
+
+/// What [`order`] reads besides the entry, which with it decides the order completely: of the
+/// device's profile, whether a subgroup barrier where the simdgroup's threads diverge orders the
+/// threads that run it together; and whether the kernel is its one-row variant
+/// (`LoweringInputs::one_row`); and whether the profile orders no pair (`unordered`: the identity
+/// domains, whose kernels take no order, the module documentation). Two asks with equal keys order
+/// an entry the same way, so an ordered entry is kept under its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderKey {
+    tangle: bool,
+    one_row: bool,
+    unordered: bool,
+}
+
+impl OrderKey {
+    /// The key of a device of profile `p`, for the one-row variant where `one_row`. Under the
+    /// identity domains (`lower::access::identity`) the key orders nothing: [`order`] finds the
+    /// kernel's pairs and inserts no barrier.
+    pub fn of(p: &DeviceProfile, one_row: bool) -> OrderKey {
+        if crate::lower::access::identity(p) {
+            return OrderKey {
+                tangle: false,
+                one_row,
+                unordered: true,
+            };
+        }
+        // A subgroup barrier where the simdgroup's threads diverge orders the threads that run it
+        // together (the tangle) where the entry reconverges maximally on 32-lane subgroups, so no
+        // place needs the `Emulated` tier there.
+        let model = &p.fields().subgroup;
+        let tangle = model.maximal_reconvergence
+            && matches!(
+                tier(&SimdClass::CrossLane(OpBits::BASIC), Stage::Kernel, model),
+                Ok(Tier::Direct | Tier::Cluster32)
+            );
+        OrderKey {
+            tangle,
+            one_row,
+            unordered: false,
+        }
+    }
 }
 
 /// Order the threadgroup-memory and device-memory accesses of kernel `e` that only Apple's
 /// simdgroup lockstep orders, by inserting barriers into its body (see the module
-/// documentation), for a device of profile `p`. Where `one_row` (the kernel's one-row variant,
-/// `LoweringInputs::one_row`) and each simdgroup lying within one row orders no pair a
-/// simdgroup barrier would ([`Lockstep::rows`]), only the threadgroup barriers are inserted.
-/// An entry of another stage, or a kernel without such a pair, is returned unchanged.
-pub fn order(
-    mut e: Entry,
-    p: &DeviceProfile,
-    one_row: bool,
-    m: &mut Meter,
-) -> Result<Entry, Error> {
+/// documentation), for the device and variant of `key`. Where the key's one-row variant
+/// (`LoweringInputs::one_row`) and, with each simdgroup lying within one row, no pair wants more
+/// than a threadgroup barrier, only the threadgroup barriers are inserted, on every device. Under
+/// a key that orders nothing (`OrderKey::unordered`) no barrier is inserted, and a kernel with
+/// such a pair states it ([`Lockstep::unordered`]). An entry of another stage, or a kernel without
+/// such a pair, is returned unchanged.
+pub fn order(mut e: Entry, key: OrderKey, m: &mut Meter) -> Result<Entry, Error> {
     if !matches!(e.ep.stage, AbiStage::Kernel { .. }) {
         return Ok(e);
     }
-    let device = p
-        .fields()
-        .enabled
-        .properties
-        .contains(&VkProperty::SimdgroupLockstep);
-    // A subgroup barrier where the simdgroup's threads diverge orders the threads that run it
-    // together (the tangle) where the entry reconverges maximally on 32-lane subgroups, so no place
-    // needs the `Emulated` tier there.
-    let model = &p.fields().subgroup;
-    let tangle = model.maximal_reconvergence
-        && matches!(
-            tier(&SimdClass::CrossLane(OpBits::BASIC), Stage::Kernel, model),
-            Ok(Tier::Direct | Tier::Cluster32)
-        );
     let before = m.ledger();
-    let decided = decide(&e, (device, tangle), one_row, m);
+    let decided = decide(&e, key, m);
     let spent = usize::try_from(m.ledger().saturating_sub(before)).unwrap_or(usize::MAX);
     m.release(spent);
     let Some((d, rows)) = decided? else {
@@ -678,23 +712,24 @@ pub fn order(
     e.lockstep = Lockstep {
         barriers,
         emulated: d.emulated,
-        device: d.device,
         rows,
         across_rows,
+        unordered: key.unordered,
     };
     Ok(e)
 }
 
 /// The barriers kernel `e` needs, or `None` when it needs none, and whether none is needed where
-/// each simdgroup lies within one row of its threadgroup ([`Lockstep::rows`]); `device`: the
-/// device runs a simdgroup in lockstep; `tangle`: a subgroup barrier in divergent flow orders the
-/// threads that run it together (maximal reconvergence on 32-lane subgroups).
-fn decide(
-    e: &Entry,
-    (device, tangle): (bool, bool),
-    one_row: bool,
-    m: &mut Meter,
-) -> Result<Option<(Decision, bool)>, Error> {
+/// each simdgroup lies within one row of its threadgroup ([`Lockstep::rows`]); `tangle`: a subgroup
+/// barrier in divergent flow orders the
+/// threads that run it together (maximal reconvergence on 32-lane subgroups); `unordered`: the
+/// key orders nothing, so a kernel with a pair needs no barrier.
+fn decide(e: &Entry, key: OrderKey, m: &mut Meter) -> Result<Option<(Decision, bool)>, Error> {
+    let OrderKey {
+        tangle,
+        one_row,
+        unordered,
+    } = key;
     let Some(body) = e.module.func(e.func).and_then(|f| f.body.as_ref()) else {
         return Ok(None);
     };
@@ -730,20 +765,34 @@ fn decide(
             Space::Device => flags.device = true,
         }
         wants.extend(found);
+        // A key that orders nothing needs one pair alone, not the other space's.
+        if unordered {
+            break;
+        }
     }
     if wants.is_empty() {
         return Ok(None);
+    }
+    // A key that orders nothing found a pair: no barrier, and nothing of the placement.
+    if unordered {
+        let none = Decision {
+            inserts: Vec::new(),
+            flags: MemFlags::default(),
+            emulated: false,
+        };
+        return Ok(Some((none, false)));
     }
     // The same pairs where each simdgroup lies within one row of its threadgroup, so that two of
     // its threads' positions differ in `x` and are equal in `y` and `z` (`AddrFacts::new`'s
     // `rows`). A threadgroup barrier none of them wants orders only pairs that meet where a
     // simdgroup spans two rows, so it runs only in such a threadgroup (`Order::Rows`). And where
     // none of them wants more than a threadgroup barrier, a dispatch of such threadgroups needs
-    // none of the simdgroup barriers; only a kernel whose subgroup barriers keep a 32-lane tier
-    // asks that (`tangle`, without the device's own lockstep).
+    // none of the simdgroup barriers (`cleared`): the one-row variant leaves them out on every
+    // device, and the plan states it (`rows`) where the kernel's subgroup barriers keep a 32-lane
+    // tier (`tangle`), the old binder's one-row regions.
     drop(af);
     let mut in_rows: BTreeSet<Want> = BTreeSet::new();
-    if (tangle && !device) || wants.iter().any(|w| w.order == Order::Threadgroup) {
+    if one_row || tangle || wants.iter().any(|w| w.order == Order::Threadgroup) {
         let mut rows_af = AddrFacts::new(e, body, &layouts, &us, true, m)?;
         for (_, acc) in &spaces {
             pairs(
@@ -757,7 +806,8 @@ fn decide(
             )?;
         }
     }
-    let rows = tangle && !device && in_rows.iter().all(|w| w.order == Order::Threadgroup);
+    let cleared = in_rows.iter().all(|w| w.order == Order::Threadgroup);
+    let rows = tangle && cleared;
     let mut wants: BTreeSet<Want> = wants
         .into_iter()
         .map(
@@ -772,7 +822,7 @@ fn decide(
         .collect();
     // The one-row variant keeps the threadgroup barriers alone: in a threadgroup whose simdgroups
     // each lie within one row, no pair a simdgroup barrier or an `Order::Rows` one orders meets.
-    if one_row && rows {
+    if one_row && cleared {
         wants.retain(|w| w.order == Order::Threadgroup);
         if wants.is_empty() {
             return Ok(None);
@@ -781,10 +831,7 @@ fn decide(
     let term = spaces
         .first()
         .map_or(&[][..], |(_, acc)| acc.term.as_slice());
-    Ok(Some((
-        stab(&wants, flags, (device, tangle), term, m)?,
-        rows,
-    )))
+    Ok(Some((stab(&wants, flags, tangle, term, m)?, rows)))
 }
 
 /// Collect into `wants` where barriers must order the conflicting pairs of `acc`, the accesses of
@@ -918,15 +965,13 @@ fn pairs<'a>(
 /// One barrier at a position of as many intervals as it can serve ([`points`]): threadgroup
 /// barriers first, then `Order::Rows` ones for the intervals of pairs that meet only across rows
 /// no threadgroup barrier serves, then simdgroup barriers for the intervals no threadgroup barrier
-/// that always runs serves. On a
-/// device that runs a simdgroup in lockstep (`device`), the places only emulated simdgroups
-/// would make exact are counted rather than given a barrier; where a subgroup barrier orders the
-/// threads that run it together (`tangle`), they take a simdgroup barrier and leave the tier to
-/// the kernel's class.
+/// that always runs serves. Where a subgroup barrier orders the threads that run it together
+/// (`tangle`), the places only emulated simdgroups would make exact take a simdgroup barrier and
+/// leave the tier to the kernel's class.
 fn stab(
     wants: &BTreeSet<Want>,
     flags: MemFlags,
-    (device, tangle): (bool, bool),
+    tangle: bool,
     term: &[u32],
     m: &mut Meter,
 ) -> Result<Decision, Error> {
@@ -963,35 +1008,18 @@ fn stab(
         .copied()
         .collect();
     m.charge(crate::budget::vec_bytes(&rest))?;
-    let emulated = !device && !tangle && rest.iter().any(|w| w.order == Order::Emulated);
+    let emulated = !tangle && rest.iter().any(|w| w.order == Order::Emulated);
     for (w, at) in points(rest, term, m)? {
         m.charge(bytes)?;
-        // A block holds places of one kind: a simdgroup barrier's are uniform in the
-        // simdgroup, and an emulated one's are not.
-        let order = if device && w.order == Order::Emulated {
-            Order::Emulated
-        } else {
-            Order::Simdgroup
-        };
-        placed.insert((w.block, at, order));
+        placed.insert((w.block, at, Order::Simdgroup));
     }
-    let device = placed
-        .iter()
-        .filter(|&&(_, _, o)| o == Order::Emulated)
-        .count();
     let mut inserts = Vec::new();
-    m.reserve(&mut inserts, placed.len() - device)?;
-    inserts.extend(
-        placed
-            .into_iter()
-            .filter(|&(_, _, o)| o != Order::Emulated)
-            .map(|(b, p, o)| (BlockId::new(b), p, o)),
-    );
+    m.reserve(&mut inserts, placed.len())?;
+    inserts.extend(placed.into_iter().map(|(b, p, o)| (BlockId::new(b), p, o)));
     Ok(Decision {
         inserts,
         flags,
         emulated,
-        device: u32::try_from(device).unwrap_or(u32::MAX),
     })
 }
 

@@ -33,17 +33,32 @@
 //!   memory model's operands the arena's words take; a volatile one's words carry `Volatile`,
 //!   except a load of a read-only typed constant object.
 //!
-//! **Containment** of an arena access is on unless the profile's containment is `UnsafeOff` (no
-//! robustness feature covers arenas): with `inb` the normative check against the arena's exact byte
+//! **A kernel's arena of `float` words** (`memory::arena::TgWords`, on `Device::from_queries`'
+//! profile, whose `ThreadgroupMemory` is `Native`): where every access of a kernel's threadgroup
+//! arena is a whole, aligned `float` word ([`Leaf::float_words`]), with no atomic, memory
+//! intrinsic or pointer cell in it, and its simdgroups are not emulated, the arena is a `float`
+//! array of its own words ([`choose_words`]). An access is one `OpLoad` or `OpStore` of a `float`
+//! per lane, at the word index `off / 4` and the words after it: no branch, no select and no
+//! bitcast. Every other kernel's arena keeps its `u32` words.
+//!
+//! **Bounds** of an arena access are checked unless the arena is threadgroup memory on a profile
+//! whose `ThreadgroupMemory` is `Native` ([`contained`]): there no threadgroup access is contained, an arena's, its atomics', memory
+//! intrinsics', pointer cells' and imageblock's alike, nor a typed threadgroup object's index, and
+//! one past the memory is undefined, as in Metal (no robustness feature covers arenas). An
+//! unchecked load, store or atomic at a constant offset outside the arena, which lies outside every
+//! object in it and may lie past its words, where no access chain may index with a constant, is a
+//! zero load, no store, or an atomic that writes nothing and yields zero, as a contained one is
+//! (the atomic in `atomic`). Contained,
+//! with `inb` the normative check against the arena's exact byte
 //! size, a load reads at `select(inb, off, 0)` and yields `select(inb, v, 0)`, and a store sits in
 //! a builder-closed `if_(inb)`. A dereference of a null private pointer (undefined in Metal) reads
-//! or writes the kept first word, or an object's bytes at a field's offset: inside the arena
-//! under containment, and unchecked under `UnsafeOff`. A typed access's dynamic indices are
-//! **contained** under
-//! `GuestIsolation::On` (`memory::alloca`), so the access never leaves its object: a thread's own
+//! or writes the kept first word, or an object's bytes at a field's offset: inside the arena. A
+//! typed access's dynamic indices are **bounded** (`memory::alloca`), so the access never leaves
+//! its object: a thread's own
 //! object's (an alloca's) are checked against their levels' lengths, a load past a level reading
-//! zero and a store past one sitting in a builder-closed `if_` that drops it; a threadgroup or
-//! constant object's are each clamped to the level's last element. A constant index is in range by
+//! zero and a store past one sitting in a builder-closed `if_` that drops it; a threadgroup
+//! object's, where threadgroup memory is contained ([`contained`]), and a constant object's are
+//! each clamped to the level's last element. A constant index is in range by
 //! construction. Each dynamic index is the defining `getelementptr`'s own operand where the GEP's
 //! dynamic indices line up one to one with the path's dynamic levels (`lined_up`), and is
 //! recovered from the pointer's offset otherwise.
@@ -90,12 +105,12 @@ use crate::air::ir::{
     IntPredicate, Type, TypeId, Value, ValueId,
 };
 use crate::budget::{tree_bytes, Meter, PRIVATE_ARENA_BYTES};
-use crate::device::profile::{Containment, GuestIsolation};
-use crate::error::{Error, Feature, Limit, LowerFamily, Unsupported};
+use crate::device::requirements::VkFeature;
+use crate::error::{Capability, Error, Feature, Limit, LowerFamily, Unsupported};
 use crate::lower::emit::EmitCx;
 use crate::lower::select::{Plan, SelectCx};
 use crate::memory::alloca::{self, Init, Shape, Step, Strides, TypedPath, TypedTy};
-use crate::memory::arena::{self, Arena, ArenaDecl, ArenaMem, TgDecl, TgShape};
+use crate::memory::arena::{self, Arena, ArenaDecl, ArenaMem, TgDecl, TgShape, TgWords};
 use crate::memory::contain;
 use crate::memory::fragment;
 use crate::memory::leaf::{self, k32, Leaf, WordOps};
@@ -141,7 +156,7 @@ pub struct LocalAccess {
     /// The stored value (stores only).
     pub value: Option<ValueId>,
     pub leaf: Leaf,
-    /// The in-shader containment check (off only for `Containment::UnsafeOff`).
+    /// The in-shader containment check ([`contained`]).
     pub contained: bool,
     /// A volatile access: every word it loads or stores carries `Volatile`.
     pub volatile: bool,
@@ -168,9 +183,9 @@ pub struct TypedAccess {
     /// where its dynamic indices line up one to one with the path's dynamic levels
     /// (`lined_up`); `None` recovers each from the pointer's offset.
     pub indices: Option<Vec<(ValueId, IndexForm)>>,
-    /// Each dynamic index is contained (`GuestIsolation::On`): checked against its level's length
-    /// where the access is [`checked`](Self::checked), clamped to its level's last element
-    /// otherwise.
+    /// Each dynamic index is bounded (for a typed threadgroup object where threadgroup memory is,
+    /// [`contained`]): checked against its level's length where the
+    /// access is [`checked`](Self::checked), clamped to its level's last element otherwise.
     pub clamped: bool,
     /// A volatile access: its load or store carries `Volatile`.
     pub volatile: bool,
@@ -308,9 +323,11 @@ impl LocalStrategy {
         })
     }
 
-    /// The census name (`access.<home>.<op>`).
-    pub fn name(&self) -> &'static str {
+    /// The census name (`access.<home>.<op>`), a threadgroup arena access's as `plan`'s arena
+    /// lowers it: one in an arena of `float` words is named so.
+    pub fn name(&self, plan: &LocalPlan) -> &'static str {
         use LocalStrategy as L;
+        let floats = plan.tg.as_ref().is_some_and(|t| t.words == TgWords::Floats);
         match self {
             L::Alloca { home, .. } => by_home(
                 *home,
@@ -353,6 +370,7 @@ impl LocalStrategy {
                 ],
             ),
             L::Load(a) => match (a.arena, a.contained) {
+                (Arena::Threadgroup, false) if floats => "access.threadgroup.load.floats",
                 (Arena::Threadgroup, true) => "access.threadgroup.load.checked",
                 (Arena::Threadgroup, false) => "access.threadgroup.load",
                 (Arena::Private, true) => "access.private.load.checked",
@@ -361,6 +379,7 @@ impl LocalStrategy {
                 (Arena::Payload, false) => "access.payload.load",
             },
             L::Store(a) => match (a.arena, a.contained) {
+                (Arena::Threadgroup, false) if floats => "access.threadgroup.store.floats",
                 (Arena::Threadgroup, true) => "access.threadgroup.store.checked",
                 (Arena::Threadgroup, false) => "access.threadgroup.store",
                 (Arena::Private, true) => "access.private.store.checked",
@@ -437,6 +456,9 @@ pub struct LocalPlan {
     pub tg: Option<TgShape>,
     /// The private arena's byte size, when a pointer into it is used.
     pub private: Option<u64>,
+    /// The private arena lives in device memory, an invocation's slot of the runtime's memory
+    /// (`memory::plan::ArenaLayout::device`).
+    pub private_device: bool,
     /// The payload's byte size (its parameter's `air.arg_type_size`), when a pointer into it is
     /// used.
     pub payload: Option<u64>,
@@ -444,6 +466,10 @@ pub struct LocalPlan {
     pub typed: Vec<TypedObject>,
     /// Each typed object's position in `typed`, so a use finds it in one search, not a scan.
     pub positions: BTreeMap<Home, u32>,
+    /// Whether the threadgroup arena's array and every typed threadgroup object are declared with
+    /// a null initializer, so the function's threadgroup memory reads zero until it writes it
+    /// ([`zero_threadgroup`]).
+    pub zeroed: bool,
 }
 
 impl LocalPlan {
@@ -554,6 +580,9 @@ fn use_home(cx: &mut SelectCx<'_>, home: Home, m: &mut Meter) -> Result<(), Erro
     if cx.families.access.local.position(home).is_some() {
         return Ok(());
     }
+    if let Home::Shared(_) = home {
+        zero_threadgroup(cx)?;
+    }
     let (ty, count) = object(cx, home)?;
     let tt = alloca::typed_ty(cx.entry, cx.profile, ty, fragments(cx, home), m)??;
     // A refusal past the shape releases it.
@@ -611,10 +640,49 @@ fn count_and_init(
     Ok((count, init))
 }
 
+/// Record that the function's threadgroup memory, a `Workgroup` variable, is declared with a null
+/// initializer, so it starts at zero: `Unsupported{ZeroedThreadgroupMemory}` on a profile without
+/// `shaderZeroInitializeWorkgroupMemory`, which Vulkan requires of any initializer there.
+fn zero_threadgroup(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+    let feature = VkFeature::ShaderZeroInitializeWorkgroupMemory;
+    if !cx.profile.fields().enabled.features.contains(&feature) {
+        return Err(Unsupported::needs(
+            Feature::ZeroedThreadgroupMemory,
+            Capability::Feature(feature),
+        )
+        .into());
+    }
+    cx.families.access.local.zeroed = true;
+    Ok(())
+}
+
+/// The private arena of `size` bytes in device memory (`ArenaLayout::device`): a slot of
+/// `size` rounded up to 16 bytes for each invocation of a dispatch, at the address the runtime
+/// pushes (`PushField::PrivateArenaAddress`), which the pipeline names with the slot's bytes
+/// (`RuntimeFact::PrivateArena`). A tile function, whose invocations a render pass's tiles
+/// place, keeps the refusal of private memory past the floor.
+fn device_arena(cx: &mut SelectCx<'_>, size: u64) -> Result<(), Error> {
+    let slot = size.next_multiple_of(16);
+    if super::tile::is_tile(cx) {
+        let limit = Capability::Limit {
+            limit: crate::device::VkLimit::FunctionStorageBytesPerThread,
+            required: slot.saturating_add(cx.memory.private_bytes),
+            available: crate::device::function_storage::FLOOR,
+        };
+        return Err(Unsupported::needs(Feature::PrivateMemory, limit).into());
+    }
+    let slot_bytes =
+        u32::try_from(slot).map_err(|_| Error::LimitExceeded(Limit::PrivateArenaBytes))?;
+    cx.push
+        .insert(crate::pipeline::sym::PushField::PrivateArenaAddress);
+    cx.facts.insert(RuntimeFact::PrivateArena { slot_bytes });
+    Ok(())
+}
+
 /// Record that the function uses `arena`. The threadgroup arena's shape is fixed and checked
 /// against `maxComputeSharedMemorySize` once, and every region's length becomes a runtime fact of
 /// the function. A private arena past `budget::PRIVATE_ARENA_BYTES` is
-/// `LimitExceeded(PrivateArenaBytes)`.
+/// `LimitExceeded(PrivateArenaBytes)`; one in device memory is the runtime's ([`device_arena`]).
 pub(super) fn use_arena(cx: &mut SelectCx<'_>, arena: Arena) -> Result<(), Error> {
     match arena {
         Arena::Threadgroup => {
@@ -637,6 +705,11 @@ pub(super) fn use_arena(cx: &mut SelectCx<'_>, arena: Arena) -> Result<(), Error
                 return Err(super::tile::threadgroup_variable());
             }
             let mut shape = TgShape::of(&cx.memory.tg_arena);
+            // A fragment function's arena is its tile's memory in the pass's buffer, no
+            // `Workgroup` variable.
+            if !fragment {
+                zero_threadgroup(cx)?;
+            }
             if fragment {
                 // Its arguments are its tile's memory in the pass's buffer, no workgroup array.
                 if shape.regions.is_empty() {
@@ -659,6 +732,11 @@ pub(super) fn use_arena(cx: &mut SelectCx<'_>, arena: Arena) -> Result<(), Error
             // pass keeps across its tile dispatches (`tile::wrap_entry`), and so are a fragment
             // function's.
             shape.tile = (fragment || super::tile::is_tile(cx)) && !shape.regions.is_empty();
+            // Only a kernel's own workgroup arena may be of `float` words.
+            let floats = cx.stage == Stage::Kernel && !super::tile::is_tile(cx);
+            if !floats {
+                shape.words = TgWords::Composed;
+            }
             for &(_, index) in &shape.regions {
                 if shape.tile {
                     cx.facts
@@ -678,6 +756,10 @@ pub(super) fn use_arena(cx: &mut SelectCx<'_>, arena: Arena) -> Result<(), Error
                 if size > PRIVATE_ARENA_BYTES {
                     return Err(Error::LimitExceeded(Limit::PrivateArenaBytes));
                 }
+                if cx.memory.priv_arena.device {
+                    device_arena(cx, size)?;
+                    cx.families.access.local.private_device = true;
+                }
                 cx.families.access.local.private = Some(size);
             }
         }
@@ -695,6 +777,28 @@ pub(super) fn use_arena(cx: &mut SelectCx<'_>, arena: Arena) -> Result<(), Error
         }
     }
     Ok(())
+}
+
+/// The threadgroup arena keeps its composed `u32` words: `arena`, used by an atomic, a memory
+/// intrinsic, an imageblock, a pointer cell or another use that is not a whole `float` word access.
+pub(super) fn composed(cx: &mut SelectCx<'_>, arena: Arena) {
+    if arena == Arena::Threadgroup {
+        if let Some(tg) = cx.families.access.local.tg.as_mut() {
+            tg.words = TgWords::Composed;
+        }
+    }
+}
+
+/// The form of the threadgroup arena, once every instruction is selected under `tier`: of `float`
+/// words where every access was a whole, aligned `float` word and the simdgroups are not emulated
+/// (the module docs); else composed.
+pub(crate) fn choose_words(cx: &mut SelectCx<'_>, tier: crate::device::subgroup::Tier) {
+    let Some(tg) = cx.families.access.local.tg.as_mut() else {
+        return;
+    };
+    if tg.words != TgWords::Floats || tier == crate::device::subgroup::Tier::Emulated {
+        tg.words = TgWords::Composed;
+    }
 }
 
 /// The refusal of a store into `arena` the function may not write: a mesh function's payload is
@@ -992,8 +1096,9 @@ pub fn param_value(
 }
 
 /// Declare a typed object's variable: an array of `count` elements, `Private` with a constant
-/// global's initializer, or a typed threadgroup object's `Workgroup` one.
-fn declare_typed(mb: &mut ModuleBuilder, o: &TypedObject) -> BResult<GlobalId> {
+/// global's initializer, or a typed threadgroup object's `Workgroup` one, with a null initializer
+/// where the plan's threadgroup memory is `zeroed`.
+fn declare_typed(mb: &mut ModuleBuilder, o: &TypedObject, zeroed: bool) -> BResult<GlobalId> {
     let (elem, types) = alloca::spirv_types(mb, &o.ty)?;
     let u32_ = mb.ty(SType::Int {
         width: 32,
@@ -1017,6 +1122,9 @@ fn declare_typed(mb: &mut ModuleBuilder, o: &TypedObject) -> BResult<GlobalId> {
                 parts: parts.into(),
             })?)
         }
+        None if zeroed && matches!(o.home, Home::Shared(_)) => {
+            Some(mb.constant(Constant::Null { ty })?)
+        }
         None => None,
     };
     let class = match o.home {
@@ -1031,23 +1139,19 @@ pub fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<LocalDecl> {
     let p = &plan.families.access.local;
     let mut typed = Vec::with_capacity(p.typed.len());
     for o in &p.typed {
-        typed.push((o.home, declare_typed(mb, o)?));
+        typed.push((o.home, declare_typed(mb, o, p.zeroed)?));
     }
     Ok(LocalDecl {
         tg: match &p.tg {
-            Some(shape) => Some(arena::declare_threadgroup(mb, shape)?),
+            Some(shape) => Some(arena::declare_threadgroup(mb, shape, p.zeroed)?),
             None => None,
         },
         private: match p.private {
-            Some(size) => Some(arena::declare_private(mb, size)?),
+            Some(size) => Some(arena::declare_private(mb, size, p.private_device)?),
             None => None,
         },
         payload: match p.payload {
-            Some(size) => Some(arena::declare_payload(
-                mb,
-                size,
-                plan.families.mesh.emulated,
-            )?),
+            Some(size) => Some(arena::declare_payload(mb, size)?),
             None => None,
         },
         typed,
@@ -1092,15 +1196,29 @@ pub(crate) fn access(
     let proven = cx.memory.proven_align(cx.entry, ptr);
     let leaf = leaf::leaf_of(cx.entry, cx.profile, &cx.memory.layouts, ty, align, proven)?;
     let ptr = access_ptr(cx, ptr, arena, u64::from(leaf.bytes))?;
+    if arena == Arena::Threadgroup {
+        if let Some(tg) = cx.families.access.local.tg.as_mut() {
+            tg.words = match (tg.words, leaf.float_words()) {
+                (TgWords::Unseen | TgWords::Floats, true) => TgWords::Floats,
+                _ => TgWords::Composed,
+            };
+        }
+    }
     let value = stored_value(cx, value)?;
     Ok(LocalAccess {
         arena,
         ptr,
         value,
         leaf,
-        contained: cx.profile.fields().containment != Containment::UnsafeOff,
+        contained: contained(cx, arena),
         volatile: false,
     })
+}
+
+/// Whether an access of `arena` is bounds-checked (the module docs): unless the arena is
+/// threadgroup memory, which no profile checks.
+pub(crate) fn contained(_: &SelectCx<'_>, arena: Arena) -> bool {
+    arena != Arena::Threadgroup
 }
 
 /// A pointer's offset shape while reading its definitions: `Empty` is a join's identity.
@@ -1478,8 +1596,9 @@ fn typed_access(
             (path, fragment, None)
         }
     };
-    let clamped =
-        path.dynamic().next().is_some() && cx.profile.fields().isolation == GuestIsolation::On;
+    // A typed threadgroup object's index is contained as the arena's accesses are ([`contained`]).
+    let shared = matches!(home, Home::Shared(_)) && !contained(cx, Arena::Threadgroup);
+    let clamped = path.dynamic().next().is_some() && !shared;
     let indices = match reader {
         Some(at) => lined_up(cx, at, ptr, &path, (obj, count), m)?,
         None => None,
@@ -1859,6 +1978,19 @@ pub(super) fn decl_of(
     if let Some(tile) = fragment {
         decl.tile_base = Some(cx.tile_base(fb, tile)?);
     }
+    if arena == Arena::Private && cx.plan.families.access.local.private_device {
+        decl.slot = Some(cx.arena_slot(fb)?);
+    }
+    Ok(decl)
+}
+
+/// The threadgroup arena of a word atomic: never an arena of `float` words, which an atomic keeps
+/// composed (`composed`).
+pub(super) fn words_decl(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult<ArenaDecl> {
+    let decl = decl_of(cx, fb, Arena::Threadgroup)?;
+    if decl.floats {
+        return Err(cx.fail("a word atomic in an arena of float words"));
+    }
     Ok(decl)
 }
 
@@ -1905,6 +2037,18 @@ pub(super) fn emit_access_at(
         mem: ArenaMem(decl, ops),
         kept,
     };
+    // An unchecked access at a constant offset outside the arena lies outside every object in it,
+    // where Metal leaves the access undefined, and no access chain may index the arena's words
+    // with a constant past them: it is a zero load or no store, as a contained one is.
+    if !a.contained && outside_arena(fb, off, &decl, u64::from(leaf.bytes))? {
+        return match stored {
+            None => leaf::zero(fb, &leaf).map(Some),
+            Some(_) => Ok(None),
+        };
+    }
+    if decl.floats {
+        return float_words(cx, fb, (a, decl, ops), off, stored);
+    }
     if !a.contained {
         return match stored {
             None => leaf::load(fb, &mut mem, &leaf, off).map(Some),
@@ -1928,8 +2072,7 @@ pub(super) fn emit_access_at(
             let zero = k32(fb, 0)?;
             let at = fb.select(inb, off, zero)?;
             let v = leaf::load(fb, &mut mem, &leaf, at)?;
-            let z = leaf::zero(fb, &leaf)?;
-            fb.select(inb, v, z).map(Some)
+            leaf::contained(fb, &leaf, inb, v).map(Some)
         }
         Some(v) => {
             let then: ArmFn<'_, ()> = Box::new(move |fb, _| {
@@ -1942,6 +2085,75 @@ pub(super) fn emit_access_at(
             });
             fb.if_(&mut (), inb, then, None)?;
             Ok(None)
+        }
+    }
+}
+
+/// Whether a `bytes`-byte access at `off` lies outside `decl`'s arena by the normative check
+/// (`contain::in_bounds`), decided at translation time: `off` and the arena's size are plain
+/// constants. `false` when either is not one.
+pub(super) fn outside_arena(
+    fb: &mut FunctionBuilder<'_>,
+    off: SValue,
+    decl: &ArenaDecl,
+    bytes: u64,
+) -> BResult<bool> {
+    let Some(off) = fb.const_scalar(off)? else {
+        return Ok(false);
+    };
+    let Some(ConstBits(size)) = fb.module().consts().scalar_bits(decl.size) else {
+        return Ok(false);
+    };
+    Ok(size < bytes || off > size - bytes)
+}
+
+/// Load or store (`stored`) `a`'s leaf, whole `float` words, at byte offset `off` of an arena of
+/// `float` words (`ArenaDecl::floats`, the module docs): lane `j` of `lanes` at word
+/// `off / 4 + j`, one typed access each, uncontained.
+fn float_words(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    (a, decl, ops): (&LocalAccess, ArenaDecl, WordOps),
+    off: SValue,
+    stored: Option<SValue>,
+) -> BResult<Option<SValue>> {
+    let leaf = a.leaf;
+    let lanes = u32::from(leaf.form.lanes);
+    if !leaf.float_words() || a.contained {
+        return Err(cx.fail("an access of another shape, or contained, in an arena of float words"));
+    }
+    let two = k32(fb, 2)?;
+    let first = fb.binary(BinOp::ShiftRightLogical, off, two)?;
+    let Some(global) = decl.global else {
+        return Err(cx.fail("an arena of float words without its array"));
+    };
+    let base = fb.module().global_value(global)?;
+    let access = ops.access(fb, MemAccess::default(), stored.is_some())?;
+    let mut loaded = Vec::with_capacity(lanes as usize);
+    for j in 0..lanes {
+        let at = match j {
+            0 => first,
+            _ => {
+                let j = k32(fb, j)?;
+                fb.binary(BinOp::IAdd, first, j)?
+            }
+        };
+        let p = fb.access_chain(base, &[at])?;
+        match stored {
+            None => loaded.push(fb.load(p, access)?),
+            Some(v) if lanes == 1 => fb.store(p, v, access)?,
+            Some(v) => {
+                let x = fb.composite_extract(v, &[j])?;
+                fb.store(p, x, access)?;
+            }
+        }
+    }
+    match (stored, loaded.as_slice()) {
+        (Some(_), _) => Ok(None),
+        (None, [x]) => Ok(Some(*x)),
+        (None, xs) => {
+            let ty = crate::lower::arith::ops::ty(fb, leaf.form)?;
+            fb.composite_construct(ty, xs).map(Some)
         }
     }
 }

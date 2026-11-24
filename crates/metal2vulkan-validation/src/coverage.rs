@@ -13,24 +13,17 @@
 //!
 //! A run's census ([`ExecutedCensus`]) is the class of the device it ran on ([`ExecutionClass`]:
 //! a CPU ICD, or a GPU's driver, [`HostClass`]), the product build that compiled its modules, and
-//! their censuses. Each committed profile is compiled twice where it states a robustness feature
-//! ([`Leg`]): as stated, which selects the robust encodings, and with every robustness feature
-//! removed ([`robustness_off`]), which selects the in-shader ones (validation runs both).
-//!
-//! A driver that advertises buffer robustness without containing some of its forms is a recorded
-//! limitation (MoltenVK leaves loads, stores, and atomics through buffer descriptors and
-//! fixed-function vertex input uncontained): a run of the robust buffer encoding there is
-//! evidence for the in-bounds path only, never containment evidence for those forms
-//! ([`HostClass::robust_buffers_uncontained`], which out-of-bounds evidence reads).
+//! their censuses. The tier table compiles each committed profile twice where it states a
+//! robustness feature ([`Leg`]): as stated, which selects the robust image encodings where it
+//! states image robustness, and with every robustness feature removed ([`robustness_off`]), which
+//! selects the in-shader ones. Buffers are checked in the shader on both legs.
 
 use crate::candidate::engine::artifact::ExecutedArtifact;
 use crate::case::Stage;
 use crate::observation_contract::ComparisonClass;
-use metal2vulkan::bind::BindingPlan;
-use metal2vulkan::device::Containment as ProfileContainment;
+use metal2vulkan::device::DeviceDescription;
 use metal2vulkan::device::VkFeature;
-use metal2vulkan::device::{DeviceDescription, DeviceProfile};
-use metal2vulkan::pipeline::{PrecisionNote, StageModule};
+use metal2vulkan::pipeline::PrecisionNote;
 use metal2vulkan::vk;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -53,51 +46,28 @@ pub struct SubgroupShape {
     pub full_subgroups: bool,
 }
 
-impl SubgroupShape {
-    /// The shape of a linked stage module.
-    pub fn of_stage_module(module: &StageModule) -> SubgroupShape {
-        SubgroupShape {
-            required_size: module.required_subgroup_size,
-            full_subgroups: module
-                .stage_flags
-                .contains(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS),
-        }
-    }
-}
+/// The robustness features a tier-table profile's robustness-off leg removes
+/// ([`Leg::RobustnessOff`]): image robustness, which drops the in-shader clamp and guard of images
+/// (`robust_image_access`). The translator names no buffer robustness: the shader checks every
+/// descriptor view.
+pub const ROBUSTNESS_FEATURES: [VkFeature; 2] =
+    [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2];
 
-/// The device features whose enablement chooses a containment encoding: buffer robustness drops the
-/// in-shader check of descriptor views (`DeviceProfile::checks_buffers_in_shader`), image
-/// robustness the in-shader clamp and guard of images (`robust_image_access`). A tier-table
-/// profile's robustness-off leg removes them ([`Leg::RobustnessOff`]), and an engine executor
-/// enables exactly the ones its device's description states, or none in that leg.
-pub const ROBUSTNESS_FEATURES: [VkFeature; 4] = [
-    VkFeature::RobustBufferAccess,
-    VkFeature::RobustBufferAccess2,
-    VkFeature::RobustImageAccess,
-    VkFeature::RobustImageAccess2,
-];
-
-/// How buffers reached through descriptor views (and texel buffers) are contained. A texel
-/// buffer is left to the device only under `robustBufferAccess2`, and is checked in the shader
-/// below it (`DeviceProfile::device_reads_texels`): its out-of-bounds targets' mechanism
-/// (`executor_contract::out_of_bounds`) states that exactly, where this module-wide label says
-/// what the descriptor views take.
+/// How buffers reached through descriptor views (and texel buffers) are contained: the shader
+/// checks every one, on every profile. Its out-of-bounds targets' mechanism
+/// (`executor_contract::out_of_bounds`) states each access's check, where this module-wide label
+/// says what the descriptor views take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BufferEncoding {
     /// The module declares no buffer (no variable in the `StorageBuffer` or `Uniform` storage
     /// class, no texel buffer), so no buffer encoding applies to it, whatever its profile's.
     Unused,
-    /// Checked in the shader: no buffer robustness is enabled
-    /// (`DeviceProfile::checks_buffers_in_shader`).
+    /// Checked in the shader.
     Checked,
-    /// Left to robust descriptors: `robustBufferAccess` or `robustBufferAccess2` is enabled, and
-    /// the shader emits no check. Both levels select the same shader. A device may
-    /// advertise the feature without containing every form
-    /// ([`HostClass::robust_buffers_uncontained`], MoltenVK).
+    /// Left to robust descriptors, the shader emitting no check: a stored row may state it; no
+    /// compile does.
     Robust,
-    /// Containment is off (`Containment::UnsafeOff`, never the default policy).
-    Off,
 }
 
 /// How image reads and writes are contained (`DeviceProfile::device_reads_texels` and
@@ -123,8 +93,7 @@ pub enum ImageEncoding {
 
 /// The containment encodings a module compiled under: the leaf encodings of its descriptor
 /// accesses. They are those of the profile it compiled for, which every lowering that reads them
-/// reads (`DeviceProfile::checks_buffers_in_shader`, the access targets' checks,
-/// `lower::texture::slot`).
+/// reads (the access targets' checks, `lower::texture::slot`).
 ///
 /// Census names do not all show the encoding they compiled under, so the report keys its rows by
 /// this, taken from the compile, not by the names. An access by device address (a `BufferForm::Psb`
@@ -160,109 +129,19 @@ impl From<ContainmentRecord> for Containment {
     }
 }
 
-impl Containment {
-    /// The encodings of a module of SPIR-V `words` compiled for `profile`.
-    pub fn of_compile(profile: &DeviceProfile, words: &[u32]) -> Containment {
-        let declared = Declared::of(words);
-        Containment {
-            buffers: if profile.containment() == ProfileContainment::UnsafeOff {
-                BufferEncoding::Off
-            } else if !declared.buffers {
-                BufferEncoding::Unused
-            } else if profile.checks_buffers_in_shader() {
-                BufferEncoding::Checked
-            } else {
-                BufferEncoding::Robust
-            },
-            images: if !declared.images {
-                ImageEncoding::Unused
-            } else if profile.device_reads_texels(false) {
-                ImageEncoding::Robust
-            } else if profile.device_drops_texel_writes(false) {
-                ImageEncoding::RobustWrites
-            } else {
-                ImageEncoding::Checked
-            },
-        }
-    }
-
-    /// `buffers:<b>,images:<i>`, as the report prints it.
-    pub fn label(self) -> String {
-        format!(
-            "buffers:{},images:{}",
-            match self.buffers {
-                BufferEncoding::Unused => "unused",
-                BufferEncoding::Checked => "checked",
-                BufferEncoding::Robust => "robust",
-                BufferEncoding::Off => "off",
-            },
-            match self.images {
-                ImageEncoding::Unused => "unused",
-                ImageEncoding::Checked => "checked",
-                ImageEncoding::RobustWrites => "robust_writes",
-                ImageEncoding::Robust => "robust",
-            },
-        )
-    }
-}
-
-/// The resources a SPIR-V module declares that a containment encoding can apply to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Declared {
-    /// A variable in the `StorageBuffer` or `Uniform` storage class, or a texel buffer
-    /// (`OpTypeImage` of `Dim` `Buffer`, contained by buffer robustness).
-    buffers: bool,
-    /// An image type other than a texel buffer's (`OpTypeImage` of a `Dim` other than `Buffer`),
-    /// contained by image robustness.
-    images: bool,
-}
-
-impl Declared {
-    /// What `words` declare. Words that do not parse as instructions after the header declare
-    /// both: the reading that never merges one encoding into another.
-    fn of(words: &[u32]) -> Declared {
-        const OP_TYPE_IMAGE: u32 = 25;
-        const OP_VARIABLE: u32 = 59;
-        const DIM_BUFFER: u32 = 5;
-        const UNIFORM: u32 = 2;
-        const STORAGE_BUFFER: u32 = 12;
-        let mut out = Declared {
-            buffers: false,
-            images: false,
-        };
-        let mut at = 5;
-        while let Some(&word) = words.get(at) {
-            let count = (word >> 16) as usize;
-            let Some(operands) = words.get(at + 1..at + count).filter(|_| count > 0) else {
-                break;
-            };
-            match word & 0xffff {
-                OP_TYPE_IMAGE if operands.get(2) == Some(&DIM_BUFFER) => out.buffers = true,
-                OP_TYPE_IMAGE => out.images = true,
-                OP_VARIABLE => {
-                    out.buffers |= matches!(operands.get(2), Some(&(UNIFORM | STORAGE_BUFFER)));
-                }
-                _ => {}
-            }
-            at += count;
-        }
-        if at != words.len() || words.len() < 5 {
-            return Declared {
-                buffers: true,
-                images: true,
-            };
-        }
-        out
-    }
-}
-
 /// The census of one compiled or executed stage module.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleCensus {
     pub stage: Stage,
-    pub subgroup: SubgroupShape,
-    /// `StrategyCensus` names.
+    /// The module's subgroup shape, where the executor compiled it itself: `None` for a run
+    /// through the runtime, which keeps its modules to itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgroup: Option<SubgroupShape>,
+    /// `StrategyCensus` names. A run through the runtime, which keeps the translator's census of
+    /// its modules to itself, records only the float sums and products the case's AIR calls,
+    /// under the names the translator's census gives them
+    /// (`check::interface::float_reductions`): what its comparison class is derived from.
     pub strategies: BTreeSet<String>,
     /// The module's precision notes: with `strategies`, what its observations' comparison class
     /// is derived from. An executed module's are its notes under the specialization it ran with and
@@ -275,91 +154,7 @@ pub struct ModuleCensus {
     pub containment: Option<Containment>,
 }
 
-impl ModuleCensus {
-    /// The census of a linked stage module compiled for `profile`, or `None` for a stage Metal
-    /// has no function of (a post-tessellation vertex function's module is its evaluation stage),
-    /// as a pipeline created it under `plan`'s specialization and a dispatch or draw ran it with
-    /// the values `plan` pushes: its precision notes are those that hold of them
-    /// (`StageModule::precision_notes_bound`, `BindingPlan::specialized_value`). `None`: every
-    /// note the module records, the answer where the plan is not known.
-    pub fn of_stage_module_under(
-        module: &StageModule,
-        profile: &DeviceProfile,
-        plan: Option<&BindingPlan>,
-    ) -> Option<ModuleCensus> {
-        let stage = [
-            (vk::ShaderStage::COMPUTE, Stage::Kernel),
-            (vk::ShaderStage::VERTEX, Stage::Vertex),
-            (vk::ShaderStage::TESSELLATION_EVALUATION, Stage::Vertex),
-            (vk::ShaderStage::FRAGMENT, Stage::Fragment),
-            (vk::ShaderStage::TASK_EXT, Stage::Object),
-            (vk::ShaderStage::MESH_EXT, Stage::Mesh),
-        ]
-        .into_iter()
-        .find(|(vk_stage, _)| *vk_stage == module.stage)
-        .map(|(_, stage)| stage)?;
-        Some(ModuleCensus {
-            stage,
-            subgroup: SubgroupShape::of_stage_module(module),
-            strategies: module.strategies.entries.keys().cloned().collect(),
-            precision: match plan {
-                Some(plan) => module
-                    .precision_notes_bound(&plan.specialization, &|key| plan.specialized_value(key))
-                    .into_iter()
-                    .collect(),
-                None => module.precision_notes.iter().copied().collect(),
-            },
-            containment: Some(Containment::of_compile(profile, &module.spirv)),
-        })
-    }
-
-    /// The census of each module of a linked pipeline's `modules` (in pipeline order) that runs
-    /// a Metal function, compiled for `profile`. A tessellation pipeline's synthesized vertex and
-    /// control stages run none and are left out: the pipeline is tessellated exactly when it has an
-    /// evaluation stage. So are a render pipeline's geometry stages: Metal has no geometry
-    /// function, so every one is a stage link synthesizes between the vertex and fragment
-    /// functions (`metal2vulkan::pipeline::link::geometry`: the barycentric weights, or the slice
-    /// and viewport a vertex function selects). `Err` names a module of a stage no Metal function
-    /// has.
-    pub fn of_pipeline_modules(
-        modules: &[StageModule],
-        profile: &DeviceProfile,
-    ) -> Result<Vec<ModuleCensus>, String> {
-        ModuleCensus::of_pipeline_modules_under(modules, profile, None)
-    }
-
-    /// [`ModuleCensus::of_pipeline_modules`] of a pipeline a dispatch or draw ran under `plan`
-    /// ([`ModuleCensus::of_stage_module_under`]); `None` where it is not known.
-    pub fn of_pipeline_modules_under(
-        modules: &[StageModule],
-        profile: &DeviceProfile,
-        plan: Option<&BindingPlan>,
-    ) -> Result<Vec<ModuleCensus>, String> {
-        let tessellated = modules
-            .iter()
-            .any(|m| m.stage == vk::ShaderStage::TESSELLATION_EVALUATION);
-        modules
-            .iter()
-            .filter(|m| m.stage != vk::ShaderStage::GEOMETRY)
-            .filter(|m| {
-                !tessellated
-                    || (m.stage != vk::ShaderStage::VERTEX
-                        && m.stage != vk::ShaderStage::TESSELLATION_CONTROL)
-            })
-            .map(|m| {
-                ModuleCensus::of_stage_module_under(m, profile, plan).ok_or_else(|| {
-                    format!(
-                        "the linked module's stage {:?} has no authored stage",
-                        m.stage
-                    )
-                })
-            })
-            .collect()
-    }
-}
-
-/// A Vulkan driver (`VkDriverId`): the host class of a GPU (NVIDIA proprietary, RADV, ANV,
-/// MoltenVK, ...).
+/// A Vulkan driver (`VkDriverId`): the host class of a GPU (NVIDIA proprietary, RADV, ANV, ...).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HostClass(pub vk::DriverId);
@@ -380,89 +175,6 @@ pub enum ExecutionClass {
     Host(HostClass),
 }
 
-impl ExecutionClass {
-    /// The class of a device, or `None` for a description that names no device (a capability
-    /// profile, such as `vk12-floor`, that no host is).
-    pub fn of_description(description: &DeviceDescription) -> Option<ExecutionClass> {
-        if description.device_type == Some(vk::PhysicalDeviceType::CPU) {
-            return Some(ExecutionClass::CpuIcd);
-        }
-        description
-            .driver_id
-            .map(|driver| ExecutionClass::Host(HostClass(driver)))
-    }
-
-    /// The forms this class leaves uncontained under the robust buffer encoding: its driver's
-    /// ([`HostClass::robust_buffers_uncontained`]); none for a CPU ICD.
-    pub fn robust_buffers_uncontained(self) -> &'static [RobustBufferForm] {
-        match self {
-            ExecutionClass::Host(host) => host.robust_buffers_uncontained(),
-            ExecutionClass::CpuIcd => &[],
-        }
-    }
-}
-
-/// An out-of-bounds access Vulkan's robust buffer access keeps inside the buffer's memory (the
-/// specification's "Shader Out-of-Bounds Memory Access" and "Vertex Input Extraction" under
-/// `robustBufferAccess`): what the robust buffer encoding ([`BufferEncoding::Robust`]) leaves to
-/// the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RobustBufferForm {
-    /// A load or store through a storage or uniform buffer descriptor.
-    LoadStore,
-    /// An atomic on a storage buffer.
-    Atomic,
-    /// A read, write, or atomic on a uniform or storage texel buffer.
-    TexelBuffer,
-    /// A fixed-function vertex attribute fetch.
-    VertexInput,
-}
-
-impl RobustBufferForm {
-    /// The form's name in the report.
-    pub fn label(self) -> &'static str {
-        match self {
-            RobustBufferForm::LoadStore => "load-store",
-            RobustBufferForm::Atomic => "atomic",
-            RobustBufferForm::TexelBuffer => "texel-buffer",
-            RobustBufferForm::VertexInput => "vertex-input",
-        }
-    }
-}
-
-impl HostClass {
-    /// The forms this driver leaves uncontained although it advertises `robustBufferAccess`, a
-    /// recorded driver limitation: on it a run of the robust buffer encoding is evidence for the
-    /// in-bounds path of these forms only, never for their containment.
-    ///
-    /// MoltenVK advertises the feature on every device and adds no bounds check for it (its
-    /// shader converter emits none, and Metal bounds neither a buffer access nor a
-    /// vertex-descriptor fetch). On an Apple M3 Max (macOS 26.7, MoltenVK 1.4.1) loads, stores,
-    /// and atomics through storage and uniform buffer descriptors, and fixed-function vertex
-    /// fetches, past their buffer read or wrote the next buffer's bytes; texel buffer accesses
-    /// were contained. By user decision the product keeps the robust encoding there (no in-shader
-    /// check), as native Metal bounds none of these either. SwiftShader's robustness leaves a
-    /// storage buffer's atomics uncontained too, but the product checks them in the shader there
-    /// (`DriverWorkaround::BufferAtomicsUncontained`). Under `robustBufferAccess` its storage
-    /// buffer loads and stores and its storage texel buffer atomic add and store were measured
-    /// contained, and OB1's cases (storage, uniform, and texel buffers, and buffer atomics with the
-    /// check) matched. Its vertex-input fetches and index-buffer reads were not measured; like
-    /// every other driver's, they are taken to follow Vulkan's rules until a measurement says
-    /// otherwise.
-    pub fn robust_buffers_uncontained(self) -> &'static [RobustBufferForm] {
-        if self.0 == vk::DriverId::MOLTENVK {
-            &[
-                RobustBufferForm::LoadStore,
-                RobustBufferForm::Atomic,
-                RobustBufferForm::VertexInput,
-            ]
-        } else {
-            &[]
-        }
-    }
-}
-
 /// The census of what one candidate run executed, and where (the evidence side).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -477,11 +189,6 @@ pub struct ExecutedCensus {
     /// if any (`--profiles-layer P`). `device` is then the device that executed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restricted_to: Option<String>,
-    /// The robustness leg the device ran under: the robustness features its description states
-    /// enabled, or none (`--robustness-off`). A row recorded before executors ran a leg (executor
-    /// ABI v33 and earlier, which enabled no robustness feature) has none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leg: Option<Leg>,
     pub modules: Vec<ModuleCensus>,
     /// How the run contained each out-of-bounds target of its case, and what escaped: the facts the
     /// candidate's verdict on such a case reads (`executor_contract::out_of_bounds::matches`).
@@ -501,7 +208,7 @@ pub struct ExecutedCensus {
 
 /// How a candidate drew a rate-mapped render pass: region by region (the option (a), on every
 /// device), into the product's compile of the map, each draw recorded once per region, with the
-/// plan's near-equivalent (`RateMapRegions::precision`), which the row's comparison class carries.
+/// plan's near-equivalent, which the row's comparison class carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateMapPassRun {
@@ -509,30 +216,15 @@ pub struct RateMapPassRun {
     pub screen_size: [u32; 2],
     /// The physical size of the product's compile of the map: the extent the pass draws into.
     pub compiled_physical_size: [u32; 2],
-    /// The regions each draw of the pass was recorded in (`RateMapRegions::regions`).
+    /// The regions each draw of the pass was recorded in.
     pub regions: u32,
-    /// The pass's precision notes (`RateMapRegions::precision`): with the modules', what the
+    /// The pass's precision notes: with the modules', what the
     /// row's comparison class is derived from.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub precision: BTreeSet<PrecisionNote>,
 }
 
 impl ExecutedCensus {
-    /// Whether the modules' containment agrees with the leg: a run with no robustness feature
-    /// enabled compiles no robust encoding. A census of no leg (an older row) agrees with any.
-    pub fn leg_holds(&self) -> bool {
-        self.leg != Some(Leg::RobustnessOff)
-            || self.modules.iter().all(|module| {
-                module.containment.is_none_or(|containment| {
-                    containment.buffers != BufferEncoding::Robust
-                        && !matches!(
-                            containment.images,
-                            ImageEncoding::Robust | ImageEncoding::RobustWrites
-                        )
-                })
-            })
-    }
-
     /// The comparison class of an observation of these modules, derived from their notes and
     /// strategies: what a recorded class must equal.
     pub fn comparison_class(&self) -> ComparisonClass {
@@ -552,16 +244,15 @@ impl ExecutedCensus {
     }
 }
 
-/// Which robustness a tier-table entry compiles a committed profile under, and an engine
-/// executor runs its device under (validation runs robustness on and off).
+/// Which robustness a tier-table entry compiles a committed profile under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Leg {
-    /// The profile as committed, with the robustness features it states: the robust encodings
-    /// where it states them.
+    /// The profile as committed, with the robustness features it states: the robust image
+    /// encodings where it states them.
     Stated,
-    /// The profile without any of [`ROBUSTNESS_FEATURES`]: the in-shader encodings. A profile has
-    /// this leg only when it states one of them.
+    /// The profile without any of [`ROBUSTNESS_FEATURES`]: the in-shader image encodings. A
+    /// profile has this leg only when it states one of them.
     RobustnessOff,
 }
 

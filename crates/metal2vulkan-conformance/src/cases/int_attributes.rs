@@ -9,11 +9,11 @@
 //! holds.
 //!
 //! Sixteen formats, two functions and two step functions: 64 pipelines, each with a vertex
-//! descriptor whose attribute 0 is the format at byte `16 i` of buffer 1. Metal's conversion is
-//! the subject — each component reads as its integer value, zero- or sign-extended, as a float, the
+//! descriptor whose attribute 0 is the format at byte `16 i` of buffer 1. Metal's conversion is the
+//! subject — each component reads as its integer value, zero- or sign-extended, as a float, the
 //! components the format does not hold as `(0, 0, 0, 1)`, and a `half` attribute rounds to nearest
 //! even with 65520 and above going to infinity — and the case takes it from a run rather than from
-//! the lane's table.
+//! a table.
 //!
 //! A `vertex void` function has no position to rasterize, so each pipeline disables rasterization
 //! and carries no fragment stage, and each pass has no attachment of any kind and states its own
@@ -32,8 +32,9 @@
 //! Nothing here can fault a GPU: no rasterization, no attachment, eight points a draw, and every
 //! fetch is inside a record the case bound.
 
-use crate::allowance::Allowance;
-use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
+use crate::case::{
+    call, drawn_or_refused, made, Abort, Case, Failure, Handle, Input, MetalSource, Side,
+};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -203,25 +204,6 @@ impl Case for IntAttributes {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // No value: Metal's conversion of an integer format to a float attribute is exact, and
-        // both step functions must answer the same values on any device. A row that differs is a
-        // bug in the fetch, not a tolerance.
-        //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // this case, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         let mut shaders = Vec::new();
         for (entry, _) in CONVERSIONS {
@@ -367,15 +349,11 @@ impl Case for IntAttributes {
             let name = row_name(conversion, format, step);
             let first = at * ANSWER_BYTES as usize;
             let answer = bytes[first..first + ANSWER_BYTES as usize].to_vec();
-            let mut row = Node::branch(name, Vec::new())
+            let row = Node::branch(name, Vec::new())
                 .with(Node::leaf("rows", Observed::bytes(answer, answer_layout())));
-            // What the row's pass answered, which is `None` on Metal's side: a pass of ours that
-            // refuses compares against Metal encoding and reads as a refusal rather than a
-            // divergence.
-            if let Some(Some(failure)) = outcome.refused.get(at) {
-                row = row.with(Node::leaf("pass", Observed::value(failure.recorded())));
-            }
-            sites.push(row);
+            // A row whose pass our side refused has no rows: Metal's encoder calls answer
+            // nothing, so the refusal is the row's answer and compares as one.
+            sites.push(drawn_or_refused(row, outcome.refusal(at)));
         }
         Ok(())
     }
@@ -387,8 +365,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Metal's `half` of the integer `value`: rounded to nearest even at 11 significant bits, and
-    /// 65520 and above to infinity. Copied from `runtime_lane::int_attributes::metal_half` to be
-    /// checked against the recording, never to stand in for it.
+    /// 65520 and above to infinity. Checked against the recording, never to stand in for it.
     fn metal_half(value: i64) -> f32 {
         let size = value.unsigned_abs();
         let magnitude = if size >= 65520 {
@@ -422,7 +399,7 @@ mod tests {
 
     /// Metal's `float4` for row `row` of format `at`, read into a `float4` or a `half4` attribute:
     /// each component its integer value as a float, the ones the format does not hold `(0, 0, 0,
-    /// 1)`. The lane's rule, which the recording is checked against.
+    /// 1)`. The rule the recording is checked against.
     fn metal_row(at: usize, row: usize, half: bool) -> [f32; 4] {
         let (_, bytes, count, signed) = FORMATS[at];
         let mut out = [0.0f32, 0.0, 0.0, 1.0];
@@ -457,14 +434,13 @@ mod tests {
         }
     }
 
-    /// Every answer Metal recorded holds exactly the values the lane's rule says Metal converts
-    /// to, format for format, row for row, and under both step functions.
+    /// Every answer Metal recorded holds exactly the values the rule says Metal converts to,
+    /// format for format, row for row, and under both step functions.
     ///
-    /// This is the cross-check the port owes the lane: the lane carried the rule, the case carries
-    /// Metal's own floats, and this says whether they agree. It reads the recording, so it runs
-    /// where there is no GPU.
+    /// The rule is fitted, the case carries Metal's own floats, and this says whether they agree.
+    /// It reads the recording, so it runs where there is no GPU.
     #[test]
-    fn metal_s_recorded_conversions_are_the_lane_s_values() {
+    fn metal_s_recorded_conversions_are_the_rule_s_values() {
         let case = IntAttributes;
         let Ok(recording) = crate::recording::read(case.name()) else {
             println!("{}: no recording in the tree yet", case.name());
@@ -499,7 +475,7 @@ mod tests {
                         let want = metal_row(format, row, CONVERSIONS[conversion].1);
                         if got.map(f32::to_bits) != want.map(f32::to_bits) {
                             differ.push(format!(
-                                "{name} row {row}: Metal {got:?}, the lane's rule {want:?}"
+                                "{name} row {row}: Metal {got:?}, the rule {want:?}"
                             ));
                         }
                     }
@@ -512,7 +488,7 @@ mod tests {
         }
         assert!(
             differ.is_empty(),
-            "{} value(s) of {checked} recorded answers differ from the lane's rule",
+            "{} value(s) of {checked} recorded answers differ from the rule",
             differ.len()
         );
     }

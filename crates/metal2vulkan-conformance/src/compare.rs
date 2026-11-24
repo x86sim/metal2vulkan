@@ -70,7 +70,7 @@ pub struct Refusal {
 }
 
 /// A site where plain Metal answered a call and we returned a typed error that is the **venue's**
-/// honest gap rather than ours ([`crate::verdict::device_gap`]), or a getter answered a limit the
+/// honest gap rather than ours ([`crate::verdict::device_gap_of`]), or a getter answered a limit the
 /// device holds below Metal's where our side states it is the device's
 /// ([`crate::transcript::Sites::device_gap`]).
 ///
@@ -250,8 +250,8 @@ pub fn compare_run(
         let missing = match &allowance.justified_by {
             justification @ crate::allowance::Justification::Degradation(code) => {
                 let announced = std::slice::from_ref(code);
-                match justification.unjustified(&Offered::new(announced, offered.metal_validation))
-                {
+                let exists = Offered::new(announced, offered.metal_validation);
+                match justification.unjustified(&exists) {
                     // The run's own notices are checked where the allowance fires, not here.
                     Some(Unjustified::NoticeNotAnnounced(_)) | None => None,
                     other => other,
@@ -295,7 +295,7 @@ pub fn compare_run(
         fired: &mut fired,
         found: &mut found,
     };
-    walk.node("", &metal.root, &ours.root);
+    walk.node("", &metal.root, &ours.root, false);
     // An allowance no site needed is the case naming a tolerance this run cannot vouch for. It is
     // counted rather than failed, and the justification is re-read here without the exemption the
     // up-front check gives a notice, because "the tolerance fired nowhere and the notice was never
@@ -329,7 +329,7 @@ pub fn compare_run(
 /// site whatever is in the set, and marks only *that* allowance fired. Both halves were defects:
 ///
 /// - **One declaration excused every other notice.** Measured at `f2fc351534`: a case declaring
-///   `carried-decoded-twin` while the run announced it *plus* `device-texel-conversion` *plus*
+///   one notice while the run announced it *plus* `device-texel-conversion` *plus*
 ///   `native-division` compared with **zero** divergences. The honest rule is a subset — what we
 ///   announce is covered by what the case names — and no allowance can reach it, because a
 ///   declaration of one code must not excuse another's.
@@ -435,8 +435,22 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    /// Compare one pair of sites, under `parent`'s path, and descend.
-    fn node(&mut self, parent: &str, metal: &Node, ours: &Node) {
+    /// Compare one pair of sites, under `parent`'s path, and descend; answer whether the site is
+    /// one **we refused**.
+    ///
+    /// `after_refusal` says a site before this one, beside it or beside a site above it, is one we
+    /// refused. A site under this one that only Metal reached is then folded under that refusal
+    /// and is no divergence of its own: a case records a piece of work's sites in order, and the
+    /// ones after a refused call are the ones the refusal kept our side from reaching (a row's
+    /// labels after its refused `setLabel:`, its sites after its refused rate map). The fold runs
+    /// forward over the refused site's later siblings and down into them, and never up: a site
+    /// before the refusal, or one beside the site that holds it (another row of the case), still
+    /// reads as only Metal's.
+    ///
+    /// A refusal only ours holds is a call of ours that refused where Metal's answered and went on
+    /// (a row's map, whose Metal row holds the map's facts instead). It stands where Metal's sites
+    /// after the last site the two rows share before it stand, so the fold starts there.
+    fn node(&mut self, parent: &str, metal: &Node, ours: &Node, after_refusal: bool) -> bool {
         let path = if parent.is_empty() {
             metal.name.clone()
         } else {
@@ -448,7 +462,7 @@ impl Walk<'_> {
             // the reasoning [`compare_run`]'s `stopped` rests on, applied at one site rather than
             // at a whole case. Without this, a site whose answer is a tree reported the refusal
             // nowhere and its children everywhere.
-            return;
+            return true;
         }
         // Before pairing anything: a name held twice under one parent is a pair this walk cannot
         // settle, and `Node::child` below would answer with the first namesake and compare the
@@ -465,10 +479,20 @@ impl Walk<'_> {
                 ));
             }
         }
-        for child in &metal.children {
+        let folded_from = (ours.children.iter())
+            .position(|child| child.observed.value.is_error() && metal.child(&child.name).is_none())
+            .map(|refused| {
+                let before = &ours.children[..refused];
+                (metal.children.iter())
+                    .rposition(|child| before.iter().any(|shared| shared.name == child.name))
+                    .map_or(0, |last| last + 1)
+            });
+        let mut after_refusal = after_refusal;
+        for (at, child) in metal.children.iter().enumerate() {
+            after_refusal |= folded_from.is_some_and(|from| at >= from);
             match ours.child(&child.name) {
-                Some(theirs) => self.node(&path, child, theirs),
-                None if self.stopped => {}
+                Some(theirs) => after_refusal |= self.node(&path, child, theirs, after_refusal),
+                None if self.stopped || after_refusal => {}
                 None => self.found.divergences.push(Divergence::new(
                     format!("{path}/{}", child.name),
                     DivergenceKind::Site {
@@ -478,7 +502,13 @@ impl Walk<'_> {
             }
         }
         for child in &ours.children {
-            if metal.child(&child.name).is_none() {
+            // A site only ours holds whose value is our refusal is a call of ours that refused
+            // where Metal's answered: a case records a piece of work's failure where it failed,
+            // and Metal's piece did not fail, so Metal holds no site for it. That is a refusal,
+            // which the run reports and the ledger names, never a site only ours observed.
+            if metal.child(&child.name).is_none() && child.observed.value.is_error() {
+                self.refusal(&format!("{path}/{}", child.name), &child.observed.value);
+            } else if metal.child(&child.name).is_none() {
                 self.found.divergences.push(Divergence::new(
                     format!("{path}/{}", child.name),
                     DivergenceKind::Site {
@@ -487,6 +517,7 @@ impl Walk<'_> {
                 ));
             }
         }
+        false
     }
 
     /// Compare what one site observed, and say whether the site is one **we refused**, whose

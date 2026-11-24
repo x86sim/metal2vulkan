@@ -16,7 +16,7 @@ use crate::device::DevicePolicy;
 use crate::error::{Capability, Error, Feature, Needs};
 use crate::library::{FunctionArtifact, FunctionConstantValues};
 use crate::metal::{VertexFormat, VertexStepFunction};
-use crate::pipeline::compile::{compile_bitcode, plan_bitcode, EntryRef};
+use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
@@ -29,11 +29,12 @@ use crate::pipeline::stage_io::{
 };
 use crate::pipeline::sym::{Symbol, VaryingKey};
 use crate::pipeline::testing::{
-    compile, engine_dir, llvm_assemble, meter, profile, zero_relocations, AssembleError, Scratch,
+    compile, engine_dir, llvm_assemble, meter, profile, profile_without, zero_relocations,
+    AssembleError, Scratch,
 };
 use crate::spirv::testing::check_words_valid;
 
-const PROFILES: [&str; 3] = ["moltenvk-m3", "lunarg-desktop-baseline-2023", "vk12-floor"];
+const PROFILES: [&str; 2] = ["moltenvk-m3", "runtime-floor"];
 
 fn fixture() -> Option<Vec<u8>> {
     match llvm_assemble(&engine_dir().join("stage_io.ll")) {
@@ -47,7 +48,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> crate::device::DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 /// Whether `words` hold an `OpDecorate <id> Invariant` (opcode 71, decoration 18).
@@ -252,46 +253,60 @@ fn locations_are_relocation_only() {
 }
 
 /// The refusals of the fixture's feature-dependent entries name the capability (the primitive id's
-/// too), and the invariant position compiles with its `Invariant` decoration.
+/// too), and the invariant position compiles with its `Invariant` decoration. The floor states
+/// clip distances, sample-rate shading, dual-source blending and the vertex `Layer` output, so each
+/// of those refusals is on `runtime-floor` without its feature (below the runtime's floor).
 #[test]
 fn feature_dependent_entries_name_their_capability() {
-    let Some(bc) = fixture() else { return };
-    let floor = prof("vk12-floor");
-    let needs = |entry: &str, feature: Feature, cap: Capability| match compile(&bc, entry, &floor) {
-        Err(Error::Unsupported(u)) => {
-            assert_eq!(u.feature, feature, "{entry}");
-            assert_eq!(u.needs, Needs::AnyOf(vec![vec![cap]]), "{entry}");
-        }
-        other => panic!("{entry}: {other:?}"),
-    };
     use crate::device::requirements::VkFeature as F;
+    let Some(bc) = fixture() else { return };
+    let floor = prof("runtime-floor");
+    let needs = |entry: &str, feature: Feature, without: F| {
+        let p = profile_without("runtime-floor", &[without], DevicePolicy::RESIDENT_TABLES)
+            .expect("below the runtime's floor");
+        match compile(&bc, entry, &p) {
+            Err(Error::Unsupported(u)) => {
+                assert_eq!(u.feature, feature, "{entry}");
+                assert_eq!(
+                    u.needs,
+                    Needs::AnyOf(vec![vec![Capability::Feature(without)]]),
+                    "{entry}"
+                );
+            }
+            other => panic!("{entry}: {other:?}"),
+        }
+    };
     needs(
         "stage_io_vertex_clip",
         Feature::ClipDistance,
-        Capability::Feature(F::ShaderClipDistance),
+        F::ShaderClipDistance,
     );
-    // A vertex `Layer` takes the output feature or a geometry stage that writes it.
-    match compile(&bc, "stage_io_vertex_layer", &floor) {
-        Err(Error::Unsupported(u)) => {
-            assert_eq!(u.feature, Feature::LayeredRendering);
-            assert_eq!(
-                u.needs,
-                Needs::AnyOf(vec![
-                    vec![Capability::Feature(F::ShaderOutputLayer)],
-                    vec![Capability::Feature(F::GeometryShader)],
-                ])
-            );
-        }
-        other => panic!("stage_io_vertex_layer: {other:?}"),
-    }
+    // A vertex `Layer` takes the output feature.
+    compile(&bc, "stage_io_vertex_layer", &floor).expect("the floor's Layer output");
+    needs(
+        "stage_io_vertex_layer",
+        Feature::LayeredRendering,
+        F::ShaderOutputLayer,
+    );
     needs(
         "stage_io_fragment_point",
         Feature::SampleRateShading,
-        Capability::Feature(F::SampleRateShading),
+        F::SampleRateShading,
     );
-    // Without either enabling capability of a fragment `PrimitiveId`, the ID is the flat varying
+    // Without either enabling capability of a fragment `PrimitiveId` (`runtime-floor` states
+    // `tessellationShader`; without it and the features that need it), the ID is the flat varying
     // the pipeline's vertex function writes (`engine_primitive_ids`).
-    let a = compile(&bc, "stage_io_fragment_primitive", &floor).expect("primitive");
+    let untessellated = profile_without(
+        "runtime-floor",
+        &[
+            F::TessellationShader,
+            F::ShaderTessellationAndGeometryPointSize,
+            F::MultiviewTessellationShader,
+        ],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("below the runtime's floor");
+    let a = compile(&bc, "stage_io_fragment_primitive", &untessellated).expect("primitive");
     assert!(a
         .interface
         .io
@@ -301,7 +316,7 @@ fn feature_dependent_entries_name_their_capability() {
     needs(
         "stage_io_fragment_dual_source",
         Feature::DualSourceBlending,
-        Capability::Feature(F::DualSrcBlend),
+        F::DualSrcBlend,
     );
     let m = prof("moltenvk-m3");
     for entry in [
@@ -330,10 +345,11 @@ fn feature_dependent_entries_name_their_capability() {
     );
 }
 
-/// The vertex fetch projection: fixed function where the format and step have an exact Vulkan form,
-/// pulled otherwise (a constant step always), with the source buffer, offset, and step in the key.
-/// A pulled attribute compiles to an in-shader fetch; one whose source buffer is also a buffer
-/// argument of the function reads through that argument's slot, bound once.
+/// The vertex fetch projection: under the identity domains fixed function where the format and
+/// step have an exact Vulkan form (a constant step at a stride of 0, here on a native driver);
+/// outside them pulled, with the source buffer, offset, and step in the key. A pulled attribute
+/// compiles to an in-shader fetch; one whose source buffer is also a buffer argument of the
+/// function reads through that argument's slot, bound once.
 #[test]
 fn the_vertex_fetch_projection_selects_fixed_function_or_pulled() {
     let Some(bc) = fixture() else { return };
@@ -352,8 +368,23 @@ fn the_vertex_fetch_projection_selects_fixed_function_or_pulled() {
         .insert(1, VertexAttributeDescriptor::new(VertexFormat::Half2, 4, 2));
     // The function reads both as `float` (the one projection takes the declared classes).
     let floats = BTreeMap::from([(0, IoNumeric::Float), (1, IoNumeric::Float)]);
+    // A native driver's: the portability subset's stride rule refuses the binding's stride of 0.
+    let identity = profile("amd-780m-radv", DevicePolicy::default()).expect("committed profile");
+    let fixed = vertex_fetch_projection(Some(&desc), &floats, &identity).expect("projection");
+    for a in [0, 1] {
+        assert_eq!(fixed.attributes[&a], VertexFetch::FixedFunction, "{a}");
+    }
     let proj = vertex_fetch_projection(Some(&desc), &floats, &p).expect("projection");
-    assert_eq!(proj.attributes[&0], VertexFetch::FixedFunction);
+    assert_eq!(
+        proj.attributes[&0],
+        VertexFetch::Pulled {
+            format: VertexFormat::Float3,
+            buffer_index: 0,
+            offset: 0,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+        }
+    );
     assert_eq!(
         proj.attributes[&1],
         VertexFetch::Pulled {
@@ -391,9 +422,9 @@ fn the_vertex_fetch_projection_selects_fixed_function_or_pulled() {
     fixed.attributes.insert(0, VertexFetch::FixedFunction);
     let a = run(fixed).expect("fixed-function projection");
     validate(&a, &alone(&a, &p), &p);
-    let a = run(proj).expect("pulled attribute");
+    let a = run(proj).expect("pulled attributes");
     let pulled: Vec<u32> = a.interface.io.pulled.iter().map(|x| x.index).collect();
-    assert_eq!(pulled, [1]);
+    assert_eq!(pulled, [0, 1]);
     validate(&a, &alone(&a, &p), &p);
 
     // Buffer 1 is also the function's `scale` argument: one widened slot.
@@ -411,39 +442,6 @@ fn the_vertex_fetch_projection_selects_fixed_function_or_pulled() {
     validate(&a, &alone(&a, &p), &p);
     assert_eq!(a.interface.descriptors.len(), 1, "one binding for buffer 1");
     assert_eq!(a.interface.slots.len(), 1, "one slot for buffer 1");
-}
-
-/// The plan's size estimate bounds the emitted words of every stage entry.
-#[test]
-fn the_estimate_bounds_every_stage_entry() {
-    let Some(bc) = fixture() else { return };
-    let p = prof("moltenvk-m3");
-    for entry in [
-        "stage_io_vertex",
-        "stage_io_vertex_position",
-        "stage_io_vertex_clip",
-        "stage_io_vertex_layer",
-        "stage_io_fragment",
-        "stage_io_fragment_point",
-        "stage_io_fragment_dual_source",
-    ] {
-        let plan = plan_bitcode(
-            &bc,
-            EntryRef::Name(entry),
-            &FunctionConstantValues::defaults(),
-            &p,
-            &LoweringInputs::new(),
-            &mut meter(),
-        )
-        .expect("plan");
-        let a = compile(&bc, entry, &p).expect("compile");
-        let words = a.module.words.len() as u64;
-        assert!(
-            plan.estimate.words >= words,
-            "{entry}: estimate {} < emitted {words}",
-            plan.estimate.words
-        );
-    }
 }
 
 /// The variables `words` decorate `BuiltIn PointSize` (`OpDecorate <id> BuiltIn(11) PointSize(1)`)
@@ -471,9 +469,10 @@ fn stored_point_sizes(words: &[u32]) -> Vec<u32> {
 
 /// The values `words` store to `PointSize` (`OpDecorate <id> BuiltIn(11) PointSize(1)`), through
 /// the variable itself or an access chain into it (a mesh function's arrayed output), each as
-/// `Some(true)` where it is Metal's largest point applied to a size (an `OpSelect`, opcode 169,
-/// whose first choice is the `float` constant 511.0), `Some(false)` where it is another select
-/// or a constant (opcode 43), and `None` where another instruction computes it.
+/// `Some(true)` where it is Metal's point size of a size (`stage_io::metal_point_size`: an
+/// `OpSelect`, opcode 169, whose second choice is the `float` constant 1.0 and whose first is a
+/// select whose first choice is the `float` constant 511.0), `Some(false)` where it is another
+/// select or a constant (opcode 43), and `None` where another instruction computes it.
 pub(super) fn point_size_stores(words: &[u32]) -> Vec<Option<bool>> {
     let limit = 511.0f32.to_bits();
     let mut insts = Vec::new();
@@ -519,7 +518,13 @@ pub(super) fn point_size_stores(words: &[u32]) -> Vec<Option<bool>> {
         })
         .map(|value| {
             defined(value).map(|(op, o)| match (op, o) {
-                (169, [_, _, _, chosen, _]) => constant(*chosen) == Some(limit),
+                (169, [_, _, _, held, one]) => {
+                    constant(*one) == Some(1.0f32.to_bits())
+                        && matches!(
+                            defined(*held),
+                            Some((169, [_, _, _, chosen, _])) if constant(*chosen) == Some(limit)
+                        )
+                }
                 _ => false,
             })
         })
@@ -529,7 +534,8 @@ pub(super) fn point_size_stores(words: &[u32]) -> Vec<Option<bool>> {
 /// A vertex function's `[[point_size]]` is stored as Metal draws it, a size past Metal's largest
 /// point (511 pixels, `stage_io::METAL_POINT_SIZE_LIMIT`) as 511, on every profile: Vulkan clamps a
 /// point only to the device's `pointSizeRange`, up to 2047.94 on the RTX 5080 and 8191.875 on RADV.
-/// The default 1.0 of a function without one is stored as it is.
+/// A size not greater than 0 is stored as 1.0, which Vulkan's `PointSize` takes. The default 1.0
+/// of a function without one is stored as it is.
 #[test]
 fn a_point_size_past_metals_largest_point_is_stored_as_it() {
     let Some(bc) = fixture() else { return };
@@ -553,10 +559,10 @@ fn a_point_size_past_metals_largest_point_is_stored_as_it() {
 }
 
 /// A vertex function writing `[[point_size]]` records `PrecisionNote::DevicePointSize` on a device
-/// whose largest point is below Metal's 511 pixels (lavapipe's 256, ANV's 255.875, the 2023
-/// baseline's 64), which draws a size between the two smaller than Metal; not on one that reaches
-/// 511 (MoltenVK on the M3, the RTX 5080's 2047.94, RADV's 8191.88, SwiftShader's 1023), where the
-/// stored clamp gives Metal's size. A function storing only the default 1.0 records nothing on
+/// whose largest point is below Metal's 511 pixels (lavapipe's 256, ANV's 255.875, the runtime
+/// floor's 63), which draws a size between the two smaller than Metal; not on one that reaches 511
+/// (MoltenVK on the M3, the RTX 5080's 2047.94, RADV's 8191.88), where the stored clamp gives
+/// Metal's size. A function storing only the default 1.0 records nothing on
 /// either.
 #[test]
 fn a_device_below_metals_largest_point_announces_its_point_size() {
@@ -566,11 +572,10 @@ fn a_device_below_metals_largest_point_announces_its_point_size() {
     for (stem, below) in [
         ("lavapipe", true),
         ("intel-irisxe-rplp-anv", true),
-        ("lunarg-desktop-baseline-2023", true),
+        ("runtime-floor", true),
         ("moltenvk-m3", false),
         ("nvidia-rtx5080-laptop", false),
         ("amd-780m-radv", false),
-        ("swiftshader", false),
     ] {
         let p = prof(stem);
         let a = compile(&bc, "stage_io_vertex", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -587,9 +592,8 @@ fn a_device_below_metals_largest_point_announces_its_point_size() {
 /// A vertex function without outputs (a rasterization-disabled `vertex void`) writes the default
 /// point size too. A point-list pipeline's vertex stage must write `PointSize` on a device without
 /// `maintenance5`, under rasterizer discard as well
-/// (`VUID-VkGraphicsPipelineCreateInfo-topology-08773`); `swiftshader` and
-/// `lunarg-desktop-baseline-2023` state no `VK_KHR_maintenance5`, and the module does not know the
-/// topology. The owned `ob3_index_buffer` function returns `void` and stores to a buffer.
+/// (`VUID-VkGraphicsPipelineCreateInfo-topology-08773`); `runtime-floor` states no
+/// `VK_KHR_maintenance5`, and the module does not know the topology. The owned `ob3_index_buffer` function returns `void` and stores to a buffer.
 #[test]
 fn a_vertex_function_without_outputs_writes_the_default_point_size() {
     let bc = match llvm_assemble(&engine_dir().join("ob3_index_buffer.ll")) {
@@ -600,7 +604,7 @@ fn a_vertex_function_without_outputs_writes_the_default_point_size() {
         }
         Err(AssembleError::Rejected(why)) => panic!("llvm-as rejected ob3_index_buffer.ll: {why}"),
     };
-    for stem in ["swiftshader", "lunarg-desktop-baseline-2023", "moltenvk-m3"] {
+    for stem in ["runtime-floor", "moltenvk-m3"] {
         let p = prof(stem);
         let a = compile(&bc, "ob3_index_buffer", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         assert!(a.interface.io.outputs.is_empty(), "{stem}: a void function");
@@ -904,7 +908,7 @@ fn a_half_color_output_records_its_precision() {
         return;
     };
     // Profiles with sample-rate shading, which the function's sample input needs.
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe"] {
+    for stem in ["moltenvk-m3", "amd-780m-radv", "lavapipe"] {
         let p = prof(stem);
         let half = compile(&bc, "stage_io_fragment_point", &p).expect("half");
         assert!(!half.precision.contains(&fast), "{stem}");
@@ -978,57 +982,37 @@ fn output_widths(words: &[u32]) -> Vec<u32> {
     found
 }
 
-/// A `half` color output (`stage_io_fragment_point`'s `half4` to color 0) is declared with 16-bit
-/// float lanes on a profile that enables `storageInputOutput16` and `shaderFloat16`
-/// (`StageIo::half_outputs`), so the device receives the `half` the function returns as a `half`,
-/// and the module requires `StorageInputOutput16`; on a profile without it (lavapipe) the output is
-/// 32-bit, the `half` widened, as is a `float` output (`stage_io_fragment`) everywhere and a
-/// `half` one to an attachment held with its channels rotated. Each module passes L3.
+/// A `half` color output (`stage_io_fragment_point`'s `half4` to color 0) is declared 32-bit, the
+/// `half` widened, on every device, as is a `float` output (`stage_io_fragment`) and a `half` one
+/// to an attachment held with its channels rotated; the module requires no
+/// `StorageInputOutput16`. Each module passes L3.
 #[test]
-fn a_half_color_output_is_declared_16_bit_where_the_device_enables_it() {
+fn a_half_color_output_is_declared_32_bit_on_every_device() {
     use crate::device::requirements::VkFeature;
     use crate::lower::select::LowerInputs;
     use crate::pipeline::testing::compile_with;
     let Some(bc) = fixture() else { return };
-    let color = VaryingKey::color(0, 0);
-    let mut seen = [false; 2];
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe"] {
+    for stem in ["moltenvk-m3", "amd-780m-radv", "lavapipe"] {
         let p = prof(stem);
-        let leaf = p.fields().leaf;
-        let sixteen = leaf.input_output_16bit && leaf.float16;
-        seen[usize::from(sixteen)] = true;
         let half = compile(&bc, "stage_io_fragment_point", &p).expect("half");
         let words = validate(&half, &alone(&half, &p), &p);
-        let io16 = half
-            .requirements
-            .features
-            .contains(&VkFeature::StorageInputOutput16);
-        match sixteen {
-            true => {
-                assert_eq!(
-                    half.interface.io.half_outputs,
-                    std::slice::from_ref(&color),
-                    "{stem}"
-                );
-                assert_eq!(output_widths(&words), [16], "{stem}");
-                assert!(io16, "{stem}: {:?}", half.requirements.features);
-            }
-            false => {
-                assert!(half.interface.io.half_outputs.is_empty(), "{stem}");
-                assert_eq!(output_widths(&words), [32], "{stem}");
-                assert!(!io16, "{stem}");
-            }
-        }
+        assert_eq!(output_widths(&words), [32], "{stem}");
+        assert!(
+            !half
+                .requirements
+                .features
+                .contains(&VkFeature::StorageInputOutput16),
+            "{stem}"
+        );
         let float = compile(&bc, "stage_io_fragment", &p).expect("float");
-        assert!(float.interface.io.half_outputs.is_empty(), "{stem}");
         let words = validate(&float, &alone(&float, &p), &p);
         assert!(output_widths(&words).iter().all(|w| *w == 32), "{stem}");
         let mut inputs = LowerInputs::new();
         inputs.rotated_colors.insert(0);
         let rotated = compile_with(&bc, "stage_io_fragment_point", &p, &inputs).expect("rotated");
-        assert!(rotated.interface.io.half_outputs.is_empty(), "{stem}");
+        let words = validate(&rotated, &alone(&rotated, &p), &p);
+        assert_eq!(output_widths(&words), [32], "{stem}");
     }
-    assert_eq!(seen, [true, true], "both kinds of profile are exercised");
 }
 
 /// A `half` color output of a module without fast math (the `stage_io` fixture stating
@@ -1077,7 +1061,7 @@ fn a_half_output_without_fast_math_is_noted_where_its_attachment_blends() {
         ("one and one", all, blend(F::ONE, F::ONE, O::ADD), true),
         ("min", all, blend(F::ONE, F::ONE, O::MIN), true),
     ];
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe"] {
+    for stem in ["moltenvk-m3", "amd-780m-radv", "lavapipe"] {
         let p = prof(stem);
         let f = compile(&disabled, "stage_io_fragment_point", &p).expect("half");
         assert_eq!(f.interface.io.half_blend_colors, [0], "{stem}");
@@ -1130,7 +1114,7 @@ fn a_half_output_with_fast_math_is_noted_where_its_attachment_stores() {
         ("no channel written", none, None, false),
         ("no channel written, blended", none, over, false),
     ];
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe"] {
+    for stem in ["moltenvk-m3", "amd-780m-radv", "lavapipe"] {
         let p = prof(stem);
         let f = compile(&bc, "stage_io_fragment_point", &p).expect("half");
         assert_eq!(f.interface.io.half_fast_colors, [0], "{stem}");

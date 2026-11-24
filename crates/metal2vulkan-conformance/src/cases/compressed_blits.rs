@@ -1,16 +1,12 @@
-//! Blits through a losslessly compressed texture, ported from `runtime_lane::compressed_blits`.
+//! Blits through a losslessly compressed texture.
 //!
 //! Metal keeps a texture losslessly compressed where `allowGPUOptimizedContents` holds, the shorter
 //! side of its level 0 is at least 16 texels, and its usage has neither `ShaderWrite` nor
 //! `PixelFormatView`. A GPU blit that reads or writes such a texture moves its texels **through**
 //! that compression, so for three families the bytes the blit writes are not the bytes it read:
 //! the same value in its canonical encoding. The runtime's answer is the device's copy, which keeps
-//! the bytes, announced by the note of the encoding it keeps (`compressed_blit.rs`): where the
-//! device's own copy of the compressed image is not Metal's blit, those sites are `known-gaps.tsv`
-//! rows that name the note. `BGRA10_XR` and its sRGB twin have an exact form: under the suite's
-//! `Policy::Exact` (`ExtendedRangeBlitPolicy::Canonical`) the runtime writes Metal's encoding, so
-//! their sites hold Metal's bytes and announce nothing; their note's declaration covers a
-//! `--default-policy` run, where the device's copy keeps the bytes.
+//! the bytes, announced by the note of the encoding it keeps where the format has one
+//! (`kept_encoding_notice`).
 //!
 //! Record mode runs the whole program on this M3 Max, because every call it makes is public Metal:
 //! a texture of any descriptor, a texture over a buffer, the blit copies, `replaceRegion:` and
@@ -19,7 +15,7 @@
 //! One case per format, so a venue that holds no texture of one answers its typed refusal and
 //! counts as lacking the feature rather than taking the other three down with it.
 //!
-//! Each case is one program of the lane's rows, over the lane's own splitmix64 bytes:
+//! Each case is one program of the family's rows, over seeded splitmix64 bytes:
 //!
 //! - a buffer blitted into a private texture and back out, three ways: compressed, without
 //!   `allowGPUOptimizedContents`, and 8 texels high (the last two keep the bytes);
@@ -31,24 +27,23 @@
 //! - the shared texture copied into a texture over a buffer whose rows are 256 bytes past the
 //!   texels', the bytes between the rows compared.
 //!
-//! **Not ported, and why:** the lane's heap row asks a device for
-//! `heapTextureSizeAndAlignWithDescriptor:`'s answer and compares a shared texture's with a private
-//! one's. That is a CPU-side *query*, not a copy, and the transcript has no record kind for it —
-//! the copy-and-fill vocabulary makes resources and reads bytes. It wants a query record kind of
-//! its own; until there is one, the heap row stays a lane.
+//! **Not a case here:** what `heapTextureSizeAndAlignWithDescriptor:` answers for a shared
+//! compressed texture against a private one. That is a CPU-side *query*, not a copy; the heap-size
+//! queries are [`crate::cases::heap_metal_sizes`]'s, and none of its descriptors is of a
+//! block-compressed format.
 //!
 //! Nothing here can fault a GPU: blit copies and host copies inside the textures the program makes,
 //! no dispatch, no draw and no loop.
 
 use crate::allowance::Allowance;
 use crate::case::{made, Abort, Case, Failure, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::transcript::{Aspect, ByteLayout, Element, Gaps, Observed, Region, Sites, Value};
 use crate::work::{Rect, Resource, Step, TextureSpec, Work};
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
-/// The textures' width, and the height of all but the short one: the lane's, and at least the 16
-/// texels Metal needs on the shorter side to keep a texture compressed.
+/// The textures' width, and the height of all but the short one: at least the 16 texels Metal
+/// needs on the shorter side to keep a texture compressed.
 const SIDE: u64 = 64;
 
 /// The short texture's height: below 16, so Metal keeps it uncompressed and its blits keep the
@@ -70,11 +65,11 @@ const OVER_PAST: u64 = 256;
 
 /// One format whose blits through the compression change bytes: the case's name, the raw
 /// `MTLPixelFormat`, and the note a blit through it announces where the device's copy keeps the
-/// bytes.
+/// bytes, where it announces one.
 struct Format {
     name: &'static str,
     format: PixelFormat,
-    note: Degradation,
+    note: Option<Degradation>,
 }
 
 /// Every format whose blits through the compression change bytes.
@@ -82,22 +77,22 @@ const FORMATS: [Format; 4] = [
     Format {
         name: "compressed-blits-bgra10xr",
         format: PixelFormat::BGRA10XR,
-        note: Degradation::ExtendedRangeBitsKept,
+        note: None,
     },
     Format {
         name: "compressed-blits-bgra10xr-srgb",
         format: PixelFormat::BGRA10XRSRGB,
-        note: Degradation::ExtendedRangeBitsKept,
+        note: None,
     },
     Format {
         name: "compressed-blits-rg11b10f",
         format: PixelFormat::RG11B10Float,
-        note: Degradation::DeviceNanEncoding,
+        note: Some(Degradation::DeviceNanEncoding),
     },
     Format {
         name: "compressed-blits-rgb9e5f",
         format: PixelFormat::RGB9E5Float,
-        note: Degradation::SharedExponentKept,
+        note: Some(Degradation::SharedExponentKept),
     },
 ];
 
@@ -114,25 +109,22 @@ const COMPRESSED_SITES: [&str; 7] = [
 ];
 
 /// The declaration of the note a blit through a texture of the raw `MTLPixelFormat` `format` that
-/// Metal keeps losslessly compressed announces (the runtime's `compressed_blit.rs`: the device's
-/// copy keeps the bytes Metal's compression rewrites), where that note is not one of the device's
-/// native notes the suite declares for every case (`crate::replay::NATIVE_NOTES`):
-/// `extended-range-bits-kept` for `BGRA10_XR` and its sRGB twin, `shared-exponent-kept` for
+/// Metal keeps losslessly compressed announces (the device's copy keeps the bytes Metal's
+/// compression rewrites), where that note is not one of the device's native notes the suite
+/// declares for every case (`crate::replay::NATIVE_NOTES`): `shared-exponent-kept` for
 /// `RGB9E5Float`. Every case whose program blits through such a texture declares it, at the
-/// notices site alone: each value still compares against Metal's. Under `Policy::Exact` the
-/// `BGRA10_XR` formats' note does not fire (`ExtendedRangeBlitPolicy::Canonical` writes Metal's
-/// encoding), and the report counts its declaration as unfired.
+/// notices site alone: each value still compares against Metal's. A `BGRA10_XR` format has no
+/// such note.
 pub(crate) fn kept_encoding_notice(format: u32) -> Option<Allowance> {
     FORMATS
         .iter()
         .find(|f| f.format.as_raw() == format)
-        .map(|f| f.note)
+        .and_then(|f| f.note)
         .filter(|note| !crate::replay::NATIVE_NOTES.contains(note))
         .map(|note| crate::replay::notice_allowance(note.code()))
 }
 
-/// A splitmix64 stream of bytes: the lane's own, seeded as the lane seeds it, so a case feeds the
-/// bytes the lane measured.
+/// A splitmix64 stream of bytes, seeded per format.
 struct Rng(u64);
 
 impl Rng {
@@ -217,8 +209,7 @@ impl CompressedBlits {
         }
     }
 
-    /// Every byte the case feeds, in the order the program uses them: one stream, as the lane
-    /// draws one stream per format.
+    /// Every byte the case feeds, in the order the program uses them: one stream per format.
     fn fed(&self) -> Fed {
         let per = self.texel();
         let whole = (SIDE * SIDE * per) as usize;
@@ -620,67 +611,19 @@ impl Case for CompressedBlits {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Our side's padded copies go through a tightly packed scratch buffer, a performance
-        // notice the runtime announces once per device, and one that leaves the bytes exactly
-        // Metal's: the only site loosened is the set of notices, which Metal holds empty, and the
-        // allowance fails the case if the notice did not fire.
-        //
-        // `shadowed-texture`, which every row of this family announces: its texture over a buffer
-        // reaches the buffer's bytes through a shadow image rather than an image aliasing them.
-        //
-        // This comment used to leave the code undeclared and the rows divergent on purpose, on the
-        // grounds that naming an unexamined mechanism makes a permanent excuse of it, and it asked
-        // whoever took it to decide whether a shadow image is the right answer for these formats
-        // and then declare or change the runtime. The decision, and what it rests on:
-        //
-        // It is the right answer, because there is no other exact one. A texture over a buffer
-        // aliases the buffer's bytes with a linear image where the device can make one
-        // (`texture.rs`, `alias_image`); where it cannot, the only remaining way to reach those
-        // bytes exactly is to copy them into an image and back, which is this notice. These four
-        // are the formats the device makes no linear image of -- `BGRA10XR`, its sRGB twin,
-        // `RG11B10Float` and `RGB9E5Float`, whose linear tiling the device does not list
-        // (`linear_lack`) -- and Metal makes a texture over a buffer in all four, so refusing them
-        // is not open to us either. A cheaper exact form would have to come from the device
-        // gaining linear tiling for the format, not from a choice of ours.
-        //
-        // It is also the answer the suite has already made for this mechanism, not a new one: five
-        // cases across four other families declare `shadowed-texture` for a texture whose bytes no
-        // image can alias -- `two-plane-row-blits`, `texture-fills-heap-run-550-b5` and `-551-b5`,
-        // `surface-fills-over-planes-and-buffers`, and `buffer-texture-blits-to-and-from`. Leaving
-        // these four undeclared made them divergent at `case/notices` on every run while the same
-        // code was justified elsewhere, which is noise rather than an open question.
-        //
-        // It loosens no value. Every byte of all four rows compares exactly with Metal's; the whole
-        // difference the declaration covers is the announcement, which Metal holds empty because
-        // the copy is not a thing Metal has to do. Measured announced by all four rows on Apple
-        // M3 Max in the whole-set run this declaration was taken from; the earlier reading recorded
-        // the same code on lavapipe.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 4 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
+        // Every byte of all four rows compares exactly with Metal's; the declarations cover the
+        // notices site alone.
         //
         // The note of the encoding the device's copy keeps ([`kept_encoding_notice`]).
-        let mut allowances = vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(Degradation::StagedTextureCopy.code()),
-            crate::replay::notice_allowance(Degradation::ShadowedTexture.code()),
-        ];
-        allowances.extend(kept_encoding_notice(self.format().format.as_raw()));
+        let mut allowances: Vec<Allowance> = kept_encoding_notice(self.format().format.as_raw())
+            .into_iter()
+            .collect();
         // On a venue that presents no texture compression no texture is compressed: Metal's own
         // uncompressed texture keeps its bytes through every blit, so each site a blit reaches
         // through the texture the recording's Mac compressed holds the bytes the device's copy
         // kept ([`COMPRESSED_SITES`]), where the recording holds the compressor's canonical
-        // encoding, and the runtime announces no note for it and, under the suite's exact policy,
-        // rewrites no `BGRA10_XR` texel. Every format's: the RTX 5080's run differs at exactly
-        // these seven sites for each.
+        // encoding, and the runtime announces no note for it. Every format's: the RTX 5080's run
+        // differs at exactly these seven sites for each.
         allowances.extend(
             COMPRESSED_SITES
                 .iter()
@@ -734,9 +677,9 @@ mod tests {
         assert_eq!(named.len(), FORMATS.len());
     }
 
-    /// Every case of the family declares exactly the notice codes it announces: the same three
-    /// for every format, because every row reaches its bytes the same way, and the note of the
-    /// encoding its blits keep where that note is not a native one the suite declares itself.
+    /// Every case of the family declares exactly the notice codes it announces: the note of the
+    /// encoding its blits keep where it has one that is not a native one the suite declares
+    /// itself.
     ///
     /// Stated as the whole set rather than as "the codes are present", because a declaration fires
     /// on its own code: a code announced and declared nowhere is a divergence at the notices site,
@@ -746,15 +689,9 @@ mod tests {
     fn every_case_declares_exactly_the_notices_it_announces() {
         use crate::allowance::Justification;
         for case in all() {
-            let mut wanted = vec![
-                // The venue's own: a card without unified memory holds the `Shared` buffer each
-                // row reads its answer back through in system memory.
-                Degradation::SharedInSystemMemory.code().to_owned(),
-                Degradation::StagedTextureCopy.code().to_owned(),
-                Degradation::ShadowedTexture.code().to_owned(),
-            ];
+            let mut wanted = Vec::new();
             let note = case.format().note;
-            if !crate::replay::NATIVE_NOTES.contains(&note) {
+            if let Some(note) = note.filter(|note| !crate::replay::NATIVE_NOTES.contains(note)) {
                 wanted.push(note.code().to_owned());
             }
             let allowances = case.allowances();

@@ -21,12 +21,7 @@ use crate::pipeline::testing::{
 use crate::pipeline::PrecisionNote;
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 
-const PROFILES: [&str; 4] = [
-    "moltenvk-m3",
-    "lunarg-desktop-baseline-2023",
-    "vk12-floor",
-    "amd-rdna3-radv",
-];
+const PROFILES: [&str; 3] = ["moltenvk-m3", "runtime-floor", "amd-780m-radv"];
 
 /// Metal's answers (`nofastmath-offline`): `(x, frexp mantissa, frexp
 /// exponent, ilogb)`.
@@ -425,22 +420,20 @@ fn half_nan(bits: u32) -> bool {
 /// infinities and NaNs returned with their bits and exponent 0, `ilogb` `INT_MAX` for an infinity
 /// and `INT_MIN` for a NaN, lane by lane. The one exception: a module that records
 /// `NativeNanEncoding` answers a `half` NaN's mantissa with a NaN of the device's bits; every
-/// `half` kernel records it, on a profile whose moves of a NaN are measured to be Metal's
-/// (`DriverDeviation::MetalNanMoves`) too, since the routines read the widened value's bits.
+/// `half` kernel records it, since the routines read the widened value's bits.
 #[test]
 fn frexp_and_ilogb_answer_as_metals_routines() {
     let Some(bc) = assemble() else {
         return;
     };
     for stem in PROFILES {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for k in &KERNELS {
             let what = format!("{} on {stem}", k.name);
             let a = compile(&bc, k.name, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
             let device_nans = a.precision.contains(&PrecisionNote::NativeNanEncoding);
-            // The routines read a `half`'s widened bits, which the device's measured moves of a
-            // NaN do not cover (`narrow::moves_unfolded`): noted on every profile.
+            // The routines read a `half`'s widened bits: noted on every profile.
             assert!(!k.half || device_nans, "{what}: {:?}", a.precision);
             let got = interpret(&bc, k, &p, &what);
             for (i, &(x, mantissa, exponent, ilogb)) in k.inputs().iter().enumerate() {

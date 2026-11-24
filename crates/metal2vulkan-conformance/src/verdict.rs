@@ -9,7 +9,6 @@ use crate::compare::{Comparison, DeviceGap};
 use crate::diff::Divergence;
 use crate::recording::Validated;
 use metal2vulkan::error::{Needs, Unsupported};
-use metal2vulkan_runtime::Error;
 
 /// What one case's comparison on one venue says.
 #[derive(Clone, Debug, PartialEq)]
@@ -184,9 +183,9 @@ impl std::fmt::Display for Verdict {
             Verdict::Divergent { found, refused } => {
                 out.write_str("divergent")?;
                 for divergence in found {
-                    // The summary first, which is the line a `known-gaps.tsv` row's answer holds,
-                    // then where to start looking. The position is a line of its own precisely so
-                    // that it is not part of the row's identity.
+                    // The summary first, which is the line a `known-gaps-rt.tsv` row's answer
+                    // holds, then where to start looking. The position is a line of its own
+                    // precisely so that it is not part of the row's identity.
                     write!(out, "\n  {divergence}")?;
                     if let Some(detail) = divergence.kind.detail() {
                         write!(out, "\n    {detail}")?;
@@ -264,69 +263,13 @@ fn announced_fields(found: &Comparison) -> Vec<String> {
         .collect()
 }
 
-/// Whether `error` is a device's honest gap rather than ours: the typed refusal names capabilities
-/// a device could enable, or a measured driver defect. A refusal the translator or the runtime has
-/// not built, and one Metal itself gives, is ours to answer for.
-///
-/// **Three** variants carry such a refusal, not one, and the typed `Unsupported` means the same
-/// thing in each: which of them wraps it says where the refusal was decided, never whose gap it
-/// is. So all three are read by the same test, and only `Unsupported::needs` decides.
-///
-/// - `Error::Unsupported` is the plain form.
-/// - A dispatch or draw whose shape the device cannot take is refused by the **bind stage**, which
-///   wraps the same typed `Unsupported` in `Error::Bind`, and that is where a device's threadgroup
-///   and threadgroup-memory limits are met. Reading only the plain form made a device limit read
-///   as a divergence or a refusal of ours (verified on lavapipe, whose emulated 32-lane simdgroups
-///   refuse a tile threadgroup of 1024 threads that Metal runs).
-/// - A kernel the **runtime itself dispatches** for a Metal command with no single Vulkan command
-///   is built by the compile layer on demand, and its refusal is wrapped in `Error::Compile`
-///   (`owned_kernel.rs`, 43 such builds). An extended-range attachment's shadow load is the
-///   reachable one: `extended_shadow_module` refuses `Unsupported::needs(FramebufferFetch, c)`
-///   where the device's profile lacks the capability its module needs — a `Needs::AnyOf`, the
-///   device's own gap — and `render/extended_shadow.rs` hands that to the caller with `?`.
-///
-/// What any of the three has **not built** — `Needs::NotImplemented` and the rest — is still ours
-/// to answer for, by the same test.
-///
-/// **Open gap in the vocabulary.** `Error::SamplerLimit` is a device's lack by its own words — the
-/// device's `maxSamplerAllocationCount` samplers are live — and it carries no typed `Unsupported`,
-/// so this reads it as a refusal of ours. No case reaches it, because none exhausts a device's
-/// samplers, and inventing a carrier for one variant would be the special case this function
-/// exists to avoid. It is written down here rather than worked around: a case that ever does
-/// exhaust them needs the vocabulary to say "the device ran out", not a third kind of refusal.
-pub fn device_gap(error: &Error) -> Option<String> {
-    match error {
-        Error::Unsupported(unsupported) => device_gap_of(unsupported),
-        Error::Bind(metal2vulkan::error::BindError::Unsupported(unsupported)) => {
-            device_gap_of(unsupported)
-        }
-        Error::Compile(metal2vulkan::error::Error::Unsupported(unsupported)) => {
-            device_gap_of(unsupported)
-        }
-        _ => None,
-    }
-}
-
-/// [`device_gap`] of a typed `Unsupported`.
+/// Whether a typed `Unsupported` is a device's honest gap rather than ours: it names
+/// capabilities a device could enable. A refusal the translator or the
+/// runtime has not built, and one Metal itself gives, is ours to answer for.
 pub fn device_gap_of(unsupported: &Unsupported) -> Option<String> {
     match &unsupported.needs {
         Needs::AnyOf(alternatives) => Some(format!(
             "{:?} needs any of {alternatives:?}",
-            unsupported.feature
-        )),
-        // A Vulkan capability the compile layer's vocabulary does not name, which only the
-        // runtime needs: a sparse heap's residency, as `timelineSemaphore` would be. The device's
-        // own gap by construction — a device with it runs the input — so it belongs here and not
-        // among the refusals.
-        Needs::DeviceCapability(capability) => {
-            Some(format!("{:?} needs {capability}", unsupported.feature))
-        }
-        Needs::DriverDefect(workaround) => Some(format!(
-            "{:?} on a driver measured to run it wrong ({workaround:?})",
-            unsupported.feature
-        )),
-        Needs::RuntimeDriverDefect(defect) => Some(format!(
-            "{:?} on a driver measured to run it wrong ({defect:?})",
             unsupported.feature
         )),
         // Everything else is ours to answer for: a form the translator or the runtime has not

@@ -6,8 +6,10 @@
 //! chooses a class. Byte equality is a match under every class; a class only ever widens what
 //! counts as a match on lanes of a structurally known float format ([`ObservationLanes`]), and
 //! only by a bound that follows from the note ([`allowance`]). A note whose effect on a stored
-//! value no table bounds makes the class [`ComparisonClass::Unbounded`]: a difference stays a
-//! mismatch, recorded with the notes that may explain it, and is never accepted.
+//! value no table bounds makes the class [`ComparisonClass::Unbounded`]. A difference is never a
+//! match: under such notes it is a noted difference, recorded with the notes that can explain it
+//! and counted apart (unless a C3 answer gap holds its case open), else a mismatch
+//! (`crate::observation::CandidateStatus`).
 //!
 //! The class is per observation, not per lane: every lane of the declared format gets the
 //! tolerance, including lanes the noted operation did not produce, and a tolerance says nothing
@@ -35,8 +37,8 @@ pub enum ComparisonClass {
     /// reassociation bound of the widest sum of that format the census records
     /// ([`reduction_table`]), together with the table of the other notes.
     ReductionOrderTolerant(UlpTable),
-    /// These notes accept a difference that no table bounds on the stored value: only byte
-    /// equality is a match.
+    /// These notes record a difference from Metal that no table bounds on the stored value: only
+    /// byte equality is a match.
     Unbounded(BTreeSet<PrecisionNote>),
 }
 
@@ -153,13 +155,9 @@ impl UlpTable {
 ///   whole primitives, not lanes.
 /// - `UnmeasuredGroupSpeculation`: unbounded: a quad or simdgroup operation answering over other
 ///   lanes reads another lane's value, which differs from Metal's by any amount.
-/// - `NotMipmappedAnisotropicFilter`: unbounded: another anisotropic footprint reads other texels,
-///   which differ from Metal's by up to the texture's range.
 /// - `DeviceSampleLevel`: unbounded: another level or filter near a boundary reads other texels,
 ///   which differ from Metal's by up to the texture's range, and an LOD query answers the device's
 ///   level.
-/// - `UnmeasuredFetchBlend`: unbounded until Metal readings bound its blend arithmetic for the
-///   format: the shader's `float` blend is not Metal's, whose arithmetic for it is not measured.
 /// - `Fp8Value`: unbounded until a Metal device that implements 8-bit float conversions reads
 ///   them: Metal on Apple M3 returns the carrier byte's integer extension, which differs from the
 ///   format's value by any amount.
@@ -184,23 +182,17 @@ impl UlpTable {
 /// - `RestrictedDepthRange`: unbounded: without `VK_EXT_depth_range_unrestricted` a depth image
 ///   takes no texel outside `[0, 1]`, so a comparison of one Metal holds there can answer
 ///   otherwise.
+/// - `RestrictedDepthUpload`: unbounded: a depth uploaded outside `[0, 1]` is the device's, which
+///   Vulkan does not define without `VK_EXT_depth_range_unrestricted`.
 /// - `CubeGradientFootprint`: unbounded: Apple's approximate length and truncated level against the
 ///   device's can select another level or filter near a boundary, which changes whole texels, not
 ///   lanes.
 /// - `HalfTexelConversion`: unbounded: a format whose conversion to `half` is not measured keeps
 ///   the device's quantize of its `f32` texel, so a lane can differ from Metal's by any amount (an
 ///   sRGB texel's decode).
-/// - `HalfSampleFilter`: unbounded: a filtered `half` sample of a two-plane YCbCr texture through
-///   Metal's own sampler (MoltenVK) filters the converted texels as an `RGBA16Float` or
-///   `RGBA32Float` texture's, off the format's grid; one step of the grid was measured on one chip
-///   and format, which no tolerance is derived from.
 /// - `SrgbTexelDecode`: unbounded: an 8-bit sRGB texel the device decodes where Metal decodes its
 ///   raw code through a twelve-bit table; Vulkan bounds the device's decode only by its precision
 ///   rules, and Metal's `float` gathers of sRGB texels are not measured.
-/// - `FloatSampleFilter`: unbounded: a filtered `float` sample of a two-plane YCbCr texture through
-///   Metal's own sampler (MoltenVK) filters the converted texels as an `RGBA16Float` or
-///   `RGBA32Float` texture's, off the format's grid; one step of the grid was measured on one chip
-///   and format, which no tolerance is derived from.
 /// - `QuadsCountedBeforeDiscard`: unbounded: a non-quad simdgroup operation before a discard, in a
 ///   shape whose placement by Metal's compiler is not known, takes, among its lanes, the quads the
 ///   discard drops, which moves a count, a ballot, or a reduction by whole lanes.
@@ -213,13 +205,13 @@ impl UlpTable {
 ///   1.0 on the pull-model lane's geometry), and the value is ordinary data later words use.
 /// - `QuadsSplitByClipping`: unbounded: a quad a clipping seam crosses runs once per piece, which
 ///   moves a count, a ballot, or a reduction by whole lanes.
-/// - `VertexSimdgroupGrouping`: unbounded: a vertex function's simdgroup holds the device's group
-///   of vertices (ANV's 8, interleaved, where Apple's GPUs group 32 consecutive ones), which moves
-///   a sum, a ballot, or a shuffle by whole vertices.
 /// - `FragmentSimdgroupGrouping`: unbounded: a fragment function's simdgroup holds the pixels the
 ///   device's rasterizer packs together, not Apple's, which moves a sum, a ballot, or a shuffle by
 ///   whole pixels; and a quad of a function that discards holds every covered pixel where Apple's
 ///   GPU may run some as helpers, which moves a ballot of a helper query by whole lanes.
+/// - `VertexSimdgroupGrouping`: unbounded: a vertex function's simdgroup or quad holds the vertices
+///   the device packs into a subgroup, not Apple's, which moves a sum, a vote, or a shuffle by
+///   whole vertices.
 /// - `BlendedWriteRounding`: unbounded: a blended half-float channel under
 ///   `textureWriteRoundingMode` 2 stores the device's rounding of the blend's result, which no
 ///   Vulkan blend states, where Metal rounds it to nearest even.
@@ -229,9 +221,9 @@ impl UlpTable {
 /// - `DeviceAlphaCoverage`: unbounded: the device's alpha to coverage may cover other samples
 ///   than Metal's, a whole fragment stored or dropped at one sample, which moves every channel a
 ///   resolve or a later blend reads there.
-/// - `RotatedBlendRounding`: unbounded: an `ARGB8Unorm` attachment blended in none of the measured
-///   forms may store a channel one code apart from Metal's, which moves every later word that reads
-///   it.
+/// - `RotatedBlendRounding`: unbounded: an `ARGB8Unorm` attachment whose blend is not exact by
+///   construction may store a channel one code apart from Metal's, which moves every later word
+///   that reads it.
 /// - `DeviceDenormals`, `DeviceNanEncoding`: [`Allowance::Recorded`]. Metal flushes `float`
 ///   denormals and canonicalizes NaNs, a device need not, and every `float` operation the device
 ///   performs is exposed to both; a `half` texel's NaN is the device's decode where Metal hands
@@ -249,9 +241,6 @@ impl UlpTable {
 ///   difference is a mismatch for review, never accepted or explained by the note.
 /// - `LinkedSamplerNumbering`: [`Allowance::Recorded`]. Only sampler resource IDs may differ, no
 ///   shader value; a difference is a mismatch for review.
-/// - `ColorAttachmentGroups`: [`Allowance::Recorded`]. Only a group past the first may differ, at
-///   a discard or depth edge where the driver compiled the groups' variants apart; a difference is
-///   a mismatch for review.
 /// - `DeviceInterpolationOffset`: [`Allowance::Recorded`]. Recorded at every read at an offset,
 ///   where only an offset past the device's range or off its grid reads otherwise than Metal; a
 ///   difference is a mismatch for review, never accepted or explained by the note.
@@ -273,7 +262,7 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::FunctionStorageAssumed
         | N::ViewBaseTexelOffset => Allowance::Recorded,
         N::DeviceColorConversion => Allowance::Recorded,
-        N::LinkedSamplerNumbering | N::ColorAttachmentGroups => Allowance::Recorded,
+        N::LinkedSamplerNumbering => Allowance::Recorded,
         N::DeviceInterpolationOffset => Allowance::Recorded,
         N::GradFromBias
         | N::DeviceTranscendentals
@@ -287,36 +276,28 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::TessellationFactorEdgeCases
         | N::TessellationFactorScale
         | N::TessellationFactorInstance
+        | N::TessellationFractionalSpacing
         | N::TessellationTriangleOrder
         | N::UnmeasuredGroupSpeculation
-        | N::NotMipmappedAnisotropicFilter
         | N::DeviceSampleLevel
-        | N::UnmeasuredFetchBlend
         | N::Fp8Value
         | N::MultisamplePosition
-        | N::RasterizationRateMap
         | N::BicubicFilterArithmetic
         | N::SparseResidency
         | N::RestrictedDepthRange
         | N::CubeGradientFootprint
         | N::HalfTexelConversion
-        | N::HalfSampleFilter
         | N::SrgbTexelDecode
-        | N::FloatSampleFilter
         | N::QuadsCountedBeforeDiscard
         | N::DeviceInterpolation
         | N::ExtrapolatedInterpolation
-        | N::ComputedSampleDepth
         | N::QuadsSplitByClipping
-        | N::VertexSimdgroupGrouping
         | N::FragmentSimdgroupGrouping
         | N::BlendedWriteRounding
         | N::CoverageReadsRoundedAlpha
         | N::DeviceAlphaCoverage
         | N::RotatedBlendRounding
         | N::HalfOutputPrecision
-        | N::ExtendedRangeBlendSource
-        | N::ExtendedRangeFloatBlendSource
         | N::AnisotropicFilter
         | N::DeviceAnisotropicFilter
         | N::DevicePointSize
@@ -336,11 +317,24 @@ pub fn allowance(note: PrecisionNote) -> Allowance {
         | N::NativeDot
         | N::NativeMix
         | N::DevicePackConversion
-        | N::DiscardDropsSimdgroupStores
-        | N::HelperBranchDropsSimdgroupStores
         | N::UnorderedFetchWithinDraw
         | N::NativeLogicOperation
-        | N::NativeFloat8 => Allowance::Unbounded,
+        | N::CappedLodBias
+        | N::DeviceReconvergence
+        | N::SimdgroupAccessOrder
+        | N::SnormMinimumKept
+        | N::DeviceDepthBias
+        | N::DepthDenormals
+        | N::DeviceFilteredMipmaps
+        | N::DeviceRoundedResolve
+        | N::CompressedTexelDecode
+        | N::SharedExponentKept
+        | N::SwizzledOpaqueBlackBorder
+        | N::DeviceLineRasterization
+        | N::DeviceFragmentRuns
+        | N::DeviceOcclusionCount
+        | N::VertexSimdgroupGrouping
+        | N::RestrictedDepthUpload => Allowance::Unbounded,
     }
 }
 

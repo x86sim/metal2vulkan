@@ -5,22 +5,22 @@
 //! that hold the format's block (for a compressed format: its block's bytes, width, height and
 //! depth). Private Metal is Metal: a program that asks it gets Metal's answer.
 //!
-//! The answers are our own measurements on an Apple M3 Max at the release every device answers as
-//! (`metal_release.rs`; every raw value from 0 to 2047, plain Metal): 264 values described. An
-//! Apple M4 at that release answers the M3 Max's every one of those, and also describes the 16
-//! values from 630 to 645, which the runtime does not (`docs/FAST-PATHS.md`, known gaps). A value
-//! the table does not describe answers [`PixelFormatInfo::INVALID`], as Metal answers it:
-//! `MTLPixelFormatInvalid`, every word 0.
+//! The answers are our own measurements on an Apple M3 Max under macOS 27.0.1 (every raw value
+//! from 0 to 2047, plain Metal): 264 values described. An Apple M4 under that release answers the
+//! M3 Max's every one of those, and also describes the 16 values from 630 to 645, which the
+//! runtime does not (the README's known gaps of textures). A value the table does not describe
+//! answers [`PixelFormatInfo::INVALID`], as Metal answers it: `MTLPixelFormatInvalid`, every word
+//! 0.
 //!
-//! The answer is Metal's description of the format on an Apple GPU, which every device answers
-//! as. Its flags are Apple's, whose bits no document names: they state what Metal does with the
-//! format on that GPU, not what this Vulkan device does. The device's own answers are its typed
-//! queries ([`Device::pixel_format_capabilities`], the creators' refusals).
-//!
-//! `describes` reads it: Metal describes a format exactly where the table has a row for it.
+//! The answer is Metal's description of the format on an Apple GPU, the same on every device. Its
+//! flags are Apple's, whose bits no document names: they state what Metal does with the format on
+//! that GPU, not what this Vulkan device does, and a format described here may still be one the
+//! device makes no texture of. The device's own answers are its typed refusals
+//! ([`Device::new_texture`]'s `Gap::TextureFormat`).
 //!
 //! `MTLGetTextureLevelInfoForDeviceWithOptions`, Metal's layout of one level of a texture, is
-//! computed from the description ([`Device::texture_level_info`]).
+//! computed from the description ([`Device::texture_level_info`]). Neither call asks Vulkan
+//! anything.
 
 use crate::Device;
 use metal2vulkan::metal::PixelFormat;
@@ -34,6 +34,10 @@ use PixelFormat as P;
 /// formats, and `GBGR422` and `BGRG422`, whose blocks are 2 by 1) they are its block's bytes,
 /// width, height and depth; for another format they are the texel's bytes, a packed word, and two
 /// more words Metal does not name.
+///
+/// Every field is public to read; a value is made only by [`Device::pixel_format_info`] or is
+/// [`INVALID`](Self::INVALID). On every device it is an Apple M3 Max's answer under macOS
+/// 27.0.1, not this device's (the module docs).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PixelFormatInfo {
@@ -62,11 +66,6 @@ impl PixelFormatInfo {
     pub fn describes_a_format(&self) -> bool {
         *self != PixelFormatInfo::INVALID
     }
-
-    /// Whether Metal describes a depth or a stencil format here ([`DEPTH_OR_STENCIL`]).
-    pub(crate) fn depth_or_stencil(&self) -> bool {
-        self.flags & DEPTH_OR_STENCIL != 0
-    }
 }
 
 /// `MTLPixelFormatGetInfoForDevice(device, raw)` as Metal answers it on its Apple GPU (the module
@@ -85,32 +84,39 @@ pub(crate) fn pixel_format_info(raw: u64) -> PixelFormatInfo {
     }
 }
 
-/// Whether Metal describes `pf`: `MTLPixelFormatGetInfoForDevice` answers a format for it
-/// ([`pixel_format_info`], the measured table, which holds no row for `Invalid`). Plain Metal ends
-/// its process over every texture of a format it describes none of, and its alignment queries
-/// assert on one, which the runtime answers alike (`Invalid`, `TextureProblem::NotAFormat` and
-/// `BufferTextureProblem::NotLinear`), and so does its render pipeline descriptor's validation for
-/// an attachment of one ("is not a valid MTLPixelFormat", `Problem::AttachmentNotAFormat`). An
-/// Apple GPU, whose Metal every device answers as, describes neither `Depth24Unorm_Stencil8` nor
-/// `X24_Stencil8` (an M4 stops a texture, a depth and a stencil attachment of each as of no
-/// format; our probe and the consumer's M3 run), so `isDepth24Stencil8PixelFormatSupported`
-/// answers no.
-pub(crate) fn describes(pf: PixelFormat) -> bool {
-    pixel_format_info(u64::from(pf.as_raw())).describes_a_format()
-}
-
 impl Device {
     /// `MTLPixelFormatGetInfoForDevice(device, raw)` (Apple SPI): Metal's description of the raw
-    /// pixel format value `raw` on an Apple GPU at the release every device answers as (the
+    /// pixel format value `raw` on an Apple M3 Max under macOS 27.0.1, on every device (the
     /// module docs). Any value is taken, as Metal takes any: one it describes no format for
-    /// answers [`PixelFormatInfo::INVALID`]. The flags are those of Apple's GPU, not this
-    /// device's.
+    /// answers [`PixelFormatInfo::INVALID`]. The description, its flags included, is an Apple
+    /// GPU's, not this device's: a format this device lacks is still described here, and is
+    /// refused where a texture of it is made, with its typed gap ([`Device::new_texture`]'s
+    /// [`Gap::TextureFormat`](crate::Gap::TextureFormat)). Its flags promise nothing about this
+    /// device: a write to a texture of the format that has no storage element here is
+    /// [`Gap::StorageElement`](crate::Gap::StorageElement), whatever the M3's flags say. An Apple
+    /// M4 also describes the values from 630 to 645, which this answers
+    /// [`PixelFormatInfo::INVALID`] (the README's known gaps of textures). No Vulkan call is made.
+    ///
+    /// ```
+    /// use metal2vulkan_runtime::{Device, PixelFormatInfo};
+    ///
+    /// // Every field a consumer reads; 80 is `MTLPixelFormatBGRA8Unorm`.
+    /// fn describe(device: &Device) -> (&'static str, u64, u64, [u64; 4]) {
+    ///     let info = device.pixel_format_info(80);
+    ///     assert!(info.describes_a_format());
+    ///     assert_ne!(info, PixelFormatInfo::INVALID);
+    ///     let PixelFormatInfo {
+    ///         name,
+    ///         flags,
+    ///         cast_class,
+    ///         words,
+    ///         ..
+    ///     } = info;
+    ///     (name, flags, cast_class, words)
+    /// }
+    /// # let _ = describe;
+    /// ```
     pub fn pixel_format_info(&self, raw: u64) -> PixelFormatInfo {
-        self.current().pixel_format_info_now(raw)
-    }
-
-    /// [`Device::pixel_format_info`] on the generation that serves (`device/line.rs`).
-    pub(crate) fn pixel_format_info_now(&self, raw: u64) -> PixelFormatInfo {
         pixel_format_info(raw)
     }
 
@@ -135,12 +141,63 @@ impl Device {
     /// - a row is the blocks across times a block's bytes, an image the rows, the level the
     ///   images times its depth, and the size the blocks cover the blocks times the block, all
     ///   in 64-bit arithmetic that wraps.
+    ///
+    /// It is Metal's layout of the level, not this device's image's: the device's own pitch of a
+    /// texture's rows is its own answer. No Vulkan call is made.
+    ///
+    /// ```
+    /// use metal2vulkan_runtime::{Device, TextureLevelInfo, TextureLevelQuery};
+    ///
+    /// // A query a consumer builds field by field, and every field of the answer.
+    /// fn level(device: &Device) -> [u64; 13] {
+    ///     let query = TextureLevelQuery {
+    ///         pixel_format: 80,
+    ///         width: 17,
+    ///         height: 9,
+    ///         depth: 1,
+    ///         array_length: 1,
+    ///         level: 0,
+    ///         planes: 0,
+    ///     };
+    ///     assert_eq!(query, TextureLevelQuery::plane_2d(80, 17, 9));
+    ///     let info = device.texture_level_info(&query);
+    ///     let TextureLevelInfo {
+    ///         width,
+    ///         height,
+    ///         depth,
+    ///         blocks_across,
+    ///         blocks_down,
+    ///         blocks_deep,
+    ///         aligned_width,
+    ///         aligned_height,
+    ///         aligned_depth,
+    ///         bytes_per_block,
+    ///         bytes_per_row,
+    ///         bytes_per_image,
+    ///         bytes,
+    ///         ..
+    ///     } = info;
+    ///     let words = [
+    ///         width,
+    ///         height,
+    ///         depth,
+    ///         blocks_across,
+    ///         blocks_down,
+    ///         blocks_deep,
+    ///         aligned_width,
+    ///         aligned_height,
+    ///         aligned_depth,
+    ///         bytes_per_block,
+    ///         bytes_per_row,
+    ///         bytes_per_image,
+    ///         bytes,
+    ///     ];
+    ///     assert_eq!(words, info.words());
+    ///     words
+    /// }
+    /// # let _ = level;
+    /// ```
     pub fn texture_level_info(&self, query: &TextureLevelQuery) -> TextureLevelInfo {
-        self.current().texture_level_info_now(query)
-    }
-
-    /// [`Device::texture_level_info`] on the generation that serves (`device/line.rs`).
-    pub(crate) fn texture_level_info_now(&self, query: &TextureLevelQuery) -> TextureLevelInfo {
         texture_level_info(query)
     }
 }
@@ -312,11 +369,6 @@ fn blocks(extent: u64, block: u64) -> u64 {
 /// ASTC and PVRTC format, and the 4:2:2 formats `GBGR422` and `BGRG422`, whose blocks are 2 by 1),
 /// whose description's words are then the block's.
 const BLOCKS: u64 = 0x400;
-
-/// The flags bits Metal sets on exactly its depth (`0x20`) and stencil (`0x40`) formats in the
-/// table: `Depth16Unorm`, `Depth32Float`, `Stencil8`, `Depth32Float_Stencil8`, `X32_Stencil8`,
-/// `AnyDepth` and `AnyStencil`.
-const DEPTH_OR_STENCIL: u64 = 0x60;
 
 /// One format's measured description: its four words, its flags and its cast class.
 struct Described {

@@ -18,12 +18,9 @@
 //! no loop, no mapping; every status a handler reads is sent on a channel read with a bound, and
 //! every wait is for work that ends on its own.
 
-use crate::allowance::Allowance;
 use crate::case::{Abort, Case, Input, MetalSource, Side};
 use crate::empty_command_buffers::{EMPTY, FILL, FILL_BYTES};
-use crate::replay::notice_allowance;
 use crate::transcript::{Node, Observed, Sites};
-use metal2vulkan_runtime::Degradation;
 
 /// The case's name.
 pub const EMPTY_COMMAND_BUFFERS: &str = "empty-command-buffers";
@@ -65,22 +62,6 @@ impl Case for EmptyCommandBuffersCase {
         5
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // `GpuTimesFromHost`: the runtime answers the fill's GPU times from the host clock where
-        // the driver's own timestamps wait for every queue's (MoltenVK on Apple's GPUs), and says
-        // so once. `UncalibratedGpuTimes`: it places them without the device's calibration where
-        // that calibration disagrees with the command buffer's life (`gpu_time.rs`). The RX 7900
-        // XTX (RADV NAVI31) announced that on 2026-11-07, where its calibrated pair placed the
-        // fill outside its life (`WorkCounts::calibration_disagreements` 1 in each of three `cost`
-        // runs); the Radeon 780M in the same machine agreed with its calibration (0). The orderings
-        // this case compares hold for every source, so every value still compares exactly; the
-        // notice site alone takes either notice.
-        vec![
-            notice_allowance(Degradation::GpuTimesFromHost.code()),
-            notice_allowance(Degradation::UncalibratedGpuTimes.code()),
-        ]
-    }
-
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
         match side.empty_command_buffers() {
             Ok(facts) => sites.push(facts.node(AT)),
@@ -95,16 +76,16 @@ impl Case for EmptyCommandBuffersCase {
 mod tests {
     use super::*;
 
-    /// The case states its inputs, names itself once, takes the two GPU-time notices alone, and
-    /// records more than one run.
+    /// The case states its inputs, names itself once, takes no allowance, and records more than
+    /// one run.
     #[test]
-    fn the_case_states_its_inputs_and_only_the_gpu_time_notices() {
+    fn the_case_states_its_inputs_and_takes_no_allowance() {
         let cases = all();
         assert_eq!(cases.len(), 1);
         let case = &cases[0];
         assert_eq!(case.name(), EMPTY_COMMAND_BUFFERS);
         assert!(!case.inputs().expect("the inputs").is_empty());
-        assert_eq!(case.allowances().len(), 2);
+        assert!(case.allowances().is_empty());
         assert!(case.record_runs() > 1);
     }
 }

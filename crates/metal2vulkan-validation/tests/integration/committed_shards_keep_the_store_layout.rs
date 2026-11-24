@@ -10,14 +10,11 @@
 //! MoltenVK shards. Byte-level canonical form is not part of this check: rows of executor v34 still
 //! carry the legacy `containment.device_addresses` field that a rewrite drops.
 
-use std::path::Path;
-
-use metal2vulkan_validation::observation::Backend;
 use metal2vulkan_validation::store::CorpusStore;
 
 #[test]
 fn committed_shards_keep_the_store_layout() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let root = metal2vulkan_devtools::validation_dir().join("corpus");
     let store = CorpusStore::new(&root);
     let errors = store.layout_errors().expect("read the committed shards");
     assert!(
@@ -31,45 +28,39 @@ fn committed_shards_keep_the_store_layout() {
     // unique, and every observation names a committed case with its inputs, in a unique slot.
     let cases = store.read_all_cases().expect("committed cases");
     let metal = store.read_metal().expect("committed Metal observations");
-    let moltenvk = store
-        .read_candidates(Backend::Moltenvk)
-        .expect("committed MoltenVK observations");
     let vulkan = store
-        .read_candidates(Backend::Vulkan)
+        .read_candidates()
         .expect("committed Vulkan observations");
     assert!(
-        !cases.is_empty() && !metal.is_empty() && !moltenvk.is_empty() && !vulkan.is_empty(),
-        "the committed store is empty: {} cases, {} Metal, {} MoltenVK, {} Vulkan rows",
+        !cases.is_empty() && !metal.is_empty() && !vulkan.is_empty(),
+        "the committed store is empty: {} cases, {} Metal, {} Vulkan rows",
         cases.len(),
         metal.len(),
-        moltenvk.len(),
         vulkan.len()
     );
 }
 
 /// Every committed observation and every committed refusal record names a committed case, with
-/// that case's AIR. The store's readers check this when they read a backend's rows or refusals, so
+/// that case's AIR. The store's readers check this when they read the rows or refusals, so
 /// this reads every one of them from the committed store. A case re-keyed or deleted on one branch
 /// while another committed rows or refusals of its old id leaves records that name no case:
 /// `corpus-status --c3` then refuses the whole store (a case was once re-keyed while six refusals
 /// of it were recorded on another branch).
 #[test]
 fn every_committed_observation_and_refusal_names_a_committed_case() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let root = metal2vulkan_devtools::validation_dir().join("corpus");
     let store = CorpusStore::new(&root);
     let mut errors = Vec::new();
     if let Err(error) = store.read_metal() {
         errors.push(format!("Metal observations: {error}"));
     }
     let mut refusals = 0;
-    for backend in [Backend::Moltenvk, Backend::Vulkan] {
-        if let Err(error) = store.read_candidates(backend) {
-            errors.push(format!("{} observations: {error}", backend.directory()));
-        }
-        match store.read_refusals(backend) {
-            Ok(rows) => refusals += rows.len(),
-            Err(error) => errors.push(format!("{} refusals: {error}", backend.directory())),
-        }
+    if let Err(error) = store.read_candidates() {
+        errors.push(format!("vulkan observations: {error}"));
+    }
+    match store.read_refusals() {
+        Ok(rows) => refusals += rows.len(),
+        Err(error) => errors.push(format!("vulkan refusals: {error}")),
     }
     assert!(
         errors.is_empty(),

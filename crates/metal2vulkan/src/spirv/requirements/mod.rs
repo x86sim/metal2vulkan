@@ -11,17 +11,17 @@
 //!
 //! Conventions:
 //!
-//! - **Features imply their exposure; extensions are what every device needs.** A requirement
-//!   lists the gating *feature* (e.g. `shaderDemoteToHelperInvocation`, which exists through
-//!   `VK_EXT_shader_demote_to_helper_invocation` or Vulkan 1.3), and `extensions` lists exactly
-//!   the device extensions the module needs on **every** device: the extension of each required
-//!   feature that no core version exposes (`VkFeature::exposure`; e.g.
-//!   `VK_EXT_fragment_shader_interlock`, `VK_KHR_maintenance8`), added in one closing step, and
-//!   the extension of a declaration the registry gates by exposure alone with no feature and no
-//!   core version (`VK_EXT_shader_stencil_export`). An extension a core version promoted
+//! - **Features imply their exposure; extensions are what every device needs.** A requirement lists
+//!   the gating *feature* (e.g. `shaderDemoteToHelperInvocation`, which exists through
+//!   `VK_EXT_shader_demote_to_helper_invocation` or Vulkan 1.3), and `extensions` lists exactly the
+//!   device extensions the module needs on **every** device: the extension of each required feature
+//!   that no core version exposes (`VkFeature::exposure`; e.g. `VK_EXT_fragment_shader_interlock`,
+//!   `VK_KHR_maintenance8`), added in one closing step, and the extension of a declaration the
+//!   registry gates by exposure alone with no feature and no core version
+//!   (`VK_EXT_shader_stencil_export`). An extension a core version promoted
 //!   (`VK_KHR_shader_terminate_invocation`) depends on the device's version, so it is not listed:
-//!   the description lists the feature only where it is exposed (`Device::new` checks it), and
-//!   `DeviceDescription::required_enables` names the extension below that version.
+//!   the description lists the feature only where it is exposed (`Device::from_queries` checks it),
+//!   and `DeviceDescription::required_enables` names the extension below that version.
 //! - **A capability with a version or an extension beside its feature is enabled on the device.**
 //!   `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` are enabled by
 //!   `shaderStorageImage{Read,Write}WithoutFormat`, by Vulkan 1.3, or by
@@ -63,12 +63,12 @@ use crate::pipeline::sym::Stage;
 use crate::spirv::error::{BResult, BuildError, Dangling, GlobalRule, TypeRule};
 use crate::spirv::ids::{FuncId, GlobalId, TypeId, Value};
 use crate::spirv::ir::{
-    AtomicOp, DerivOp, Dim, ExecMode, ExecModel, GlobalKind, GlslOp, GroupInst, GroupOperation,
-    ImageOperands, ImageType, ImageUsage, Inst, IoDir, LayoutRule, RayQueryInst, Scope, ScopeId,
-    Semantics, SemanticsId, Shape, StorageClass, Terminator, TexelMemory, Type, ValueOrigin,
+    Block, Consts, EntryPoint, Function, GlobalVar, MemAccess, Types, ValueDef,
 };
 use crate::spirv::ir::{
-    Block, Consts, EntryPoint, Function, GlobalVar, MemAccess, Types, ValueDef,
+    DerivOp, Dim, ExecMode, ExecModel, GlobalKind, GlslOp, GroupInst, GroupOperation,
+    ImageOperands, ImageType, ImageUsage, Inst, IoDir, LayoutRule, RayQueryInst, Scope, ScopeId,
+    Semantics, SemanticsId, Shape, StorageClass, Terminator, TexelMemory, Type, ValueOrigin,
 };
 
 /// `SkipTrianglesKHR | SkipAABBsKHR`.
@@ -90,12 +90,10 @@ fn independence_needed(widths: &BTreeSet<u8>) -> Independence {
 
 mod level_reads;
 mod own_pixel;
-mod snapshot;
 mod writes;
 
 pub use level_reads::level_reads;
 pub use own_pixel::own_pixel_textures;
-pub use snapshot::{snapshot_copies_alone, snapshot_textures, Judged};
 pub use writes::writes_memory;
 
 #[cfg(test)]
@@ -218,25 +216,14 @@ pub fn interface(m: &ModuleView<'_>) -> BResult<Vec<GlobalId>> {
         .filter(|(_, u)| **u)
         .map(|(i, _)| GlobalId::new(i as u32))
         .collect();
-    // Explicitly laid-out `Workgroup` memory is all or nothing per entry point, and an entry has
-    // at most one payload (`TaskPayloadWorkgroupEXT`).
-    let (mut blocks, mut implicit, mut payloads) = (false, false, 0usize);
+    // An entry has at most one payload (`TaskPayloadWorkgroupEXT`).
+    let mut payloads = 0usize;
     for g in &interface {
         let gv = m
             .globals
             .get(g.index())
             .ok_or(BuildError::Dangling(Dangling::Global(*g)))?;
-        if gv.class == StorageClass::Workgroup {
-            if m.types.facts(gv.pointee)?.block {
-                blocks = true;
-            } else {
-                implicit = true;
-            }
-        }
         payloads += usize::from(gv.class == StorageClass::TaskPayloadWorkgroupEXT);
-    }
-    if blocks && implicit {
-        return Err(BuildError::Global(GlobalRule::MixedWorkgroupLayout));
     }
     if payloads > 1 {
         return Err(BuildError::Global(GlobalRule::Payload));
@@ -244,14 +231,13 @@ pub fn interface(m: &ModuleView<'_>) -> BResult<Vec<GlobalId>> {
     Ok(interface)
 }
 
-/// The Metal stage of an execution model: both tessellation stages and the synthesized geometry
-/// stage belong to Metal's vertex stage.
+/// The Metal stage of an execution model: both tessellation stages belong to Metal's vertex
+/// stage.
 pub(crate) fn metal_stage(model: ExecModel) -> Stage {
     match model {
-        ExecModel::Vertex
-        | ExecModel::TessellationEvaluation
-        | ExecModel::TessellationControl
-        | ExecModel::Geometry => Stage::Vertex,
+        ExecModel::Vertex | ExecModel::TessellationEvaluation | ExecModel::TessellationControl => {
+            Stage::Vertex
+        }
         ExecModel::Fragment => Stage::Fragment,
         ExecModel::GLCompute => Stage::Kernel,
         ExecModel::TaskEXT => Stage::Object,
@@ -284,10 +270,6 @@ pub fn derive(m: &ModuleView<'_>) -> BResult<Requirements> {
     if m.entry.model.is_tessellation() {
         d.cap(Cap::Tessellation);
         d.feat(VkFeature::TessellationShader);
-    }
-    if m.entry.model == ExecModel::Geometry {
-        d.cap(Cap::Geometry);
-        d.feat(VkFeature::GeometryShader);
     }
     // A task or mesh entry, and a fragment entry reading a mesh entry's primitive outputs
     // (`PerPrimitiveEXT`), declare mesh shading.
@@ -479,8 +461,9 @@ impl Deriver<'_> {
         match self.model {
             ExecModel::Vertex
             | ExecModel::TessellationEvaluation
-            | ExecModel::TessellationControl
-            | ExecModel::Geometry => self.feat(VkFeature::VertexPipelineStoresAndAtomics),
+            | ExecModel::TessellationControl => {
+                self.feat(VkFeature::VertexPipelineStoresAndAtomics)
+            }
             ExecModel::Fragment => self.feat(VkFeature::FragmentStoresAndAtomics),
             // Vulkan's stage store features name no task or mesh stage.
             ExecModel::GLCompute | ExecModel::TaskEXT | ExecModel::MeshEXT => {}
@@ -512,11 +495,6 @@ impl Deriver<'_> {
                 Type::Float { width: 64 } => {
                     self.cap(Cap::Float64);
                     self.feat(VkFeature::ShaderFloat64);
-                }
-                Type::Float8 { .. } => {
-                    self.cap(Cap::Float8EXT);
-                    self.feat(VkFeature::ShaderFloat8);
-                    self.ext(SpirvExtension::ExtFloat8);
                 }
                 Type::RuntimeArray { stride: None, .. } => {
                     self.cap(Cap::RuntimeDescriptorArray);
@@ -568,8 +546,8 @@ impl Deriver<'_> {
                 }
                 return Ok(());
             }
-            // Workgroup narrow access is a property of explicitly laid-out `Workgroup` blocks
-            // (see `globals`); other classes need only the arithmetic capability.
+            // `Workgroup` memory is implicitly laid out (`ModuleBuilder::plain_global`), so its
+            // narrow access, as other classes', needs only the arithmetic capability.
             _ => return self.layout(class, pointee),
         };
         if n.w8 {
@@ -585,8 +563,7 @@ impl Deriver<'_> {
 
     /// The layout feature an explicitly laid-out pointee needs in `class` (the P8a layout rules:
     /// scalar layout needs `scalarBlockLayout`, std430 in `Uniform` needs
-    /// `uniformBufferStandardLayout`, scalar `Workgroup` blocks need
-    /// `workgroupMemoryExplicitLayoutScalarBlockLayout`).
+    /// `uniformBufferStandardLayout`).
     fn layout(&mut self, class: StorageClass, pointee: TypeId) -> BResult<()> {
         // A descriptor array's layout is its element's.
         let laid = match self.ty(pointee)? {
@@ -610,9 +587,6 @@ impl Deriver<'_> {
             ) => self.feat(VkFeature::ScalarBlockLayout),
             (StorageClass::Uniform, LayoutRule::Std430) => {
                 self.feat(VkFeature::UniformBufferStandardLayout)
-            }
-            (StorageClass::Workgroup, LayoutRule::Scalar) => {
-                self.feat(VkFeature::WorkgroupMemoryExplicitLayoutScalarBlockLayout)
             }
             _ => {}
         }
@@ -672,20 +646,6 @@ impl Deriver<'_> {
                     if g.init.is_some() {
                         self.feat(VkFeature::ShaderZeroInitializeWorkgroupMemory);
                     }
-                    if m.types.facts(g.pointee)?.block {
-                        self.cap(Cap::WorkgroupMemoryExplicitLayoutKHR);
-                        self.ext(SpirvExtension::KhrWorkgroupMemoryExplicitLayout);
-                        self.feat(VkFeature::WorkgroupMemoryExplicitLayout);
-                        let n = self.narrow(g.pointee)?;
-                        if n.w8 {
-                            self.cap(Cap::WorkgroupMemoryExplicitLayout8BitAccessKHR);
-                            self.feat(VkFeature::WorkgroupMemoryExplicitLayout8BitAccess);
-                        }
-                        if n.w16 {
-                            self.cap(Cap::WorkgroupMemoryExplicitLayout16BitAccessKHR);
-                            self.feat(VkFeature::WorkgroupMemoryExplicitLayout16BitAccess);
-                        }
-                    }
                 }
                 GlobalKind::BuiltIn { builtin, dir } => {
                     let id =
@@ -728,16 +688,13 @@ impl Deriver<'_> {
         ty: TypeId,
     ) -> BResult<()> {
         use crate::spv::BuiltIn as B;
-        // A mesh entry's outputs are arrayed per vertex or per primitive, and a geometry or
-        // evaluation entry's per-vertex inputs and a control entry's per-vertex inputs and
-        // outputs per vertex: a builtin's own array, a clip or cull distance's, is that array's
+        // A mesh entry's outputs are arrayed per vertex or per primitive, and an evaluation
+        // entry's per-vertex inputs and a control entry's per-vertex inputs and outputs per
+        // vertex: a builtin's own array, a clip or cull distance's, is that array's
         // element.
         let arrays_vertices = matches!(
             (self.model, dir),
-            (
-                ExecModel::Geometry | ExecModel::TessellationEvaluation,
-                IoDir::Input
-            ) | (ExecModel::TessellationControl, _)
+            (ExecModel::TessellationEvaluation, IoDir::Input) | (ExecModel::TessellationControl, _)
         );
         let arrayed = (self.model == ExecModel::MeshEXT && dir == IoDir::Output)
             || (arrays_vertices && crate::spirv::builder::geometry_per_vertex(b));
@@ -752,35 +709,18 @@ impl Deriver<'_> {
                 _ => Ok(None),
             }
         };
-        // A tessellation stage's `PrimitiveId` is enabled by `Tessellation`, and a geometry stage's
-        // by `Geometry`, which the entry declared.
-        if b == B::PrimitiveId
-            && (self.model.is_tessellation() || self.model == ExecModel::Geometry)
-        {
+        // A tessellation stage's `PrimitiveId` is enabled by `Tessellation`, which the entry
+        // declared.
+        if b == B::PrimitiveId && self.model.is_tessellation() {
             return Ok(());
-        }
-        // A geometry stage's `Layer` output is enabled by `Geometry`, which the entry declared, and
-        // its `ViewportIndex` output by `MultiViewport` (`multiViewport`).
-        if self.model == ExecModel::Geometry && dir == IoDir::Output {
-            match b {
-                B::Layer => return Ok(()),
-                B::ViewportIndex => {
-                    self.cap(Cap::MultiViewport);
-                    self.feat(VkFeature::MultiViewport);
-                    return Ok(());
-                }
-                _ => {}
-            }
         }
         // A task or mesh entry's `DrawIndex` is enabled by `MeshShadingEXT` (as the grammar lists
         // it), which the entry declared: it needs no `DrawParameters`.
         if b == B::DrawIndex && matches!(self.model, ExecModel::TaskEXT | ExecModel::MeshEXT) {
             return Ok(());
         }
-        // A geometry stage's point size, input or output, is `GeometryPointSize`'s, and a
-        // tessellation stage's `TessellationPointSize`'s.
+        // A tessellation stage's point size, input or output, is `TessellationPointSize`'s.
         let point_size = match self.model {
-            ExecModel::Geometry => Some(Cap::GeometryPointSize),
             ExecModel::TessellationControl | ExecModel::TessellationEvaluation => {
                 Some(Cap::TessellationPointSize)
             }
@@ -906,11 +846,6 @@ impl Deriver<'_> {
                     self.ext(SpirvExtension::ExtFragmentShaderInterlock);
                     self.feat(VkFeature::FragmentShaderPixelInterlock);
                 }
-                ExecMode::SampleInterlockOrdered => {
-                    self.cap(Cap::FragmentShaderSampleInterlockEXT);
-                    self.ext(SpirvExtension::ExtFragmentShaderInterlock);
-                    self.feat(VkFeature::FragmentShaderSampleInterlock);
-                }
                 ExecMode::StencilRefReplacing => {
                     self.cap(Cap::StencilExportEXT);
                     self.ext(SpirvExtension::ExtShaderStencilExport);
@@ -935,11 +870,6 @@ impl Deriver<'_> {
                     self.cap(Cap::QuadControlKHR);
                     self.ext(SpirvExtension::KhrQuadControl);
                     self.feat(VkFeature::ShaderQuadControl);
-                }
-                ExecMode::PostDepthCoverage => {
-                    self.cap(Cap::SampleMaskPostDepthCoverage);
-                    self.ext(SpirvExtension::KhrPostDepthCoverage);
-                    self.r.extensions.insert(VkExtension::ExtPostDepthCoverage);
                 }
                 // A task or mesh entry's local size is bounded by the mesh shader limits, which no
                 // profile records yet: the stage's feature, which none enables, refuses it first.
@@ -972,15 +902,6 @@ impl Deriver<'_> {
                 | ExecMode::OutputPoints
                 | ExecMode::OutputLines
                 | ExecMode::OutputTriangles => {}
-                // The entry's `Geometry` covers a geometry entry's modes. The synthesized stage
-                // emits at most 3 vertices in one invocation, within every device's
-                // `maxGeometryOutputVertices` (at least 256) and `maxGeometryShaderInvocations`
-                // (at least 32) where `geometryShader` is.
-                ExecMode::InputPoints
-                | ExecMode::InputLines
-                | ExecMode::OutputLineStrip
-                | ExecMode::OutputTriangleStrip
-                | ExecMode::Invocations { .. } => {}
             }
         }
         // The widths the denormal and rounding modes name: a width without one keeps the
@@ -1012,12 +933,7 @@ impl Deriver<'_> {
     // ---- Instructions ----
 
     fn subgroup(&mut self, op: SubgroupOp) {
-        // A geometry module's are the geometry stage's, though its Metal stage is the vertex
-        // function's (`metal_stage`).
-        self.prop(match self.model {
-            ExecModel::Geometry => VkProperty::SubgroupGeometryStage,
-            _ => VkProperty::SubgroupStage(self.stage),
-        });
+        self.prop(VkProperty::SubgroupStage(self.stage));
         self.prop(VkProperty::SubgroupOperation(SubgroupOp::Basic));
         self.prop(VkProperty::SubgroupOperation(op));
     }
@@ -1072,25 +988,21 @@ impl Deriver<'_> {
             Inst::AtomicLoad { ptr, scope, sem } => {
                 self.scope(*scope);
                 self.semantics(*sem);
-                self.atomic(*ptr, None)?;
+                self.atomic(*ptr)?;
             }
             Inst::AtomicStore {
                 ptr, scope, sem, ..
             } => {
                 self.scope(*scope);
                 self.semantics(*sem);
-                self.atomic(*ptr, None)?;
+                self.atomic(*ptr)?;
             }
             Inst::Atomic {
-                op,
-                ptr,
-                scope,
-                sem,
-                ..
+                ptr, scope, sem, ..
             } => {
                 self.scope(*scope);
                 self.semantics(*sem);
-                self.atomic(*ptr, Some(*op))?;
+                self.atomic(*ptr)?;
             }
             Inst::AtomicCompareExchange {
                 ptr,
@@ -1102,7 +1014,7 @@ impl Deriver<'_> {
                 self.scope(*scope);
                 self.semantics(*equal);
                 self.semantics(*unequal);
-                self.atomic(*ptr, None)?;
+                self.atomic(*ptr)?;
             }
             Inst::ControlBarrier { exec, mem, sem } => {
                 self.scope(*exec);
@@ -1200,22 +1112,6 @@ impl Deriver<'_> {
                 {
                     self.cap(Cap::RayTraversalPrimitiveCullingKHR);
                 }
-            }
-            // The builder admits 16- and 32-bit floats (`FunctionBuilder::fma`): `shaderFmaFloat16`
-            // or `shaderFmaFloat32` by the operands' width, the result's
-            // (VUID-RuntimeSpirv-shaderFmaFloat16-10977, VUID-RuntimeSpirv-shaderFmaFloat32-10978).
-            Inst::Fma { a, .. } => {
-                self.cap(Cap::Fmakhr);
-                self.ext(SpirvExtension::KhrFma);
-                let half = matches!(
-                    self.scalar_of(self.value_ty(*a)?)?,
-                    Type::Float { width: 16 }
-                );
-                self.feat(if half {
-                    VkFeature::ShaderFmaFloat16
-                } else {
-                    VkFeature::ShaderFmaFloat32
-                });
             }
             Inst::DemoteToHelperInvocation | Inst::IsHelperInvocation => {
                 self.cap(Cap::DemoteToHelperInvocation);
@@ -1374,10 +1270,8 @@ impl Deriver<'_> {
     }
 
     /// Features an atomic on `ptr` needs: 64-bit integer and float atomics per storage class, and
-    /// the stage's store feature for descriptor-backed memory. `op` is the read-modify-write
-    /// operation (`None` for loads, stores, exchanges of the plain kind, steps, and
-    /// compare-exchange).
-    fn atomic(&mut self, ptr: Value, op: Option<AtomicOp>) -> BResult<()> {
+    /// the stage's store feature for descriptor-backed memory.
+    fn atomic(&mut self, ptr: Value) -> BResult<()> {
         let (class, pointee) = self.pointer_of(ptr)?;
         let buffer = matches!(
             class,
@@ -1395,73 +1289,33 @@ impl Deriver<'_> {
                     _ => VkFeature::ShaderBufferInt64Atomics,
                 });
             }
-            Type::Float { width } => self.float_atomic(class, width, op)?,
+            Type::Float { width } => self.float_atomic(class, width)?,
             _ => {}
         }
         Ok(())
     }
 
-    fn float_atomic(
-        &mut self,
-        class: StorageClass,
-        width: u8,
-        op: Option<AtomicOp>,
-    ) -> BResult<()> {
+    /// The feature a float atomic (a load, a store, an exchange or a compare-exchange) on a
+    /// pointer of `class` to a float of `width` bits needs.
+    fn float_atomic(&mut self, class: StorageClass, width: u8) -> BResult<()> {
         use VkFeature as F;
-        // [plain (load/store/exchange), add] per (class, width).
-        let set = match (class, width) {
-            (StorageClass::Workgroup, 16) => [
-                F::ShaderSharedFloat16Atomics,
-                F::ShaderSharedFloat16AtomicAdd,
-            ],
-            (StorageClass::Workgroup, 32) => [
-                F::ShaderSharedFloat32Atomics,
-                F::ShaderSharedFloat32AtomicAdd,
-            ],
-            (StorageClass::Workgroup, 64) => [
-                F::ShaderSharedFloat64Atomics,
-                F::ShaderSharedFloat64AtomicAdd,
-            ],
-            (StorageClass::Image, 32) => {
-                [F::ShaderImageFloat32Atomics, F::ShaderImageFloat32AtomicAdd]
+        let feature = match (class, width) {
+            (StorageClass::Workgroup, 16) => F::ShaderSharedFloat16Atomics,
+            (StorageClass::Workgroup, 32) => F::ShaderSharedFloat32Atomics,
+            (StorageClass::Workgroup, 64) => F::ShaderSharedFloat64Atomics,
+            (StorageClass::Image, 32) => F::ShaderImageFloat32Atomics,
+            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 16) => {
+                F::ShaderBufferFloat16Atomics
             }
-            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 16) => [
-                F::ShaderBufferFloat16Atomics,
-                F::ShaderBufferFloat16AtomicAdd,
-            ],
-            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 32) => [
-                F::ShaderBufferFloat32Atomics,
-                F::ShaderBufferFloat32AtomicAdd,
-            ],
-            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 64) => [
-                F::ShaderBufferFloat64Atomics,
-                F::ShaderBufferFloat64AtomicAdd,
-            ],
+            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 32) => {
+                F::ShaderBufferFloat32Atomics
+            }
+            (StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer, 64) => {
+                F::ShaderBufferFloat64Atomics
+            }
             _ => return Err(BuildError::Type(TypeRule::PointeeForClass(class))),
         };
-        let [plain, add] = set;
-        match op {
-            Some(AtomicOp::FAdd) => {
-                self.feat(add);
-                let (c, e) = match width {
-                    16 => (
-                        Cap::AtomicFloat16AddEXT,
-                        SpirvExtension::ExtShaderAtomicFloat16Add,
-                    ),
-                    32 => (
-                        Cap::AtomicFloat32AddEXT,
-                        SpirvExtension::ExtShaderAtomicFloatAdd,
-                    ),
-                    _ => (
-                        Cap::AtomicFloat64AddEXT,
-                        SpirvExtension::ExtShaderAtomicFloatAdd,
-                    ),
-                };
-                self.cap(c);
-                self.ext(e);
-            }
-            _ => self.feat(plain),
-        }
+        self.feat(feature);
         Ok(())
     }
 
@@ -1481,10 +1335,18 @@ impl Deriver<'_> {
             } => (Cap::GroupNonUniformClustered, SubgroupOp::Clustered),
             GroupInst::Arith { .. } => (Cap::GroupNonUniformArithmetic, SubgroupOp::Arithmetic),
             GroupInst::QuadBroadcast { .. } | GroupInst::QuadSwap { .. } => {
-                if self.model == ExecModel::Vertex {
+                // Vulkan gives quad instructions outside the fragment and compute stages only
+                // with `subgroupQuadOperationsInAllStages`.
+                if !matches!(self.model, ExecModel::Fragment | ExecModel::GLCompute) {
                     self.prop(VkProperty::SubgroupQuadOperationsInAllStages);
                 }
                 (Cap::GroupNonUniformQuad, SubgroupOp::Quad)
+            }
+            // `SPV_KHR_quad_control`'s quad votes, a fragment's (`lower::simd`).
+            GroupInst::QuadAll(_) | GroupInst::QuadAny(_) => {
+                self.ext(SpirvExtension::KhrQuadControl);
+                self.feat(VkFeature::ShaderQuadControl);
+                (Cap::QuadControlKHR, SubgroupOp::Quad)
             }
         };
         self.cap(Cap::GroupNonUniform);

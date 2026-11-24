@@ -15,50 +15,60 @@
 //!    (`Unsupported{Lowering(StageIo), NotImplemented}`): Metal's meaning for that conversion is
 //!    not established, so neither fetch path guesses one. A signed-integer format feeds a `uint`
 //!    variable, which fixed-function input may not (Vulkan's numeric-type match), so it is pulled
-//!    and sign-extended in the shader;
+//!    and sign-extended in the shader; under the identity domains it is fetched in fixed function
+//!    into a variable declared `int` (`VertexFetch::SignedFixedFunction`), the device's `SINT`
+//!    fetch sign-extending each component as Metal's does;
 //! 2. the per-attribute choice of `metal::vertex::attribute_fetch` (format, step, profile), in
 //!    item 1's Vulkan format. It
-//!    pulls every attribute when the profile's buffer containment is checked in the shader
-//!    (`memory::contain::encoding`: containment on and no buffer robustness): Vulkan bounds
-//!    fixed-function input only under robust buffer access (`VUID-vkCmdDraw-None-02721`), and a
+//!    pulls every attribute outside the identity domains: Vulkan bounds fixed-function input only
+//!    under robust buffer access (`VUID-vkCmdDraw-None-02721`), which no profile enables, and a
 //!    Metal draw may fetch past its buffer, so the fetch moves into the shader behind the check.
-//!    Every later item then finds no fixed-function attribute.
-//!    A layout of Metal's **constant step** is answered there with a divisor of 0, whose binding
-//!    this module emits with a **stride of 0** ([`binding_stride`]): Vulkan's zero divisor fetches
-//!    element `firstInstance`, Metal's constant step the first element whatever the base instance,
-//!    and a stride of 0 is what makes those the same bytes for every draw. Items 3, 4 and 6 read
-//!    the stride the binding carries and not the layout's, so such a binding meets their limits as
-//!    a stride of 0 does -- including the portability subset's, which a stride of 0 fails, so the
-//!    constant step stays pulled there;
+//!    Every later item then finds no fixed-function attribute there.
+//!    A layout of Metal's **constant step** is answered there under the identity domains at
+//!    vertex rate (pulled outside them), and this module emits its binding with a **stride of 0**
+//!    ([`binding_stride`]): a vertex-rate binding fetches element `vertexIndex`, Metal's constant
+//!    step the first element whatever the vertex, instance and base instance, and a stride of 0
+//!    is what makes those the same bytes for every draw. Items 3, 4 and 6 read the stride the binding
+//!    carries and not the layout's, so such a binding meets their limits as a stride of 0 does --
+//!    including the portability subset's, which a stride of 0 fails, so the constant step stays
+//!    pulled there, and under the identity domains is refused there;
 //! 3. **alignment**: Metal lets a stride and an attribute offset be any byte multiple on Apple5 and
 //!    later, while Vulkan's fixed-function attribute address must be a multiple of the format's
-//!    component size (of the whole format for a packed one). An attribute whose offset or static
-//!    binding stride is not such a multiple is pulled (the pulled fetch reads bytes), and so is one
-//!    whose static stride breaks the portability subset's rule (a multiple of
+//!    component size (of the whole format for a packed one). A fixed-function attribute whose
+//!    offset or static binding stride is not such a multiple is refused, and so is one whose static
+//!    stride breaks the portability subset's rule (a multiple of
 //!    `minVertexInputBindingStrideAlignment` and at least as large), or that ends past its static
 //!    stride where the subset withholds `vertexAttributeAccessBeyondStride`;
-//! 4. an attribute whose offset or binding stride exceeds `maxVertexInputAttributeOffset` /
-//!    `maxVertexInputBindingStride` is pulled;
-//! 5. while the fixed-function attributes exceed `maxVertexInputAttributes` or their layouts
-//!    `maxVertexInputBindings`, the highest fixed-function attribute is pulled. Locations are
-//!    dense in attribute order, so an attribute's index itself is never a limit;
+//! 4. a fixed-function attribute whose offset or binding stride exceeds
+//!    `maxVertexInputAttributeOffset` / `maxVertexInputBindingStride` is refused, naming the limit;
+//! 5. fixed-function attributes past `maxVertexInputAttributes`, or their layouts past
+//!    `maxVertexInputBindings`, are refused, naming the limit. Locations are dense in attribute
+//!    order, so an attribute's index itself is never a limit;
 //! 6. when the strides are dynamic state (`strides_dynamic`: a fixed-function binding's stride
 //!    is set per bind and the profile has dynamic strides), `vkCmdBindVertexBuffers2` passes
 //!    every binding's stride, static ones included, and a nonzero one must cover every
 //!    attribute the binding fetches (`VUID-vkCmdBindVertexBuffers2-pStrides-06209`): a
 //!    fixed-function attribute of a static layout that ends past the layout's nonzero stride is
-//!    pulled. Pulling it changes no per-bind layout, so the strides stay dynamic;
+//!    refused;
 //! 7. a **pulled-vertex-buffer variant** (`VariantKey::pulled_vertex_buffers`) pulls every
 //!    remaining fixed-function attribute of the layouts it names: the binder asks for it when a
 //!    shape binds such a layout at an offset or with a per-bind stride fixed-function input
 //!    cannot fetch. It runs after the items above, so the variant's fixed-function bindings are
 //!    exactly the projection's others, attribute for attribute;
 //! 8. the **de-indexed and private list forms** (`VariantKey::primitive_id_indices`,
-//!    `VariantKey::private_list`) pull every remaining fixed-function attribute in the projection
-//!    their compile takes, and link resolves their vertex input the same way
-//!    (`RenderLinkInputs::pull_every`): their draw runs without indices, so fixed-function input
-//!    would fetch at the stream position, where the function reads the vertex its index names. The
-//!    layouts they pull are not a pulled-vertex-buffer variant's (`variant_pulled` keeps item 7's).
+//!    `VariantKey::private_list`) and a pipeline made for indirect command buffers
+//!    (`supportIndirectCommandBuffers`) pull every remaining fixed-function attribute in the
+//!    projection their compile takes, and link resolves their vertex input the same way
+//!    (`RenderLinkInputs::pull_every`): the first two draw without indices, so fixed-function
+//!    input would fetch at the stream position, where the function reads the vertex its index
+//!    names, and a command binds its vertex buffers by address alone. The layouts they pull are
+//!    not a pulled-vertex-buffer variant's (`variant_pulled` keeps item 7's).
+//!
+//! Only the identity domains (`Device::from_queries`' profile) fetch in fixed function, and items 2
+//! to 6 pull nothing there: item 2's cases are `metal::vertex::attribute_fetch`'s refusals, and
+//! items 3 to 6 refuse as `Feature::VertexInputLayout`. What items 7 and 8 pull is read through
+//! the source buffer's device address, as every slot is read there, at the layout's pushed stride
+//! (`PushField::VertexBufferStride`).
 //!
 //! A fixed-function entry keeps nothing of the format (`VertexFetch::FixedFunction`): no
 //! instruction of the module names it, so every format the device fetches in fixed function
@@ -66,25 +76,26 @@
 //! `VertexAttribute` state this module emits, and what the device's conversion of it may answer
 //! otherwise than Metal's fetch is noted where the pipeline links, on its vertex stage
 //! ([`fixed_function_notes`]): a normalized format's quotient
-//! (`PrecisionNote::DeviceVertexConversion`; on a profile whose conversion is measured to be
-//! Metal's, `VkProperty::MetalNormalizedVertexFetch` among the pipeline's requirements in its
-//! place) and a narrow float's NaN read as `float` (`PrecisionNote::DeviceNanEncoding`).
+//! (`PrecisionNote::DeviceVertexConversion`) and a narrow float's NaN read as `float`
+//! (`PrecisionNote::DeviceNanEncoding`).
 //!
 //! The projection is part of the vertex function's compile key; link recomputes it from the
 //! function's stage-IO contract and refuses a stage compiled under another one
-//! ([`vertex_input_state`]), so a stage compiled with fixed-function input for a profile without
-//! buffer robustness never links against a vertex descriptor there.
+//! ([`vertex_input_state`]), so a stage compiled with fixed-function input under the identity
+//! domains never links against a vertex descriptor outside them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::device::requirements::{VkFeature, VkProperty};
+use crate::device::requirements::{VkFeature, VkLimit};
 use crate::device::DeviceProfile;
-use crate::error::{DescriptorError, DriverDeviation, Error, InternalError, InternalKind};
+use crate::error::{
+    Capability, DescriptorError, Error, Feature, InternalError, InternalKind, Unsupported,
+};
 use crate::lower::stage_io::fetch::{class_match, encoding, ClassMatch, Encoding};
 use crate::metal::vertex::{
     fetch_as, vertex_alignment, vk_scaled_vertex_format, vk_vertex_format, AttributeFetch,
 };
-use crate::metal::VertexFormat;
+use crate::metal::{VertexFormat, VertexStepFunction};
 use crate::pipeline::artifact::PrecisionNote;
 use crate::pipeline::descriptor::{
     VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
@@ -100,10 +111,11 @@ use crate::pipeline::vertex::{
 use crate::vk;
 
 /// How attribute `attribute` of `format` meets a variable of class `declared` (item 1 of the
-/// module docs): the Vulkan format fixed-function input would deliver it in, and whether it can
-/// (not an unnormalized signed-integer format into the `uint` variable every integer attribute is
-/// declared as, which Vulkan's numeric-type match does not allow and which is pulled and
-/// sign-extended in the shader), or the class refusals of `fetch::class_match`.
+/// module docs): the Vulkan format fixed-function input would deliver it in, and whether that
+/// format is an unnormalized signed-integer one, which Vulkan's numeric-type match lets feed only
+/// a variable declared `int` (pulled and sign-extended in the shader where the module declares it
+/// `uint`, as every integer attribute is but under the identity domains), or the class refusals
+/// of `fetch::class_match`.
 ///
 /// A signed **normalized** format is not that case: it is a float-class format (`Encoding`'s
 /// `is_float`), so `fetch::class_match` admits it to a `float` variable alone and refuses it to
@@ -118,7 +130,7 @@ fn class_format(
     match class_match(e, declared == IoNumeric::Float, attribute)? {
         ClassMatch::Same => Ok((
             vk_vertex_format(format)?,
-            !matches!(
+            matches!(
                 e,
                 Encoding::Int {
                     signed: true,
@@ -128,7 +140,7 @@ fn class_format(
             ),
         )),
         ClassMatch::IntToFloat => vk_scaled_vertex_format(format)
-            .map(|f| (f, true))
+            .map(|f| (f, false))
             .ok_or_else(|| {
                 Error::Internal(InternalError::new(
                     InternalKind::Invariant,
@@ -139,18 +151,19 @@ fn class_format(
 }
 
 /// The stride the Vulkan binding of `fetch` on `layout` is emitted with (`None`: set per bind, a
-/// runtime fact the binder owns): **0** for Metal's constant step, which `metal::vertex::fetch_as`
-/// answers with a divisor of 0 and no other step can, and `layout`'s own otherwise.
+/// runtime fact the binder owns): **0** for a fixed-function fetch of Metal's constant step, and
+/// `layout`'s own otherwise.
 ///
-/// A zero divisor fetches element `firstInstance` ("Vertex Input Extraction"), and Metal's
-/// constant step fetches the layout's first element whatever the base instance, so the binding
-/// must read the same bytes at every base instance: `firstInstance * 0`. The layout's own stride
-/// is not key data of a fetch that reads one element, and every limit below reads the stride the
-/// binding carries rather than the layout's, so a constant-step binding meets them as a stride of
-/// 0 does.
+/// Metal's constant step fetches the layout's first element for every vertex and instance,
+/// whatever the base instance. `metal::vertex::fetch_as` answers it with an instance-rate binding
+/// of divisor 0, which fetches element `firstInstance`, or under the identity domains with a
+/// vertex-rate binding, which fetches element `vertexIndex` ("Vertex Input Address
+/// Calculation"); at a stride of 0 both read the first element. The layout's own stride is not
+/// key data of a fetch that reads one element, and every limit below reads the stride the binding
+/// carries rather than the layout's, so a constant-step binding meets them as a stride of 0 does.
 fn binding_stride(fetch: AttributeFetch, layout: &VertexBufferLayoutDescriptor) -> Option<u32> {
-    match fetch {
-        AttributeFetch::FixedFunction { divisor: 0, .. } => Some(0),
+    match (fetch, layout.step_function) {
+        (AttributeFetch::FixedFunction { .. }, VertexStepFunction::Constant) => Some(0),
         _ => layout.stride,
     }
 }
@@ -167,6 +180,8 @@ struct Resolved<'a> {
     attr: &'a VertexAttributeDescriptor,
     layout: &'a VertexBufferLayoutDescriptor,
     fetch: AttributeFetch,
+    /// The format is an unnormalized signed-integer one ([`class_format`]).
+    signed: bool,
 }
 
 /// Every attribute of `attributes` resolved (items 1-8 of the module docs; item 8 when
@@ -181,6 +196,9 @@ fn resolve<'a>(
     pull_every: bool,
 ) -> Result<(BTreeMap<u32, Resolved<'a>>, BTreeSet<u32>), Error> {
     let l = &p.fields().limits;
+    // Only the identity domains fetch in fixed function (item 2), and they pull nothing: what a
+    // fixed-function attribute cannot take is refused (the module docs).
+    let identity = crate::lower::access::identity(p);
     if let Some(d) = desc {
         d.check_layouts()?;
     }
@@ -196,8 +214,8 @@ fn resolve<'a>(
                 layout: attr.buffer_index,
             }),
         )?;
-        let (vk_format, fits) = class_format(attr.format, numeric, a)?;
-        let mut fetch = fetch_as(vk_format, layout.step_function, layout.step_rate, p)?;
+        let (vk_format, signed) = class_format(attr.format, numeric, a)?;
+        let fetch = fetch_as(vk_format, layout.step_function, layout.step_rate, p)?;
         let emitted = binding_stride(fetch, layout);
         let beyond_stride = match (fetch, emitted) {
             (AttributeFetch::FixedFunction { format, .. }, Some(stride)) => {
@@ -206,17 +224,40 @@ fn resolve<'a>(
             }
             _ => false,
         };
-        let pulled = !fits
-            || (beyond_stride
-                && p.fields()
-                    .enabled
-                    .portability_withholds(VkFeature::VertexAttributeAccessBeyondStride))
+        let unaligned = (beyond_stride
+            && p.fields()
+                .enabled
+                .portability_withholds(VkFeature::VertexAttributeAccessBeyondStride))
             || !aligned(attr.format, attr.offset, emitted)?
-            || emitted.is_some_and(|s| !l.portable_vertex_stride(s))
-            || attr.offset > l.max_vertex_input_attribute_offset
-            || emitted.is_some_and(|s| s > l.max_vertex_input_binding_stride);
-        if pulled {
-            fetch = AttributeFetch::Pulled;
+            || emitted.is_some_and(|s| !l.portable_vertex_stride(s));
+        let past = |limit, value: u32, max: u32| {
+            (value > max).then_some(Capability::Limit {
+                limit,
+                required: u64::from(value),
+                available: u64::from(max),
+            })
+        };
+        let limit = past(
+            VkLimit::MaxVertexInputAttributeOffset,
+            attr.offset,
+            l.max_vertex_input_attribute_offset,
+        )
+        .or_else(|| {
+            emitted.and_then(|s| {
+                past(
+                    VkLimit::MaxVertexInputBindingStride,
+                    s,
+                    l.max_vertex_input_binding_stride,
+                )
+            })
+        });
+        if identity && matches!(fetch, AttributeFetch::FixedFunction { .. }) {
+            if let Some(limit) = limit {
+                return Err(Unsupported::needs(Feature::VertexInputLayout, limit).into());
+            }
+            if unaligned {
+                return Err(Unsupported::not_implemented(Feature::VertexInputLayout).into());
+            }
         }
         out.insert(
             a,
@@ -224,30 +265,38 @@ fn resolve<'a>(
                 attr,
                 layout,
                 fetch,
+                signed,
             },
         );
     }
-    // Pull the highest fixed-function attribute while the fixed-function attributes or their
-    // layouts exceed the device's limits.
-    loop {
-        let fixed: Vec<&Resolved<'_>> = out
-            .values()
-            .filter(|r| matches!(r.fetch, AttributeFetch::FixedFunction { .. }))
-            .collect();
-        let layouts: BTreeSet<u32> = fixed.iter().map(|r| r.attr.buffer_index).collect();
-        if fixed.len() as u64 <= u64::from(l.max_vertex_input_attributes)
-            && layouts.len() as u64 <= u64::from(l.max_vertex_input_bindings)
-        {
-            break;
-        }
-        match out
-            .values_mut()
-            .rev()
-            .find(|r| matches!(r.fetch, AttributeFetch::FixedFunction { .. }))
-        {
-            Some(r) => r.fetch = AttributeFetch::Pulled,
-            None => break,
-        }
+    // The fixed-function attributes and their layouts within the device's limits (item 5).
+    let fixed: Vec<&Resolved<'_>> = out
+        .values()
+        .filter(|r| matches!(r.fetch, AttributeFetch::FixedFunction { .. }))
+        .collect();
+    let layouts: BTreeSet<u32> = fixed.iter().map(|r| r.attr.buffer_index).collect();
+    let counts = [
+        (
+            VkLimit::MaxVertexInputAttributes,
+            fixed.len(),
+            l.max_vertex_input_attributes,
+        ),
+        (
+            VkLimit::MaxVertexInputBindings,
+            layouts.len(),
+            l.max_vertex_input_bindings,
+        ),
+    ];
+    let over = counts
+        .into_iter()
+        .find(|&(_, count, max)| count as u64 > u64::from(max));
+    if let Some((limit, count, max)) = over {
+        let limit = Capability::Limit {
+            limit,
+            required: count as u64,
+            available: u64::from(max),
+        };
+        return Err(Unsupported::needs(Feature::VertexInputLayout, limit).into());
     }
     // Static strides under dynamic stride state cover their attributes (item 6).
     let dynamic = strides_dynamic(
@@ -257,13 +306,13 @@ fn resolve<'a>(
             .map(|r| binding_stride(r.fetch, r.layout)),
     );
     if dynamic {
-        for r in out.values_mut() {
+        for r in out.values() {
             if let (AttributeFetch::FixedFunction { format, .. }, Some(stride)) =
                 (r.fetch, binding_stride(r.fetch, r.layout))
             {
                 let size = format.block().map_or(u32::MAX, |b| b.size);
                 if stride != 0 && r.attr.offset.saturating_add(size) > stride {
-                    r.fetch = AttributeFetch::Pulled;
+                    return Err(Unsupported::not_implemented(Feature::VertexInputLayout).into());
                 }
             }
         }
@@ -278,7 +327,8 @@ fn resolve<'a>(
             moved.insert(r.attr.buffer_index);
         }
     }
-    // The de-indexed and private list forms (item 8).
+    // The de-indexed and private list forms and a pipeline made for indirect command buffers
+    // (item 8).
     if pull_every {
         for r in out.values_mut() {
             r.fetch = AttributeFetch::Pulled;
@@ -317,7 +367,8 @@ pub fn vertex_fetch_projection(
 /// `vertex_fetch_projection` under a pulled-vertex-buffer variant and a form that pulls every
 /// attribute: the attributes of the layouts in `pulled_vertex_buffers`
 /// (`VariantKey::pulled_vertex_buffers`) are pulled (item 7), and every attribute when
-/// `pull_every` (the de-indexed and private list forms, item 8).
+/// `pull_every` (the de-indexed and private list forms and a pipeline made for indirect command
+/// buffers, item 8).
 pub fn vertex_fetch_projection_for(
     desc: Option<&VertexDescriptor>,
     attributes: &BTreeMap<u32, IoNumeric>,
@@ -332,43 +383,26 @@ pub fn vertex_fetch_projection_for(
     Ok(out)
 }
 
-/// The projection entry of a resolved attribute: fixed function, or the pulled fetch of its
-/// format, offset and step.
+/// The projection entry of a resolved attribute: fixed function (into a variable declared `int`
+/// for an unnormalized signed-integer format), or the pulled fetch of its format, offset and step.
 fn fetch_of(r: &Resolved<'_>) -> VertexFetch {
     match r.fetch {
+        AttributeFetch::FixedFunction { .. } if r.signed => VertexFetch::SignedFixedFunction,
         AttributeFetch::FixedFunction { .. } => VertexFetch::FixedFunction,
         _ => VertexFetch::pulled(r.attr, r.layout),
     }
 }
 
-/// What the device's fixed-function operations give a render pipeline: the precision notes one of
-/// its stages records and the measured properties it relies on in their place. The conversions of
-/// its vertex stage's fixed-function attributes ([`fixed_function_notes`]) and its alpha to
-/// coverage (`graphics::coverage_notes`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FixedFunctionNotes {
-    /// The notes, sorted, each once.
-    pub(crate) notes: Vec<PrecisionNote>,
-    /// The measured properties an attribute that records no note relies on.
-    pub(crate) properties: BTreeSet<VkProperty>,
-}
-
 /// The precision notes of vertex stage `vs`'s attributes that fixed-function vertex input fetches
 /// for descriptor `desc` on `p` (its `IoRole::Attribute` inputs, which [`vertex_input_state`]
-/// holds to the descriptor's projection), sorted, each once, and the measured properties the
-/// pipeline requires in place of a note: the device converts each attribute's format, and the
-/// module, which every such format shares, cannot say what it was.
+/// holds to the descriptor's projection), sorted, each once: the device converts each attribute's
+/// format, and the module, which every such format shares, cannot say what it was.
 ///
 /// - `PrecisionNote::DeviceVertexConversion` for a normalized format (the 8- and 16-bit
 ///   `Normalized` formats of either sign, `UChar4Normalized_BGRA`, `Int1010102Normalized`,
 ///   `UInt1010102Normalized`), whatever width the function reads it at: the device's `UNORM` or
 ///   `SNORM` conversion of the codes, where Metal's quotient is correctly rounded (but an
-///   `Int1010102Normalized` 10-bit field's, the code times `float(1 / 511)`). Where `p` takes
-///   `DriverDeviation::MetalNormalizedVertexFetch`, the device's `float` is Metal's at every code:
-///   an attribute the function reads as a 32-bit `float` records no note and the pipeline requires
-///   `VkProperty::MetalNormalizedVertexFetch`, and so does one read as `half` of an 8- or 10-bit
-///   format, whose `float` rounds to Metal's `half` at every code. A 16-bit format read as `half`
-///   ([`rounds_twice_to_half`]) records the note there too;
+///   `Int1010102Normalized` 10-bit field's, the code times `float(1 / 511)`);
 /// - `PrecisionNote::DeviceNanEncoding` for a float format narrower than 32 bits
 ///   (`Encoding::widens_narrow_float`) that the function reads as a 32-bit `float`
 ///   (`StageIo::f32_attributes`): Metal widens its NaN to `0x7fc00000`, the device's widening
@@ -379,14 +413,14 @@ pub(crate) struct FixedFunctionNotes {
 pub(crate) fn fixed_function_notes(
     vs: &StageInterface,
     desc: Option<&VertexDescriptor>,
-    p: &DeviceProfile,
-) -> Result<FixedFunctionNotes, Error> {
+) -> Result<Vec<PrecisionNote>, Error> {
     let f32_reads = vs.io.f32_attributes();
-    let metal = p.takes_driver_deviation(DriverDeviation::MetalNormalizedVertexFetch);
     let mut notes = BTreeSet::new();
-    let mut properties = BTreeSet::new();
     for (a, (_, fetch)) in vs.io.attributes() {
-        if fetch != VertexFetch::FixedFunction {
+        if !matches!(
+            fetch,
+            VertexFetch::FixedFunction | VertexFetch::SignedFixedFunction
+        ) {
             continue;
         }
         let attr = desc
@@ -397,36 +431,13 @@ pub(crate) fn fixed_function_notes(
         let e = encoding(attr.format)?;
         let f32_read = f32_reads.contains(&a);
         if e.is_normalized() {
-            if metal && (f32_read || !rounds_twice_to_half(e)) {
-                properties.insert(VkProperty::MetalNormalizedVertexFetch);
-            } else {
-                notes.insert(PrecisionNote::DeviceVertexConversion);
-            }
+            notes.insert(PrecisionNote::DeviceVertexConversion);
         }
         if e.widens_narrow_float() && f32_read {
             notes.insert(PrecisionNote::DeviceNanEncoding);
         }
     }
-    Ok(FixedFunctionNotes {
-        notes: notes.into_iter().collect(),
-        properties,
-    })
-}
-
-/// Whether normalized encoding `e`'s `float` quotient, rounded to `half` as the module rounds an
-/// attribute the function reads as `half`, can differ from Metal's `half`, which rounds the
-/// quotient once: a 16-bit field's can land on a `half` midpoint (codes 65455 and 65519 unsigned,
-/// and 32759 and -32759 signed, each one `half` ulp from Metal's), an 8-, 10- or 2-bit field's
-/// at no code (`Int1010102Normalized`'s 10-bit fields through Metal's reciprocal product too).
-fn rounds_twice_to_half(e: Encoding) -> bool {
-    matches!(
-        e,
-        Encoding::Int {
-            bits: 16,
-            normalized: true,
-            ..
-        }
-    )
+    Ok(notes.into_iter().collect())
 }
 
 /// The vertex input state of vertex stage `vs` for descriptor `desc` under the
@@ -454,11 +465,13 @@ pub fn vertex_input_state(
         }
     }
     // The varyings the stage writes alike at every vertex of a primitive hold only while the
-    // attributes it took as stepped per instance are.
+    // attributes it took as stepped per instance or at the constant step are: an instance-rate
+    // binding, or a constant step's binding of stride 0, which reads one element at any rate.
     for a in &vs.io.instanced_attributes {
         let per_instance = resolved.get(a).is_some_and(|r| match r.fetch {
             AttributeFetch::FixedFunction { input_rate, .. } => {
                 input_rate == crate::vk::VertexInputRate::INSTANCE
+                    || r.layout.step_function == VertexStepFunction::Constant
             }
             AttributeFetch::Pulled => false,
         });

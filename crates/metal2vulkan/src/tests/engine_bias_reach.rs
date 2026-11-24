@@ -123,7 +123,7 @@ declare {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr
 }
 
 fn p(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect(stem)
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect(stem)
 }
 
 fn max_bias(p: &DeviceProfile) -> f32 {
@@ -311,11 +311,9 @@ impl Shape {
 }
 
 /// Through a sampler without a bias of its own every fragment bias is the `Bias` operand alone, the
-/// device's sampler's: on MoltenVK (`VkProperty::MetalSampler`) the device hands it to Metal whole,
-/// so Metal applies its own rule (the bias rounded to `half`, floored onto `1/64` and clamped into
-/// `[-32, 31.984375]`); elsewhere the device clamps it into `±maxSamplerLodBias`
-/// (`VkProperty::DeviceSampling`). A dynamic bias and a constant past the limit alike take no
-/// derivatives and no branch, record no `PrecisionNote::GradFromBias`, and require the property.
+/// device's sampler's, which clamps it into `±maxSamplerLodBias` (`VkProperty::DeviceSampling`). A
+/// dynamic bias and a constant past the limit alike take no derivatives and no branch, record no
+/// `PrecisionNote::GradFromBias`, and require the property.
 #[test]
 fn a_bias_without_the_samplers_own_is_the_bias_operand() {
     use crate::device::requirements::VkProperty;
@@ -331,17 +329,9 @@ fn a_bias_without_the_samplers_own_is_the_bias_operand() {
             fixtures.push((what, bc, "k"));
         }
     }
-    for stem in ["moltenvk-m3", "amd-rdna3-radv", "lavapipe", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "amd-780m-radv", "lavapipe", "runtime-floor"] {
         let prof = p(stem);
-        let property = match prof
-            .fields()
-            .enabled
-            .properties
-            .contains(&VkProperty::MetalSampler)
-        {
-            true => VkProperty::MetalSampler,
-            false => VkProperty::DeviceSampling,
-        };
+        let property = VkProperty::DeviceSampling;
         for (what, bc, entry) in &fixtures {
             let what = format!("{stem}, {what}");
             let a = ok(bc, entry, &prof);
@@ -371,12 +361,12 @@ fn a_bias_without_the_samplers_own_is_the_bias_operand() {
 
 /// Through a constexpr sampler with a bias of its own, a constant bias whose sum with the
 /// sampler's is within the limit is the `Bias` operand alone (no derivatives, no note); past it,
-/// the scaled derivatives alone. The sampler's own bias counts: on amd-rdna3-radv (limit 16) a
+/// the scaled derivatives alone. The sampler's own bias counts: on amd-780m-radv (limit 16) a
 /// constexpr sampler bias of 10 with a shader bias of 4 is within, with 8 or -30 past. (MoltenVK's portability subset withholds a sampler bias, so it refuses such
 /// a sampler.)
 #[test]
 fn a_constant_bias_is_decided_at_compile_time_with_the_samplers_own() {
-    let radv = p("amd-rdna3-radv");
+    let radv = p("amd-780m-radv");
     assert_eq!(max_bias(&radv), 16.0);
     // Half 10.0 is 0x4900.
     for (what, bias, half_bias, past) in [
@@ -425,19 +415,28 @@ fn a_constant_bias_is_decided_at_compile_time_with_the_samplers_own() {
 
 /// The hoisted derivatives (`fragment_mixed_samplers`, a sampler selected per fragment,
 /// `bias(0.5)`) are scaled by the whole bias through the same finite scaling: no clamp of the bias
-/// to `maxSamplerLodBias` (formerly `FClamp(bias, ±max)` before `Exp2`). Off Metal's own sampler,
-/// the runtime slot among the candidates takes them into Metal's anisotropic filter, emulated where
-/// its word states anisotropy.
+/// to `maxSamplerLodBias` (formerly `FClamp(bias, ±max)` before `Exp2`). The runtime slot among the
+/// candidates takes them into Metal's anisotropic filter, emulated where its word states anisotropy
+/// on a device without `samplerAnisotropy` (the runtime's floor without it, below that floor).
 #[test]
 fn hoisted_derivatives_take_the_whole_bias() {
     let Some(bc) = assemble_file("sampling_completion.ll") else {
         return;
     };
-    for (stem, emulations) in [("moltenvk-m3", 0), ("vk12-floor", 1)] {
+    let without = crate::pipeline::testing::profile_without(
+        "runtime-floor",
+        &[crate::device::requirements::VkFeature::SamplerAnisotropy],
+        crate::device::DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("profile");
+    for (stem, profile, emulations) in [
+        ("moltenvk-m3", p("moltenvk-m3"), 0),
+        ("runtime-floor without samplerAnisotropy", without, 1),
+    ] {
         let a = ok_with(
             &bc,
             "fragment_mixed_samplers",
-            &p(stem),
+            &profile,
             &anisotropic_slot_0(),
         );
         let s = shape(&a);
@@ -468,7 +467,7 @@ fn a_base_level_takes_the_whole_bias() {
     let Some(bc) = assemble_file("sampling_completion.ll") else {
         return;
     };
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let a = ok(&bc, "sample_bias_kernel", &p(stem));
         let s = shape(&a);
         assert_eq!(s.glsl_count(GLSL_FCLAMP), 0, "{stem}");
@@ -494,7 +493,7 @@ const WRITTEN_TAPS: u32 = 2;
 /// blending the sampler's linear mip filter's two levels), `AnisotropicFilter` recorded.
 #[test]
 fn an_anisotropic_sampler_takes_the_axis_gradients() {
-    for stem in ["amd-rdna3-radv", "lavapipe"] {
+    for stem in ["amd-780m-radv", "lavapipe"] {
         for withheld in [false, true] {
             let prof = {
                 let mut desc = crate::pipeline::testing::description(stem).expect(stem);
@@ -503,7 +502,7 @@ fn an_anisotropic_sampler_takes_the_axis_gradients() {
                         .features
                         .remove(&crate::device::requirements::VkFeature::SamplerAnisotropy));
                 }
-                crate::device::Device::new(desc, DevicePolicy::default())
+                crate::device::Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
                     .expect(stem)
                     .profile()
                     .clone()

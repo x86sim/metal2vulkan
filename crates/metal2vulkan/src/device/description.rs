@@ -2,7 +2,7 @@
 //!
 //! A description records what the consumer **enables**, not what the hardware has: output may
 //! only declare what was enabled at `vkCreateDevice`. It is the only input of
-//! `Device::new`; Khronos profile JSON is parsed into a description
+//! `Device::from_queries`; Khronos profile JSON is parsed into a description
 //! ([`DeviceDescription::from_khronos_json`]), never directly into a `DeviceProfile`.
 //!
 //! Absence means "not supported": a feature, extension, or format usage the description does not
@@ -24,7 +24,7 @@ use crate::vk;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DeviceDescription {
     /// The device's Vulkan version (`VkPhysicalDeviceProperties::apiVersion`, capped by the
-    /// instance version the consumer uses). Below 1.2 is refused by `Device::new`.
+    /// instance version the consumer uses). Below 1.2 is refused by `Device::from_queries`.
     pub api_version: ApiVersion,
     /// `VkPhysicalDeviceDriverProperties::driverID`, when known.
     pub driver_id: Option<vk::DriverId>,
@@ -52,13 +52,6 @@ pub struct DeviceDescription {
     /// `rgba4OpaqueBlackSwizzled` (`VkPhysicalDeviceMaintenance10PropertiesKHR`): false where the
     /// device does not report it.
     pub rgba4_opaque_black_swizzled: bool,
-    /// `robustBufferAccessUpdateAfterBind` (`VkPhysicalDeviceVulkan12Properties`): whether
-    /// `robustBufferAccess` may be enabled together with the update-after-bind features of the
-    /// buffer descriptor types (VUID-VkDeviceCreateInfo-robustBufferAccess-10247; the enable-set
-    /// rules of `device::enables` read it). True only where the device or document reports it
-    /// true: a document that does not state it describes devices that may report false, so it is
-    /// held to the rule. No translation reads it.
-    pub robust_buffer_access_update_after_bind: bool,
     /// The device lists `VK_KHR_format_feature_flags2`, which, like Vulkan 1.3, reports
     /// `VkFormatProperties3` ([`DeviceDescription::has_format_feature_flags2`]): a fact of the
     /// query, which an enable set that leaves the extension out keeps. Enabled, the extension is
@@ -70,15 +63,14 @@ pub struct DeviceDescription {
     /// [`DeviceDescription::query`] and `from_khronos_json` fill it whenever the device (or the
     /// profile document) supports it; clear it where you do not enable the extension, since the
     /// device replay's generated-commands path (`bind::replay`), the only reader, then records
-    /// commands that need it. No translation reads it, so, like
-    /// `robust_buffer_access_update_after_bind`, it is not a profile field: two devices that
-    /// differ only in it share every artifact.
+    /// commands that need it. No translation reads it, so it is not a profile field: two devices
+    /// that differ only in it share every artifact.
     pub generated_commands: Option<GeneratedCommandsProperties>,
     /// The device's allocation sizes ([`AllocationLimits`]): what one allocation and one buffer may
     /// hold. They follow the machine's installed memory on integrated GPUs (ANV, MoltenVK), so two
     /// machines with one GPU and one driver differ in them. No translation reads them, so, like
-    /// `robust_buffer_access_update_after_bind`, they are not profile fields: two devices that
-    /// differ only in them share every artifact and every profile fingerprint. The Metal-facing
+    /// `generated_commands`, they are not profile fields: two devices that differ only in them
+    /// share every artifact and every profile fingerprint. The Metal-facing
     /// `maxBufferLength` and the runtime's heap sizes read them from the `Device`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub allocation: AllocationLimits,
@@ -159,12 +151,9 @@ impl GeneratedCommandsProperties {
     }
 }
 
-/// `VkPhysicalDeviceProperties::vendorID` of Apple's GPUs.
-pub(crate) const APPLE_VENDOR_ID: u32 = 0x106B;
-
 impl DeviceDescription {
     /// A description of a device of `api_version` that enables nothing and reports zero limits.
-    /// Callers fill the public fields; `Device::new` validates the result.
+    /// Callers fill the public fields; `Device::from_queries` validates the result.
     pub fn new(api_version: ApiVersion) -> DeviceDescription {
         DeviceDescription {
             api_version,
@@ -182,7 +171,6 @@ impl DeviceDescription {
             filter_minmax_single_component_formats: false,
             formats: FormatSupport::default(),
             rgba4_opaque_black_swizzled: false,
-            robust_buffer_access_update_after_bind: false,
             khr_format_feature_flags2: false,
             generated_commands: None,
             allocation: AllocationLimits::default(),
@@ -206,19 +194,6 @@ impl DeviceDescription {
     /// Whether the feature is enabled.
     pub fn has(&self, feature: VkFeature) -> bool {
         self.features.contains(&feature)
-    }
-
-    /// Whether `GLSL.std.450 InterpolateAtOffset` reads at the pixel center plus its offset, as
-    /// GLSL.std.450 states ("An offset of (0, 0) identifies the center of the pixel"): every
-    /// driver but MoltenVK, whose SPIRV-Cross converts the instruction to Metal's
-    /// `interpolate_at_offset(offset + 0.4375)`, which Metal measures from the pixel's upper-left
-    /// corner, so offset 0 reads a sixteenth of a pixel from the center. That conversion is read in
-    /// SPIRV-Cross's source and Metal's reading measured on the Apple M3 Max; no release of
-    /// MoltenVK is measured to read at the center, so none takes it: a device without it has
-    /// `VkProperty::InterpolateAtOffsetFromSevenSixteenths`, where translation moves a Metal
-    /// offset by 7/16 and reads nothing else through the instruction.
-    pub(crate) fn interpolates_at_offset_centered(&self) -> bool {
-        self.driver_id != Some(vk::DriverId::MOLTENVK)
     }
 }
 
@@ -405,7 +380,6 @@ impl FormatProperties {
 /// Notably `uniformBufferStandardLayout` is required by Vulkan 1.2 (the `u32[]` UBO view therefore
 /// needs no optional feature on any 1.2 device that enables it).
 pub fn required_features(version: ApiVersion) -> impl Iterator<Item = VkFeature> {
-    const V1_0: &[VkFeature] = &[VkFeature::RobustBufferAccess];
     const V1_1: &[VkFeature] = &[VkFeature::Multiview];
     const V1_2: &[VkFeature] = &[
         VkFeature::UniformBufferStandardLayout,
@@ -446,8 +420,7 @@ pub fn required_features(version: ApiVersion) -> impl Iterator<Item = VkFeature>
         VkFeature::Maintenance5,
         VkFeature::FullDrawIndexUint32,
     ];
-    let tiers: [(u32, &'static [VkFeature]); 5] =
-        [(0, V1_0), (1, V1_1), (2, V1_2), (3, V1_3), (4, V1_4)];
+    let tiers: [(u32, &'static [VkFeature]); 4] = [(1, V1_1), (2, V1_2), (3, V1_3), (4, V1_4)];
     tiers
         .into_iter()
         .filter(move |&(minor, _)| version >= ApiVersion { major: 1, minor })

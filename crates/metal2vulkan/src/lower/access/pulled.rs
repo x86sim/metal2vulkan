@@ -12,14 +12,13 @@
 //!
 //! - **Shared.** When an accessed buffer slot of the function (a buffer argument or a
 //!   buffer-table element) has the source buffer's Metal index, the fetch reads through that
-//!   slot. Its window widens to `Whole`, and it is a storage slot (a uniform view's declared size
-//!   is a bounded range and has no `OpArrayLength` for the in-shader check) whose access is the
-//!   function's plus the fetch's read. The function may write it or reach it by atomics: the fetch
-//!   runs once, before any instruction of the body, so it reads what Metal's attribute holds, an
-//!   input the body's writes do not change. One shape has no sharing and is
-//!   `Unsupported{Lowering(StageIo), NotImplemented}` (`share`): a window that is not within the
-//!   first 2³² bytes at or above the bind offset, the reach of a `Whole` window (a `u32` Metal
-//!   displacement from the bind offset, through a view or a device address).
+//!   slot. Its window widens to `Whole`, and its access is the function's plus the fetch's read.
+//!   The function may write it or reach it by atomics: the fetch runs once, before any
+//!   instruction of the body, so it reads what Metal's attribute holds, an input the body's writes
+//!   do not change. One shape has no sharing and is `Unsupported{Lowering(StageIo),
+//!   NotImplemented}` (`share`): a window that is not within the first 2³² bytes at or above the
+//!   bind offset, the reach of a `Whole` window (a `u32` Metal displacement from the bind offset,
+//!   through a view or a device address).
 //! - **Own.** Otherwise the source buffer is a read-only `Whole` slot of its own.
 //!
 //! Either way it is a storage slot like any other: a `Whole` range is never provably within
@@ -28,16 +27,19 @@
 //! device address, and a shared slot takes the device address the argument's wide pointers or typed
 //! atomics need. A device-replay variant (`LowerInputs.replay_bindings`) reads it, as every other
 //! slot, through its root entry in the replayed command's slot table. The fetch reads a storage view at the bind residual plus its Metal displacement,
-//! contained by the profile's encoding, and a device address through the slot's root entry (`psb`,
-//! window start 0), always contained unless containment is off. Reads are plain: a vertex function
-//! has no barrier a coherence could order them with.
+//! checked in the shader, and a device address through the slot's root entry (`psb`,
+//! window start 0), always contained unless containment is off. Under the identity domains every
+//! source buffer is its device address, which the fetch reads from the slot's own pushed address
+//! (`SlotGuestBase`) plus its displacement, read as signed, checked against the slot's buffer
+//! (`SlotBounds`): outside its buffer a fetch reads zero at the zero range (`ZeroAddress`). Reads
+//! are plain: a vertex function has no barrier a coherence could order them with.
 
 use crate::error::{Error, Feature, LowerFamily, Unsupported};
 use crate::lower::emit::EmitCx;
 use crate::lower::stage_io::fetch;
-use crate::memory::contain::{self, Check};
+use crate::memory::contain;
 use crate::memory::leaf::{self, k32, Leaf, WordMem};
-use crate::memory::views::{self, View, ViewKind};
+use crate::memory::views::{self, View};
 use crate::pipeline::interface::{
     AccessSet, BufferForm, BufferKind, BufferSlot, SlotInterface, Window,
 };
@@ -48,7 +50,7 @@ use crate::spirv::ids::Value as SValue;
 use crate::spirv::ir::BinOp;
 
 use super::psb::{self, PsbMem};
-use super::{descriptor_view, slot_root, AccessPlan, SlotLowering};
+use super::{slot_root, AccessPlan, SlotLowering};
 
 /// How the fetch reaches a pulled source buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,7 +110,7 @@ pub fn slot_interfaces(plan: &AccessPlan) -> impl Iterator<Item = (SlotRef, Slot
                 access: AccessSet::READ,
                 window: Window::Whole,
                 form: match l {
-                    SlotLowering::View(kind) => BufferForm::Descriptor(descriptor_view(kind)),
+                    SlotLowering::View => BufferForm::Descriptor,
                     SlotLowering::Psb { .. } => BufferForm::Psb,
                 },
                 kind: BufferKind::Buffer,
@@ -122,8 +124,8 @@ pub fn slot_interfaces(plan: &AccessPlan) -> impl Iterator<Item = (SlotRef, Slot
 pub(super) fn declare(mb: &mut ModuleBuilder, plan: &AccessPlan) -> BResult<Vec<(u32, View)>> {
     let mut out = Vec::new();
     for p in &plan.pulled {
-        if let Reach::Own(SlotLowering::View(kind)) = p.reach {
-            out.push((p.slot.index, views::declare(mb, p.slot, kind)?));
+        if let Reach::Own(SlotLowering::View) = p.reach {
+            out.push((p.slot.index, views::declare(mb, p.slot)?));
         }
     }
     Ok(out)
@@ -152,6 +154,27 @@ impl WordMem for SourceMem {
         Err(BuildError::Dangling(Dangling::Value(value)))
     }
 
+    fn whole(&self) -> bool {
+        match &self.0 {
+            Mem::View(_) => false,
+            Mem::Psb(m) => m.whole(),
+        }
+    }
+
+    fn read_whole(
+        &mut self,
+        fb: &mut FunctionBuilder<'_>,
+        off: SValue,
+        at: u32,
+        ty: crate::spirv::ids::TypeId,
+        align: u32,
+    ) -> BResult<SValue> {
+        match &mut self.0 {
+            Mem::View(v) => Err(BuildError::Dangling(Dangling::Global(v.global))),
+            Mem::Psb(m) => m.read_whole(fb, off, at, ty, align),
+        }
+    }
+
     fn write_bits(
         &mut self,
         _: &mut FunctionBuilder<'_>,
@@ -178,56 +201,41 @@ impl SourceRead {
         let v = leaf::load(fb, &mut self.mem, leaf, self.off)?;
         match self.inb {
             None => Ok(v),
-            Some(inb) => {
-                let z = leaf::zero(fb, leaf)?;
-                fb.select(inb, v, z)
-            }
+            Some(inb) => leaf::contained(fb, leaf, inb, v),
         }
     }
 }
 
 /// An `n`-byte read of storage view `view` at the bind residual `residual` plus the Metal
-/// displacement `m` (wrapping `u32`), contained by `check`: out of bounds it reads at offset 0 (a
+/// displacement `m` (wrapping `u32`), checked in the shader: out of bounds it reads at offset 0 (a
 /// bound range is never empty and is padded to 16 bytes, so the at most 16 bytes of a vertex format
 /// exist there) and yields zero.
 pub fn view_read(
     fb: &mut FunctionBuilder<'_>,
     view: View,
-    check: Check,
     residual: SValue,
     m: SValue,
     n: u32,
 ) -> BResult<SourceRead> {
     let off = fb.binary(BinOp::IAdd, residual, m)?;
-    view_read_at(fb, view, check, off, n)
+    view_read_at(fb, view, off, n)
 }
 
 /// [`view_read`] at the view's own byte offset `off`.
 fn view_read_at(
     fb: &mut FunctionBuilder<'_>,
     view: View,
-    check: Check,
     off: SValue,
     n: u32,
 ) -> BResult<SourceRead> {
-    let inb = match check {
-        Check::None => None,
-        Check::InShader => match views::storage_bytes(fb, view)? {
-            Some(size) => Some(contain::in_bounds(fb, off, size, u64::from(n))?),
-            None => return Err(BuildError::Dangling(Dangling::Global(view.global))),
-        },
-    };
-    let off = match inb {
-        Some(inb) => {
-            let zero = k32(fb, 0)?;
-            fb.select(inb, off, zero)?
-        }
-        None => off,
-    };
+    let size = views::storage_bytes(fb, view)?;
+    let inb = contain::in_bounds(fb, off, size, u64::from(n))?;
+    let zero = k32(fb, 0)?;
+    let off = fb.select(inb, off, zero)?;
     Ok(SourceRead {
         mem: SourceMem(Mem::View(view)),
         off,
-        inb,
+        inb: Some(inb),
     })
 }
 
@@ -251,23 +259,52 @@ pub fn psb_read(
     })
 }
 
+/// An `n`-byte read of a source buffer under the identity domains, at the `u32` Metal
+/// displacement `m` from its bind offset, read as signed: from `address` (a `u64`), the slot's own
+/// device address, the word below the read and the byte offset in it (`psb::prepare_at`). No
+/// table is read. Where `check` holds the checked slot and the `ZeroAddress` and `m` is not a
+/// constant, the read is checked as a load of the slot is (`emit::prepare`, `psb::in_buffer`):
+/// outside its buffer it reads zero at the zero range.
+fn address_read(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    address: SValue,
+    m: SValue,
+    (n, check): (u32, Option<(SlotRef, SValue)>),
+) -> BResult<SourceRead> {
+    let a = psb::prepare_at(fb, address, m)?;
+    let mem = match check {
+        Some((slot, zero)) if leaf::known(fb, m)?.is_none() => {
+            let limit = cx.slot_limit(fb, slot, n)?;
+            let inb = psb::in_buffer(fb, m, limit)?;
+            a.mem.outside(inb, zero)
+        }
+        _ => a.mem,
+    };
+    Ok(SourceRead {
+        mem: SourceMem(Mem::Psb(mem)),
+        off: a.off,
+        inb: a.inb,
+    })
+}
+
 /// Prepare an `n`-byte read of source buffer `buffer` at the `u32` Metal displacement `m` from
-/// its bind offset, in the form [`super::finish_slots`] chose; a view is contained by `check`.
+/// its bind offset, in the form [`super::finish_slots`] chose; a view is checked in the shader.
 pub fn prepare(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     buffer: u32,
     m: SValue,
     n: u32,
-    check: Check,
 ) -> BResult<SourceRead> {
     match source(cx, fb, buffer)? {
-        Source::View { view, residual } => view_read(fb, view, check, residual, m, n),
+        Source::View { view, residual } => view_read(fb, view, residual, m, n),
         Source::Psb {
             table,
             start,
             contained,
         } => psb_read(fb, table, buffer, m, start, n, contained),
+        Source::Address { address, check } => address_read(cx, fb, address, m, (n, check)),
     }
 }
 
@@ -286,7 +323,6 @@ pub fn prepare_within(
     m: SValue,
     fits: SValue,
     n: u32,
-    check: Check,
 ) -> BResult<SourceRead> {
     let (read, fits) = match source(cx, fb, buffer)? {
         Source::View { view, residual } => {
@@ -298,7 +334,7 @@ pub fn prepare_within(
             let view_fits = fb.binary(BinOp::LogicalAnd, kept, ends)?;
             let fits = fb.binary(BinOp::LogicalAnd, fits, view_fits)?;
             let off = fb.select(fits, off, residual)?;
-            (view_read_at(fb, view, check, off, n)?, fits)
+            (view_read_at(fb, view, off, n)?, fits)
         }
         Source::Psb {
             table,
@@ -308,6 +344,11 @@ pub fn prepare_within(
             let zero = k32(fb, 0)?;
             let m = fb.select(fits, m, zero)?;
             (psb_read(fb, table, buffer, m, start, n, contained)?, fits)
+        }
+        Source::Address { address, check } => {
+            let zero = k32(fb, 0)?;
+            let m = fb.select(fits, m, zero)?;
+            (address_read(cx, fb, address, m, (n, check))?, fits)
         }
     };
     let inb = match read.inb {
@@ -331,6 +372,12 @@ enum Source {
         start: i64,
         contained: bool,
     },
+    /// Under the identity domains, its own device address (`SlotGuestBase`, a `u64`), with the
+    /// slot and the `ZeroAddress` where the access plan checks it (`AccessPlan::variable`).
+    Address {
+        address: SValue,
+        check: Option<(SlotRef, SValue)>,
+    },
 }
 
 /// The form source buffer `buffer` is read in.
@@ -344,6 +391,8 @@ fn source(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, buffer: u32) -> BRe
         .map(|p| p.reach);
     // The form is `AccessPlan::source_lowering`'s, which the census reads too.
     let lowering = access.source_lowering(slot);
+    let identity = access.identity;
+    let checked = access.variable.contains(&slot);
     let view = match reach {
         Some(Reach::Shared { slot }) => cx.decl.families.access.views.get(slot).copied().flatten(),
         Some(Reach::Own(_)) => cx
@@ -357,9 +406,17 @@ fn source(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, buffer: u32) -> BRe
         None => return Err(cx.fail(format!("source buffer {slot:?} has no planned slot"))),
     };
     match (lowering, view) {
-        (Some(SlotLowering::View(ViewKind::Storage)), Some(view)) => {
+        (Some(SlotLowering::View), Some(view)) => {
             let residual = cx.push_field(fb, PushField::SlotBindOffset(slot))?;
             Ok(Source::View { view, residual })
+        }
+        (Some(SlotLowering::Psb { .. }), _) if identity => {
+            let address = super::pointer::slot_address(cx, fb, slot)?;
+            let check = match checked {
+                true => Some((slot, cx.push_field(fb, PushField::ZeroAddress)?)),
+                false => None,
+            };
+            Ok(Source::Address { address, check })
         }
         (Some(SlotLowering::Psb { start }), _) => {
             let table = cx.push_field(fb, PushField::RootTableAddress)?;

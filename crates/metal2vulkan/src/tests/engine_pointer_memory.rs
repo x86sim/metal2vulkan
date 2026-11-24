@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::status::{ExecutionStatus, StatusWord};
+use crate::bind::status::StatusWord;
 use crate::budget::SPIRV_WORDS;
 use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
@@ -32,15 +32,17 @@ use crate::library::FunctionConstantValues;
 use crate::lower::select::{LowerInputs, Plan};
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
 use crate::pipeline::interface::{BufferForm, PushLoc, Window};
-use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, SpecKey, Stage,
-};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SlotClass, SlotRef, Stage};
 use crate::pipeline::testing::{
     compile, fixtures_dir, link_and_validate, llvm_assemble, meter, typed_module_with,
     AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Order, Resources, TrapKind};
 use crate::spirv::ir::{AtomicOp, Inst, StorageClass, Type, TypedModule};
+
+/// The `ExecutionStatus` buffer's bytes, every word 0 at the start: through its last word.
+const STATUS_BYTES: usize =
+    crate::bind::status::StatusWord::SeqCstFences.byte_offset() as usize + 4;
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
@@ -65,35 +67,32 @@ const fn alloc_guest(k: u64) -> u64 {
     0x0000_0003_0000_0000 + k * 0x1_0000
 }
 
-fn profile(stem: &str, robust: bool) -> DeviceProfile {
+/// Committed profile `stem` without `features` (a device below the runtime's floor where the floor
+/// states one).
+fn profile_without(stem: &str, features: &[VkFeature]) -> DeviceProfile {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    if !robust {
-        desc.features.remove(&VkFeature::RobustBufferAccess);
-        desc.features.remove(&VkFeature::RobustBufferAccess2);
+    for f in features {
+        desc.features.remove(f);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
 }
 
-/// Profile-A profiles in both descriptor encodings, with and without `u64` buffer atomics and
-/// the native `f32` add.
+/// Profile-A profiles, with and without `u64` buffer atomics and the native `f32` add.
 fn profiles() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"] {
-        for robust in [true, false] {
-            out.push((format!("{stem} robust={robust}"), profile(stem, robust)));
-        }
-    }
-    out
+    ["moltenvk-m3", "lavapipe", "amd-rdna2-apu-radv"]
+        .into_iter()
+        .map(|stem| (stem.to_owned(), profile_without(stem, &[])))
+        .collect()
 }
 
-fn assemble(name: &str, text: &str) -> Option<Vec<u8>> {
+pub(super) fn assemble(name: &str, text: &str) -> Option<Vec<u8>> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "m2v-pointer-memory-{}-{}-{name}",
@@ -140,7 +139,7 @@ fn meta(name: &str, buffers: u32) -> String {
 }
 
 /// A kernel `name(b0, .., b{buffers-1}, t)` with `body` and the declarations `decls`.
-fn kernel(name: &str, buffers: u32, body: &str, decls: &str) -> String {
+pub(super) fn kernel(name: &str, buffers: u32, body: &str, decls: &str) -> String {
     let params: Vec<String> = (0..buffers)
         .map(|i| format!("ptr addrspace(1) noundef \"air-buffer-no-alias\" %b{i}"))
         .collect();
@@ -268,10 +267,7 @@ fn resources(plan: &Plan, mem: &Memory, threads: u32) -> (Resources, Layout) {
 /// [`resources`] with the slots of `binds` bound inside extra allocations.
 fn resources_bound(plan: &Plan, mem: &Memory, threads: u32, binds: &[Bind]) -> (Resources, Layout) {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(threads));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         let PushLoc::Push { offset } = f.loc else {
@@ -335,7 +331,7 @@ fn resources_bound(plan: &Plan, mem: &Memory, threads: u32, binds: &[Bind]) -> (
     buffers.push(Buffer {
         slot: None,
         address: Some(STATUS),
-        bytes: ExecutionStatus::initial().to_vec(),
+        bytes: vec![0; STATUS_BYTES],
     });
     (
         Resources {
@@ -350,9 +346,8 @@ fn resources_bound(plan: &Plan, mem: &Memory, threads: u32, binds: &[Bind]) -> (
     )
 }
 
-/// Compile entry `entry` of `bc` for `p` under `inputs`, pass L3, check that the plan's size
-/// estimate bounds the emitted words, and return the plan and the typed module the interpreter
-/// runs.
+/// Compile entry `entry` of `bc` for `p` under `inputs`, pass L3, and return the plan and the
+/// typed module the interpreter runs.
 fn checked(
     bc: &[u8],
     entry: &str,
@@ -372,12 +367,6 @@ fn checked(
     .unwrap_or_else(|e| panic!("{what}: {e}"));
     link_and_validate(&a, p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
     let (plan, m) = typed_module_with(bc, entry, p, inputs).expect("module");
-    let words = a.module.words.len() as u64;
-    assert!(
-        plan.estimate.words >= words,
-        "{what}: estimate {} < emitted {words}",
-        plan.estimate.words
-    );
     (plan, m)
 }
 
@@ -398,7 +387,7 @@ fn run_orders(m: &TypedModule, res: &Resources, what: &str) -> Vec<Vec<Vec<u8>>>
 }
 
 /// The uses of the strategy named `name`, the memory it reaches included (`.psb`,
-/// `.psb_and_view`), in either robustness encoding: `name` and `name.checked`.
+/// `.psb_and_view`), with or without its in-shader check: `name` and `name.checked`.
 fn uses(plan: &Plan, name: &str) -> u32 {
     plan.census()
         .iter()
@@ -497,21 +486,11 @@ fn atomics_through_a_loaded_pointer_are_exact_and_contained() {
     };
     for (what, p) in profiles() {
         let (plan, m) = checked(&bc, "wide_atomics", &p, &LowerInputs::new(), &what);
-        let native = p.fields().leaf.buffer_float32_atomic_add;
         // add, max, the far add, and the null add.
         assert_eq!(uses(&plan, "access.atomic.wide.rmw"), 4, "{what}");
         assert_eq!(uses(&plan, "access.atomic.wide.cmpxchg"), 1, "{what}");
         assert_eq!(uses(&plan, "access.atomic.wide.cas"), 1, "{what}");
-        assert_eq!(
-            uses(&plan, "access.atomic.wide.float_add"),
-            u32::from(native),
-            "{what}"
-        );
-        assert_eq!(
-            uses(&plan, "access.atomic.wide.float_cas"),
-            2 - u32::from(native),
-            "{what}"
-        );
+        assert_eq!(uses(&plan, "access.atomic.wide.float_cas"), 2, "{what}");
         let mut target = vec![0u32; 16];
         target[1] = (-5i32) as u32;
         target[5] = f(-1.0);
@@ -853,7 +832,7 @@ fn narrow_stores_through_a_loaded_pointer_are_native_where_the_profile_has_the_a
             for f in removed {
                 desc.features.remove(f);
             }
-            let p = Device::new(desc, DevicePolicy::default())
+            let p = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
                 .expect("device")
                 .profile()
                 .clone();
@@ -1894,9 +1873,10 @@ fn a_memmove_between_static_slots_compares_metal_addresses() {
         return;
     };
     let mut all = profiles();
-    for stem in ["vk12-floor", "swiftshader", "lunarg-desktop-baseline-2023"] {
-        all.push((stem.to_owned(), profile(stem, false)));
-    }
+    all.push((
+        "runtime-floor without shaderInt64".to_owned(),
+        profile_without("runtime-floor", &[VkFeature::ShaderInt64]),
+    ));
     let mut refused = 0;
     for (what, p) in all {
         if !p.fields().leaf.int64 {
@@ -2180,17 +2160,16 @@ fn a_wide_pointers_bits_through_a_cell_are_its_guest_address() {
                 assert_eq!(status[StatusWord::ResidentMisses.index() as usize], 0);
             }
         }
-        for stem in ["vk12-floor", "lunarg-desktop-baseline-2023"] {
-            let p = profile(stem, true);
-            match typed_module_with(&bc, &name, &p, &LowerInputs::new()) {
-                Err(crate::error::Error::Unsupported(u)) => assert_eq!(
-                    u.feature,
-                    crate::error::Feature::DereferenceLoadedPointer,
-                    "{shape} {stem}: {u:?}"
-                ),
-                Err(e) => panic!("{shape} {stem}: {e}"),
-                Ok(_) => panic!("{shape} {stem}: a loaded pointer on Profile F"),
-            }
+        let stem = "runtime-floor without bufferDeviceAddress";
+        let p = profile_without("runtime-floor", &[VkFeature::BufferDeviceAddress]);
+        match typed_module_with(&bc, &name, &p, &LowerInputs::new()) {
+            Err(crate::error::Error::Unsupported(u)) => assert_eq!(
+                u.feature,
+                crate::error::Feature::DereferenceLoadedPointer,
+                "{shape} {stem}: {u:?}"
+            ),
+            Err(e) => panic!("{shape} {stem}: {e}"),
+            Ok(_) => panic!("{shape} {stem}: a loaded pointer on Profile F"),
         }
     }
 }
@@ -2246,6 +2225,7 @@ fn accesses_through_a_loaded_pointer_read_no_root_entry_in_a_loop() {
     let Some(bc) = assemble("loop_access", LOOP_ACCESS) else {
         return;
     };
+    let mut reloaded = Vec::new();
     for (what, p) in profiles() {
         let (plan, m) = checked(&bc, "loop_access", &p, &LowerInputs::new(), &what);
         assert_eq!(uses(&plan, "access.dynamic.load"), 1, "{what}");
@@ -2308,11 +2288,21 @@ fn accesses_through_a_loaded_pointer_read_no_root_entry_in_a_loop() {
                 continue;
             }
             kernel_loops += 1;
-            let loads = insts()
+            let loads: Vec<_> = insts()
                 .filter(|n| matches!(&n.inst, Inst::Load { ptr, .. } if is_entry_load(*ptr)))
-                .count();
-            assert_eq!(loads, 0, "{what}: root-entry loads in the loop");
+                .map(|n| {
+                    // The load and the instruction that forms its pointer.
+                    let formed = m.blocks().iter().flat_map(|b| &b.insts).find(
+                        |d| matches!(&n.inst, Inst::Load { ptr, .. } if d.result == Some(*ptr)),
+                    );
+                    format!("{n:?} <- {formed:?}")
+                })
+                .collect();
+            if !loads.is_empty() {
+                reloaded.push(format!("{what}: root-entry loads in the loop: {loads:#?}"));
+            }
         }
         assert_eq!(kernel_loops, 1, "{what}: the kernel's loop");
     }
+    assert!(reloaded.is_empty(), "{reloaded:#?}");
 }

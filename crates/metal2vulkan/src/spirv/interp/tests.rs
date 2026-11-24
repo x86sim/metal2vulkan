@@ -5,6 +5,7 @@
 use super::*;
 use crate::pipeline::sym::{Axis, ResourceKind, ResourceSlot, SpecKey, Stage};
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn, LoopFn, LoopSpec};
+use crate::spirv::builder::ops::arith::RemainderSign;
 use crate::spirv::builder::ops::group::GroupMode;
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
@@ -387,8 +388,10 @@ fn integer_float_and_conversion_ops() {
         // -7 / 2 = -3, -7 srem 2 = -1, -7 smod 2 = 1.
         let m7 = k(f, i32_, (-7i32) as u32 as u64);
         let two = k(f, i32_, 2);
-        for op in [BinOp::SDiv, BinOp::SRem, BinOp::SMod] {
-            let r = f.binary(op, m7, two)?;
+        let q = f.binary(BinOp::SDiv, m7, two)?;
+        outs.push(f.convert(ConvOp::Bitcast, q, u32_)?);
+        for sign in [RemainderSign::Dividend, RemainderSign::Divisor] {
+            let r = f.signed_remainder(m7, two, sign)?;
             outs.push(f.convert(ConvOp::Bitcast, r, u32_)?);
         }
         // Arithmetic shift right of -8 by 1 = -4.
@@ -882,8 +885,12 @@ fn a_small_specialized_threadgroup_arena_is_floored_at_eight_words() {
                 imageblock: None,
                 tile: false,
                 fragment: None,
+                words: Default::default(),
             };
-            Ok(declare_threadgroup(mb, &shape)?.decl.global)
+            Ok(declare_threadgroup(mb, &shape, false)?
+                .decl
+                .global
+                .expect("a threadgroup arena's array"))
         });
         let mut res = buffers(&[64]);
         res.spec.insert(SpecKey::TgLength(0), len);
@@ -906,8 +913,12 @@ fn a_small_specialized_threadgroup_arena_is_floored_at_eight_words() {
             imageblock: None,
             tile: false,
             fragment: None,
+            words: Default::default(),
         };
-        Ok(declare_threadgroup(mb, &shape)?.decl.global)
+        Ok(declare_threadgroup(mb, &shape, false)?
+            .decl
+            .global
+            .expect("a threadgroup arena's array"))
     });
     let mut res = buffers(&[64]);
     res.spec.insert(SpecKey::TgLength(0), 48);
@@ -1300,58 +1311,6 @@ fn length_is_the_rounded_root_of_the_summed_squares() {
     );
     let w = words(&out.buffers[0]);
     assert_eq!(&w[..2], &[14.0f32.sqrt().to_bits(), 2.5f32.to_bits()]);
-}
-
-/// `OpFmaKHR` rounds once: on `a = 1 + 2^-23`, `b = 1 - 2^-24`, `c = -RN(a * b)` (A1 case
-/// 52343cc4's lane) it gives the product's rounding error, where a separate multiply and add give
-/// zero; per lane of a vector too.
-#[test]
-fn fma_khr_rounds_once() {
-    let a = 1.0f32 + f32::EPSILON;
-    let b = 1.0f32 - f32::EPSILON / 2.0;
-    let c = -(a * b);
-    let m = kernel([1, 1, 1], 1, |f, buf| {
-        let u32_ = u32_ty(f.module());
-        let f32_ = f.module().ty(Type::Float { width: 32 })?;
-        let vec2 = f.module().ty(Type::Vector { elem: f32_, len: 2 })?;
-        let fc = |f: &mut FunctionBuilder<'_>, x: f32| -> BResult<Value> {
-            let k = f.module().constant(Constant::Scalar {
-                ty: f32_,
-                bits: ConstBits(u64::from(x.to_bits())),
-            })?;
-            f.module().const_value(k)
-        };
-        let (x, y, z) = (fc(f, a)?, fc(f, b)?, fc(f, c)?);
-        let r = f.fma(x, y, z)?;
-        let r = f.convert(ConvOp::Bitcast, r, u32_)?;
-        let zero = c32(f, 0);
-        store_at(f, buf[0], zero, r)?;
-        let two = fc(f, 2.0)?;
-        let xv = f.composite_construct(vec2, &[x, two])?;
-        let yv = f.composite_construct(vec2, &[y, two])?;
-        let zv = f.composite_construct(vec2, &[z, two])?;
-        let rv = f.fma(xv, yv, zv)?;
-        for k in 0..2u32 {
-            let lane = f.composite_extract(rv, &[k])?;
-            let lane = f.convert(ConvOp::Bitcast, lane, u32_)?;
-            let at = c32(f, k + 1);
-            store_at(f, buf[0], at, lane)?;
-        }
-        Ok(())
-    });
-    let out = run_both(
-        &m,
-        cfg(1, SubgroupSize::W32, Order::Forward),
-        &buffers(&[3]),
-    );
-    let w = words(&out.buffers[0]);
-    let fused = a.mul_add(b, c);
-    assert_ne!(fused, 0.0);
-    assert_eq!(a * b + c, 0.0);
-    assert_eq!(
-        &w[..3],
-        &[fused.to_bits(), fused.to_bits(), 6.0f32.to_bits()]
-    );
 }
 
 #[test]

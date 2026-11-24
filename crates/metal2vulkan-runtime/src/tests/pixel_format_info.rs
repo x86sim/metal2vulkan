@@ -1,9 +1,9 @@
-//! `pixel_format_info`: `MTLPixelFormatGetInfoForDevice` answers our own measurements at the
-//! release every device answers as (an Apple M3 Max: our probe and the consumer's macOS 27 host
-//! lane, whose answers are an M4's but from 630 to 645), Metal describes a format exactly where the
-//! table has a row, and `MTLGetTextureLevelInfoForDeviceWithOptions` answers the probes' layouts.
+//! `pixel_format_info`: `MTLPixelFormatGetInfoForDevice` answers our own measurements (an Apple
+//! M3 Max under macOS 27.0.1: our probe and the consumer's macOS 27 host lane, whose answers are an
+//! M4's but from 630 to 645), Metal describes a format exactly where the table has a row, and
+//! `MTLGetTextureLevelInfoForDeviceWithOptions` answers the probes' layouts.
 
-use crate::pixel_format_info::{describes, pixel_format_info, texture_level_info};
+use crate::pixel_format_info::{pixel_format_info, texture_level_info};
 use crate::{PixelFormatInfo, TextureLevelQuery};
 use metal2vulkan::metal::PixelFormat as P;
 
@@ -27,19 +27,21 @@ fn the_table_answers_its_measured_rows() {
     }
 }
 
-/// Metal describes a format (`describes`) exactly where `pixel_format_info` answers one, and then
-/// under the format's own Metal name; neither 24-bit depth format, which no Apple GPU has.
+/// Where `pixel_format_info` describes a format it is under the format's own Metal name; neither
+/// 24-bit depth format is described, which no Apple GPU has.
 #[test]
 fn metal_describes_exactly_the_formats_it_answers() {
     for &pf in P::ALL {
         let info = pixel_format_info(u64::from(pf.as_raw()));
-        assert_eq!(describes(pf), info.describes_a_format(), "{pf:?}");
         if info.describes_a_format() {
             assert_eq!(info.name, pf.name(), "{pf:?}");
         }
     }
     for pf in [P::Depth24UnormStencil8, P::X24Stencil8] {
-        assert!(!describes(pf), "{pf:?}");
+        assert!(
+            !pixel_format_info(u64::from(pf.as_raw())).describes_a_format(),
+            "{pf:?}"
+        );
     }
 }
 
@@ -244,8 +246,8 @@ fn extents_near_two_to_the_64_wrap_the_block_count() {
 }
 
 /// Every ASTC format, LDR, sRGB and HDR, of the fourteen 2D footprints Vulkan's ASTC formats have
-/// and of Apple's 4x2 and 8x4, is described as Metal describes it whatever the device holds its
-/// blocks in (its ASTC format, or a carrier, `astc.rs`): a format of blocks (flags
+/// and of Apple's 4x2 and 8x4, is described as Metal describes it whether or not the device makes
+/// a texture of it: a format of blocks (flags
 /// bit 0x400) of 16 bytes, its footprint, depth 1; and a level's layout counts its blocks, a side
 /// no multiple of the block rounded up, rows of 16-byte blocks, an image of those rows.
 #[test]

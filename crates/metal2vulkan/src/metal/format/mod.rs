@@ -12,10 +12,10 @@
 //! bits 0–4); Vulkan packed formats are named from the most significant bit. The table below pairs
 //! them by layout (`B5G6R5Unorm` ↔ `R5G6B5_UNORM_PACK16`).
 //!
-//! A candidate whose Vulkan format enum value a core version or an extension defines
-//! (`A8_UNORM`, the ASTC HDR and PVRTC blocks) is usable only where the profile exposes the value
-//! ([`vk::Format::exposure`]): `Device::new` keeps only exposed formats in the profile's tables,
-//! and a refusal names the version or extension that would expose it.
+//! A candidate whose Vulkan format enum value a core version or an extension defines (`A8_UNORM`,
+//! the ASTC HDR and PVRTC blocks) is usable only where the profile exposes the value
+//! ([`vk::Format::exposure`]): `Device::from_queries` keeps only exposed formats in the profile's
+//! tables, and a refusal names the version or extension that would expose it.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -25,9 +25,7 @@ use crate::device::enables::format_exposure_gap;
 use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::device::DeviceProfile;
 use crate::error::{Capability, DescriptorError, Error, Feature, Unsupported};
-use crate::metal::{
-    PixelFormat, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage,
-};
+use crate::metal::{PixelFormat, TextureSwizzleChannels, TextureType, TextureUsage};
 use crate::pipeline::lower_inputs::{
     AliasView, ChannelWrite, StorageImageChoice, StorageImageClass,
 };
@@ -133,18 +131,16 @@ pub enum FormatEmulation {
     ExtendedRange,
     /// Apple's two-plane YCbCr formats this crate holds ([`ycbcr`]), which Metal makes only over
     /// an IOSurface's two planes and reads as RGB: held as texels of exactly Metal's values,
-    /// which the consumer computes from the planes' bytes (`bind::ycbcr_convert_module`):
+    /// which the consumer computes from the planes' bytes (Metal's conversion, `bind::ycbcr_convert`):
     /// `R16G16B16A16_SFLOAT` of a converted format's (a grid of `1/2048`),
     /// `R32G32B32A32_SFLOAT` of an `_sRGB` twin's (a grid of `1/8192`), and
     /// `A2B10G10R10_UNORM_PACK32` of the codes. Exact for a sampled image a function reads or
     /// fetches from; a linear sample is the device's filter of the texels, noted, off their grid
-    /// (`metal::texel_format::PackedTexels::YCbCr2048` and `YCbCr8192`), but where the function
-    /// reads the planes in place (`bind::YCbCrInPlace`), Metal's filter. Admitted for sampling only:
+    /// (`metal::texel_format::PackedTexels::YCbCr2048` and `YCbCr8192`). Admitted for sampling only:
     /// Metal drops a function's writes to a 4:2:0 or 4:2:2 format ([`writes_dropped`]), stores a
-    /// 4:4:4 one's into both planes (which a slot that only writes one of [`ycbcr_writes_stored`]
-    /// does through the texture's write shadow; the others are refused), and renders into such a
-    /// texture by an inverse conversion, which a pass into one of [`ycbcr_renders`] does through
-    /// [`FormatEmulation::YCbCrRendered`] (a packed one's pass is refused, its pipeline made,
+    /// 4:4:4 one's into both planes (refused here, `storage_choice`), and renders into such a
+    /// texture by an inverse conversion, for which a pipeline into one of [`ycbcr_renders`] is
+    /// made through [`FormatEmulation::YCbCrRendered`] (a packed one's too,
     /// [`ycbcr_pass_refused`]; the others are not modelled).
     YCbCr,
     /// `ARGB8Unorm`'s bytes (alpha, then red, green and blue) held in `R8G8B8A8_UNORM`, whose red,
@@ -157,19 +153,16 @@ pub enum FormatEmulation {
     /// rotates too; Metal stores, clears, masks, resolves and blends the format as `RGBA8Unorm`
     /// with its channels rotated. Admitted for those usages, and for blending
     /// through the factors `pipeline::rotated_blend` finds Metal's blend in; a blend no such
-    /// factor gives the fragment function computes over the texel where the device orders
-    /// framebuffer fetch (`pipeline::color_writes::shader_rotated_blend`).
+    /// factor gives is refused (`pipeline::color_writes::rotated_blend_in_shader`).
     RotatedView,
-    /// A render pass's color attachment of a two-plane YCbCr format whose store Metal's planes
-    /// are matched for ([`ycbcr_renders`]): `R32G32B32A32_SFLOAT` of the values the pass leaves
-    /// in each texel (the fragment function's output, the clear color through `float`, or the
-    /// texel the pass loads), which the consumer encodes into the surface's planes as the pass
-    /// stores (`bind::ycbcr_store`, the encode kernel's store of every texel). Exact for an
-    /// attachment a fragment function writes unblended, under any write mask (a masked channel
-    /// keeps the texel's value, as Metal's tile keeps it). Admitted for a color attachment and
-    /// its blend (where the device blends `R32G32B32A32_SFLOAT`), which the device computes in
-    /// floats where Metal's tile blends halves: within a code of Metal's, which the consumer
-    /// announces.
+    /// A render pass's color attachment of a two-plane YCbCr format Metal renders into
+    /// ([`ycbcr_renders`]): `R32G32B32A32_SFLOAT` of the values the pass leaves in each texel (the
+    /// fragment function's output, the clear color through `float`, or the texel the pass loads),
+    /// under any write mask (a masked channel keeps the texel's value, as Metal's tile keeps it).
+    /// The pass's store of those values into the surface's planes is not implemented:
+    /// `metal2vulkan-runtime` refuses such a texture (`Gap::TextureFormat`), so the pipeline is
+    /// made and no pass renders into one. Admitted for a color attachment and its blend (where the
+    /// device blends `R32G32B32A32_SFLOAT`).
     YCbCrRendered,
     /// A pipeline's color attachment of a packed 10-bit two-plane YCbCr format whose pass is
     /// refused ([`ycbcr_pass_refused`]): `R32G32B32A32_SFLOAT`, which no pass renders into.
@@ -189,8 +182,8 @@ pub enum FormatEmulation {
     /// function reads and writes through its slot's [`ExtendedRange`] variant
     /// (`LoweringInputs::extended_range`), converting Metal's values in the shader. Exact for a
     /// sampled image a function fetches from and for a storage image; admitted for those usages
-    /// and for a color attachment, whose render pass clears the raw codes as Metal's does
-    /// (`clear_texel`) and keeps the codes its draws do not write, where Metal's pass takes them
+    /// and for a color attachment, whose render pass clears the raw codes as Metal's does and
+    /// keeps the codes its draws do not write, where Metal's pass takes them
     /// through `half` (the runtime's `extended-range-bits-kept`). Metal filters no bfloat texel (a linear sample
     /// reads the nearest texel) and blends none (its validation asserts), so a filter and a blend
     /// are not admitted.
@@ -200,7 +193,7 @@ pub enum FormatEmulation {
     /// formats reconstruct chroma by the implementation's rules): the texture's blocks are held
     /// for copies alone, and its sampled views present a decoded twin, an image of Metal's decode
     /// of them ([`AstcDecode`](crate::bind::AstcDecode), [`PvrtcDecode`](crate::bind::PvrtcDecode),
-    /// [`EtcDecode`](crate::bind::EtcDecode), [`ChromaDecode`](crate::bind::ChromaDecode)), which
+    /// [`EtcDecode`](crate::bind::EtcDecode)), which
     /// the consumer decodes after each write. The candidate's format is the twin's view of compact
     /// texels, `R8G8B8A8_UNORM` (an `_sRGB` form's `R8G8B8A8_SRGB`), whose texels are 8-bit codes
     /// of Metal's values (a PVRTC, ETC2, EAC or 4:2:2 format's own codes, an sRGB one's decoded by
@@ -333,8 +326,8 @@ pub enum ExtendedRange {
     },
     /// `R10Unorm_X6` (576), a 10-bit unsigned normalized red code in the top 10 bits of a
     /// little-endian 16-bit word, held as `R16_UINT`. Metal makes a texture of it in memory of
-    /// its own as readily as over an IOSurface's plane or a buffer ([`padded_words`], which has
-    /// the creators measured). Measured on an Apple M4 under macOS 27.0.1 and an Apple M3
+    /// its own as readily as over an IOSurface's plane or a buffer. Measured on an Apple M4
+    /// under macOS 27.0.1 and an Apple M3
     /// Max under macOS 26.7: a read is `c / 1023` correctly rounded (its `half` to nearest even),
     /// the low 6 bits unread; a kernel write stores the code of the exact product of the value,
     /// clamped to `[0, 1]` (a NaN 0), with 1023, rounded to nearest, the low 6 bits zero; a render
@@ -375,8 +368,7 @@ pub enum ExtendedRange {
     /// decoded texel, border texels included. A kernel write stores the value's top 16 bits (toward
     /// zero), a NaN `0x7fc0`, a `half` value widened first. A render pass's clear stores the color
     /// through `float` and then `half`, each rounded to nearest even, then the bfloat code nearest
-    /// that, ties to even, a NaN `0x7fc0` ([`clear_texel`](Self::clear_texel)). Copies and the
-    /// CPU's accesses keep the bytes.
+    /// that, ties to even, a NaN `0x7fc0`. Copies and the CPU's accesses keep the bytes.
     R16Bfloat,
     /// `RG16Bfloat` (66): two such words, red then green, held as `R16G16_UINT`.
     Rg16Bfloat,
@@ -485,10 +477,11 @@ impl ExtendedRange {
         )
     }
 
-    /// The forms an argument buffer's texture is read in (a heap element), in the order their
-    /// classes follow `metal::texel_format::heap_classes`' own: a function decodes such a texture's
-    /// raw texels, read through the heap's unsigned integer array. A heap holds no `_sRGB` form
-    /// (their heap classes are not built) and no two-plane form, which is held in two planes.
+    /// The forms an argument buffer's texture is read in (a heap element), in the order their heap
+    /// class indices follow (`metal::texel_format::heap_extended_base`): a function decodes such a
+    /// texture's raw texels, read through the heap's unsigned integer array. A heap holds no
+    /// `_sRGB` form (their heap classes are not built) and no two-plane form, which is held in two
+    /// planes.
     pub const HEAP_READ: [ExtendedRange; 7] = [
         ExtendedRange::Bgr10 { srgb: false },
         ExtendedRange::Bgra10 { srgb: false },
@@ -546,142 +539,6 @@ impl ExtendedRange {
             ExtendedRange::Rg16Bfloat => 2,
             ExtendedRange::Rgba16Bfloat => 4,
         }
-    }
-
-    /// The raw texel (the components of [`raw_format`](Self::raw_format)) Metal's `Clear` load
-    /// action stores for the clear color `color` (red, green, blue, alpha; measured on an Apple M3
-    /// Max and an M4): each channel goes through `float` and then `half`,
-    /// each rounded to nearest even, and is stored as a kernel write stores that value; the bits
-    /// Metal does not read are written as a write writes them. That is Metal's route `route` where
-    /// it is [`ClearRoute::ThroughHalf`]; a texel by [`ClearRoute::Straight`] is that route's. A
-    /// bfloat form's code is the one `route` gives. (A color fill, Apple SPI, goes through neither:
-    /// the runtime's `blit_fill`.)
-    pub fn clear_texel(self, color: [f64; 4], route: ClearRoute) -> [u32; 4] {
-        let half =
-            |v: f64| crate::float16::f16_bits_to_f32(crate::float16::f32_to_f16_bits(v as f32));
-        let straight = route == ClearRoute::Straight
-            && matches!(
-                self,
-                ExtendedRange::Bgr10 { .. } | ExtendedRange::Bgra10 { .. }
-            );
-        let codes = std::array::from_fn(|c| match (self.bfloat(), route) {
-            (true, ClearRoute::ThroughHalf) => bfloat_nearest_even(half(color[c])),
-            (true, ClearRoute::Straight) => bfloat_of_double(color[c]),
-            (false, _) if straight => self.straight_code(color[c] as f32, c == 3),
-            (false, _) => self.code(half(color[c]), c == 3),
-        });
-        let texel = self.texel(codes);
-        match (self, straight) {
-            // Bits 30 and 31 zero.
-            (ExtendedRange::Bgr10 { .. }, true) => [texel[0] & 0x3fff_ffff, 0, 0, 0],
-            _ => texel,
-        }
-    }
-
-    /// The code Metal's straight clear route ([`ClearRoute::Straight`]) stores in a `BGR10_XR`
-    /// or `BGRA10_XR` channel, or its alpha where `alpha`, for the `float` `v` (an Apple M4 under
-    /// macOS 27.0.1: every channel of 2,574 colors of each form; the consumer's M3 Max under 26.7
-    /// alike). A linear channel's: `(v + 384/510) · 510`, each step a `float` rounded to nearest
-    /// even, rounded to the nearest code with ties up, clamped to `[0, 1023]`, a NaN 0 (`0.25` is
-    /// 511 and `-0.25` is 257, where a write stores 512 and 256); alpha's that of `v` clamped to
-    /// `[0, 1]` first, a NaN 384. An `_sRGB` color channel's: the offset from code 384, toward the
-    /// sign of `v`, of the thresholds of Metal's own encode of that sign at most `|v|`
-    /// (`extended_srgb::STRAIGHT_SRGB_FIRST`), a NaN 384.
-    fn straight_code(self, v: f32, alpha: bool) -> u32 {
-        if self.srgb() && !alpha {
-            let bits = v.abs().to_bits();
-            let at = |thresholds: &[u32]| thresholds.partition_point(|&t| t <= bits) as u32;
-            return match (v.is_nan(), v < 0.0) {
-                (true, _) => 384,
-                (false, true) => 384 - at(&extended_srgb::STRAIGHT_SRGB_FIRST_NEGATIVE),
-                (false, false) => 384 + at(&extended_srgb::STRAIGHT_SRGB_FIRST),
-            };
-        }
-        let v = match (v.is_nan(), alpha) {
-            (true, true) => 0.0,
-            (true, false) => return 0,
-            (false, true) => v.clamp(0.0, 1.0),
-            (false, false) => v,
-        };
-        let x = (v + 384.0 / 510.0) * 510.0;
-        // Ties up, of the `float`: its sum with a half is exact in `f64`.
-        (f64::from(x) + 0.5).floor().clamp(0.0, 1023.0) as u32
-    }
-
-    /// Whether a render pass's `Clear` load of the clear color `color` leaves Metal's tile memory
-    /// holding the values the clear's stored codes ([`clear_texel`](Self::clear_texel)) read
-    /// back, rounded to `half`. Metal's tile memory holds each channel of a pass's
-    /// `BGR10_XR`, `BGRA10_XR` or two-plane color, and their `_sRGB` twins, as `half` until the
-    /// pass stores it, and a `Clear` load as the clear color through `float` and then `half`
-    /// (on an Apple M4 and the same probe on an Apple M3 Max): a draw that reads
-    /// or blends into the color then sees those halves, where an image of the codes holds the
-    /// codes nearest them. A padded form's tile holds its channels as `half` too, an unblended
-    /// draw's past `[0, 1]` unclamped (the M3 Max under macOS 27.0.1: a blend over a clear and
-    /// over such a draw, `probes/padded_and_bfloat_blends.m` of the conformance crate); its codes
-    /// read back
-    /// `c / 1023` (`RGB10A2Unorm_sRGB`'s alpha `c / 3`), the color of `R10Unorm_X6_sRGB` and
-    /// `RGB10A2Unorm_sRGB` through the sRGB transfer function. `None` for the bfloat forms,
-    /// whose tile memory is unmeasured.
-    pub fn clear_read_back(self, color: [f64; 4]) -> Option<bool> {
-        if self.bfloat() {
-            return None;
-        }
-        let half = |v: f32| crate::float16::f16_bits_to_f32(crate::float16::f32_to_f16_bits(v));
-        if self.padded() {
-            use crate::metal::ColorWriteMask as M;
-            let held = self.channels();
-            let lanes = [M::RED, M::GREEN, M::BLUE, M::ALPHA];
-            return Some((0..4).filter(|&c| held.contains(lanes[c])).all(|c| {
-                let tile = half(color[c] as f32);
-                tile == half(self.padded_code_value(self.code(tile, c == 3), c == 3))
-            }));
-        }
-        let channels = match self {
-            ExtendedRange::Bgr10 { .. } => 3,
-            _ => 4,
-        };
-        Some((0..channels).all(|c| {
-            let held = half(color[c] as f32);
-            held == half(self.code_value(self.code(held, c == 3), c == 3))
-        }))
-    }
-
-    /// The value a padded form's code `code` of a color channel, or of alpha where `alpha`, reads:
-    /// `code / 1023`, `RGB10A2Unorm_sRGB`'s alpha `code / 3`, the color of `R10Unorm_X6_sRGB` and
-    /// `RGB10A2Unorm_sRGB` through the sRGB transfer function (`RG10Unorm_X12_sRGB` reads its codes
-    /// as `RG10Unorm_X12` does), in `f64` and then rounded to `f32`.
-    fn padded_code_value(self, code: u32, alpha: bool) -> f32 {
-        let linear = |d: f64| f64::from(code) / d;
-        let v = match self {
-            ExtendedRange::Rgb10A2Srgb if alpha => linear(3.0),
-            ExtendedRange::R10X6Srgb | ExtendedRange::Rgb10A2Srgb => {
-                let c = linear(1023.0);
-                if c <= 0.04045 {
-                    c / 12.92
-                } else {
-                    ((c + 0.055) / 1.055).powf(2.4)
-                }
-            }
-            _ => linear(1023.0),
-        };
-        v as f32
-    }
-
-    /// The `half` values Metal's tile memory holds for a color of this form after a render
-    /// pass's `Clear` load of the clear color `color` (red, green, blue, alpha), as `f32`: each
-    /// channel through `float` and then `half`, each rounded to nearest even, and `BGR10_XR`'s
-    /// alpha 1, as a read of the tile reads it. The runtime clears the attachment's `half` shadow
-    /// to them. `None` for the padded forms, whose `half` shadow the runtime does not hold, and
-    /// the bfloat forms, whose tile memory is unmeasured.
-    pub fn clear_tile_value(self, color: [f64; 4]) -> Option<[f32; 4]> {
-        if self.padded() || self.bfloat() {
-            return None;
-        }
-        let half = |v: f32| crate::float16::f16_bits_to_f32(crate::float16::f32_to_f16_bits(v));
-        Some(std::array::from_fn(|c| match (self, c) {
-            (ExtendedRange::Bgr10 { .. }, 3) => 1.0,
-            _ => half(color[c] as f32),
-        }))
     }
 
     /// The `float` value Metal reads from the code `code` (below 1024) of a color channel, or of
@@ -781,93 +638,6 @@ impl ExtendedRange {
         let code = if neg { 384 - k } else { 384 + k };
         code.clamp(0, 1023) as u32
     }
-
-    /// The raw texel of the red, green, blue and alpha codes `rgba` (alpha the two-plane
-    /// formats' byte there), with the bits Metal does not read as its writes write them:
-    /// `BGR10_XR`'s bits 30 and 31 ones, plane 0's zero, `BGRA10_XR`'s low 6 bits of each field
-    /// zero.
-    fn texel(self, rgba: [u32; 4]) -> [u32; 4] {
-        let word = rgba[0] << 20 | rgba[1] << 10 | rgba[2];
-        match self {
-            ExtendedRange::Bgr10 { .. } => [0xC000_0000 | word, 0, 0, 0],
-            ExtendedRange::Planes { .. } => [word, rgba[3], 0, 0],
-            ExtendedRange::Bgra10 { .. } => {
-                [rgba[2] << 6, rgba[1] << 6, rgba[0] << 6, rgba[3] << 6]
-            }
-            // Each code in its word's top 10 bits, the low 6 bits zero.
-            ExtendedRange::R10X6 | ExtendedRange::R10X6Srgb => [rgba[0] << 6, 0, 0, 0],
-            ExtendedRange::Rgb10A2Srgb => [
-                rgba[3] << 30 | rgba[2] << 20 | rgba[1] << 10 | rgba[0],
-                0,
-                0,
-                0,
-            ],
-            ExtendedRange::Rg10X12 | ExtendedRange::Rg10X12Srgb => {
-                [rgba[0] << 6, rgba[1] << 6, 0, 0]
-            }
-            // A bfloat code a word.
-            ExtendedRange::R16Bfloat => [rgba[0], 0, 0, 0],
-            ExtendedRange::Rg16Bfloat => [rgba[0], rgba[1], 0, 0],
-            ExtendedRange::Rgba16Bfloat => rgba,
-        }
-    }
-}
-
-/// How Metal converts a render pass's clear color to a bfloat attachment's codes
-/// ([`ExtendedRange::clear_texel`]). Its two routes depend on the pass and the attachment, not on
-/// the release: an Apple M4 under macOS 27.0.1 (16 colors and 39 NaN colors, 34 shapes, each bfloat
-/// format) and the consumer's Apple M3 Max under macOS 26.7 take each as the shape says. The
-/// runtime chooses by its clear's pass and attachment. A `BGR10_XR` or `BGRA10_XR` attachment and
-/// their `_sRGB` twins take the same two routes by the same shapes (the M4 under 27.0.1; the
-/// consumer's M3 Max under 26.7 byte for byte alike); a two-plane form's are one (each of its 2,574
-/// colors' planes alike).
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ClearRoute {
-    /// Each channel through `float` and then `half`, each rounded to nearest even (past the
-    /// largest `half`, the infinity), then the bfloat code nearest that `half`, ties to even; a
-    /// NaN `0x7fc0`, its sign and payload dropped. Metal's clear of a texture it does not keep
-    /// losslessly compressed (a level under 16 texels a side, `ShaderWrite` or `PixelFormatView`
-    /// usage, `allowGPUOptimizedContents` off), and of any texture in a pass that records a draw
-    /// call, even one that draws nothing.
-    ThroughHalf,
-    /// Each channel through `float`, rounded to nearest even, then the bfloat code nearest that,
-    /// ties to even, `float` subnormals kept: `-3e38` is `0xff62`, `1e-40` is `0x0001`, `70000` is
-    /// `0x4789`, `1 + 2^-8 + 2^-23` is `0x3f81`. A NaN is the `float` NaN of its sign and its top
-    /// 23 payload bits, quieted, cut to its top 16 bits (`0xfff0_0400_0000_0000` is `0xffc0`,
-    /// `0x7ff8_4000_0000_0000` is `0x7fc2`, `0x7fff_ffff_ffff_ffff` is `0x7fff`). Metal's clear of
-    /// a texture it keeps losslessly compressed, the attachment's level 16 texels or more a side,
-    /// by a pass that records no draw call (the consumer's M3 Max rows of a 16x16 `Private`
-    /// texture). A `BGR10_XR` or `BGRA10_XR` channel's code there is straight from the `float` too:
-    /// a linear channel's `(v + 384/510) · 510` in `float` steps, ties up, a color NaN 0 and an
-    /// alpha NaN 384, an `_sRGB` color channel's by Metal's own encode, and `BGR10_XR`'s bits 30
-    /// and 31 zero.
-    Straight,
-}
-
-/// The bfloat code of `v` by [`ClearRoute::Straight`]: its `float` rounded to nearest even
-/// (Rust's conversion), then [`bfloat_nearest_even`]; a NaN the `float` NaN of its sign and top
-/// 23 payload bits, quieted, cut to its top 16 bits.
-fn bfloat_of_double(v: f64) -> u32 {
-    if v.is_nan() {
-        let bits = v.to_bits();
-        let sign = ((bits >> 63) as u32) << 31;
-        let payload = ((bits >> 29) & 0x7f_ffff) as u32;
-        return (sign | 0x7fc0_0000 | payload) >> 16;
-    }
-    bfloat_nearest_even(v as f32)
-}
-
-/// The bfloat code nearest `v`, ties to even (an overflow past the largest finite code the
-/// infinity), a NaN the quiet NaN `0x7fc0`.
-pub(crate) fn bfloat_nearest_even(v: f32) -> u32 {
-    if v.is_nan() {
-        return 0x7fc0;
-    }
-    // No sum passes `u32`: the largest non-NaN bits, `0xff80_0000`, plus `0x8000`.
-    let b = v.to_bits();
-    (b + 0x7fff + ((b >> 16) & 1)) >> 16
 }
 
 /// The layout of a two-plane YCbCr format ([`ycbcr_format`]): Metal's texture over an IOSurface's
@@ -1226,8 +996,8 @@ macro_rules! formats_held_for_copies {
 ///
 /// Measured on an Apple M3 Max under macOS 27.0.1, plain Metal (the `format-footprints-*`
 /// conformance recordings): `newTextureWithDescriptor:` makes a texture of each in every texture
-/// type its type rules take (`metal2vulkan-runtime`'s `texture_descriptor.rs`: no cube of a
-/// one-plane YCbCr format), in `Shared` and `Private` storage, and `replaceRegion:` and
+/// type its type rules take (no cube of a one-plane YCbCr format), in `Shared` and `Private`
+/// storage, and `replaceRegion:` and
 /// `getBytes:` move each texel's bytes unchanged, 2 or 4 a texel ([`footprint()`]'s element), a
 /// fresh texture's reading zero; where Metal keeps the texture compressed (seven of the padded
 /// formats, 16 by 16 under `ShaderRead`) both host copies leave their destinations as they were,
@@ -1255,59 +1025,6 @@ fn copies_only_repr(pf: PixelFormat) -> Repr {
         _ => return Repr::NotImplemented,
     };
     color(vec![combined(format, FormatEmulation::CopiesOnly)])
-}
-
-/// Whether a render pipeline on `profile` blends into a color attachment of `pf`, one of Apple's
-/// extended-range formats ([`ExtendedRange::of`]). No device blends such an attachment's raw
-/// texels: the fragment function computes Metal's blend in the shader, inside the pixel
-/// interlock, from the texel it reads. `Ok` where the device orders fetch through the pixel
-/// interlock alone and that form is exact for an attachment of `pf` written whole under a blend
-/// Metal's model holds (a padded 10-bit form's among them); else what blocks it. A pipeline's own
-/// blend, write mask or output may still be refused by name (`Feature::ExtendedRangeBlend`), as
-/// [`rotated_channels`]' blends are per pipeline. A bfloat format answers `NotRepresentable(Format)`:
-/// Metal blends none (`compile_render_pipeline` refuses such a blend
-/// `InvalidDescriptor(ColorAttachment)`). Another format answers `NotImplemented(Format)`.
-pub fn extended_range_blend(pf: PixelFormat, profile: &DeviceProfile) -> Result<(), Unsupported> {
-    crate::lower::fragment::extended_range_blend(pf, profile)
-}
-
-/// Whether `pf` holds each of its 10-bit codes in the top 10 bits of its own little-endian
-/// 16-bit word, the low 6 unread: the padded formats `R10Unorm_X6` and `RG10Unorm_X12` and their
-/// `_sRGB` twins. `RGB10A2Unorm_sRGB` packs its codes in one 32-bit word instead, so it is not
-/// one of these ([`ExtendedRange::padded`] names both sets).
-///
-/// Metal makes a texture of such a format wherever it makes one of any format, in memory of its
-/// own as much as over an IOSurface's plane or a buffer. Measured on an Apple M3 Max under macOS
-/// 27.0.1 (26A434) for all four, 2D 8x8 unless said: `newTextureWithDescriptor:` answers a
-/// texture in `Shared`, `Private` and `Memoryless` storage, under `ShaderRead`,
-/// `ShaderRead | ShaderWrite` and `ShaderRead | RenderTarget` usage, with four levels, as an
-/// array of three slices, and as a texture buffer of 64 texels; an automatic, a placement and a
-/// sparse heap each place one, and `heapTextureSizeAndAlignWithDescriptor:` answers the tight
-/// linear size at an alignment of 128. A shader read answers the code's value and a shader write
-/// stores the code, a blit from a buffer lands exactly, and a render pass clears and draws into
-/// one. `newSharedTextureWithDescriptor:` makes one as well, in the `Private` storage that is the
-/// only storage any shareable texture is made in: all four formats at 2D 8x8, 2D 16x16 and a
-/// texture buffer of 8 and of 16 texels answered a shareable texture of the format, 8 of 8
-/// processes each, where `Shared`, `Managed` and `Memoryless` storage answer nil for every format
-/// alike (`RGBA8Unorm` and `R16Uint` beside these four). Only a multisample descriptor is stopped
-/// by Metal's validation.
-///
-/// Metal's own host copies of such a texture are exact only while it keeps the texture linear —
-/// `allocatedSize` equal to the tight `width * bytes * height`, which held for every height up
-/// to 8 at widths to 1024, for heights to 12 at a width of 16, and at any extent whose usage
-/// includes `ShaderWrite`. Where Metal picks its compressed layout instead (an extra 128 bytes
-/// or more in `allocatedSize`: 16x16 and 64x64 under `ShaderRead` alone) both host copies are
-/// silent no-ops: `getBytes:` leaves its destination untouched and `replaceRegion:` leaves the
-/// texture zero as a shader reads it, while a blit either way still moves the texels. The
-/// runtime's copies are exact at every extent (docs/API.md, accepted differences).
-pub fn padded_words(pf: PixelFormat) -> bool {
-    matches!(
-        pf,
-        PixelFormat::R10UnormX6
-            | PixelFormat::RG10UnormX12
-            | PixelFormat::R10UnormX6SRGB
-            | PixelFormat::RG10UnormX12SRGB
-    )
 }
 
 /// The texel extent of one block of the compressed format `pf`, `None` for an uncompressed one.
@@ -1411,24 +1128,6 @@ pub fn alpha_in_red(pf: PixelFormat, profile: &DeviceProfile) -> bool {
         .any(|usage| profile.supports_format(own, usage))
     };
     alpha_in_red_format(pf).is_some() && direct_format(pf).is_some_and(|own| !held(own))
-}
-
-/// The format a texel buffer view of a texture buffer of `pf` takes for `usage` (a texel buffer
-/// usage) on `profile` where the format's own does not serve it and the bytes hold Metal's alpha in
-/// red ([`FormatEmulation::AlphaInRed`]): `R8_UNORM` for `A8Unorm` on a device that views no
-/// `A8_UNORM` texels for the usage (a Vulkan 1.2 device without `VK_KHR_maintenance5`), where it
-/// views `R8_UNORM` ones. A view reads `(r, 0, 0, 1)` where Metal reads `(0, 0, 0, r)`: a storage
-/// view's reads and writes convert by its choice's class (`StorageImageClass::AlphaInRed`,
-/// [`storage_choice`]), and a uniform view's reads take the alpha from red through the slot's
-/// swizzle (`TextureSwizzleChannels::alpha_in_red`). `None` elsewhere.
-pub(crate) fn texel_buffer_alpha_in_red(
-    pf: PixelFormat,
-    usage: FormatUsage,
-    profile: &DeviceProfile,
-) -> Option<vk::Format> {
-    let own = direct_format(pf)?;
-    let held = alpha_in_red_format(pf)?;
-    (!profile.supports_format(own, usage) && profile.supports_format(held, usage)).then_some(held)
 }
 
 /// The format of `pf`'s image where the device holds no image of its direct format and `pf`
@@ -1769,7 +1468,7 @@ fn make_repr(pf: PixelFormat) -> Repr {
         // 4:2:2: `G8B8G8R8_422_UNORM`/`B8G8R8G8_422_UNORM` exist (core 1.1), but a view of them
         // needs a sampler Y′CbCr conversion (VUID-VkImageViewCreateInfo-format-06415), whose
         // chroma reconstruction is the implementation's. The decoded twin's view
-        // (`FormatEmulation::Decoded`) holds Metal's texels instead (`bind::ChromaDecode`).
+        // (`FormatEmulation::Decoded`) holds Metal's texels instead.
         P::GBGR422 | P::BGRG422 => {
             color(vec![combined(F::R8G8B8A8_UNORM, FormatEmulation::Decoded)])
         }
@@ -1893,93 +1592,6 @@ pub fn vk_format(
     Err(Unsupported::needs_any_of(Feature::Format, alternatives).into())
 }
 
-/// The swizzle, over the channels of `own`, through which a texture of `own` reads what a view
-/// of `pf` made with `swizzle` reads, where `pf` holds its texels in the very bits of `own`'s and
-/// presents them in other channels: `own` samples as its direct Vulkan format on `profile`, and
-/// one of `pf`'s candidates is [`FormatEmulation::SwizzledView`] or
-/// [`FormatEmulation::AlphaInRed`] of that format (`A8Unorm` over `R8Unorm`, read through
-/// `(Zero, Zero, Zero, Red)`). Exact for sampling and reads as that
-/// emulation is: the same bits, the same filter, the channels moved by the view's mapping, which
-/// Vulkan applies to gathered texels and border texels as to any other ("Texel Input Operations":
-/// replacement, then the component swizzle). `None` elsewhere, for `pf` equal to `own`, where
-/// `profile` takes no view of the composed mapping
-/// (`VUID-VkImageViewCreateInfo-imageViewFormatSwizzle-04465`), and where an opaque-black border
-/// would read otherwise: Vulkan leaves it undefined through a mapping other than the identity
-/// unless the device swizzles borders (`VK_EXT_border_color_swizzle`), so the swizzle is given only
-/// where Metal reads the transparent-black texel for opaque black through it
-/// ([`opaque_black_reads_transparent`](crate::metal::sampler::opaque_black_reads_transparent)),
-/// whose sampler every device reads exactly; transparent black and opaque white are defined through
-/// any mapping. A write through it stores as a swizzled texture's storage binding does
-/// (`LoweringInputs::swizzled_storage`): each of the image's channels from the first lane whose
-/// source it is, else from the channel's own lane, as Metal stores each of the view's (probe
-/// `a8write`, an M3 Max under macOS 27.0.1: an `A8Unorm` view of an `R8Unorm` texture stores the
-/// first lane whose source is alpha, else the alpha lane). So `None` too where a channel of the
-/// view that holds one of the image's is no lane's source (an `A8Unorm` view of swizzle
-/// `(Red, Green, Blue, One)`), where the two fallbacks name different lanes.
-pub fn swizzle_over(
-    pf: PixelFormat,
-    swizzle: TextureSwizzleChannels,
-    own: PixelFormat,
-    profile: &DeviceProfile,
-) -> Option<TextureSwizzleChannels> {
-    if pf == own {
-        return None;
-    }
-    let sampled = [FormatUsage::SampledImage].into();
-    let image = vk_format(own, &sampled, profile).ok()?;
-    if image.emulation != FormatEmulation::Direct {
-        return None;
-    }
-    let (_, candidates) = candidates(pf).ok()?;
-    let candidate = candidates.iter().find(|c| {
-        matches!(
-            c.emulation,
-            FormatEmulation::SwizzledView | FormatEmulation::AlphaInRed
-        ) && c.format == image.format
-    })?;
-    let mapping = swizzle.compose(candidate.components);
-    if view_mapping_gap(mapping, profile).is_some() {
-        return None;
-    }
-    let over = swizzle_of(mapping);
-    // A write stores each of the image's channels from the first lane whose source it is, else
-    // from the channel's own lane: the view's channel holding it must be some lane's source, so
-    // that the image's channel is too and both take the same lane.
-    let held = swizzle_of(candidate.components);
-    let lanes = [over.red, over.green, over.blue, over.alpha];
-    let writes = [held.red, held.green, held.blue, held.alpha]
-        .into_iter()
-        .filter(|c| !matches!(c, TextureSwizzle::Zero | TextureSwizzle::One))
-        .all(|c| lanes.contains(&c));
-    let reads = crate::metal::sampler::opaque_black_reads_transparent(own, over);
-    (reads && writes).then_some(over)
-}
-
-/// The swizzle that reads as component mapping `m` (in `TextureSwizzleChannels::compose`'s
-/// canonical form over a format's own channels): each channel from the one `m` names, from itself
-/// where `m` names none, or a constant.
-fn swizzle_of(m: vk::ComponentMapping) -> TextureSwizzleChannels {
-    use crate::metal::TextureSwizzle as T;
-    use vk::ComponentSwizzle as S;
-    let named = [
-        (S::ZERO, T::Zero),
-        (S::ONE, T::One),
-        (S::R, T::Red),
-        (S::G, T::Green),
-        (S::B, T::Blue),
-        (S::A, T::Alpha),
-    ];
-    let channel = |c: vk::ComponentSwizzle, own: T| {
-        named.iter().find(|(s, _)| *s == c).map_or(own, |&(_, t)| t)
-    };
-    TextureSwizzleChannels::new(
-        channel(m.r, T::Red),
-        channel(m.g, T::Green),
-        channel(m.b, T::Blue),
-        channel(m.a, T::Alpha),
-    )
-}
-
 /// What `profile` lacks to make an image view whose component mapping is `components`:
 /// `imageViewFormatSwizzle`, where its portability subset withholds it and the mapping is not the
 /// identity (`VUID-VkImageViewCreateInfo-imageViewFormatSwizzle-04465`). A swizzled candidate's
@@ -2059,6 +1671,74 @@ pub fn srgb_raw_twin(pf: PixelFormat) -> Option<PixelFormat> {
     })
 }
 
+/// The other member of `pf`'s sRGB pair, the same bits read as linear values or as sRGB codes:
+/// an 8-bit format and its sRGB form, a compressed format and its sRGB form, an extended-range
+/// format and its sRGB form. Metal views a texture as it whatever the texture's usage (Apple's
+/// `MTLTextureUsage.pixelFormatView`: "Don't set this option if your texture view only converts
+/// between linear space and sRGB"). `None` for a format with no such pair.
+pub fn srgb_sibling(pf: PixelFormat) -> Option<PixelFormat> {
+    use PixelFormat as P;
+    // The pairs `srgb_raw_twin` leaves out, linear first: ASTC's LDR and sRGB forms decode the
+    // same blocks, and the extended-range formats are no twin of a unorm format.
+    const PAIRS: [(PixelFormat, PixelFormat); 17] = [
+        (P::ASTC4x4LDR, P::ASTC4x4SRGB),
+        (P::ASTC5x4LDR, P::ASTC5x4SRGB),
+        (P::ASTC5x5LDR, P::ASTC5x5SRGB),
+        (P::ASTC6x5LDR, P::ASTC6x5SRGB),
+        (P::ASTC6x6LDR, P::ASTC6x6SRGB),
+        (P::ASTC8x5LDR, P::ASTC8x5SRGB),
+        (P::ASTC8x6LDR, P::ASTC8x6SRGB),
+        (P::ASTC8x8LDR, P::ASTC8x8SRGB),
+        (P::ASTC10x5LDR, P::ASTC10x5SRGB),
+        (P::ASTC10x6LDR, P::ASTC10x6SRGB),
+        (P::ASTC10x8LDR, P::ASTC10x8SRGB),
+        (P::ASTC10x10LDR, P::ASTC10x10SRGB),
+        (P::ASTC12x10LDR, P::ASTC12x10SRGB),
+        (P::ASTC12x12LDR, P::ASTC12x12SRGB),
+        (P::BGR10XR, P::BGR10XRSRGB),
+        (P::BGRA10XR, P::BGRA10XRSRGB),
+        (P::RGB10A82PXR10, P::RGB10A82PXR10SRGB),
+    ];
+    if let Some(linear) = srgb_raw_twin(pf) {
+        return Some(linear);
+    }
+    if let Some(&srgb) = (P::ALL.iter()).find(|&&srgb| srgb_raw_twin(srgb) == Some(pf)) {
+        return Some(srgb);
+    }
+    PAIRS.iter().find_map(|&(linear, srgb)| match pf {
+        _ if pf == linear => Some(srgb),
+        _ if pf == srgb => Some(linear),
+        _ => None,
+    })
+}
+
+/// Whether Metal views a texture of `pf` as `view` with no usage asked: `pf` itself, its sRGB
+/// sibling ([`srgb_sibling`]), or the stencil format of a combined depth and stencil format
+/// (`Depth32Float_Stencil8` as `X32_Stencil8`, `Depth24Unorm_Stencil8` as `X24_Stencil8`).
+pub fn views_without_usage(pf: PixelFormat, view: PixelFormat) -> bool {
+    use PixelFormat as P;
+    pf == view
+        || srgb_sibling(pf) == Some(view)
+        || matches!(
+            (pf, view),
+            (P::Depth32FloatStencil8, P::X32Stencil8) | (P::Depth24UnormStencil8, P::X24Stencil8)
+        )
+}
+
+/// Whether Metal views a texture of `pf` made with `PixelFormatView` usage as `view`: as
+/// [`views_without_usage`], or both uncompressed color formats whose images hold Metal's bytes
+/// ([`byte_format`]) with the same bytes a texel (Apple's `makeTextureView(pixelFormat:)`: "All
+/// 8-, 16-, 32-, 64-, and 128-bit color formats are compatible with other formats with the same
+/// bit length").
+pub fn views_with_usage(pf: PixelFormat, view: PixelFormat) -> bool {
+    let color = |pf| {
+        let block = byte_format(pf)?.block()?;
+        let color = block.texels == 1 && block.color.is_some();
+        (color && block.depth.is_none() && block.stencil.is_none()).then_some(block.size)
+    };
+    views_without_usage(pf, view) || color(pf).is_some_and(|size| color(view) == Some(size))
+}
+
 /// The bit width of each channel of integer format `f`, red to alpha (a channel `f` lacks takes
 /// the first one's width; nothing is stored there): the ranges into which Metal saturates each
 /// channel of an integer texel's write, as the format's signedness reads the word. `None` for a
@@ -2080,10 +1760,10 @@ pub(crate) fn integer_channel_bits(f: vk::Format) -> Option<[u32; 4]> {
 
 /// The word `PushField::TextureIntegerChannels` carries for a texture of pixel format `pf`: byte
 /// `c` holds `32 - bits` for channel `c` (red to alpha) of an integer format whose channel is
-/// narrower than 32 bits ([`integer_channel_bits`]), else 0. A write saturates each lane to the
-/// range `bits` spans in the image's signedness, so a word of 0 (a float, 32-bit integer or
-/// unbound texture's) leaves every lane as it is.
-pub(crate) fn integer_channels_word(pf: PixelFormat) -> u32 {
+/// narrower than 32 bits, else 0. A write saturates each lane to the range `bits` spans in the
+/// image's signedness, so a word of 0 (a float, 32-bit integer or unbound texture's) leaves every
+/// lane as it is.
+pub fn integer_channels_word(pf: PixelFormat) -> u32 {
     direct_format(pf)
         .and_then(integer_channel_bits)
         .map_or(0, |bits| {
@@ -2093,11 +1773,34 @@ pub(crate) fn integer_channels_word(pf: PixelFormat) -> u32 {
         })
 }
 
+/// The word `PushField::BicubicTexels` carries for a texture of pixel format `pf` sampled
+/// through swizzle `swizzle` (the texture's own over its parent's, for a view): how Metal's
+/// bicubic filter treats its texels, the value the binder specializes `SpecKey::BicubicTexels`
+/// to for such a texture. Its bits select the bilinear inner taps (32-bit float channels), the
+/// clamp into `[0, 1]` or `[-1, 1]` (normalized channels) or neither (half and small-float
+/// channels), and the border texels of the format's channels under `swizzle`.
+///
+/// `None` for a format of no measured family (compressed, YUV, stencil, integer and
+/// extended-range formats), whose bicubic sample Metal does not establish, and for a format of
+/// 8-bit sRGB codes, whose decode before the sum the identity domains do not establish (the
+/// binder's form of a texture held as its UNORM twin decodes the codes a UNORM view reads): a
+/// consumer refuses a bicubic sample of such a texture.
+pub fn bicubic_texels_word(pf: PixelFormat, swizzle: TextureSwizzleChannels) -> Option<u32> {
+    if crate::metal::texel_format::srgb_coded(pf) {
+        return None;
+    }
+    crate::metal::bicubic::texels(pf).map(|t| t.with_border(pf, swizzle).0)
+}
+
+/// The word `PushField::BicubicTexels` carries for a slot bound to nothing, whose neutral texture
+/// reads zero: every channel present, the sum unchanged, a four-channel format's border texels.
+pub const BICUBIC_TEXELS_UNBOUND: u32 = crate::metal::bicubic::BicubicTexels::NEUTRAL.0;
+
 /// The class of pixel format `pf` (`metal::texel_format::TexelFormat`'s word, as its `half`
 /// conversion takes it): the value a specialized note's test of
 /// `SpecKey::BoundTexelFormat` reads for a texture of `pf` bound at its slot
-/// (`StageModule::bound_format_clauses`), which a runtime takes from each draw's or dispatch's
-/// bound textures.
+/// (`StageModule::precision_notes_bound`'s `bound`), which a runtime takes from each draw's or
+/// dispatch's bound textures.
 pub fn bound_texel_format(pf: PixelFormat) -> u32 {
     crate::metal::texel_format::texel_format(pf).0
 }
@@ -2151,14 +1854,13 @@ pub fn ycbcr(pf: PixelFormat) -> bool {
 /// kernel's write leaves both planes' bytes as they were, and Metal's validation stops the
 /// binding), and the packed ones, `YCBCR10_444_2P_PACKED` and its `_sRGB` twin among them (the
 /// M3 Max under macOS 27.0.1, our probe `ycw` over `p444` and `pf44` surfaces: every byte of both
-/// planes kept, the command buffer completed; an Apple M4 stores them). A storage slot a function
-/// only writes takes its neutral there (`bind::plan`), and so does a heap's storage class
-/// (`bind::heap`, an argument buffer's texture, whose writes Metal drops alike: the M3 Max under
-/// macOS 27.0.1, `YCBCR8_420_2P`), which the writes leave as Metal leaves the texture.
+/// planes kept, the command buffer completed; an Apple M4 stores them). A heap's storage class
+/// holds such a texture as its neutral (`bind::heap::fit`, an argument buffer's texture, whose
+/// writes Metal drops alike: the M3 Max under macOS 27.0.1, `YCBCR8_420_2P`), which the writes
+/// leave as Metal leaves the texture.
 ///
 /// An unpacked 4:4:4 YCbCr format's writes are not dropped: Metal stores each texel's codes into
-/// both planes, which a slot that only writes one of [`ycbcr_writes_stored`]
-/// does as Metal does; a slot that writes another is refused (`storage_choice`).
+/// both planes, and a slot that writes one is refused (`storage_choice`).
 pub fn writes_dropped(pf: PixelFormat) -> bool {
     matches!(pf, PixelFormat::GBGR422 | PixelFormat::BGRG422)
         || (ycbcr(pf)
@@ -2166,37 +1868,12 @@ pub fn writes_dropped(pf: PixelFormat) -> bool {
                 .is_some_and(|f| f.subsampling != ChromaSubsampling::Chroma444 || f.packed))
 }
 
-/// Whether a function's writes to a two-plane YCbCr texture of `pf` ([`ycbcr`]) store into its
-/// planes as Metal stores them, at a slot that only writes it
-/// (`pipeline::lower_inputs::StorageImageClass::YCbCrWrite`), and through an argument buffer's
-/// handle, which a heap's float storage class holds through the texture's write shadow
-/// (`bind::heap`; Metal stores the same bytes either way, an Apple M3 Max under macOS 27.0.1):
-/// the 4:4:4 formats of unpacked 8- and 10-bit codes read converted, as codes or through the sRGB
-/// curve, `YCBCR8_444_2P`, `YCBCR10_444_2P`, `RGB8_444_2P`, `RGB10_444_2P`,
-/// `YCBCR8_444_2P_sRGB` and `YCBCR10_444_2P_sRGB`. Metal stores each written texel's luma code into the luma plane and its
-/// own chroma pair into the chroma plane, the codes `bind::ycbcr_write` states (an Apple M4 under
-/// macOS 27.0.1, and an Apple M3 Max under macOS 26.7, byte for byte the same; the `_sRGB` twins'
-/// on an Apple M3 Max under macOS 27.0.1, each channel through the sRGB curve first). Not the
-/// packed formats, whose writes Metal drops ([`writes_dropped`]).
-pub fn ycbcr_writes_stored(pf: PixelFormat) -> bool {
-    ycbcr(pf)
-        && ycbcr_format(pf).is_some_and(|f| {
-            f.subsampling == ChromaSubsampling::Chroma444
-                && !f.packed
-                && matches!(f.bits, 8 | 10)
-                && matches!(
-                    f.reads,
-                    YCbCrReads::Converted | YCbCrReads::Codes | YCbCrReads::Srgb
-                )
-        })
-}
-
 /// Whether a render pass stores its color attachment of a two-plane YCbCr texture of `pf`
 /// ([`ycbcr`]) into the texture's planes as Metal stores it: the formats of unpacked 8- and
 /// 10-bit codes read converted, `YCBCR8_420_2P`, `YCBCR8_422_2P`, `YCBCR8_444_2P`,
 /// `YCBCR10_420_2P`, `YCBCR10_422_2P` and `YCBCR10_444_2P`, or read as codes, `RGB8_420_2P` to
 /// `RGB10_444_2P`. Metal re-encodes every texel of the attachment, drawn or not, into both planes
-/// at the pass's store, by the codes `bind::ycbcr_store` states (an Apple M4 under macOS 27.0.1:
+/// at the pass's store, by an inverse conversion (an Apple M4 under macOS 27.0.1:
 /// every byte of the 8-bit formats' clears and full-screen draws over `420v`, `420f`, `422v` and
 /// `444v` surfaces, no matrix and BT.709; the consumer's run of the same probe on an Apple M3 Max
 /// under macOS 26.7: the M4's bytes in every case; the same M4: every byte of the 10-bit formats'
@@ -2205,9 +1882,9 @@ pub fn ycbcr_writes_stored(pf: PixelFormat) -> bool {
 /// `YCBCR8_444_2P_sRGB` and `YCBCR10_444_2P_sRGB`, each texel's channels through the sRGB curve
 /// first (an Apple M3 Max under macOS 27.0.1: clears over `444v` and `x444`, no matrix).
 /// Such an attachment renders into `R32G32B32A32_SFLOAT` ([`FormatEmulation::YCbCrRendered`]),
-/// through any write mask and, where the device blends that format, any blend (within a code of
-/// Metal's, the runtime announces it; refused elsewhere, `Unsupported(Format)` naming the need)
-/// but an `_sRGB` twin's: Metal's blend into one and its load of one are not measured (whether its
+/// whose store into the planes is not implemented, through any write mask and, where the device
+/// blends that format, any blend (refused elsewhere, `Unsupported(Format)` naming the need) but
+/// an `_sRGB` twin's: Metal's blend into one and its load of one are not measured (whether its
 /// tile holds the texels' linear values or their encoding), so a pipeline that blends into one is
 /// refused at the attachment and a pass that loads one at its start (`NotImplemented(Format)`).
 /// Not the 4:2:0 and 4:2:2 `_sRGB` twins, nor the packed formats, whose stores no rule matches
@@ -2283,25 +1960,6 @@ pub fn color_record(formats: &[Option<PixelFormat>]) -> Option<Vec<Option<(u32, 
         record.push(Some((offset, block.size)));
     }
     Some(record)
-}
-
-/// Metal's `imageblockSampleLength` of a render pipeline whose fragment function declares an
-/// explicit imageblock of `data_size` bytes (`air.imageblock_data_size`) whose layouts align to
-/// `alignment`, beside color attachments that pack to `colors` bytes
-/// ([`imageblock_sample_length`]): the data, then the colors rounded up to 8 bytes and then to
-/// `alignment`; no colors add nothing. Measured on an M3 Max and an M4 over nine layouts and 23
-/// sets of color formats: a `char` with `R8Unorm` is 9, a `float4` with `R8Unorm` 32, a
-/// `packed_float4` with it 24, and a `float4` and a `float` (32 bytes) with
-/// `R8Unorm` and `RGBA32Float` 64. `None` past `u32`.
-pub fn explicit_imageblock_sample_length(
-    data_size: u32,
-    alignment: u32,
-    colors: u32,
-) -> Option<u32> {
-    let colors = colors
-        .checked_next_multiple_of(8)?
-        .checked_next_multiple_of(alignment.max(1))?;
-    data_size.checked_add(colors)
 }
 
 /// The aspects of `pf` (`COLOR`, `DEPTH`, `STENCIL`, or `DEPTH | STENCIL`), for formats with a
@@ -2489,9 +2147,9 @@ pub(crate) fn write_conversion(pf: PixelFormat) -> Option<WriteConversion> {
     if ExtendedRange::of(pf).is_some() {
         return Some(WriteConversion::Encoded);
     }
-    // A two-plane YCbCr attachment a pass renders holds the function's floats, which the
-    // consumer's store converts as Metal's does (`FormatEmulation::YCbCrRendered`); a packed
-    // one's pass is refused, so nothing converts its writes (`ycbcr_pass_refused`).
+    // A two-plane YCbCr attachment a pass renders holds the function's floats
+    // (`FormatEmulation::YCbCrRendered`), whose store into the planes is not implemented; a
+    // packed one's pass is refused (`ycbcr_pass_refused`): nothing converts their writes.
     if ycbcr_renders(pf) || ycbcr_pass_refused(pf) {
         return Some(WriteConversion::Exact);
     }
@@ -2984,8 +2642,7 @@ pub fn storage_image_choice(
 /// `SrgbEncode` (`BGRA8Unorm_sRGB`, where its twin is not accessed without a format, through
 /// `R8G8B8A8_UNORM` with `SrgbEncodeBgra`), `RGB9E5Float` through `R32_UINT` with
 /// `SharedExponentBits`, and `A8Unorm` through `R8_UNORM` with `AlphaInRed` (no alias: such a
-/// texture's image is `R8_UNORM` itself, [`FormatEmulation::AlphaInRed`]; a texture buffer's bytes
-/// take that view wherever `A8_UNORM` does not serve the use, [`texel_buffer_alpha_in_red`]).
+/// texture's image is `R8_UNORM` itself, [`FormatEmulation::AlphaInRed`]).
 /// Anything else is `Unsupported{Format}` naming what each route lacks, a format's without-format
 /// usage included.
 ///
@@ -3020,9 +2677,8 @@ fn held_storage_choice(
     }
     // A YCbCr texture's image holds converted values, not the planes' bytes a write would store
     // into: Metal drops a write-only slot's writes to a 4:2:0 or 4:2:2 format
-    // ([`writes_dropped`]), and a write-only slot of a format whose writes Metal stores into both
-    // planes ([`ycbcr_writes_stored`]) writes the texture's write shadow (`bind::plan`); the other
-    // 4:4:4 formats' writes, and a slot that reads and writes any of them, are not modelled.
+    // ([`writes_dropped`]); the 4:4:4 formats' writes, which Metal stores into both planes, and a
+    // slot that reads and writes any of them, are not modelled.
     // Nor does a function write a texture held for copies alone ([`copies_only`]).
     if matches!(
         candidates[0].emulation,
@@ -3157,91 +2813,6 @@ pub(crate) fn red_blue_exchanged(pf: PixelFormat) -> bool {
     )
 }
 
-/// The RGBA-order twin of a BGRA-order direct format, whose fields are the format's with red and
-/// blue exchanged: `R8G8B8A8_UNORM` for `B8G8R8A8_UNORM` and `A2B10G10R10_UNORM_PACK32` for
-/// `A2R10G10B10_UNORM_PACK32`, each of the format's texel size and compatibility class (the
-/// kernels' `SwizzleBgra` alias views, [`storage_choice`]). SPIR-V names no image format for
-/// either BGRA-order format. `None` for every other format.
-pub(crate) fn rgba_twin(format: vk::Format) -> Option<vk::Format> {
-    match format {
-        vk::Format::B8G8R8A8_UNORM => Some(vk::Format::R8G8B8A8_UNORM),
-        vk::Format::A2R10G10B10_UNORM_PACK32 => Some(vk::Format::A2B10G10R10_UNORM_PACK32),
-        _ => None,
-    }
-}
-
-/// What a storage view in `twin`, an RGBA-order twin ([`rgba_twin`]), lacks on `profile` for a
-/// function that reads and writes it: the format's storage usage, and a declaration, without a
-/// format where the device grants the format that access without one, else by its SPIR-V image
-/// format (`shaderStorageImageExtendedFormats` for an extended one). Empty where it lacks
-/// nothing.
-pub(crate) fn rgba_twin_gaps(twin: vk::Format, profile: &DeviceProfile) -> Vec<Capability> {
-    let use_ = StorageUse::READ_WRITE_TEXTURE;
-    let mut gaps = Vec::new();
-    if !profile.supports_format(twin, FormatUsage::StorageImage) {
-        gaps.push(Capability::Format {
-            format: twin,
-            usage: FormatUsage::StorageImage,
-        });
-    }
-    if !accessed_without_format(twin, use_, profile) {
-        match spirv_image_format(twin) {
-            Some(declared)
-                if crate::spirv::requirements::extended_format(declared)
-                    && !profile.fields().images.storage_extended_formats =>
-            {
-                gaps.push(Capability::Feature(
-                    VkFeature::ShaderStorageImageExtendedFormats,
-                ));
-            }
-            Some(_) => {}
-            None => gaps.extend(without_format_gaps(twin, use_, profile)),
-        }
-    }
-    gaps
-}
-
-/// The format other than `format` a fetching draw's storage view of a color attachment of
-/// `format` takes in the storage form of framebuffer fetch on `profile`
-/// (`StorageAttachmentUse::view_alias_of`, its public door): an 8-bit sRGB format's
-/// unsigned-integer format of its texel size on every device, and a BGRA-order format's
-/// RGBA-order twin ([`rgba_twin`]) where the device neither reads nor writes the format without a
-/// format ([`accessed_without_format`]; SPIR-V names no image format for it, so no declaration
-/// reaches it otherwise) and the twin lacks nothing ([`rgba_twin_gaps`]). `None` elsewhere: the
-/// view is in `format`, and a device that accesses a BGRA-order format without one keeps that.
-pub(crate) fn fetch_view_alias(format: vk::Format, profile: &DeviceProfile) -> Option<vk::Format> {
-    use vk::Format as F;
-    match format {
-        F::B8G8R8A8_SRGB | F::R8G8B8A8_SRGB => Some(F::R32_UINT),
-        F::R8G8_SRGB => Some(F::R16_UINT),
-        F::R8_SRGB => Some(F::R8_UINT),
-        _ => rgba_twin(format).filter(|&twin| {
-            !accessed_without_format(format, StorageUse::READ_WRITE_TEXTURE, profile)
-                && rgba_twin_gaps(twin, profile).is_empty()
-        }),
-    }
-}
-
-/// Whether `pf`'s alpha is a 1-bit unorm channel (`crate::metal::texel_format::PackedTexels::Rgb5A1`:
-/// `A1BGR5Unorm`, `BGR5A1Unorm`), whose `float` write Metal stores as 1 only above one half, where
-/// a device measured to store every other normalized channel as Metal does rounds the half up
-/// (RADV): the device's conversion of such a write is noted (`lower::texture`'s
-/// `norm_storage_facts`).
-pub(crate) fn one_bit_alpha(pf: PixelFormat) -> bool {
-    crate::metal::texel_format::PackedTexels::of(pf)
-        == Some(crate::metal::texel_format::PackedTexels::Rgb5A1)
-}
-
-/// Whether `profile` stores a texture (or texture buffer) of a format with a 1-bit alpha
-/// ([`one_bit_alpha`]) for `use_`: a write whose bound texture may be one notes the device's
-/// conversion.
-pub(crate) fn one_bit_storage(use_: StorageUse, profile: &DeviceProfile) -> bool {
-    PixelFormat::ALL
-        .iter()
-        .filter(|&&pf| one_bit_alpha(pf))
-        .any(|&pf| storage_choice(pf, use_, profile).is_ok())
-}
-
 /// The SPIR-V `Image Format` a storage image of Vulkan format `format` is declared with (Vulkan
 /// spec "Compatibility Between SPIR-V Image Formats and Vulkan Formats"); `None` for formats only
 /// a formatless (`Unknown`) declaration can access. Crate-private: only the lowering and the
@@ -3296,8 +2867,7 @@ pub(crate) fn spirv_image_format(format: vk::Format) -> Option<crate::spv::Image
 }
 
 /// Every Vulkan format a Metal pixel format (every candidate of every format) or vertex format
-/// can map to, and `R64_UINT`, the view of a `ulong` texture that a `ulong` atomic updates, sorted
-/// and without duplicates: `FormatSupport::queries()` (some are defined by an extension or a later
+/// can map to, sorted and without duplicates: `FormatSupport::queries()` (some are defined by an extension or a later
 /// core version; `FormatSupport::queries_for` filters them). Consumers call
 /// `FormatSupport::queries`; crate-private.
 pub(crate) fn queried_formats() -> Vec<vk::Format> {
@@ -3310,18 +2880,8 @@ pub(crate) fn queried_formats() -> Vec<vk::Format> {
         .flatten()
         .map(|c| c.format)
         .chain(crate::metal::vertex::vertex_formats_queried())
-        .chain([vk::Format::R64_UINT])
         .collect();
     set.into_iter().collect()
-}
-
-/// The Vulkan formats of `pf`'s candidates, none for a format without one.
-#[cfg(test)]
-pub(crate) fn candidate_formats(pf: PixelFormat) -> Vec<vk::Format> {
-    match repr(pf) {
-        Repr::Candidates(_, c) => c.iter().map(|c| c.format).collect(),
-        _ => Vec::new(),
-    }
 }
 
 #[cfg(test)]

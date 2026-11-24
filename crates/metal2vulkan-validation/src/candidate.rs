@@ -1,10 +1,6 @@
 use crate::gpu::DeviceType;
-use crate::observation::Backend;
-use metal2vulkan::device::DevicePolicy;
-use std::sync::OnceLock;
 
-/// The exit statuses of the candidate executors' processes (`corpus-vulkan`, `corpus-moltenvk`):
-/// one per [`ExecutorError`](crate::check::admission::ExecutorError) kind that is not a failure, so a caller that runs them as processes
+/// The exit statuses of the candidate executor's processes (`corpus-vulkan`): one per [`ExecutorError`](crate::check::admission::ExecutorError) kind that is not a failure, so a caller that runs them as processes
 /// (`corpus-vulkan --batch`) reads the kind from the status. A failure exits 1, and so does a
 /// mismatch, whose row the store then holds; a timed-out device wait exits
 /// [`crate::gpu::wait::HANG_EXIT_CODE`].
@@ -25,14 +21,20 @@ pub mod exit_status {
     pub const VENUE_MISMATCH: i32 = 7;
 }
 
-/// Create an engine pipeline on `device` from the binder layout its artifact carries, time
-/// the creation, and destroy it. Nothing is bound or dispatched.
+/// Create a render row's pipeline on `device` from the binder layout its artifact carries, time
+/// the creation, and destroy it. Nothing is bound or drawn.
 pub fn create_acceptance_pipeline(
     device: DeviceType,
-    pipeline: &crate::acceptance::RowPipeline,
+    pipeline: &metal2vulkan::pipeline::RenderPipeline,
 ) -> Result<crate::acceptance::Acceptance, crate::acceptance::AcceptanceError> {
     platform::create_acceptance_pipeline(device, pipeline)
 }
+
+/// The sweep's one runtime device of a kind, opened under the validation layer: each kernel row's
+/// pipeline state made on it, as a guest's kernel is made, and one dispatch of one representative
+/// threadgroup of it encoded, never committed; what the runtime, the driver and the layer
+/// answered.
+pub use platform::RuntimeKernels;
 
 /// Restrict every Vulkan context this process opens to committed device profile `stem` through
 /// `VK_LAYER_KHRONOS_profiles` (a command's `--profiles-layer P`). Call it once, before any device
@@ -76,117 +78,26 @@ pub(crate) fn requested_restriction() -> Option<String> {
     platform::requested_restriction()
 }
 
-/// Run every engine context this process opens in the robustness-off leg (a command's
-/// `--robustness-off`): it enables no robustness feature, so the product compiles the in-shader
-/// containment encodings, and its rows are stored in the leg's own slot. Without it an engine
-/// context enables every robustness feature its device's description states (the stated leg). Call
-/// it once, before any device opens.
-pub fn run_robustness_off() -> Result<(), String> {
-    platform::run_robustness_off()
-}
-
-/// The robustness leg every engine context this process opens runs under
-/// ([`run_robustness_off`]), which an engine device worker applies before it opens a device.
-/// Reading it decides that it is the stated leg if none was set.
-pub fn requested_leg() -> crate::coverage::Leg {
-    platform::requested_leg()
-}
-
-/// Whether every engine context this process opens enables `VK_EXT_device_generated_commands`
-/// where its device supports it, so the device replay takes the generated-commands path: decided
-/// once, by [`run_without_generated_commands`] (or a device worker's
-/// [`decide_generated_commands`]) or by the first read without it (enabled).
-static GENERATED_COMMANDS: OnceLock<bool> = OnceLock::new();
-
-/// Open every engine context this process opens without `VK_EXT_device_generated_commands`
-/// (a command's `--without-generated-commands`), so the device replay takes K14c's path on a device
-/// that has the extension. A measurement of that path, never the default's evidence: the engine
-/// executor compares and returns its observation but does not store it. Call it once, before any
-/// device opens.
-pub fn run_without_generated_commands() -> Result<(), String> {
-    decide_generated_commands(false)
-}
-
-/// Decide this process's generated-commands setting ([`run_without_generated_commands`]); a
-/// device worker applies its parent's before it opens a device.
-pub(crate) fn decide_generated_commands(enabled: bool) -> Result<(), String> {
-    if *GENERATED_COMMANDS.get_or_init(|| enabled) == enabled {
-        Ok(())
-    } else {
-        Err("the generated-commands setting is already decided: pass \
-             --without-generated-commands once, before any device opens"
-            .into())
-    }
-}
-
-/// Whether this process's engine contexts enable `VK_EXT_device_generated_commands` where
-/// their device supports it ([`run_without_generated_commands`]); reading it decides that they do
-/// if nothing was set.
-pub fn requested_generated_commands() -> bool {
-    *GENERATED_COMMANDS.get_or_init(|| true)
-}
-
-/// The policy an engine `Device` of this process is created under: the default policy with
-/// Metal's answer wherever the policy offers the device's instead (`DevicePolicy::exact_answers`:
-/// the runtime's heap compression, completion, batch order, render lowering, host-page textures
-/// and pipeline waits, and each `half` operation rounded on a device without `shaderFloat16`), as
-/// Metal's answers are what the candidate is compared with. Where the device has a native form it
-/// changes no translation: the device's arithmetic, sampling and conversions are the only forms
-/// there, recorded as precision notes where they can differ from Metal's.
-pub fn requested_policy() -> DevicePolicy {
-    DevicePolicy::default().exact_answers()
-}
-
 /// Write every validation-layer message that fails a row to stderr as the layer reports it, for
 /// this whole process (the engine device worker's setting).
 pub(crate) fn echo_validation_messages() {
     platform::echo_validation_messages();
-    runtime_case::echo_messages();
 }
 
-fn validate_backend_host(backend: Backend) -> Result<(), String> {
-    if backend == Backend::Moltenvk && !cfg!(target_os = "macos") {
-        return Err("MoltenVK candidate execution requires macOS".into());
-    }
-    if backend == Backend::Vulkan && cfg!(target_os = "macos") {
-        return Err(
-            "native Vulkan candidate execution is not available on macOS; use corpus-moltenvk"
-                .into(),
-        );
+/// Refuse candidate execution on macOS: its Vulkan is MoltenVK's, which no candidate runs on.
+fn validate_host() -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        return Err("Vulkan candidate execution is not available on macOS".into());
     }
     Ok(())
 }
 
 pub(crate) mod device_facts;
 pub mod engine;
-pub mod runtime_case;
-pub mod runtime_samples;
-pub(crate) mod unadvertised_stage;
 pub(crate) mod unsupported_set;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform;
-pub(crate) use platform::{runtime_restriction, Restricting, RuntimeRestriction};
-
-/// What the runtime path's second check of a profile restriction found on its device
-/// (`RuntimeRestriction::check`): the description the executor's context translates for under the
-/// profile, the members where the description the runtime read through the profiles layer differs
-/// from it (the kept ones, which the layer reads from the device), and the environment's
-/// `profiles_layer` record.
-pub(crate) struct RestrictedDevice {
-    pub(crate) translated: metal2vulkan::device::DeviceDescription,
-    pub(crate) kept: Vec<String>,
-    pub(crate) record: serde_json::Value,
-}
-/// The loader-word guard, for the runtime lane's tests that make their own devices
-/// (`runtime_lane/presenting.rs`).
-#[cfg(all(
-    test,
-    any(m2v_gpu, m2v_cpu_icd),
-    any(target_os = "linux", target_os = "macos")
-))]
-pub(crate) use platform::LoaderWord;
-
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -217,56 +128,42 @@ mod platform {
 
     pub fn create_acceptance_pipeline(
         _device: DeviceType,
-        _pipeline: &crate::acceptance::RowPipeline,
+        _pipeline: &metal2vulkan::pipeline::RenderPipeline,
     ) -> Result<crate::acceptance::Acceptance, crate::acceptance::AcceptanceError> {
         Err(crate::acceptance::AcceptanceError::DeviceUnavailable(
             "pipeline creation is supported only on Linux and macOS".into(),
         ))
     }
 
-    pub fn execute_engine(
+    /// No device opens here.
+    pub struct RuntimeKernels(std::convert::Infallible);
+
+    impl RuntimeKernels {
+        pub fn open(
+            _device: DeviceType,
+        ) -> Result<RuntimeKernels, crate::acceptance::AcceptanceError> {
+            Err(crate::acceptance::AcceptanceError::DeviceUnavailable(
+                "pipeline creation is supported only on Linux and macOS".into(),
+            ))
+        }
+
+        pub fn accept(
+            &mut self,
+            _row: &crate::acceptance::RuntimeRow<'_>,
+        ) -> Result<crate::acceptance::Acceptance, crate::acceptance::AcceptanceError> {
+            match self.0 {}
+        }
+
+        pub fn finish(self) -> Result<(), String> {
+            match self.0 {}
+        }
+    }
+
+    pub fn execute_runtime(
         _device: DeviceType,
         _case_id: &str,
         _case: &super::engine::ComputeCase,
-        _compile: impl FnOnce(
-            &crate::worker::compile::WorkerDevice,
-            &metal2vulkan::bind::BindShape,
-        ) -> Result<
-            super::engine::CompiledCase<metal2vulkan::pipeline::ComputePipeline>,
-            ExecutorError,
-        >,
-        _children: impl FnMut(
-            &crate::worker::compile::WorkerDevice,
-            u64,
-            &metal2vulkan::bind::BindShape,
-            &super::engine::ChildCommand,
-        ) -> Result<super::engine::CompiledChild, ExecutorError>,
-        _registered: &[metal2vulkan::bind::ReplayVariant],
-        _backend: Backend,
-    ) -> super::engine::RunAttempt {
-        super::engine::RunAttempt::of(Err(
-            "candidate execution is supported only on Linux and macOS".into(),
-        ))
-    }
-
-    pub fn execute_engine_render(
-        _device: DeviceType,
-        _case_id: &str,
-        _case: &super::engine::graphics::RenderCase,
-        _compile: impl FnOnce(
-            &crate::worker::compile::WorkerDevice,
-            &metal2vulkan::bind::BindShape,
-        ) -> Result<
-            super::engine::CompiledCase<metal2vulkan::pipeline::RenderPipeline>,
-            ExecutorError,
-        >,
-        _children: impl FnMut(
-            &crate::worker::compile::WorkerDevice,
-            u64,
-            &metal2vulkan::bind::BindShape,
-            &super::engine::ChildCommand,
-        ) -> Result<super::engine::CompiledChild, ExecutorError>,
-        _backend: Backend,
+        _kernel: super::engine::RuntimeKernel<'_>,
     ) -> super::engine::RunAttempt {
         super::engine::RunAttempt::of(Err(
             "candidate execution is supported only on Linux and macOS".into(),
@@ -283,61 +180,10 @@ mod platform {
         Err("profile restriction is supported only on Linux and macOS".into())
     }
 
-    pub fn run_robustness_off() -> Result<(), String> {
-        Err("candidate execution is supported only on Linux and macOS".into())
-    }
-
-    pub fn requested_leg() -> crate::coverage::Leg {
-        crate::coverage::Leg::Stated
-    }
-
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub fn opened_worker_device(
         _device: DeviceType,
     ) -> Result<crate::worker::compile::WorkerDevice, ExecutorError> {
         Err("candidate execution is supported only on Linux and macOS".into())
-    }
-
-    /// No restriction runs here ([`restrict_devices_to`] refuses one).
-    pub(crate) enum Restricting {
-        Takes(Box<RuntimeRestriction>),
-        Refused(Box<crate::candidate::engine::RunAttempt>),
-    }
-
-    /// No value: no restriction runs here.
-    pub(crate) enum RuntimeRestriction {}
-
-    impl RuntimeRestriction {
-        pub(crate) fn stem(&self) -> &str {
-            match *self {}
-        }
-
-        pub(crate) fn restrict(
-            &self,
-            _options: &mut metal2vulkan_runtime::DeviceOptions,
-        ) -> Result<(), String> {
-            match *self {}
-        }
-
-        pub(crate) fn check(
-            &self,
-            _device: &metal2vulkan_runtime::Device,
-        ) -> Result<super::RestrictedDevice, String> {
-            match *self {}
-        }
-
-        pub(crate) fn refused_on(
-            &self,
-            _executor: &str,
-        ) -> Result<crate::worker::device::OpenedDevice, String> {
-            match *self {}
-        }
-    }
-
-    pub(crate) fn runtime_restriction(
-        _device_type: DeviceType,
-        _executor: &str,
-    ) -> Result<Option<Restricting>, String> {
-        Ok(None)
     }
 }

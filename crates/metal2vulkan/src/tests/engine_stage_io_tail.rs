@@ -11,29 +11,26 @@
 //!   their features on a profile with none.
 //! - `[[barycentric_coord]]` reads `BaryCoordKHR` or `BaryCoordNoPerspKHR`, its leading lanes for a
 //!   `float` or `float2`, and for a `float3` its first two lanes and `1 - (x + y)` of them as the
-//!   third, Metal's, on a profile with `fragmentShaderBarycentric`; the linked graphics state states
-//!   whether the fragment function reads it.
+//!   third, Metal's, on a profile with `fragmentShaderBarycentric`, and is refused needing the
+//!   feature on a profile without it; the linked graphics state states whether the fragment
+//!   function reads it.
 //!
 //! Every module that compiles passes L3 (`spirv-val` and requirements within the profile) under
 //! the stage-only numbering. `llvm-as` assembles the fixture; a missing tool skips visibly. No
 //! GPU is used.
 
-use crate::device::profile::DriverWorkaround;
 use crate::device::requirements::VkFeature as F;
 use crate::device::{DevicePolicy, DeviceProfile};
 use crate::error::{Capability, Error, Feature, Needs};
 use crate::library::FunctionArtifact;
-use crate::library::FunctionConstantValues;
 use crate::metal::PixelFormat;
-use crate::pipeline::compile::{plan_bitcode, EntryRef};
 use crate::pipeline::descriptor::ColorAttachmentDescriptor;
 use crate::pipeline::link::{link, LinkInputs, RenderLinkInputs};
-use crate::pipeline::lower_inputs::LoweringInputs;
 use crate::pipeline::relocate::relocate;
 use crate::pipeline::stage_io::{Interpolation, IoNumeric, IoRole, IoType, StageBuiltin};
 use crate::pipeline::testing::{
-    compile, compile_kept, compile_with, engine_dir, fragment_inputs, llvm_assemble, meter,
-    profile, AssembleError,
+    compile, compile_kept, compile_with, engine_dir, fragment_inputs, llvm_assemble, profile,
+    profile_without, AssembleError,
 };
 use crate::spirv::ir::{BinOp, ConstKind, Constant, Contraction, Inst, TypedModule, ValueOrigin};
 use crate::spirv::testing::check_words_valid;
@@ -58,7 +55,7 @@ fn fixture() -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 /// Link `a` alone, relocate it, and run L3; the relocated words.
@@ -113,7 +110,7 @@ fn bool_varyings_are_flat_uints_converted_at_both_ends() {
     // (numeric, components, AIR bits) of a `bool` varying of `n` lanes.
     let bool_ty = |n: u8| (IoNumeric::Uint, n, 1u8);
     let parts = |t: &IoType| (t.numeric, t.components, t.source_bits);
-    for stem in ["moltenvk-m3", "lavapipe", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "lavapipe", "runtime-floor"] {
         let p = prof(stem);
         let v = compile(&bc, "tail_vertex_bool", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         let mut r = RenderLinkInputs::new();
@@ -193,9 +190,18 @@ fn a_fragment_primitive_id_takes_the_enabled_alternative() {
         assert!(a.interface.io.builtins.contains(&StageBuiltin::PrimitiveId));
         validate(&a, &p);
     }
-    // The floor has neither: the ID is the flat varying the pipeline's vertex function writes
-    // (`engine_primitive_ids`).
-    let floor = prof("vk12-floor");
+    // `runtime-floor` without `tessellationShader` (below the runtime's floor) has neither: the ID
+    // is the flat varying the pipeline's vertex function writes (`engine_primitive_ids`).
+    let floor = profile_without(
+        "runtime-floor",
+        &[
+            F::TessellationShader,
+            F::ShaderTessellationAndGeometryPointSize,
+            F::MultiviewTessellationShader,
+        ],
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("below the runtime's floor");
     let a = compile(&bc, "tail_fragment_primitive", &floor).expect("floor");
     assert!(a
         .interface
@@ -207,15 +213,18 @@ fn a_fragment_primitive_id_takes_the_enabled_alternative() {
     validate(&a, &floor);
 }
 
-/// Fragment `Layer` and `ViewportIndex` inputs take their enabled alternatives. On the floor, which
-/// can declare neither, no stage can have written either, so the function reads both as 0, Metal's
-/// value with no vertex write (`StageIo::zero_indices`), and declares neither.
+/// Fragment `Layer` and `ViewportIndex` inputs take their enabled alternatives. The floor declares
+/// both, through `shaderOutputLayer`, `shaderOutputViewportIndex` and `multiViewport`. Below it,
+/// without the viewport index's two, no stage can have written the viewport index and the function
+/// reads it as 0, Metal's value with no vertex write (`StageIo::zero_indices`); without
+/// `shaderOutputLayer` too, it reads both as 0 and declares neither.
 #[test]
 fn fragment_layer_and_viewport_inputs_take_the_enabled_alternatives() {
     let Some(bc) = fixture() else { return };
     for (stem, caps) in [
         ("moltenvk-m3", [Cap::ShaderLayer, Cap::MultiViewport]),
         ("lavapipe", [Cap::Geometry, Cap::MultiViewport]),
+        ("runtime-floor", [Cap::ShaderLayer, Cap::MultiViewport]),
     ] {
         let p = prof(stem);
         let a = compile(&bc, "tail_fragment_layer", &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
@@ -228,8 +237,30 @@ fn fragment_layer_and_viewport_inputs_take_the_enabled_alternatives() {
         }
         validate(&a, &p);
     }
-    let floor = prof("vk12-floor");
+    let viewport = [F::ShaderOutputViewportIndex, F::MultiViewport];
+    let floor = profile_without("runtime-floor", &viewport, DevicePolicy::RESIDENT_TABLES)
+        .expect("below the runtime's floor");
     let a = compile(&bc, "tail_fragment_layer", &floor).expect("floor");
+    let io = &a.interface.io;
+    assert_eq!(io.zero_indices, [StageBuiltin::ViewportIndex]);
+    assert!(io.builtins.contains(&StageBuiltin::Layer));
+    assert!(!io.builtins.contains(&StageBuiltin::ViewportIndex));
+    assert!(a
+        .requirements
+        .spirv_capabilities
+        .contains(&spirv_cap(Cap::ShaderLayer)));
+    assert!(!a
+        .requirements
+        .spirv_capabilities
+        .contains(&spirv_cap(Cap::MultiViewport)));
+    validate(&a, &floor);
+    let below = profile_without(
+        "runtime-floor",
+        &[viewport.as_slice(), &[F::ShaderOutputLayer]].concat(),
+        DevicePolicy::RESIDENT_TABLES,
+    )
+    .expect("below the runtime's floor");
+    let a = compile(&bc, "tail_fragment_layer", &below).expect("below the floor");
     let io = &a.interface.io;
     assert_eq!(
         io.zero_indices,
@@ -241,45 +272,33 @@ fn fragment_layer_and_viewport_inputs_take_the_enabled_alternatives() {
         .requirements
         .spirv_capabilities
         .contains(&spirv_cap(Cap::MultiViewport)));
-    validate(&a, &floor);
+    validate(&a, &below);
 }
 
 /// `[[barycentric_coord]]` reads `BaryCoordKHR` (perspective) or `BaryCoordNoPerspKHR`, through
-/// `SPV_KHR_fragment_shader_barycentric`, on a profile with the feature. On MoltenVK 1.4.1, whose
-/// SPIRV-Cross rejects a shader reading both, a function that reads both is refused as the driver's
-/// defect, and one form alone compiles.
+/// `SPV_KHR_fragment_shader_barycentric`, on a profile with the feature (RADV's and MoltenVK's): a
+/// function reading both forms, and one reading one form alone.
 #[test]
 fn barycentric_coordinates_read_the_khr_builtins() {
     let Some(bc) = fixture() else { return };
-    {
-        let stem = "moltenvk-m3";
+    for stem in ["amd-780m-radv", "moltenvk-m3"] {
+        let p = prof(stem);
+        let a = compile(&bc, "tail_fragment_barycentric", &p).expect("barycentric");
         assert_eq!(
-            refused(
-                compile(&bc, "tail_fragment_barycentric", &prof(stem)),
-                "tail_fragment_barycentric"
-            ),
-            (
-                Feature::Barycentrics,
-                Needs::DriverDefect(DriverWorkaround::BothBarycentricFormsRejected)
-            ),
+            a.interface.io.builtins,
+            [
+                StageBuiltin::BaryCoord { perspective: false },
+                StageBuiltin::BaryCoord { perspective: true },
+            ],
             "{stem}"
         );
+        let r = &a.requirements;
+        assert!(r
+            .spirv_capabilities
+            .contains(&spirv_cap(Cap::FragmentBarycentricKHR)));
+        assert!(r.features.contains(&F::FragmentShaderBarycentric));
+        validate(&a, &p);
     }
-    let p = prof("amd-780m-radv");
-    let a = compile(&bc, "tail_fragment_barycentric", &p).expect("barycentric");
-    assert_eq!(
-        a.interface.io.builtins,
-        [
-            StageBuiltin::BaryCoord { perspective: false },
-            StageBuiltin::BaryCoord { perspective: true },
-        ]
-    );
-    let r = &a.requirements;
-    assert!(r
-        .spirv_capabilities
-        .contains(&spirv_cap(Cap::FragmentBarycentricKHR)));
-    assert!(r.features.contains(&F::FragmentShaderBarycentric));
-    validate(&a, &p);
     for stem in ["amd-780m-radv", "moltenvk-m3"] {
         let p = prof(stem);
         let s = compile(&bc, "tail_fragment_barycentric_scalar", &p).expect("scalar barycentric");
@@ -292,83 +311,33 @@ fn barycentric_coordinates_read_the_khr_builtins() {
     }
 }
 
-/// Without `fragmentShaderBarycentric`, `[[barycentric_coord]]` reads the `float2` center varying
-/// of each form it reads (`IoRole::Barycentric`), which the pipeline's synthesized geometry stage
-/// writes: no barycentric builtin, no barycentric feature, and a `float3` read's third weight
-/// `1 - (x + y)` of it, as with the builtin. Behind a vertex function the pipeline links with the
-/// stages. Without `geometryShader` either it needs one of the two.
+/// Without `fragmentShaderBarycentric`, `[[barycentric_coord]]` is refused needing the feature,
+/// with `geometryShader` (`lavapipe`, `intel-irisxe-rplp-anv`, `nvidia-pascal-linux`) or without
+/// it (`runtime-floor`).
 #[test]
-fn without_the_feature_the_weights_are_varyings() {
+fn without_the_feature_the_weights_are_refused() {
     let Some(bc) = fixture() else { return };
-    let float2 = IoType {
-        numeric: IoNumeric::Float,
-        components: 2,
-        source_bits: 32,
-    };
-    for stem in ["lavapipe", "intel-irisxe-rplp-anv", "nvidia-pascal-linux"] {
+    for stem in [
+        "lavapipe",
+        "intel-irisxe-rplp-anv",
+        "nvidia-pascal-linux",
+        "runtime-floor",
+    ] {
         let p = prof(stem);
         assert!(!p.fields().fragment.barycentric, "{stem}");
-        for (entry, forms, weights) in [
-            ("tail_fragment_barycentric", &[true, false][..], 3),
-            ("tail_fragment_barycentric_scalar", &[true][..], 0),
+        for entry in [
+            "tail_fragment_barycentric",
+            "tail_fragment_barycentric_scalar",
         ] {
-            let (a, _, kept) =
-                compile_kept(&bc, entry, &p).unwrap_or_else(|e| panic!("{entry} on {stem}: {e:?}"));
-            assert!(
-                !a.interface
-                    .io
-                    .builtins
-                    .iter()
-                    .any(|b| matches!(b, StageBuiltin::BaryCoord { .. })),
+            assert_eq!(
+                refused(compile(&bc, entry, &p), entry),
+                (
+                    Feature::Barycentrics,
+                    any_of(&[F::FragmentShaderBarycentric])
+                ),
                 "{entry} on {stem}"
             );
-            let read: Vec<(IoRole, IoType)> = a
-                .interface
-                .io
-                .inputs
-                .iter()
-                .map(|v| (v.role.clone(), v.ty))
-                .collect();
-            let want: Vec<(IoRole, IoType)> = forms
-                .iter()
-                .map(|&perspective| (IoRole::Barycentric { perspective }, float2))
-                .collect();
-            assert_eq!(read, want, "{entry} on {stem}");
-            assert!(!a
-                .requirements
-                .features
-                .contains(&F::FragmentShaderBarycentric));
-            assert_eq!(third_weights(&kept), weights, "{entry} on {stem}");
-            validate(&a, &p);
         }
-        let mut r = RenderLinkInputs::new();
-        r.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
-        let v = compile(&bc, "tail_vertex_bool", &p).expect("vertex");
-        let f = compile_with(
-            &bc,
-            "tail_fragment_barycentric",
-            &p,
-            &fragment_inputs(&r, &p),
-        )
-        .unwrap_or_else(|e| panic!("{stem}: {e}"));
-        let linked = link(&[&v, &f], &LinkInputs::Render(Box::new(r)), &p)
-            .unwrap_or_else(|e| panic!("{stem}: link: {e}"));
-        let stages = linked.geometry.as_ref().expect("geometry stages");
-        assert_eq!(stages.forms, [false, true], "{stem}");
-        assert!(stages.varyings.is_empty(), "{stem}");
-    }
-    let floor = prof("vk12-floor");
-    for entry in [
-        "tail_fragment_barycentric",
-        "tail_fragment_barycentric_scalar",
-    ] {
-        assert_eq!(
-            refused(compile(&bc, entry, &floor), entry),
-            (
-                Feature::Barycentrics,
-                any_of(&[F::FragmentShaderBarycentric, F::GeometryShader])
-            )
-        );
     }
 }
 
@@ -464,39 +433,5 @@ fn the_graphics_state_states_whether_the_fragment_function_reads_barycentric_coo
             .graphics
             .expect("graphics");
         assert_eq!(graphics.reads_barycentric_coord, want, "{entry}");
-    }
-}
-
-/// The plan's size estimate bounds the emitted words of every entry, the `bool` conversions and the
-/// barycentric lane reads included.
-#[test]
-fn the_estimate_bounds_every_tail_entry() {
-    let Some(bc) = fixture() else { return };
-    // A profile that compiles every tail entry (on MoltenVK, both barycentric forms are refused).
-    let p = prof("amd-780m-radv");
-    for entry in [
-        "tail_vertex_bool",
-        "tail_fragment_bool",
-        "tail_fragment_primitive",
-        "tail_fragment_layer",
-        "tail_fragment_barycentric",
-        "tail_fragment_barycentric_scalar",
-    ] {
-        let plan = plan_bitcode(
-            &bc,
-            EntryRef::Name(entry),
-            &FunctionConstantValues::defaults(),
-            &p,
-            &LoweringInputs::new(),
-            &mut meter(),
-        )
-        .expect("plan");
-        let a = compile(&bc, entry, &p).expect("compile");
-        let words = a.module.words.len() as u64;
-        assert!(
-            plan.estimate.words >= words,
-            "{entry}: estimate {} < emitted {words}",
-            plan.estimate.words
-        );
     }
 }

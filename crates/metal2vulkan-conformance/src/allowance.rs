@@ -7,9 +7,9 @@
 //! into "we match except where we don't": the degrade catalogue and the accepted-difference list
 //! are checked by execution, not by discipline.
 
+use crate::degradation::Degradation;
 use crate::recording::Validated;
 use crate::transcript::{FloatWidth, Value};
-use metal2vulkan_runtime::Degradation;
 use serde::{Deserialize, Serialize};
 
 /// `docs/API.md`, compiled in: the accepted-difference entries are read from the document itself,
@@ -56,11 +56,10 @@ pub enum Justification {
     /// on.
     ///
     /// **It is scoped to the venue, and held both ways.** It holds only on a run whose device
-    /// presents no such compression (`DeviceProperties::lossless_compression` false, the venue's
-    /// [`crate::case::Venue::lossless_compression`]): on one that presents it, as the M3 Max
-    /// does, it justifies nothing, so the sites it covers compare exactly there and any difference
-    /// at them is a divergence. lavapipe and the RTX 5080 present a Mac with an Intel or AMD GPU,
-    /// so it holds there. Where it is named and no venue without the compression
+    /// presents no such compression (the venue's [`crate::case::Venue::lossless_compression`]
+    /// false): on one that presents it, as the M3 Max does, it justifies nothing, so the sites it
+    /// covers compare exactly there and any difference at them is a divergence. The runtime's
+    /// venue presents none on every device, so it holds there. Where it is named and no venue without the compression
     /// ran, the report counts it as a claim nothing checked
     /// ([`crate::report::Report::unchecked_everywhere`]), as it does a notice no run announced.
     WithoutCompression(String),
@@ -110,16 +109,17 @@ impl Justification {
     /// recording's validated oracle does not say what the case claims it says, or the venue
     /// presents the compression a venue's own answer needs it not to.
     pub fn unjustified(&self, offered: &Offered<'_>) -> Option<Unjustified> {
-        match self {
-            Justification::Degradation(code) => {
-                if !Degradation::ALL.iter().any(|kind| kind.code() == code) {
-                    return Some(Unjustified::NoSuchDegradation(code.clone()));
-                }
-                if !offered.announced.iter().any(|notice| notice == code) {
-                    return Some(Unjustified::NoticeNotAnnounced(code.clone()));
-                }
-                None
+        let notice = |code: &String| {
+            if !Degradation::ALL.iter().any(|kind| kind.code() == code) {
+                return Some(Unjustified::NoSuchDegradation(code.clone()));
             }
+            if !offered.announced.iter().any(|notice| notice == code) {
+                return Some(Unjustified::NoticeNotAnnounced(code.clone()));
+            }
+            None
+        };
+        match self {
+            Justification::Degradation(code) => notice(code),
             Justification::AcceptedDifference(slug) => {
                 (!accepted_differences().iter().any(|entry| entry == slug))
                     .then(|| Unjustified::NoSuchAcceptedDifference(slug.clone()))
@@ -274,8 +274,7 @@ pub enum Loosening {
     AnyOf(Vec<Value>),
     /// An integer zero exactly where the recorded one is: any nonzero value stands for any other.
     /// For a value whose contract states only whether it is zero, such as a `Boolean` visibility
-    /// result, which is the device's own nonzero value where Metal's M3 Max writes 1
-    /// (`device-boolean-visibility`).
+    /// result, where Metal's M3 Max writes 1.
     Nonzero,
     /// The value is not compared. The justification still has to hold, and the report says the
     /// field went unchecked.

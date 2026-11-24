@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::device::profile::{CubeGradientRoute, DeviceProfile};
+use crate::device::profile::DeviceProfile;
 use crate::device::requirements::VkFeature;
 use crate::device::DevicePolicy;
 use crate::device::{Device, DeviceDescription};
@@ -35,7 +35,7 @@ use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, AssembleError,
 };
 use crate::pipeline::PrecisionNote;
-use crate::spirv::testing::{committed_descriptions, committed_profiles};
+use crate::spirv::testing::committed_profiles;
 
 const OP_EXT_INST: u16 = 12;
 const OP_CONSTANT: u16 = 43;
@@ -98,15 +98,10 @@ fn unrobust(stem: &str) -> DeviceProfile {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    for f in [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ] {
+    for f in [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2] {
         desc.features.remove(&f);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -283,24 +278,17 @@ fn glsl(a: &FunctionArtifact, number: u32) -> usize {
 /// name is `sampler.sample_cube_grad`, and the module records `CubeGradientFootprint`. The 3D and
 /// depth 2D and 2D array gradient samples pass their gradients unchanged (`sampler.sample_grad`),
 /// and a module whose gradients are all 2D (the 2D fixture's, through a runtime sampler) records no
-/// such note. On a driver that
-/// hands a compute pipeline's cube gradients to Metal's `gradientcube`
-/// (`CubeGradientRoute::Metal`), the kernel hands Metal's own gradients, exactly: no note.
+/// such note, on every profile.
 #[test]
 fn explicit_cube_gradients_take_metals_footprint() {
-    let handed = handed_metal();
     let Some((compiled, _)) = each("unk_sample_grad", "unk_sample_grad", |stem, a| {
         assert_eq!(uses(a, "sampler.sample_cube_grad"), 6, "{stem}");
         assert_eq!(uses(a, "sampler.sample_grad"), 5, "{stem}");
-        let metal = handed.iter().any(|m| m == stem);
         assert_eq!(glsl(a, GLSL_LENGTH), 0, "{stem}");
-        if !metal {
-            let samples = uses(a, "sampler.sample_cube_grad") as usize;
-            assert!(glsl(a, GLSL_FMAX) >= 4 * samples, "{stem}");
-        }
-        assert_eq!(
+        let samples = uses(a, "sampler.sample_cube_grad") as usize;
+        assert!(glsl(a, GLSL_FMAX) >= 4 * samples, "{stem}");
+        assert!(
             a.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            !metal,
             "{stem}: {:?}",
             a.precision
         );
@@ -308,7 +296,6 @@ fn explicit_cube_gradients_take_metals_footprint() {
         return;
     };
     assert!(compiled >= 4, "{compiled}");
-    assert!(!handed.is_empty(), "no profile hands Metal's gradients");
     let Some((compiled, _)) = each("a4_sample_grad", "a4_sample_grad", |stem, a| {
         assert_eq!(uses(a, "sampler.sample_cube_grad"), 0, "{stem}");
         assert!(uses(a, "sampler.sample_grad") > 0, "{stem}");
@@ -334,9 +321,8 @@ const CUBE_GRAD_TEXTURES: usize = 2;
 /// Metal's level and taps: each texture's routine, which its samples call, queries the level count
 /// and loops over its taps, `AnisotropicFilter` is recorded and `CubeGradientFootprint` is not;
 /// with the feature, and through the isotropic sampler on every profile, the device's sample at
-/// Metal's footprint: no loop, no level query, `CubeGradientFootprint` recorded. On a driver that
-/// hands a compute pipeline's cube gradients to Metal's `gradientcube`, the kernel hands Metal's
-/// own through either sampler: no note. Neither module has a `Length`.
+/// Metal's footprint: no loop, no level query, `CubeGradientFootprint` recorded. Neither module
+/// has a `Length`.
 #[test]
 fn an_anisotropic_constexpr_sampler_takes_metals_cube_gradient_footprint() {
     let path = engine_dir().join("unk_cube_grad_lod.ll");
@@ -360,21 +346,18 @@ fn an_anisotropic_constexpr_sampler_takes_metals_cube_gradient_footprint() {
         return;
     };
     let mut compiled = 0;
-    let handed = handed_metal();
     for (stem, p) in profiles() {
         let Some(i) = artifact(&iso, "unk_cube_grad_lod", &stem, &p) else {
             continue;
         };
-        let metal = handed.contains(&stem);
         let shader = !p.fields().images.sampler_anisotropy;
         assert_eq!(glsl(&i, GLSL_LENGTH), 0, "{stem}");
         let samples = uses(&i, "sampler.sample_cube_grad") as usize;
         assert!(samples > 0, "{stem}");
         assert_eq!(count(&i, OP_IMAGE_QUERY_LEVELS), 0, "{stem}");
         assert_eq!(count(&i, OP_LOOP_MERGE), 0, "{stem}");
-        assert_eq!(
+        assert!(
             i.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            !metal,
             "{stem}"
         );
         assert!(
@@ -403,7 +386,7 @@ fn an_anisotropic_constexpr_sampler_takes_metals_cube_gradient_footprint() {
         );
         assert_eq!(
             a.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            !metal && !shader,
+            !shader,
             "{stem}: {:?}",
             a.precision
         );
@@ -411,16 +394,12 @@ fn an_anisotropic_constexpr_sampler_takes_metals_cube_gradient_footprint() {
     assert!(compiled >= 4, "{compiled}");
 }
 
-/// An unmeasured route: `moltenvk-m3` without its measured compute cube-gradient route (as a
-/// MoltenVK release no measurement covers) takes Vulkan's rule, the device's own reading of the
-/// form handed to it: `unk_cube_grad_lod` through its isotropic sampler and through an anisotropic
-/// constexpr one queries no level count, loops over no taps and records `CubeGradientFootprint`,
-/// not `AnisotropicFilter`. The measured description hands Metal's own gradients: no level query,
-/// no note.
+/// Vulkan's cube-gradient rule: `moltenvk-m3` takes the device's own reading of the form handed
+/// to it: `unk_cube_grad_lod` through its isotropic sampler and through an anisotropic constexpr
+/// one queries no level count, loops over no taps and records `CubeGradientFootprint`, not
+/// `AnisotropicFilter`.
 #[test]
-fn an_unmeasured_cube_gradient_route_takes_the_devices_reading() {
-    use crate::device::profile::CubeGradients;
-    use crate::error::DriverDeviation;
+fn a_cube_gradient_route_takes_the_devices_reading() {
     let path = engine_dir().join("unk_cube_grad_lod.ll");
     let text = std::fs::read_to_string(&path).expect("fixture");
     let word: u64 = 34_901_797_601_019_977;
@@ -441,23 +420,11 @@ fn an_unmeasured_cube_gradient_route_takes_the_devices_reading() {
             .join("../metal2vulkan-validation/profiles/moltenvk-m3.json"),
     )
     .expect("profile");
-    let measured = DeviceDescription::from_khronos_json(&profile_text, None).expect("description");
-    let profile = |d: DeviceDescription, taken: bool| {
-        let route = DriverDeviation::CubeGradientRoute;
-        Device::with_deviation(d, DevicePolicy::default(), route, taken)
-            .expect("device")
-            .profile()
-            .clone()
-    };
-    let (measured, unmeasured) = (profile(measured.clone(), true), profile(measured, false));
-    // The graphics route is its own deviation, measured on macOS 27's identity either way.
-    assert_eq!(
-        unmeasured.fields().cube_gradients,
-        CubeGradients {
-            graphics: CubeGradientRoute::AppleProjected,
-            compute: CubeGradientRoute::Vulkan,
-        }
-    );
+    let desc = DeviceDescription::from_khronos_json(&profile_text, None).expect("description");
+    let unmeasured = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
+        .expect("device")
+        .profile()
+        .clone();
     for (bc, taps) in [(&iso, false), (&aniso, true)] {
         let what = if taps { "anisotropic" } else { "isotropic" };
         let u = artifact(bc, "unk_cube_grad_lod", "unmeasured", &unmeasured).expect(what);
@@ -474,94 +441,6 @@ fn an_unmeasured_cube_gradient_route_takes_the_devices_reading() {
             u.precision.contains(&PrecisionNote::CubeGradientFootprint),
             "{what}: {:?}",
             u.precision
-        );
-        let m = artifact(bc, "unk_cube_grad_lod", "measured", &measured).expect(what);
-        assert_eq!(count(&m, OP_IMAGE_QUERY_LEVELS), 0, "{what}");
-        assert!(
-            !m.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            "{what}"
-        );
-        assert!(
-            !m.precision.contains(&PrecisionNote::AnisotropicFilter),
-            "{what}"
-        );
-    }
-}
-
-/// On the Apple M3 Max's identity (`moltenvk-m3`'s capture) a fragment function's explicit cube
-/// gradients through an anisotropic constexpr sampler take SPIRV-Cross's fixup in its projected
-/// form (`AppleProjected`), exact on an `x` or `z` face and a near-equivalent on a `y` face, with
-/// `CubeGradientFootprint`. Without the route's measurement the same fragment takes Vulkan's rule,
-/// the device's reading, with `CubeGradientFootprint` and without `AnisotropicFilter`, while the
-/// kernel route stays Metal's and the kernel of the same samples compiles. The cover vertex
-/// function compiles on each.
-#[test]
-fn the_graphics_cube_route_is_the_measured_projected_form() {
-    use crate::error::DriverDeviation;
-    let (Some(fragment), Some(kernel)) =
-        (fixture("rtl_cube_grad_fragment"), fixture("ani_cube_grad"))
-    else {
-        return;
-    };
-    let all = committed_profiles().expect("profiles");
-    let of = |stem: &str| {
-        all.iter()
-            .find(|(s, _)| s == stem)
-            .map(|(_, p)| p.clone())
-            .expect(stem)
-    };
-    let m3_27 = of("moltenvk-m3");
-    let m3_macos27 = committed_descriptions()
-        .expect("descriptions")
-        .iter()
-        .find(|(s, _)| s == "moltenvk-m3")
-        .map(|(_, d)| d.clone())
-        .expect("moltenvk-m3");
-    assert_eq!(
-        (
-            m3_27.fields().cube_gradients.graphics,
-            m3_27.fields().cube_gradients.compute
-        ),
-        (CubeGradientRoute::AppleProjected, CubeGradientRoute::Metal)
-    );
-    let tangents = DriverDeviation::GraphicsCubeGradientTangents;
-    let unmeasured = Device::with_deviation(m3_macos27, DevicePolicy::default(), tangents, false)
-        .expect("device")
-        .profile()
-        .clone();
-    assert_eq!(
-        unmeasured.fields().cube_gradients.graphics,
-        CubeGradientRoute::Vulkan
-    );
-    let a = artifact(&fragment, "rtl_cube_grad_fragment", "moltenvk-m3", &m3_27).expect("m3");
-    assert!(
-        a.precision.contains(&PrecisionNote::CubeGradientFootprint),
-        "{:?}",
-        a.precision
-    );
-    let a = artifact(
-        &fragment,
-        "rtl_cube_grad_fragment",
-        "unmeasured",
-        &unmeasured,
-    )
-    .expect("an unmeasured graphics route");
-    assert!(
-        !a.precision.contains(&PrecisionNote::AnisotropicFilter),
-        "{:?}",
-        a.precision
-    );
-    assert!(
-        a.precision.contains(&PrecisionNote::CubeGradientFootprint),
-        "{:?}",
-        a.precision
-    );
-    for (stem, p) in [("moltenvk-m3", &m3_27), ("unmeasured", &unmeasured)] {
-        artifact(&fragment, "rtl_cube_cover", stem, p).expect(stem);
-        let k = artifact(&kernel, "ani_cube_grad", stem, p).expect(stem);
-        assert!(
-            !k.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            "{stem}"
         );
     }
 }
@@ -591,13 +470,11 @@ declare { <4 x float>, i8 } @air.sample_texture_cube_grad.v4f32(ptr addrspace(1)
 "#;
 
 /// A cube's explicit gradients through a runtime sampler slot take their footprint by the slot's
-/// word on every profile whose route is measured and not Metal's: the slot's `SamplerState`
+/// word on every profile: the slot's `SamplerState`
 /// specialization reads `SamplerWord::ANISOTROPIC`, the module computes the isotropic form
 /// (Metal's length per gradient, two `FMax` each; macOS 26.7's fixup a `Length` instead) beside
 /// the anisotropic one and records `CubeGradientFootprint`, so the plan takes an anisotropic
-/// sampler there. On a driver that hands a compute pipeline's cube gradients to Metal's
-/// `gradientcube`, the kernel hands Metal's own: no word read, no note. `moltenvk-m3` without its
-/// measured route (unmeasured) takes Vulkan's rule, by the word too.
+/// sampler there.
 #[test]
 fn a_runtime_samplers_cube_gradients_take_their_footprint_by_its_word() {
     use crate::metal::sampler::SamplerWord;
@@ -605,26 +482,11 @@ fn a_runtime_samplers_cube_gradients_take_their_footprint_by_its_word() {
     let Some(bc) = assemble_text("runtime_cube_grad", RUNTIME_CUBE_GRAD) else {
         return;
     };
-    let profile_text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../metal2vulkan-validation/profiles/moltenvk-m3.json"),
-    )
-    .expect("profile");
-    let unmeasured =
-        DeviceDescription::from_khronos_json(&profile_text, None).expect("description");
-    let route = crate::error::DriverDeviation::CubeGradientRoute;
-    let unmeasured = Device::with_deviation(unmeasured, DevicePolicy::default(), route, false)
-        .expect("device")
-        .profile()
-        .clone();
-    let mut all = profiles();
-    all.push(("unmeasured".to_string(), unmeasured));
-    let (mut by_word, mut handed) = (0, 0);
-    for (stem, p) in all {
+    let mut by_word = 0;
+    for (stem, p) in profiles() {
         let Some(a) = artifact(&bc, "runtime_cube_grad", &stem, &p) else {
             continue;
         };
-        let route = p.fields().cube_gradients.compute;
         let fields = a.interface.read_keys().into_iter().find_map(|k| match k {
             SpecKey::SamplerState { fields, .. } => Some(fields),
             _ => None,
@@ -632,31 +494,10 @@ fn a_runtime_samplers_cube_gradients_take_their_footprint_by_its_word() {
         let reads = fields.is_some_and(|f| f & SamplerWord::ANISOTROPIC != 0);
         let noted = a.precision.contains(&PrecisionNote::CubeGradientFootprint);
         let lengths = glsl(&a, GLSL_FMAX) >= 4 || glsl(&a, GLSL_LENGTH) >= 2;
-        match route {
-            CubeGradientRoute::Metal => {
-                assert!(!reads, "{stem}: {fields:?}");
-                assert!(!noted, "{stem}");
-                handed += 1;
-            }
-            CubeGradientRoute::Vulkan => {
-                assert!(reads, "{stem}: {fields:?}");
-                assert!(lengths, "{stem}");
-                assert!(noted, "{stem}");
-                by_word += 1;
-            }
-            CubeGradientRoute::AppleProjected => panic!("{stem}: a kernel's route {route:?}"),
-        }
+        assert!(reads, "{stem}: {fields:?}");
+        assert!(lengths, "{stem}");
+        assert!(noted, "{stem}");
+        by_word += 1;
     }
     assert!(by_word >= 5, "{by_word}");
-    assert!(handed > 0, "no profile hands Metal's gradients");
-}
-
-/// The test profiles whose driver hands a compute pipeline's cube gradients to Metal's
-/// `gradientcube` as given (`CubeGradientRoute::Metal`).
-fn handed_metal() -> Vec<String> {
-    profiles()
-        .into_iter()
-        .filter(|(_, p)| p.fields().cube_gradients.compute == CubeGradientRoute::Metal)
-        .map(|(stem, _)| stem)
-        .collect()
 }

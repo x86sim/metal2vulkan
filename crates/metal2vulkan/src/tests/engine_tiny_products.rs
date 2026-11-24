@@ -9,21 +9,17 @@
 //! `2^-126` there, and the module takes the device's multiply (announced once per device,
 //! `float-tininess-after-rounding`).
 //!
-//! The CPU SPIR-V interpreter rounds first and keeps denormals, as a device without
-//! `DriverDeviation::MetalFloatDenormals` may, so on each such committed profile (one per fused
-//! multiply-add route) it shows what the device answers. `llvm-as` assembles the fixtures; without
+//! The CPU SPIR-V interpreter rounds first and keeps denormals, as a device may, so on each
+//! committed profile (one per fused multiply-add route) it shows what the device answers. `llvm-as` assembles the fixtures; without
 //! it the tests skip visibly.
 
 use crate::device::{DevicePolicy, DeviceProfile};
-use crate::error::DriverDeviation;
-use crate::lower::arith::fma;
 use crate::pipeline::sym::{ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, link_and_validate, llvm_assemble, typed_module, AssembleError,
 };
 use crate::spirv::interp::{run, Buffer, Config, Resources};
 use crate::spirv::testing::committed_profiles_with;
-use std::collections::BTreeSet;
 
 /// Metal's words (`tiny_products_m3.txt`).
 const WORDS: &str = include_str!("tiny_products_m3.txt");
@@ -138,16 +134,13 @@ fn interpret(bc: &[u8], entry: &str, p: &DeviceProfile, threads: &[Thread]) -> V
         .collect()
 }
 
-/// The committed profiles whose device may keep denormals (no
-/// `DriverDeviation::MetalFloatDenormals`), as the interpreter does, one per fused multiply-add
-/// route.
+/// The first committed profile (every one's fused multiply-add is the device's `Fma`): each device
+/// may keep denormals, as the interpreter does.
 fn keeping() -> Vec<(String, DeviceProfile)> {
-    let mut seen = BTreeSet::new();
-    committed_profiles_with(DevicePolicy::default())
+    committed_profiles_with(DevicePolicy::RESIDENT_TABLES)
         .expect("profiles")
         .into_iter()
-        .filter(|(_, p)| !p.takes_driver_deviation(DriverDeviation::MetalFloatDenormals))
-        .filter(|(_, p)| seen.insert(fma::float_route(p)))
+        .take(1)
         .collect()
 }
 
@@ -168,7 +161,7 @@ fn a_tiny_product_is_the_device_s() {
         let Some(bc) = assemble(entry) else {
             return;
         };
-        for (stem, p) in committed_profiles_with(DevicePolicy::default()).expect("profiles") {
+        for (stem, p) in committed_profiles_with(DevicePolicy::RESIDENT_TABLES).expect("profiles") {
             let what = format!("{entry} on {stem}");
             let a = compile(&bc, entry, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
@@ -217,7 +210,7 @@ fn the_fast_entry_keeps_no_zero_signs() {
     let Some(bc) = assemble(entry) else {
         return;
     };
-    for (stem, p) in committed_profiles_with(DevicePolicy::default()).expect("profiles") {
+    for (stem, p) in committed_profiles_with(DevicePolicy::RESIDENT_TABLES).expect("profiles") {
         let what = format!("{entry} on {stem}");
         let a = compile(&bc, entry, &p).unwrap_or_else(|e| panic!("{what}: {e:?}"));
         let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));

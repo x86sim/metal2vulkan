@@ -14,7 +14,7 @@ use crate::pipeline::{ComputePipelineDescriptor, FunctionDescriptor, StageSource
 
 const ENTRY: &str = "kernel_texture_unit_bit_test";
 
-const PROFILES: [&str; 3] = ["lavapipe", "amd-rdna3-radv", "moltenvk-m3"];
+const PROFILES: [&str; 3] = ["lavapipe", "amd-780m-radv", "moltenvk-m3"];
 
 fn fixture() -> Option<Vec<u8>> {
     match llvm_assemble(&fixtures_dir().join(format!("{ENTRY}.ll"))) {
@@ -29,7 +29,7 @@ fn fixture() -> Option<Vec<u8>> {
 
 /// The fixture's kernel as the compile specializes it for profile `stem`, printed.
 fn specialized(bc: &[u8], stem: &str) -> String {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
+    let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let none = FunctionConstantValues::defaults();
     match specialized_entry(bc, ENTRY, &p, &none, &[], &mut meter()) {
         Ok(e) => print(&e.module),
@@ -45,9 +45,9 @@ fn a_cube_sample_no_picked_unit_reaches_is_deleted() {
     let library = Library::from_air(&bc).expect("library");
     for stem in PROFILES {
         let text = specialized(&bc, stem);
-        let dev = Device::new(
+        let dev = Device::from_queries(
             description(stem).expect("committed description"),
-            DevicePolicy::default(),
+            DevicePolicy::RESIDENT_TABLES,
         )
         .expect("device");
         let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(

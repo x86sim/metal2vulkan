@@ -32,12 +32,14 @@ they bind people too.
 │   │   ├── tests/                #   integration tests through the public API, golden tables
 │   │   └── examples/             #   api_preview.rs, which docs/API.md quotes
 │   ├── metal2vulkan-air/         # the AIR front end
-│   ├── metal2vulkan-runtime/     # the Metal API on Vulkan (README, examples)
+│   ├── metal2vulkan-runtime/     # the runtime, the Metal API on Vulkan (README)
 │   ├── metal2vulkan-validation/  # unpublished: cases, executors, corpus tools
 │   │   ├── fixtures/public/      #   our own synthetic fixtures (.ll, .air.ll, .metal, .spvasm)
 │   │   ├── profiles/             #   committed Khronos device profiles
 │   │   └── corpus/               #   authored cases and observations (local/ is private, ignored)
-│   └── metal2vulkan-devtools/    # unpublished: tool runner, fixture assemblers
+│   ├── metal2vulkan-conformance/ # unpublished: the Metal conformance suite
+│   ├── metal2vulkan-devtools/    # unpublished: tool runner, fixture assemblers
+│   └── metal2vulkan-harness/     # unpublished: the runtime's compute harness (crate docs)
 ├── docs/                         # guides and generated references
 ├── scripts/                      # developer utilities and generators
 ├── Cargo.toml                    # the virtual workspace
@@ -52,14 +54,18 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 scripts/api-docs   # the translator's API reference; fails on a link to a hidden item
-cargo nextest run -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime -p metal2vulkan-devtools --all-features
+cargo nextest run -p metal2vulkan -p metal2vulkan-air -p metal2vulkan-runtime -p metal2vulkan-devtools -p metal2vulkan-harness --all-features
 cargo nextest run -p metal2vulkan-validation --all-features
+cargo nextest run -p metal2vulkan-conformance --all-features
 cargo test --workspace --all-features --doc
 ```
 
 None of these opens a device. Device tests compile only under `--cfg m2v_gpu` or
 `--cfg m2v_cpu_icd`, and on a GPU the tests that fault it, hold it for long or allocate toward its
 limits only with `--cfg m2v_gpu_hazards` too ([docs/VALIDATION.md](docs/VALIDATION.md)).
+`metal2vulkan-runtime`'s device tests run under the Khronos validation layer and fail without it: point
+`VK_LAYER_PATH` at the layer's directory (`scripts/validation-layer`; docs/VALIDATION.md, "The
+validation layer under `metal2vulkan-runtime`'s device tests").
 
 To build the command:
 
@@ -96,6 +102,23 @@ build fingerprint). kache imports incremental state only between targets inside 
 a `CARGO_TARGET_DIR` outside the worktree neither gives nor takes it. `seed-target new` takes such
 a path too (`scripts/seed-target new WORKTREE/target SEED WORKTREE`).
 
+### The matrix
+
+After a landing on `development`, run the matrix on its tip:
+
+```sh
+scripts/matrix/matrix run development     # or a sha; --legs 1002:744c,lavapipe for some legs
+scripts/matrix/matrix show development    # the verdicts already attached to it
+```
+
+It dispatches every leg through potluck at priority 5, waits for them, writes the commit's note
+under `refs/notes/matrix`, and prints one verdict line per leg; it exits 0 only when every leg
+passes. `--dry-run` prints the legs and their nodes and dispatches nothing. Runs never overlap: a
+second one refuses to start. It keeps its state (its own checkout, workspaces, measured job sizes,
+each run's job logs and note) in `~/.cache/metal2vulkan-matrix/`, and reads the lab's builders from
+`~/.config/metal2vulkan/matrix.json` (the script's header has the format).
+[docs/VALIDATION.md](docs/VALIDATION.md) has the legs and the rules.
+
 ## Where tests go
 
 - A test that names an internal item is a unit test of its crate: under `src/tests/` (or its
@@ -120,9 +143,11 @@ fixture entry point on every committed profile, in `crates/metal2vulkan/tests/go
 `cache::SEMANTICS_VERSION` is part of every cache key, so a change that moves a cell while its
 fixture and profile are unchanged must bump `SEMANTICS_VERSION`
 (`crates/metal2vulkan/src/cache/mod.rs`) in the same change. New, removed or edited fixtures and
-profiles need only the bless. The table records cells only, no version: a `SEMANTICS_VERSION` bump
-alone leaves it unchanged, and the bless on `development` refuses a cell that moved under an
-unchanged fixture and profile when `SEMANTICS_VERSION` is still its value at the table's last bless.
+profiles need only the bless. The table records `SEMANTICS_VERSION` as it was at its bless (its
+`semantics` line), which a bump alone leaves unchanged. A cell that moved under an unchanged fixture
+and profile while `SEMANTICS_VERSION` is still the table's fails the check as a missing bump, and
+the bless on `development` refuses it; once `SEMANTICS_VERSION` is above the table's, the same cell
+is a bless due.
 
 The tables are re-blessed on `development` after merges, so a change need not carry its own bless.
 One command blesses both (on macOS, which has `xcrun metal-as`):
@@ -142,31 +167,31 @@ Edit the source, then regenerate:
 
 | Doc | Generator | Source |
 |---|---|---|
-| `docs/REFUSALS.md` | `python3 scripts/refusal-surface/refusal_surface.py` (`--check` to verify, `--missing-basis` and `--missing-reach` to list the gaps, `--selftest` for the basis parse's own cases) | the code's refusal types, the `Basis:` line each refusal's doc comment ends with; `reach.tsv` beside the script |
+| `docs/REFUSALS.md`, `crates/metal2vulkan-runtime/src/error/basis.rs` | `python3 scripts/refusal-surface/refusal_surface.py` (`--check` to verify, `--missing-basis` and `--missing-reach` to list the gaps, `--selftest` for the basis parse's and the generator's own cases) | the code's refusal types, the `Basis:` line each refusal's doc comment ends with; `reach.tsv` beside the script |
 | `docs/METAL-COVERAGE.md` | `python3 scripts/metal-coverage/coverage.py` (`--check` to verify) | `scripts/metal-coverage/coverage.tsv` |
 | `docs/CONFORMANCE-COVERAGE.md` | `python3 scripts/conformance-coverage/coverage.py` (`--check` to verify, `--selftest` for the option-space axis's own tests) | the suite's sources, its committed recordings, `scripts/metal-coverage/coverage.tsv`, `objc2_metal.tsv`, and the generated Metal enum tables |
 | `crates/metal2vulkan/src/spv.rs`, `crates/metal2vulkan/src/spirv_binary/table.rs` | `scripts/regen-spirv-grammar/regen-spirv-grammar.sh` | Khronos SPIRV-Headers' grammar JSON, and `items.txt` beside the script |
 | `crates/metal2vulkan-validation/profiles/*.json` | `scripts/regen-device-profiles/` | gpuinfo reports and local captures |
 
 `crates/metal2vulkan/tests/api_signatures.tsv` is written the same way: the signature-level public
-surface of the three published crates, by `python3 scripts/api-signatures/signatures.py --bless`
-(`--check` to verify, `--selftest` for the derivation's own tests), from those crates' sources
-alone. `crates/metal2vulkan/tests/api_signatures.rs` says what it pins, what it cannot see, and
-what blessing it asserts; a removed or changed line is a breaking change of a published crate.
+surface of the three published crates, by
+`python3 scripts/api-signatures/signatures.py --bless` (`--check` to verify, `--selftest` for the
+derivation's own tests), from those crates' sources alone.
+`crates/metal2vulkan/tests/api_signatures.rs` says what it pins, what it cannot see, and what
+blessing it asserts; a removed or changed line is a breaking change of a published crate.
 
-Four docs are checked by tests. `docs/REFUSALS.md` must be the surface the sources state, and
-every variant of the runtime's `Problem` must end its doc comment with a `Basis:` line that says
+Three docs are checked by tests. `docs/REFUSALS.md` must be the surface the sources state, and
+every variant of the runtime's refusal enums must end its doc comment with a `Basis:` line that says
 where the belief that Metal refuses that input comes from and cites its evidence
 (`crates/metal2vulkan/tests/refusal_surface.rs`, which says what it cannot see; a basis that is
-not settled is `Basis: unknown (why)`, never nothing). `docs/FAST-PATHS.md` must name every
-`DevicePolicy` accuracy choice and the notes it records (`tests::fast_paths`); `docs/API.md` must list every degrade code
+not settled is `Basis: unknown (why)`, never nothing); `docs/API.md` must list every degrade code
 with its category and quote `examples/api_preview.rs` verbatim in its `rust` blocks; and
 `docs/METAL-COVERAGE.md` must carry the coverage table's totals.
 
 ## Changes
 
-- Follow [AGENTS.md](AGENTS.md): structure over names, honest refusals, fast defaults with exact
-  switches (and their row in `docs/FAST-PATHS.md`), tests for every fixed bug class.
+- Follow [AGENTS.md](AGENTS.md): structure over names, honest refusals, one form per Vulkan
+  capability, tests for every fixed bug class.
 - One concern per commit when practical; run `cargo fmt --all` first.
 - Update the docs a consumer reads when what they describe changes: `docs/API.md` and
   `examples/api_preview.rs` for the translator's API, the runtime's README and rustdoc for the
@@ -181,6 +206,7 @@ metal2vulkan is dual-licensed, `GPL-2.0-or-later OR LGPL-3.0-or-later`, at the r
 can be redistributed and modified under either.
 
 The license files sit at the root and, because cargo packages each crate from its own directory,
-as copies in every published crate (`crates/metal2vulkan`, `crates/metal2vulkan-air` and
-`crates/metal2vulkan-runtime`). Change them at the root and copy them over; a validation test (`published_crates`) holds every copy equal to the root's file
+as copies in every published crate (`crates/metal2vulkan` and `crates/metal2vulkan-air`). Change
+them at the root and copy them over; a validation test (`published_crates`) holds every copy equal
+to the root's file
 and the notice's SPDX line equal to the manifests' `license`.

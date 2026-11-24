@@ -2,7 +2,8 @@
 //!
 //! `api_surface` pins the **names** `metal2vulkan` exports and the construction class of each
 //! public type; `metal2vulkan-air`'s own `api_surface` pins its names. Neither pins a method's
-//! parameters or its return type, neither covers `metal2vulkan-runtime` at all, and neither sees a
+//! parameters or its return type, neither covers `metal2vulkan-runtime` at
+//! all, and neither sees a
 //! method or an enum variant disappear — so a parameter added to a public method, a return type
 //! widened to an `Option`, a unit variant that became a struct variant, and a `pub fn` that
 //! stopped being public are all breaking changes those tables pass. This test is what makes them
@@ -38,8 +39,8 @@
 //!   of its record, so a derive that is dropped does show.
 //! - A method a macro expands. The declaring macro's template stands for every type it declares,
 //!   so a change to the generated methods shows once, against the template, not once per type.
-//! - A value the build computes. `cache::SOURCE_DIGEST` is `env!("M2V_SOURCE_DIGEST")`: its type
-//!   is a record and its value is that call, never the digest.
+//! - A value the build computes. A constant that is an `env!(..)` call has its type as a record
+//!   and its value as that call, never the value.
 //! - The values of `cache::SEMANTICS_VERSION`, `cache::ARTIFACT_FORMAT_VERSION` and
 //!   `cache::RUNTIME_VERSION`. Their declarations are pinned like any other constant; their
 //!   values are not recorded, because this repository bumps them whenever behaviour, an encoding
@@ -132,11 +133,12 @@ fn the_derivation_still_sees_what_it_claims() {
 ///
 /// `--check` holds the table to the derivation, and holds the derivation to a floor. Neither
 /// notices a table that was truncated and blessed while the derivation was truncated the same
-/// way, so the committed file is read here on its own terms: every published crate is in it, in
+/// way, so the committed file is read here on its own terms: every crate it pins is in it, in
 /// quantity, and each kind of record it claims to carry is present. The floor is far under the
-/// real counts and says only that a table of a few items is wrong rather than quiet.
+/// real counts and says only that a table of a few items is wrong rather than quiet; the new
+/// runtime's is low because its surface is new.
 #[test]
-fn the_table_covers_all_three_published_crates() {
+fn the_table_covers_every_crate_it_pins() {
     let path = table_path();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
     let mut per_crate: BTreeMap<&str, usize> = BTreeMap::new();
@@ -157,10 +159,14 @@ fn the_table_covers_all_three_published_crates() {
             .entry(key.split("::").next().unwrap_or_default())
             .or_default() += 1;
     }
-    for name in ["metal2vulkan", "metal2vulkan-runtime", "metal2vulkan-air"] {
+    for (name, least) in [
+        ("metal2vulkan", 1000),
+        ("metal2vulkan-air", 1000),
+        ("metal2vulkan-runtime", 20),
+    ] {
         let got = per_crate.get(name).copied().unwrap_or_default();
         assert!(
-            got >= 1000,
+            got >= least,
             "{path:?} holds {got} record(s) for {name}, which is not that crate's public \
              surface: the table was truncated, not derived. Counts: {per_crate:?}"
         );

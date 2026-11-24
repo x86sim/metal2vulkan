@@ -1,5 +1,4 @@
-//! Metal's private texture fills of multisample textures, ported from
-//! `runtime_lane::sample_fills`.
+//! Metal's private texture fills of multisample textures.
 //!
 //! The probe (`ms.m`, an Apple M3 Max under macOS 27.0.1): a private multisample texture of 5 x 3
 //! texels (a two-slice array for one), every slice cleared by a render pass that draws nothing
@@ -15,32 +14,26 @@
 //!
 //! **One case per row**, so a sample count the venue does not render stops that row alone and the
 //! suite counts it as [`LacksFeature`](crate::verdict::Verdict::LacksFeature). That is not
-//! cosmetic: lavapipe does not render 2 samples, which Vulkan leaves optional, and the lane's own
-//! loop prints a line and carries on, leaving nothing compared and nothing counted.
+//! cosmetic: lavapipe does not render 2 samples, which Vulkan leaves optional.
 //!
-//! **The honest gap.** `d32-wide-4` fills a depth texture with the 16-byte pattern, so its samples
-//! are depths outside `[0, 1]`. On a device whose depth copies go by a draw, the draw announces
-//! that it changes such values (`drawn-depth-copy`), and the probe's lines are not what comes back
-//! — so the lane committed that row's digest alone and compares the digest where the notice fired.
-//! The ported case keeps that shape exactly: a digest-only site, with the notice named as what
-//! justifies leaving it unchecked. It is not recoverable on this host and the port does not pretend
-//! otherwise.
+//! **The digest-only row.** `d32-wide-4` fills a depth texture with the 16-byte pattern, so its
+//! samples are depths outside `[0, 1]`, and only that row's digest is committed. The case keeps
+//! that shape exactly: a digest-only site, compared by its digest. Its lines are not recoverable
+//! on this host.
 //!
 //! Metal's answer is **carried** and re-recording is **forbidden**: Metal fills a texture through
 //! private API.
 
-use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::{answered, call, Abort, Case, Failure, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::measured::{hex_bytes, public_fixture};
 use crate::recording::ShaderRef;
-use crate::replay::{notice_allowance, NOTICES_SITE};
+use crate::replay::NOTICES_SITE;
 use crate::transcript::{Digest, DigestKind, Node, Observed, Sites, Transcript, Value};
 use crate::work::{Clear, Rect, Resource, Step, TextureSpec, Work};
 
 /// Where the carried values were measured.
-const MEASURED_IN: &str =
-    "runtime_lane::sample_fills, from the probe ms.m (an Apple M3 Max, macOS 27.0.1)";
+const MEASURED_IN: &str = "the probe ms.m (an Apple M3 Max, macOS 27.0.1)";
 
 /// Why record mode must not run these cases on Metal.
 const NO_PUBLIC_CALL: &str =
@@ -68,10 +61,10 @@ const P32: &str = "00112233445566778899aabbccddeeff102132435465768798a9bacbdcedf
 /// Depths in `[0, 1]`, one a sample: a denormal, 1, 0 and 0.25.
 const DEPTHS: &str = "010000000000803f000000000000803e";
 
-/// The one case whose depths lie outside `[0, 1]`, so a drawn depth copy changes them.
+/// The one case whose depths lie outside `[0, 1]`, whose lines are kept as a digest alone.
 const WIDE_DEPTH: &str = "d32-wide-4";
 
-/// The digest the probe printed of `d32-wide-4`'s lines, which is all the lane keeps of it.
+/// The digest the probe printed of `d32-wide-4`'s lines, which is all that is kept of it.
 const WIDE_DEPTH_DIGEST: &str = "9c5b7be066d1c9fc";
 
 /// What a case fills: bytes in hexadecimal, or a color packed in the texture's own format.
@@ -368,7 +361,7 @@ const NAMES: [&str; 17] = [
     "sample-fills-whole-2",
 ];
 
-/// Every ported case: one per row.
+/// Every case: one per row.
 pub fn all() -> Vec<SampleFills> {
     ROWS.iter()
         .zip(NAMES)
@@ -433,49 +426,6 @@ impl Case for SampleFills {
             Input::bytes("kernels-air-ll", fixture.text(METAL_TEXT)?.as_bytes()),
             Input::bytes("metal-lines", public_fixture(METAL_LINES)?.as_bytes()),
         ])
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        let mut allowances = Vec::new();
-        if self.digest_only() {
-            // The depths outside [0, 1]: where the device's depth copies go by a draw, the draw
-            // announces that it changes such values, and the probe's lines are not what comes
-            // back. The lane keeps the digest alone there, and so does this case: the site goes
-            // unchecked, named, counted and reported, with that notice as the justification.
-            allowances.push(Allowance::new(
-                format!("case/{}", site(self.row.name)),
-                Loosening::Unchecked,
-                Justification::Degradation(
-                    metal2vulkan_runtime::Degradation::DrawnDepthCopy
-                        .code()
-                        .to_owned(),
-                ),
-            ));
-        }
-        // What a multisample fill and its read-back announce on a device that needs them: the
-        // drawn depth copy, a shadowed texture view, and shared storage in system memory. Metal
-        // announces none of them, so the notices site differs on such a device, and the
-        // difference is justified where one of these fired. A depth texture's denormals and a
-        // `Depth32Float` target's signed test (`depth-denormals`, `signed-depth-test`) are the
-        // device's own answers, which the suite declares for every case
-        // (`crate::replay::NATIVE_NOTES`); every depth word still compares exactly.
-        use metal2vulkan_runtime::Degradation as D;
-        for kind in [
-            D::DrawnDepthCopy,
-            D::SharedInSystemMemory,
-            D::ShadowedTextureView,
-        ] {
-            allowances.push(notice_allowance(kind.code()));
-        }
-        // A 32-bit float depth row's fill reaches its depth image by an upload, which a device
-        // without `VK_EXT_depth_range_unrestricted` (MoltenVK on the M3 Max) clamps into [0, 1]
-        // and announces (`restricted-depth-upload`); measured there, the notices site is the
-        // whole of the difference of each of the four such rows, and the wide row's digest is
-        // unchecked above.
-        if matches!(self.row.format, 252 | 260) {
-            allowances.push(notice_allowance(D::RestrictedDepthUpload.code()));
-        }
-        allowances
     }
 
     fn carried_transcript(&self) -> Result<Option<(u32, Transcript)>, String> {

@@ -6,9 +6,9 @@
 //! The two numbers were swept on the **descriptor** ([`crate::pass_descriptors`]'s number sweep
 //! reads each of the pass's eight numbers at 0, 1, its documented limit and either side of it) and
 //! no case ever rendered through a render area smaller than its attachment. Our runtime, meanwhile,
-//! carries a whole measured model of what Metal does there (`metal2vulkan_runtime`'s
-//! `clear_reach.rs`: 44 Metal cases on an M3 Max and an M4, every answer the same on both, each
-//! with and without API validation), and every rule in it was reached by a probe and by nothing
+//! carries a whole measured model of what Metal does there (44 Metal cases on an M3 Max and an
+//! M4, every answer the same on both, each with and without API validation), and every rule in it
+//! was reached by a probe and by nothing
 //! else:
 //!
 //! - a **`Clear`** load of an attachment the pass stores clears it from the origin over the render
@@ -129,10 +129,8 @@
 //!
 //! `DontCare` is **not** swept, in either position. A `DontCare` **load** of an attachment the pass
 //! stores keeps its texels only in the tiles no primitive touched, and which tiles those are
-//! depends on where the GPU places the vertices — our runtime reaches Metal's answer in the tiles
-//! a draw reaches and announces a near-equivalent for the rest
-//! (`Degradation::DontCareLoadTiles`), so a cell over it would compare a device's rasterizer. A
-//! `DontCare` **store** leaves the attachment undefined on both sides.
+//! depends on where the GPU places the vertices, so a cell over it would compare a device's
+//! rasterizer. A `DontCare` **store** leaves the attachment undefined on both sides.
 //!
 //! # Why this family is safe
 //!
@@ -142,7 +140,6 @@
 //! case off `setScissorRect:` past the render target, the one shape Metal's validation calls a
 //! programming error), every vertex inside the clip volume, and no multisampling.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
@@ -153,8 +150,8 @@ use crate::render::{
 use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
+use crate::values::{LoadAction, StoreAction};
 use metal2vulkan::metal::{PixelFormat, PrimitiveType};
-use metal2vulkan_runtime::{LoadAction, StoreAction};
 
 /// The owned fixture: the fullscreen triangle at buffer 0's depth, and the fragment that returns
 /// white.
@@ -174,8 +171,8 @@ const FRAGMENT: &str = "rt6_resolve_white";
 const SIDE: u32 = 40;
 
 /// The side, in pixels, of the tiles Metal's `Clear` load clears in past the render area, on both
-/// axes: what `metal2vulkan_runtime`'s `clear_reach.rs` measured on an M3 Max and an M4 at every
-/// format, sample count and tile size it tried.
+/// axes: what a probe measured on an M3 Max and an M4 at every format, sample count and tile size
+/// it tried.
 ///
 /// It is stated here as the **number this family expects Metal to answer**, and the recording is
 /// what says whether it does: the grid is built so that a different tile size moves at least one
@@ -431,7 +428,6 @@ fn load_name(load: LoadAction) -> &'static str {
         LoadAction::DontCare => "MTLLoadActionDontCare",
         LoadAction::Load => "MTLLoadActionLoad",
         LoadAction::Clear => "MTLLoadActionClear",
-        _ => "MTLLoadActionUnknown",
     }
 }
 
@@ -469,18 +465,6 @@ impl Case for BoundReach {
 
     fn record_runs(&self) -> u32 {
         RUNS
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // **Nothing is loosened.** Every texel Metal leaves is one we must leave, every attachment
-        // of every pass here is stored with `Store`, and no cell states a `DontCare` load, which
-        // is the one shape of this subject our runtime reaches by a near-equivalent.
-        //
-        // One notice is declared. The case reads its attachments back through a `Shared` buffer,
-        // and a device with no unified memory keeps a `Shared` allocation in system memory because
-        // that is the only memory both sides can reach: the venue's memory model, not this
-        // subject. A device whose driver is Metal announces nothing for it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -628,8 +612,6 @@ impl Case for BoundReach {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allowance::Loosening;
-    use crate::replay::NOTICES_SITE;
     use crate::transcript::Transcript;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -883,13 +865,9 @@ mod tests {
         assert!(primed.steps.is_empty());
         assert_eq!(primed.colors[0].load, LoadAction::Clear);
         assert_eq!(primed.colors[0].store, StoreAction::Store);
-        // The case loosens no value: its one allowance is the declaration of the notice a
-        // device with no unified memory announces for the read-back buffer, over the notices site.
+        // The case loosens no value and declares no notice.
         for case in all() {
-            let allowances = case.allowances();
-            assert_eq!(allowances.len(), 1, "{allowances:?}");
-            assert_eq!(allowances[0].path, format!("case/{NOTICES_SITE}/*"));
-            assert_eq!(allowances[0].loosening, Loosening::Unchecked);
+            assert!(case.allowances().is_empty(), "{}", case.name());
             assert_eq!(case.record_runs(), RUNS);
             assert!(matches!(case.metal_source(), MetalSource::Run));
         }

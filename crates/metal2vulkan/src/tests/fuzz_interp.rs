@@ -30,14 +30,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::bind::ExecutionStatus;
 use crate::budget::SPIRV_WORDS;
 use crate::device::{DevicePolicy, DeviceProfile, SubgroupSizes};
 use crate::pipeline::compile::compile_bitcode_kept;
 use crate::pipeline::testing::{link_and_validate, meter, profile};
 use crate::pipeline::{
-    Axis, EntryRef, LoweringInputs, PushField, PushLoc, ResourceKind, ResourceSlot, SlotClass,
-    SlotRef, SpecKey, Stage,
+    EntryRef, LoweringInputs, PushField, PushLoc, ResourceKind, ResourceSlot, SlotClass, SlotRef,
+    Stage,
 };
 use crate::spirv::interp::{
     run, BarrierRule, Buffer, Config, Order, Outcome, Resources, SubgroupSize,
@@ -147,16 +146,19 @@ fn widths(sizes: SubgroupSizes, pinned: Option<u32>) -> Result<Vec<SubgroupSize>
     )
 }
 
+/// The `ExecutionStatus` buffer's 32-bit words.
+const STATUS_WORDS: usize = crate::bind::status::StatusWord::SeqCstFences.index() as usize + 1;
+
 /// Check every word of the `ExecutionStatus` buffer `bytes` after a run: a run that misses
 /// nothing leaves every word 0 (no status bit, no resident-set miss, reserved words untouched).
 /// Any other value fails the run.
 fn check_status(bytes: &[u8]) -> Result<(), String> {
     let words = bytes_words(bytes);
-    if words.len() != ExecutionStatus::WORDS {
+    if words.len() != STATUS_WORDS {
         return Err(format!(
             "the status buffer holds {} words, wanted {}",
             words.len(),
-            ExecutionStatus::WORDS
+            STATUS_WORDS
         ));
     }
     if words.iter().any(|&word| word != 0) {
@@ -175,11 +177,11 @@ pub(super) struct CpuInterp {
 
 impl CpuInterp {
     /// The executor for committed profile `stem` (`validation/profiles/<stem>.json`, derived
-    /// under the default policy), dispatching [`THREADS`] threads. `Ok(None)` when `llvm-as` is
-    /// not installed: the caller skips visibly, because there is no way to turn generated text
-    /// into bitcode.
+    /// under the resident-table domains), dispatching [`THREADS`] threads. `Ok(None)` when
+    /// `llvm-as` is not installed: the caller skips visibly, because there is no way to turn
+    /// generated text into bitcode.
     pub(super) fn new(stem: &str) -> Result<Option<CpuInterp>, String> {
-        let profile = profile(stem, DevicePolicy::default())?;
+        let profile = profile(stem, DevicePolicy::RESIDENT_TABLES)?;
         match llvm_assemble_text("define void @probe() {\n  ret void\n}\n") {
             Ok(_) => Ok(Some(CpuInterp {
                 profile,
@@ -308,10 +310,7 @@ impl Execute for CpuInterp {
             }
         }
         let mut spec = BTreeMap::new();
-        spec.insert(SpecKey::LocalSize(Axis::X), u64::from(self.threads));
-        spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-        spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-        spec.insert(SpecKey::FlatLocalSize, u64::from(self.threads));
+        spec.extend(crate::pipeline::threadgroup_constants([self.threads, 1, 1]));
 
         // Every kernel buffer backs its slot and is reachable at its device address.
         let contents = std::iter::once(kernel.output_init.clone())
@@ -346,7 +345,7 @@ impl Execute for CpuInterp {
             buffers.push(Buffer {
                 slot: None,
                 address: Some(STATUS),
-                bytes: ExecutionStatus::initial().to_vec(),
+                bytes: vec![0; 4 * STATUS_WORDS],
             });
             buffers.len() - 1
         });
@@ -497,9 +496,9 @@ fn a_selected_pointer_reads_and_writes_where_the_choice_says_on_the_cpu_interpre
 /// Every word of the status buffer is checked: one nonzero word, whichever, fails the run.
 #[test]
 fn a_run_fails_on_any_nonzero_status_word() {
-    let clean = [0u32; ExecutionStatus::WORDS];
+    let clean = [0u32; STATUS_WORDS];
     check_status(&word_bytes(&clean)).unwrap();
-    for word in 0..ExecutionStatus::WORDS {
+    for word in 0..STATUS_WORDS {
         let mut bad = clean;
         bad[word] = 1 << 7;
         assert!(
@@ -531,7 +530,7 @@ fn the_interpreter_runs_every_modelled_width_the_stage_may_run_with() {
 #[test]
 fn the_soak_profiles_run_at_their_devices_widths() {
     let lanes = |stem: &str| {
-        let profile = profile(stem, DevicePolicy::default()).unwrap();
+        let profile = profile(stem, DevicePolicy::RESIDENT_TABLES).unwrap();
         widths(profile.subgroups().kernel.sizes, None)
             .unwrap()
             .iter()
@@ -539,7 +538,7 @@ fn the_soak_profiles_run_at_their_devices_widths() {
             .collect::<Vec<_>>()
     };
     assert_eq!(lanes("moltenvk-m3"), [32]);
-    assert_eq!(lanes("amd-rdna3-radv"), [32, 64]);
+    assert_eq!(lanes("amd-780m-radv"), [32, 64]);
     assert_eq!(lanes("lavapipe"), [8]);
-    assert_eq!(lanes("vk12-floor"), [8]);
+    assert_eq!(lanes("runtime-floor"), [8]);
 }

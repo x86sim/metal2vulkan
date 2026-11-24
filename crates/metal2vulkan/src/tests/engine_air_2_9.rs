@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::device::{DevicePolicy, DeviceProfile};
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, fixtures_dir, link_and_validate, link_standalone, llvm_assemble, meter,
     profile, typed_module, AssembleError,
@@ -474,7 +474,7 @@ fn msl_4_1_orders_reach_spirv() {
         }
         Err(AssembleError::Rejected(why)) => panic!("llvm-as: {why}"),
     };
-    let p = profile("nvidia-rtx50-linux", DevicePolicy::default()).expect("profile");
+    let p = profile("nvidia-rtx50-linux", DevicePolicy::RESIDENT_TABLES).expect("profile");
     // Scopes: Device 1, Workgroup 2, Subgroup 3. Semantics: Acquire 0x2, Release 0x4,
     // AcquireRelease 0x8, UniformMemory 0x40, WorkgroupMemory 0x100, ImageMemory 0x800.
     let every = 0x40 | 0x100 | 0x800;
@@ -526,7 +526,9 @@ fn msl_4_1_orders_reach_spirv() {
             "a27_wide_and_float",
             vec![
                 ("OpAtomicUMax", vec![1, 0]),
-                ("OpAtomicFAddEXT", vec![1, 0x8 | every]),
+                // The float add's compare-and-swap loop: its acquiring read, then the exchange.
+                ("OpAtomicLoad", vec![1, 0x2 | 0x40]),
+                ("OpAtomicCompareExchange", vec![1, 0x8 | every, 0]),
             ],
         ),
         (
@@ -585,7 +587,7 @@ fn a_fragment_ordered_tile_atomic_keeps_its_order() {
         }
         Err(AssembleError::Rejected(why)) => panic!("llvm-as: {why}"),
     };
-    let p = profile("nvidia-rtx50-linux", DevicePolicy::default()).expect("profile");
+    let p = profile("nvidia-rtx50-linux", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(&bc, "f", &p).unwrap_or_else(|e| panic!("f: {e}"));
     let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("f: {e}"));
     let text = spirv_dis(&words);
@@ -630,7 +632,7 @@ fn a_compare_exchange_failing_acquiring_keeps_its_acquire() {
         }
         Err(AssembleError::Rejected(why)) => panic!("llvm-as: {why}"),
     };
-    let p = profile("nvidia-rtx50-linux", DevicePolicy::default()).expect("profile");
+    let p = profile("nvidia-rtx50-linux", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(&bc, "k", &p).unwrap_or_else(|e| panic!("k: {e}"));
     let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("k: {e}"));
     let text = spirv_dis(&words);
@@ -691,10 +693,7 @@ fn thread_atomic_words(t: u32) -> [u32; 24] {
 /// `words` zero words and the local size.
 fn one_buffer(plan: &Plan, words: usize, threads: u32) -> Resources {
     let mut spec = BTreeMap::new();
-    spec.insert(SpecKey::LocalSize(Axis::X), u64::from(threads));
-    spec.insert(SpecKey::LocalSize(Axis::Y), 1);
-    spec.insert(SpecKey::LocalSize(Axis::Z), 1);
-    spec.insert(SpecKey::FlatLocalSize, u64::from(threads));
+    spec.extend(crate::pipeline::threadgroup_constants([threads, 1, 1]));
     let mut push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
@@ -738,8 +737,8 @@ fn thread_atomics_compute_their_documented_words() {
     let entry = "a27_thread_atomics";
     let threads = 8;
     let want: Vec<u32> = (0..threads).flat_map(thread_atomic_words).collect();
-    for stem in ["moltenvk-m3", "lavapipe", "vk12-floor"] {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+    for stem in ["moltenvk-m3", "lavapipe", "runtime-floor"] {
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let a = compile(&bc, entry, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         let (_, words) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: {e}"));
         let text = spirv_dis(&words);

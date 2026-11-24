@@ -16,10 +16,10 @@
 //! words by construction, and the sweep over the two spellings is an equivalence and not a value
 //! comparison.
 //!
-//! So this case is **reach rather than depth**, and is the one case of this stream that is: it
-//! adds two items to what the suite calls, and neither the choice between the two spellings nor
-//! the heap placement itself is distinguishable by anything it reads back. A value sweep would
-//! compare the same bytes twice. What it does hold is still not nothing:
+//! So this case is **reach rather than depth**: it adds two items to what the suite calls, and
+//! neither the choice between the two spellings nor the heap placement itself is distinguishable by
+//! anything it reads back. A value sweep would compare the same bytes twice. What it does hold is
+//! still not nothing:
 //!
 //! - the words are **Metal's own**, through a binding whose memory is a heap's rather than a
 //!   buffer's, which no compute case did before: an implementation that placed the buffer at the
@@ -57,7 +57,6 @@
 //! `3 · (THREADS − 1) + 1`, and the input buffer holds `SOURCE_WORDS`, which is more
 //! (`the_input_holds_every_word_the_kernel_reads`).
 
-use crate::allowance::Allowance;
 use crate::case::{made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::compute_pass::{ComputePass, ComputeStep, Dispatching};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
@@ -68,11 +67,6 @@ use crate::transcript::{ByteLayout, Digest, Element, Node, Observed, Sites};
 
 /// The fixture whose `a4_index_word` is `out[t] = in[3t + 1]`: an elementwise read of a plain
 /// buffer and a write of the heap-placed one, with **no simdgroup operation**.
-///
-/// A simdgroup move would be the obvious kernel to reuse here, and it is the wrong one: the
-/// runtime announces `emulated-simdgroups` for one, and whether that notice is still in hand when
-/// this case runs depends on which case drained it first in the same process. A case whose verdict
-/// moves with its neighbours is not a case, so this one runs a kernel that announces nothing.
 const FIXTURE: &str = "a4_index_word";
 const ENTRY: &str = "a4_index_word";
 
@@ -176,23 +170,6 @@ impl Case for ComputeHeapResidency {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // No value is loosened: both slots compare exactly.
-        //
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // this case, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

@@ -28,7 +28,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{heap_classes, BindState, BindingPlan, WriteSource};
 use crate::budget::Budget;
 use crate::device::profile::DeviceProfile;
 use crate::device::DevicePolicy;
@@ -50,14 +49,15 @@ use crate::pipeline::sym::{
 };
 use crate::pipeline::testing::{
     compile, compile_given_storage_format, engine_dir, fixtures_dir, link_and_validate,
-    llvm_assemble, profile, profile_with_storage_buffers, status_reach, status_reach_on,
-    storage_buffers, typed_module, AssembleError, StatusReach,
+    llvm_assemble, profile, status_reach, status_reach_on, storage_buffers, typed_module,
+    AssembleError, StatusReach, PROFILE_F,
 };
 use crate::pipeline::{
     heap_sampler_capacity, ComputePipelineDescriptor, FunctionDescriptor, RenderPipelineDescriptor,
     StageSource,
 };
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Resources};
+use crate::spirv::testing::threadgroup_profiles;
 use crate::spirv::testing::{committed_descriptions, committed_profiles};
 use crate::vk;
 
@@ -111,7 +111,7 @@ fn assemble(name: &str, body: &str) -> Option<Vec<u8>> {
 }
 
 fn m3() -> DeviceProfile {
-    profile("moltenvk-m3", DevicePolicy::default()).expect("profile")
+    profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile")
 }
 
 fn ok(bc: &[u8], entry: &str, p: &DeviceProfile) -> std::sync::Arc<FunctionArtifact> {
@@ -139,7 +139,7 @@ fn insts(words: &[u32]) -> Vec<(u16, usize)> {
     out
 }
 
-fn count(a: &FunctionArtifact, op: u16) -> usize {
+pub(super) fn count(a: &FunctionArtifact, op: u16) -> usize {
     insts(&a.module.words)
         .iter()
         .filter(|(o, _)| *o == op)
@@ -197,17 +197,17 @@ fn texture_slots(a: &FunctionArtifact) -> Vec<u32> {
         .collect()
 }
 
-fn uses(a: &FunctionArtifact, name: &str) -> u32 {
+pub(super) fn uses(a: &FunctionArtifact, name: &str) -> u32 {
     a.strategies.entries.get(name).map_or(0, |u| u.uses)
 }
 
-const OP_SWITCH: u16 = 251;
+pub(super) const OP_SWITCH: u16 = 251;
 const OP_SELECTION_MERGE: u16 = 247;
 const OP_LABEL: u16 = 248;
 const OP_DPDX: u16 = 207;
 const OP_DPDY: u16 = 208;
 const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
-const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+pub(super) const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
 const OP_IMAGE_QUERY_LOD: u16 = 105;
 
 /// Every handle entry compiles, links, and validates on every committed profile.
@@ -392,9 +392,8 @@ declare {{ <4 x float>, i8 }} @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr
 /// The hoisted derivatives of a texture chosen per fragment are the device's own sample for a 2D
 /// color sample without a bias, an offset or a `min_lod_clamp`, through a runtime or a constexpr
 /// sampler without a bias of its own: they record no `PrecisionNote::GradFromBias` and require the
-/// device's sampler (`VkProperty::MetalSampler` on a profile that samples through Metal's own,
-/// MoltenVK, `VkProperty::DeviceSampling` on any other). A bias, a nonzero offset or a clamp keeps
-/// the note. Every case still hoists its derivatives out of the one switch-at-use.
+/// device's sampler (`VkProperty::DeviceSampling`). A bias, a nonzero offset or a clamp keeps the
+/// note. Every case still hoists its derivatives out of the one switch-at-use.
 #[test]
 fn an_unbiased_chosen_sample_is_the_device_s_own() {
     let zero = "0.000000e+00";
@@ -405,7 +404,6 @@ fn an_unbiased_chosen_sample_is_the_device_s_own() {
         ("%s", zero, "<i32 1, i32 0>", zero, false),
         ("%s", zero, "zeroinitializer", "1.000000e+00", false),
     ];
-    let mut saw_metal_sampler = false;
     for (sampler, bias, offset, clamp, exact) in cases {
         let Some(bc) = chosen_sample(sampler, bias, offset, clamp) else {
             return;
@@ -426,29 +424,19 @@ fn an_unbiased_chosen_sample_is_the_device_s_own() {
             assert_eq!((count(&a, OP_DPDX), count(&a, OP_DPDY)), (1, 1), "{what}");
             assert_no_tangled_in_a_switch(&a);
             use crate::device::requirements::VkProperty;
-            let metal = metal_sampler(&p);
-            saw_metal_sampler |= metal;
             assert_eq!(
                 a.precision.contains(&PrecisionNote::GradFromBias),
                 !exact,
                 "{what}"
             );
             if exact {
-                let sampler = match metal {
-                    true => VkProperty::MetalSampler,
-                    false => VkProperty::DeviceSampling,
-                };
                 assert!(
-                    a.requirements.properties.contains(&sampler),
+                    (a.requirements.properties).contains(&VkProperty::DeviceSampling),
                     "{what}: the module requires the device's sampler"
                 );
             }
         }
     }
-    assert!(
-        saw_metal_sampler,
-        "no committed profile samples through Metal's sampler"
-    );
 }
 
 /// A fragment `calculate_clamped_lod` through element `pos.x` of an `n`-texture array, one
@@ -606,8 +594,9 @@ entry:
 /// A texel buffer's clamp or guard follows the buffer encoding and an image's the image encoding: a
 /// read is left to the device only where its robustness returns Metal's out-of-bounds texel
 /// (`robustBufferAccess2`, `robustImageAccess2`), and a write only where it discards the write
-/// (`robustBufferAccess2`, `robustImageAccess`). On `vk12-floor` (`robustBufferAccess` alone) every
-/// read and write is checked in the shader; on `moltenvk-m3` (`robustBufferAccess` and
+/// (`robustBufferAccess2`, `robustImageAccess`). On `runtime-floor` without image robustness
+/// (`robustBufferAccess` alone, a device below the runtime's floor) every read and write is checked
+/// in the shader; on `moltenvk-m3` (`robustBufferAccess` and
 /// `robustImageAccess2`) a texel buffer's are and an image's are not. A size query at a level the
 /// thread names answers from the first level on every profile, and a texture atomic is guarded
 /// exactly without image
@@ -624,7 +613,7 @@ fn a_switch_is_named_by_the_check_its_arms_take() {
             .map(|(name, u)| (name.clone(), u.uses))
             .collect()
     };
-    let floor = profile("vk12-floor", DevicePolicy::default()).expect("profile");
+    let floor = without_robust_images("runtime-floor");
     for (op, on_floor, on_m3) in [
         (
             TexelRead,
@@ -656,7 +645,7 @@ fn a_switch_is_named_by_the_check_its_arms_take() {
             return;
         };
         for (stem, p, want) in [
-            ("vk12-floor", &floor, on_floor),
+            ("runtime-floor without image robustness", &floor, on_floor),
             ("moltenvk-m3", &m3(), on_m3),
         ] {
             let a = compile_given_storage_format(&bc, "switched", p, PixelFormat::RGBA32Float)
@@ -691,7 +680,7 @@ fn without_robust_images(stem: &str) -> DeviceProfile {
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     desc.features.remove(&VkFeature::RobustImageAccess);
     desc.features.remove(&VkFeature::RobustImageAccess2);
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -850,25 +839,37 @@ fn a_heap_class_read_and_written_through_two_members_is_volatile() {
 /// A `read_write` argument-buffer texture's float read and write convert a member the heap views
 /// through its storage choice's alias (`bind::heap::storage_conversions`): on lavapipe, which
 /// stores no 8-bit sRGB format and no `A2R10G10B10`, the search carries each handle's red-blue
-/// order beside its class, and the read's decode of an sRGB member's codes notes
-/// `SrgbTexelDecode` and the write's encode `DevicePackConversion`; on the M3 Max's MoltenVK, which
-/// stores each such format itself, the module converts nothing and notes neither. Each validates.
+/// order beside its class; on the M3 Max's MoltenVK, which stores `A2R10G10B10` itself, it
+/// carries none. On both the read's decode of an sRGB member's codes notes `SrgbTexelDecode`; the
+/// write's encode notes `DevicePackConversion` where the heap views an sRGB member through its
+/// UNORM alias (`bind::heap::storage_conversions`, which lavapipe's heap does). Each validates.
 #[test]
 fn a_heap_storage_access_converts_the_members_its_heap_views_through_an_alias() {
     let Some(bc) = assemble("heap_rw", HEAP_RW) else {
         return;
     };
-    for (stem, converts) in [("lavapipe", true), ("moltenvk-m3", false)] {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+    for (stem, red_blue) in [("lavapipe", true), ("moltenvk-m3", false)] {
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) = typed_module(&bc, "heap_rw", &p).expect("heap_rw");
-        assert_eq!(plan.families.access.heap_red_blue, converts, "{stem}");
+        assert_eq!(plan.families.access.heap_red_blue, red_blue, "{stem}");
         let a = ok(&bc, "heap_rw", &p);
-        for note in [
-            PrecisionNote::SrgbTexelDecode,
-            PrecisionNote::DevicePackConversion,
-        ] {
-            assert_eq!(a.precision.contains(&note), converts, "{stem} {note:?}");
-        }
+        assert!(
+            a.precision.contains(&PrecisionNote::SrgbTexelDecode),
+            "{stem}"
+        );
+        let encodes = crate::bind::heap::storage_conversions(&p).iter().any(|c| {
+            matches!(
+                c.class,
+                crate::pipeline::lower_inputs::StorageImageClass::SrgbEncode
+                    | crate::pipeline::lower_inputs::StorageImageClass::SrgbEncodeBgra
+            )
+        });
+        assert!(encodes || stem != "lavapipe", "{stem}");
+        assert_eq!(
+            a.precision.contains(&PrecisionNote::DevicePackConversion),
+            encodes,
+            "{stem}"
+        );
     }
 }
 
@@ -1276,6 +1277,26 @@ const OP_FUNCTION_CALL: u16 = 57;
 const OP_ULESS_THAN_EQUAL: u16 = 178;
 const DECORATION_NON_UNIFORM: u32 = 5300;
 
+/// The `op`s of the function the module's calls reach, the module's one search of the handle
+/// table: what the search emits, apart from the accesses' own in-shader checks.
+fn count_in_search(a: &FunctionArtifact, op: u16) -> usize {
+    const OP_FUNCTION_END: u16 = 56;
+    let w = &a.module.words;
+    let all = insts(w);
+    let callee = (all.iter())
+        .find(|(o, _)| *o == OP_FUNCTION_CALL)
+        .map(|(_, i)| w[i + 3])
+        .expect("a call of the search");
+    let start = (all.iter())
+        .position(|(o, i)| *o == OP_FUNCTION && w[i + 2] == callee)
+        .expect("the search");
+    all[start..]
+        .iter()
+        .take_while(|(o, _)| *o != OP_FUNCTION_END)
+        .filter(|(o, _)| *o == op)
+        .count()
+}
+
 /// The `NonUniform` decorations of a module.
 fn non_uniform(a: &FunctionArtifact) -> usize {
     let words = &a.module.words;
@@ -1300,21 +1321,6 @@ fn is_heap(k: &ResourceKind) -> bool {
 
 fn is_table(k: &ResourceKind) -> bool {
     matches!(k, ResourceKind::Synthetic(SyntheticBinding::HandleTable))
-}
-
-/// Every heap array `a` declares is one of the binder's heap classes on `p`, so the binder has a
-/// neutral of its type for element 0: one class, and its unsigned integer twin where a float read
-/// or query of its sampled group declares one.
-fn assert_binder_classes(a: &FunctionArtifact, p: &DeviceProfile, stem: &str) {
-    let classes = heap_classes(p);
-    let mut n = 0;
-    for d in &a.interface.descriptors {
-        if let ResourceKind::Heap(c) = d.slot.kind {
-            assert!(classes.contains(&c), "{stem}: {c:?}");
-            n += 1;
-        }
-    }
-    assert_eq!(n, 1 + siblings(a), "{stem}");
 }
 
 /// The sibling classes `a` declares: a sampled `Sint` or `Uint` heap class beside the sampled
@@ -1360,9 +1366,9 @@ fn an_argument_buffer_texture_is_a_heap_lookup() {
                 assert_eq!(uses(&a, "access.handle.lookup"), 1, "{stem}");
                 assert_eq!(uses(&a, heap_read(&p)), 1, "{stem}");
                 assert!(a.interface.needs_handle_translation, "{stem}");
-                // The search reads the table's length once; the element's chain and its load
-                // are non-uniform.
-                assert_eq!(count(&a, OP_ARRAY_LENGTH), 1, "{stem}");
+                // The search reads the table's length once (each in-shader check of an access
+                // reads its view's own); the element's chain and its load are non-uniform.
+                assert_eq!(count_in_search(&a, OP_ARRAY_LENGTH), 1, "{stem}");
                 assert!(count(&a, OP_ACCESS_CHAIN) >= 1, "{stem}");
                 // and the twin's, which the read's raw arm loads, and the `Sint` and `Uint`
                 // classes' the read's siblings load.
@@ -1371,7 +1377,6 @@ fn an_argument_buffer_texture_is_a_heap_lookup() {
                 // No static texture slot: the texture is the heap's.
                 assert!(texture_slots(&a).is_empty(), "{stem}");
                 assert_eq!(bindings_of(&t, is_heap), one_heap(&a), "{stem}");
-                assert_binder_classes(&a, &p, &stem);
                 let table = bindings_of(&t, is_table);
                 assert_eq!(table.len(), 1, "{stem}");
                 assert_eq!(table[0].0, 0, "{stem}");
@@ -1389,11 +1394,10 @@ fn an_argument_buffer_texture_is_a_heap_lookup() {
 }
 
 /// Through the public compile API the heap pipeline's layout is the heap's (set 1, one partially
-/// bound, update-after-bind array in an update-after-bind pool), the device accepts its
-/// requirements, and with nothing resident the binder plans the table's null entry and the array's
-/// neutral element 0 (`src/tests/engine_heap_binder.rs` binds textures).
+/// bound, update-after-bind array in an update-after-bind pool), and the device accepts its
+/// requirements.
 #[test]
-fn a_heap_pipeline_compiles_and_plans() {
+fn a_heap_pipeline_compiles_to_the_heap_layout() {
     let Some(bc) = fixture() else { return };
     let dev = m3_device();
     let lib = Library::from_air(&bc).expect("library");
@@ -1428,10 +1432,6 @@ fn a_heap_pipeline_compiles_and_plans() {
             ..
         }
     )));
-    let plan = pipe
-        .plan(&dev, &BindState::default().shape())
-        .expect("plan");
-    assert_empty_heap(&plan, 1, 3);
 }
 
 /// Set 1 of a layout whose one sampled float class a read declares its siblings beside: the heap
@@ -1457,34 +1457,11 @@ fn assert_siblings(bindings: &[crate::pipeline::layout::DescriptorBinding]) {
     }
 }
 
-/// With nothing resident, a heap plan writes each handle table as its null entry alone and each
-/// of the `arrays` heap arrays' element 0, the class's neutral.
-fn assert_empty_heap(plan: &BindingPlan, tables: usize, arrays: usize) {
-    let table_writes: Vec<_> = plan
-        .descriptors
-        .iter()
-        .filter(|d| matches!(d.source, WriteSource::HandleTable { .. }))
-        .collect();
-    assert_eq!(table_writes.len(), tables);
-    for d in table_writes {
-        assert!(matches!(
-            d.source,
-            WriteSource::HandleTable { bytes_len: 16, .. }
-        ));
-    }
-    let heap: Vec<_> = plan.descriptors.iter().filter(|d| d.set == 1).collect();
-    assert_eq!(heap.len(), arrays);
-    for d in heap {
-        assert_eq!(d.array_element, 0);
-        assert!(matches!(d.source, WriteSource::Neutral(_)));
-    }
-}
-
 /// The binding flags of a pipeline's set-1 arrays, by its `requirements`:
 /// `PARTIALLY_BOUND | UPDATE_AFTER_BIND`, and `UPDATE_UNUSED_WHILE_PENDING` exactly where the
 /// pipeline requires `descriptorBindingUpdateUnusedWhilePending` (link's
 /// `heap_unused_while_pending`).
-pub(super) fn heap_flags(requirements: &Requirements) -> vk::DescriptorBindingFlags {
+fn heap_flags(requirements: &Requirements) -> vk::DescriptorBindingFlags {
     let flags =
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
     match requirements
@@ -1502,12 +1479,12 @@ fn m3_device() -> Device {
         .join("../metal2vulkan-validation/profiles/moltenvk-m3.json");
     let text = std::fs::read_to_string(path).expect("profile");
     let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device")
 }
 
 /// A render pipeline whose vertex and fragment functions both read a texture from an argument
 /// buffer: both stages share the one set-1 array of the class and each reads its own handle
-/// table, which `RenderPipeline::plan` writes.
+/// table.
 #[test]
 fn a_render_heap_pipeline_shares_its_array() {
     let Some(bc) = assemble(
@@ -1594,12 +1571,7 @@ declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), ptr add
         })
         .count();
     assert_eq!(tables, 2, "one handle table per stage");
-    let plan = pipe
-        .plan(&dev, &BindState::default().shape())
-        .expect("plan");
-    assert_empty_heap(&plan, 2, 3);
 }
-
 /// Two members of one argument buffer merged by a select form one heap group: a storage class
 /// written through a guard on the handle (a null handle drops the write), queried and tested
 /// for null through the same element.
@@ -1664,27 +1636,20 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
                 // Both loads call the module's one search function, so its 16 steps (one
                 // `OpULessThanEqual` each: of the `u64` ids with `shaderInt64`, else of the low
                 // words) and its read of the table's length are emitted once. The module was
-                // about 3,500 words with a search per load; it is within 1,600 with `u64` ids
-                // and 2,300 with word ids, the bounds below.
-                // The write's normalized channels are the device's conversion: noted where the
-                // profile is not measured to store Metal's codes, or where it stores a texture
-                // of a 1-bit alpha, which it rounds otherwise.
-                let measured =
-                    p.takes_driver_deviation(crate::error::DriverDeviation::MetalNormStorageWrites);
-                let one_bit = crate::metal::format::one_bit_storage(
-                    crate::metal::format::StorageUse::texture(false, true),
-                    &p,
-                );
-                assert_eq!(
+                // about 3,500 words with a search per load; it is within 1,700 with `u64` ids
+                // (1,678 on MoltenVK with the device bounding its accesses) and 2,300 with word
+                // ids, the bounds below, plus 200 for the in-shader checks of the argument
+                // buffer's two id words and of the output's store.
+                // The write's normalized channels are the device's conversion, noted.
+                assert!(
                     a.precision
                         .contains(&crate::pipeline::PrecisionNote::DeviceColorConversion),
-                    !measured || one_bit,
                     "{stem}"
                 );
                 assert_eq!(count(&a, OP_FUNCTION), 2, "{stem}");
                 assert_eq!(count(&a, OP_FUNCTION_CALL), 2, "{stem}");
-                assert_eq!(count(&a, OP_ULESS_THAN_EQUAL), 16, "{stem}");
-                assert_eq!(count(&a, OP_ARRAY_LENGTH), 1, "{stem}");
+                assert_eq!(count_in_search(&a, OP_ULESS_THAN_EQUAL), 16, "{stem}");
+                assert_eq!(count_in_search(&a, OP_ARRAY_LENGTH), 1, "{stem}");
                 // And an `A8Unorm` member's alpha moved into red where the device holds such a
                 // texture so (`metal::format::alpha_in_red`): the class index's read and the
                 // conversion.
@@ -1708,12 +1673,9 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
                     "{stem}"
                 );
                 let converted = if conversions.is_empty() { 0 } else { 700 };
-                // And a 4:4:4 two-plane YCbCr member's write shadow marked under the stage's
-                // `SpecKey::HeapYCbCrWrites` (`memory::handles::FLAG_YCBCR_WRITES`): the flag's
-                // carry and element mask by the constant, and the write's test and select.
-                let ycbcr = 100;
+                let checks = 200;
                 let bound =
-                    alpha + converted + ycbcr + if p.fields().leaf.int64 { 1_600 } else { 2_300 };
+                    alpha + converted + checks + if p.fields().leaf.int64 { 1_700 } else { 2_300 };
                 assert!(
                     a.module.words.len() <= bound,
                     "{stem}: {} words over {bound} (alpha in red {a8}, {} conversions)",
@@ -1725,7 +1687,6 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
                 assert_eq!(uses(&a, "texture.is_null.heap"), 1, "{stem}");
                 // One class: both members and the merged handle name one array.
                 assert_eq!(bindings_of(&t, is_heap), one_heap(&a), "{stem}");
-                assert_binder_classes(&a, &p, &stem);
                 compiled += 1;
             }
             Err(e) => {
@@ -1778,15 +1739,10 @@ declare void @air.write_texture_2d.{elem}(ptr addrspace(1), <2 x i32>, {ty}, i32
 /// A `half` (or `float`) texel written through an argument buffer's texture is the device's write
 /// on every committed profile: the module declares the one formatless float storage class, and
 /// records `PrecisionNote::DeviceNanEncoding`, since the heap may hold a half-float, 32-bit or
-/// packed small float texture, whose stored NaN is the device's; but for a `float` texel on a
-/// profile whose stores of a `float` NaN into the half-float and the packed small float formats
-/// are measured to be Metal's (`DriverDeviation::MetalHalfStorageNans` and
-/// `DriverDeviation::MetalSmallFloatNans`: MoltenVK on the M3 Max's identity). Either texel's note
-/// holds under the families the heap can name (`SpecKey::HeapNanFamilies`; a `half` texel's held
-/// in `tests::engine_extended_range::heap`), never whatever the heap holds: a `float` texel's under
-/// a 16-bit float texture's where the profile lacks `MetalHalfStorageNans` and a packed small
-/// float one's where it lacks `MetalSmallFloatNans`. Either texel requires
-/// `VkProperty::MetalSmallFloatNans` where the profile takes `DriverDeviation::MetalSmallFloatNans`.
+/// packed small float texture, whose stored NaN is the device's. Either texel's note holds under
+/// the families the heap can name (`SpecKey::HeapNanFamilies`; a `half` texel's held in
+/// `tests::engine_extended_range::heap`), never whatever the heap holds: a `float` texel's under a
+/// 16-bit float texture's and a packed small float one's.
 #[test]
 fn a_heap_texel_write_is_the_devices_write() {
     for float in [false, true] {
@@ -1805,24 +1761,17 @@ fn a_heap_texel_write_is_the_devices_write() {
                 }
             };
             link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: L3: {e}"));
-            assert_binder_classes(&a, &p, &what);
             let classes = heap_image_classes(&a);
             assert_eq!(classes.len(), 1, "{what}: {classes:?}");
             assert_eq!(classes[0].access, ImageAccess::Storage, "{what}");
             assert_eq!(classes[0].sampled_type, SampledType::Float, "{what}");
-            let takes = |d| p.takes_driver_deviation(d);
-            let small = takes(crate::error::DriverDeviation::MetalSmallFloatNans);
-            let metal_s =
-                float && small && takes(crate::error::DriverDeviation::MetalHalfStorageNans);
-            assert_eq!(
+            assert!(
                 a.precision.contains(&PrecisionNote::DeviceNanEncoding),
-                !metal_s,
                 "{what}: {:?}",
                 a.precision
             );
-            if float && !metal_s {
+            if float {
                 use crate::bind::heap::{NAN_SIXTEEN, NAN_SMALL};
-                let halves = !takes(crate::error::DriverDeviation::MetalHalfStorageNans);
                 let mut families: Vec<u32> = a
                     .specialized
                     .iter()
@@ -1840,19 +1789,13 @@ fn a_heap_texel_write_is_the_devices_write() {
                     })
                     .collect();
                 families.sort_unstable();
-                let mut want = Vec::new();
-                want.extend(halves.then_some(NAN_SIXTEEN));
-                want.extend((!small).then_some(NAN_SMALL));
-                want.sort_unstable();
-                assert_eq!(families, want, "{what}: {:?}", a.specialized);
+                assert_eq!(
+                    families,
+                    [NAN_SIXTEEN, NAN_SMALL],
+                    "{what}: {:?}",
+                    a.specialized
+                );
             }
-            assert_eq!(
-                a.requirements
-                    .properties
-                    .contains(&crate::device::requirements::VkProperty::MetalSmallFloatNans),
-                small,
-                "{what}"
-            );
             compiled += 1;
         }
         assert!(compiled > 0, "no committed profile writes through a heap");
@@ -1947,7 +1890,6 @@ fn a_selected_member_resource_id_is_a_heap_lookup() {
                 assert_eq!(uses(&a, "access.handle.lookup"), 1, "{stem}");
                 assert_eq!(uses(&a, "texture.query.heap"), 1, "{stem}");
                 assert_eq!(bindings_of(&t, is_heap), one_heap(&a), "{stem}");
-                assert_binder_classes(&a, &p, &stem);
                 compiled += 1;
             }
             Err(e) => {
@@ -2041,7 +1983,6 @@ fn dynamic_argument_buffer_elements_are_heap_lookups() {
                     }
                     assert!(texture_slots(&a).is_empty(), "{stem} {entry}");
                     assert_eq!(bindings_of(&t, is_heap), one_heap(&a), "{stem} {entry}");
-                    assert_binder_classes(&a, &p, &stem);
                     compiled += 1;
                 }
                 Err(e) => {
@@ -2102,9 +2043,6 @@ fn an_argument_buffer_depth_texture_reads_through_the_float_class() {
                         && c.dim == ImageDim::D2),
                     "{stem}: {classes:?}"
                 );
-                for c in &classes {
-                    assert!(heap_classes(&p).contains(&HandleClass::Image(*c)), "{stem}");
-                }
                 // Every image type is 2D (Dim 1) and not a depth image.
                 for (dim, depth, _) in image_types(&a) {
                     assert_eq!((dim, depth), (1, 0), "{stem}");
@@ -2331,11 +2269,8 @@ fn a_heap_texture_samples_through_a_runtime_sampler() {
 
 /// A cube's explicit gradients through a sampler loaded from an argument buffer: the sample takes
 /// Metal's footprint as a slot's does (`PrecisionNote::CubeGradientFootprint`), the isotropic or
-/// the anisotropic form by its table entry's word, through the set-1 sampler array of its own use,
-/// and the plan takes an anisotropic listed sampler for it (`engine_heap_binder`). On a driver that
-/// hands a compute pipeline's cube gradients to Metal's `gradientcube` (`CubeGradientRoute::Metal`)
-/// the kernel hands Metal's own, exactly, through any sampler: no note. Every profile with the
-/// sampled heap compiles it and passes L3; it was `ArgumentBufferTextures NotImplemented` before.
+/// the anisotropic form by its table entry's word, through the set-1 sampler array of its own use.
+/// Every profile with the sampled heap compiles it and passes L3.
 #[test]
 fn a_cube_gradient_through_an_argument_buffer_sampler_reads_its_own_sampler_array() {
     let Some(bc) = assemble(
@@ -2396,8 +2331,6 @@ declare { <4 x float>, i8 } @air.sample_texture_cube_grad.v4f32(ptr addrspace(1)
                 _ => None,
             })
             .collect();
-        let metal =
-            p.fields().cube_gradients.compute == crate::device::profile::CubeGradientRoute::Metal;
         assert_eq!(
             classes,
             vec![HandleClass::Sampler {
@@ -2406,9 +2339,8 @@ declare { <4 x float>, i8 } @air.sample_texture_cube_grad.v4f32(ptr addrspace(1)
             }],
             "{stem}"
         );
-        assert_eq!(
+        assert!(
             a.precision.contains(&PrecisionNote::CubeGradientFootprint),
-            !metal,
             "{stem}"
         );
         compiled += 1;
@@ -2655,7 +2587,7 @@ fn an_imageblock_slice_writes_an_argument_buffer_texture() {
         let Some(bc) = heap_slice_module(name, "f16", ty, lanes, "half") else {
             return;
         };
-        for (stem, p) in committed_profiles().expect("profiles") {
+        for (stem, p) in threadgroup_profiles().expect("profiles") {
             let a = match compile(&bc, "heap_slice", &p) {
                 Ok(a) => a,
                 Err(e) => {
@@ -2705,17 +2637,9 @@ fn an_imageblock_slice_writes_an_argument_buffer_texture() {
     assert_eq!(u.needs, Needs::NotImplemented);
 }
 
-const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
+pub(super) const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
 const OP_IMAGE_GATHER: u16 = 96;
 const OP_IMAGE_DREF_GATHER: u16 = 97;
-
-/// Whether `p`'s device samples through Metal's own sampler, whose comparison is Metal's.
-fn metal_sampler(p: &DeviceProfile) -> bool {
-    p.fields()
-        .enabled
-        .properties
-        .contains(&crate::device::requirements::VkProperty::MetalSampler)
-}
 
 /// What [`heap_compare_kernel`] compares through, and [`heap_linear_kernel`] samples through: a
 /// constexpr sampler of these words, runtime sampler slot 0, or the sampler its argument buffer
@@ -2905,7 +2829,6 @@ fn an_argument_buffer_depth_texture_compares_through_the_depth_comparison_class(
             ),
             "{stem}"
         );
-        assert!(heap_classes(&p).contains(&HandleClass::Image(c)), "{stem}");
         // The one image type is 2D (Dim 1) and a depth image.
         assert_eq!(
             image_types(&a)
@@ -2926,7 +2849,7 @@ fn an_argument_buffer_depth_texture_compares_through_the_depth_comparison_class(
     assert!(compiled > 0, "no committed profile has the sampled heap");
 }
 
-const OP_SAMPLED_IMAGE: u16 = 86;
+pub(super) const OP_SAMPLED_IMAGE: u16 = 86;
 const OP_IMAGE_FETCH: u16 = 95;
 
 /// A constexpr sampler's words: linear filters, no mip filter, normalized coordinates clamped to
@@ -3011,20 +2934,15 @@ define void @k(ptr addrspace(2) %m, ptr addrspace(1) %out{param}, i32 %gid) {{
 
 /// A heap texture's linear sample, through a constexpr sampler of linear filters (2D and 3D), a
 /// runtime sampler slot, or the sampler its argument buffer holds, is the device's sample; the
-/// census names the sample by its source, and the module states no `TexelFormat`
-/// specialization. On a profile that samples through Metal's own sampler a 2D sample records the
-/// filter note only under what the command's handles can name (a two-plane YCbCr texture,
-/// `SpecKey::HeapYCbCrTextures`), never outright; a 3D one, whose class holds no two-plane
-/// texture, records none. A 2D sample through a constexpr or runtime sampler also emulates a raw-held
-/// texture's, in a branch on the class the handle carries (the search's flagged form, whose masks
-/// and table the census counts under `HEAP_CLASS_CENSUS`). Each validates; a profile without the
-/// sampled heap refuses each. (The interpreter models no sample; the runtime lane
-/// `argument_linear_samples` reads the values on each device.)
+/// census names the sample by its source. A 2D sample through a constexpr or
+/// runtime sampler also emulates a raw-held texture's, in a branch on the class the handle carries
+/// (the search's flagged form, whose masks and table the census counts under `HEAP_CLASS_CENSUS`).
+/// Each validates; a profile without the sampled heap refuses each. (The interpreter models no
+/// sample; the runtime lane `argument_linear_samples` reads the values on each device.)
 #[test]
 fn heap_linear_samples_are_the_device_s() {
     use crate::lower::texture::HEAP_CLASS_CENSUS;
     use crate::memory::handles::HANDLE_TEXEL_CLASS;
-    use crate::pipeline::sym::SpecKey;
     let cases = [
         (CompareThrough::Constexpr(LINEAR_EDGE), false),
         (CompareThrough::Constexpr(LINEAR_EDGE), true),
@@ -3071,28 +2989,6 @@ fn heap_linear_samples_are_the_device_s() {
             assert_eq!(
                 mask_constants(&a).contains(&!HANDLE_TEXEL_CLASS),
                 raw,
-                "{what}"
-            );
-            let filter = PrecisionNote::FloatSampleFilter;
-            assert_eq!(
-                a.precision.contains(&filter),
-                !three && metal_sampler(&p),
-                "{what}"
-            );
-            let clauses: Vec<_> = (a.specialized.iter())
-                .filter(|s| s.note == filter)
-                .flat_map(|s| &s.when)
-                .collect();
-            assert_eq!(clauses.is_empty(), three || !metal_sampler(&p), "{what}");
-            for c in clauses {
-                let heap = SpecKey::HeapYCbCrTextures(crate::pipeline::sym::Stage::Kernel);
-                assert!(c.all.iter().any(|t| t.key == heap), "{what}: {c:?}");
-            }
-            assert!(
-                !a.interface
-                    .read_keys()
-                    .into_iter()
-                    .any(|k| matches!(k, SpecKey::TexelFormat(_))),
                 "{what}"
             );
             compiled += 1;
@@ -3155,15 +3051,12 @@ fn heap_plain_half_kernel(through: CompareThrough, gather: bool) -> String {
     out
 }
 
-/// A heap color texture's sample or gather with a `half` result converts the device's texel (or the
-/// fetched one) by the class its handle carries, as a slot's converts by its bound format's, on a
-/// profile that samples through Metal's own sampler (`VkProperty::MetalSampler`, whose `float`
-/// result the class's rule rounds as Metal does): the module calls the `half` routine once, with
-/// the class read from the handle's table, where the same access with a `float` result calls no
-/// routine. On any other profile the `half` texel is the device's conversion: no routine. The note
-/// stays: the class may be one whose conversion is not measured.
+/// A heap color texture's sample or gather with a `half` result is the device's texel (or the
+/// fetched one) rounded to nearest even, on every profile: the module calls no routine the same
+/// access with a `float` result does not, but the raw-held emulation's twin, and records
+/// `PrecisionNote::HalfTexelConversion`.
 #[test]
-fn heap_half_texels_convert_by_the_handle_s_class() {
+fn heap_half_texels_round_the_device_s_texel() {
     let cases = [
         (CompareThrough::Constexpr(NEAREST_EDGE), false),
         (CompareThrough::Constexpr(NEAREST_EDGE), true),
@@ -3192,11 +3085,10 @@ fn heap_half_texels_convert_by_the_handle_s_class() {
             // nearest tap both ways for a `half` result (a bfloat form's toward zero, another's
             // rounded): one call more than the `float` result's.
             let twin = usize::from(!gather && !matches!(through, CompareThrough::Argument));
-            let routine = usize::from(metal_sampler(&p));
             assert_eq!(
                 count(&a, OP_FUNCTION_CALL),
-                count(&f, OP_FUNCTION_CALL) + routine + twin,
-                "{what}: the half routine is called once, the float one where it converts"
+                count(&f, OP_FUNCTION_CALL) + twin,
+                "{what}: the float routine's calls, and the twin's"
             );
             let notes = &a.precision;
             assert!(
@@ -3213,13 +3105,11 @@ fn heap_half_texels_convert_by_the_handle_s_class() {
 /// sampler or an argument buffer's sampler, are the device's access, made once, with no fetch of
 /// their own (an argument buffer's sampler's sample reads its texel's centre where its word states
 /// a nearest pixel sampler). Through a constexpr or runtime sampler the raw-held
-/// emulation fetches from the twin in a branch on the class the handle carries. The module states
-/// no `TexelFormat` specialization.
+/// emulation fetches from the twin in a branch on the class the handle carries.
 #[test]
 fn heap_gathers_and_nearest_samples_are_the_device_s() {
     use crate::lower::texture::HEAP_CLASS_CENSUS;
     use crate::memory::handles::HANDLE_TEXEL_CLASS;
-    use crate::pipeline::sym::SpecKey;
     let cases = [
         (CompareThrough::Constexpr(NEAREST_EDGE), false),
         (CompareThrough::Constexpr(NEAREST_EDGE), true),
@@ -3274,13 +3164,6 @@ fn heap_gathers_and_nearest_samples_are_the_device_s() {
             assert_eq!(
                 mask_constants(&a).contains(&!HANDLE_TEXEL_CLASS),
                 raw,
-                "{what}"
-            );
-            assert!(
-                !a.interface
-                    .read_keys()
-                    .into_iter()
-                    .any(|k| matches!(k, SpecKey::TexelFormat(_))),
                 "{what}"
             );
             compiled += 1;
@@ -3402,12 +3285,6 @@ fn argument_buffer_textures_sample_through_heap_samplers() {
                 .collect();
             sampled.sort();
             assert_eq!(sampled, classes, "{stem} {entry}");
-            for c in heap_image_classes(&a) {
-                assert!(
-                    heap_classes(&p).contains(&HandleClass::Image(c)),
-                    "{stem} {entry}"
-                );
-            }
             let hs = heap_samplers(&a);
             let integer: Vec<bool> = hs.iter().map(|c| c.integer).collect();
             assert_eq!(integer, samplers, "{stem} {entry}");
@@ -3521,10 +3398,9 @@ declare void @air.concurrent_dispatch_threadgroups_compute_command(ptr addrspace
 
 /// `air.set_pipeline_state_compute_command`'s pipeline operand is a `compute_pipeline_state`
 /// handle, the class of the argument-buffer member it is loaded from, so a GPU-encoded compute
-/// command is no class conflict: with device addresses it translates (the member words are the
-/// record buffer's guest address and the template's token), and without them it is its family's
-/// refusal, `GpuEncodedIndirectCommands`, naming what the profile lacks. The same pipeline state
-/// also read as bytes still conflicts: `HandleAsPointer`, not representable.
+/// command is no class conflict: it is its family's refusal, `GpuEncodedIndirectCommands`, not
+/// implemented, on every committed profile. The same pipeline state also read as bytes still
+/// conflicts: `HandleAsPointer`, not representable.
 #[test]
 fn a_command_set_to_an_argument_buffer_pipeline_state_is_its_family_refusal() {
     let Some(bc) = assemble(
@@ -3534,31 +3410,12 @@ fn a_command_set_to_an_argument_buffer_pipeline_state_is_its_family_refusal() {
         return;
     };
     for (stem, p) in committed_profiles().expect("profiles") {
-        match compile(&bc, "set_pipeline", &p) {
-            Ok(a) => {
-                assert_eq!(
-                    p.fields().buffer_access,
-                    crate::device::profile::BufferAccess::Addressed,
-                    "{stem}"
-                );
-                link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
-            }
-            Err(e) => {
-                let u = unsupported(e);
-                assert_eq!(
-                    (u.feature, u.needs),
-                    (
-                        Feature::GpuEncodedIndirectCommands,
-                        Unsupported::needs_any_of(
-                            Feature::GpuEncodedIndirectCommands,
-                            vec![p.addressed_needs()]
-                        )
-                        .needs
-                    ),
-                    "{stem}"
-                );
-            }
-        }
+        let u = unsupported(compile(&bc, "set_pipeline", &p).expect_err(&stem));
+        assert_eq!(
+            (u.feature, u.needs),
+            (Feature::GpuEncodedIndirectCommands, Needs::NotImplemented),
+            "{stem}"
+        );
     }
     let Some(bc) = assemble(
         "icb_pipeline_bytes",
@@ -4555,11 +4412,6 @@ fn argument_buffer_samplers_are_heap_lookups() {
             let heap = bindings_of(&t, is_heap);
             assert_eq!(heap.len(), 2, "{stem} {entry}");
             assert!(heap.iter().all(|(set, _)| *set == 1), "{stem} {entry}");
-            for d in &a.interface.descriptors {
-                if let ResourceKind::Heap(c) = d.slot.kind {
-                    assert!(heap_classes(&p).contains(&c), "{stem} {entry}: {c:?}");
-                }
-            }
             assert_eq!(count(&a, OP_SAMPLED_IMAGE), 1, "{stem} {entry}");
             assert_eq!(count(&a, op), 1, "{stem} {entry}");
             assert_eq!(
@@ -4596,7 +4448,7 @@ fn argument_buffer_samplers_are_heap_lookups() {
 /// A kernel reading a texture and its sampler from an argument buffer has one set-1 sampler
 /// array, of `heap_sampler_capacity` elements, on every committed profile that compiles it: the
 /// handle table's 65536 where the update-after-bind sampler limits pass it (MoltenVK's 500000,
-/// lavapipe's, NVIDIA's), the per-stage limit's 16 on the desktop baseline. On the M3's profile
+/// lavapipe's, NVIDIA's), the update-after-bind limits' 24000 on the runtime's floor. On the M3's profile
 /// with its per-stage update-after-bind sampler limit lowered to 100, or its set's to 200, the
 /// array and the answer follow it. A profile that refuses the kernel answers 0, and so does the
 /// M3's without `descriptorBindingPartiallyBound` or `shaderSampledImageArrayNonUniformIndexing`,
@@ -4610,7 +4462,7 @@ fn an_argument_sampler_array_has_the_heap_sampler_capacity() {
     // The answer on `desc`, and the element count of the kernel's set-1 sampler array or the
     // kernel's refusal.
     let array = |desc: DeviceDescription| -> (u32, Result<u32, Error>) {
-        let dev = Device::new(desc, DevicePolicy::default()).expect("device");
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("device");
         let f = library.function("argument_sampler_sample").expect("entry");
         let d = ComputePipelineDescriptor::new(StageSource::Function(FunctionDescriptor::new(f)));
         let count = dev
@@ -4641,7 +4493,7 @@ fn an_argument_sampler_array_has_the_heap_sampler_capacity() {
     for stem in ["moltenvk-m3", "lavapipe", "nvidia-rtx5080-laptop"] {
         assert!(compiled.contains(&(stem, 65536)), "{stem}: {compiled:?}");
     }
-    assert!(compiled.contains(&("lunarg-desktop-baseline-2023", 16)));
+    assert!(compiled.contains(&("runtime-floor", 24000)));
     let m3 = || {
         (committed_descriptions().expect("descriptions").iter())
             .find(|(stem, _)| stem == "moltenvk-m3")
@@ -4673,7 +4525,10 @@ fn an_argument_sampler_array_has_the_heap_sampler_capacity() {
 /// A sample through an argument buffer's sampler tests the sampler's entry for a cubic filter
 /// (`RuntimeFact::CubicArgumentSampler`) in a kernel on every profile with the heap, marking the
 /// status by address where the device addresses buffers and through the kernel's binding of it
-/// elsewhere; a fragment function's never does, whose store would cost it the device's
+/// elsewhere (Profile F, `runtime-floor` without device addresses, below the runtime's floor, here
+/// with room for the binding beside the kernel's storage buffers: at its own limit the binding
+/// gives way, [`the_cubic_tests_binding_gives_way_to_the_storage_buffer_limit`]); a
+/// fragment function's never does, whose store would cost it the device's
 /// hidden-surface removal, so the planner refuses a listed cubic sampler beside it.
 #[test]
 fn only_non_fragment_stages_test_argument_samplers_for_a_cubic_filter() {
@@ -4681,7 +4536,12 @@ fn only_non_fragment_stages_test_argument_samplers_for_a_cubic_filter() {
         return;
     };
     let (mut compiled, mut bound) = (0, 0);
-    for (stem, p) in committed_profiles().expect("profiles") {
+    let mut profiles = committed_profiles().expect("profiles");
+    let mut f = crate::pipeline::testing::description_f().expect("Profile F");
+    f.limits.max_per_stage_descriptor_storage_buffers = 32;
+    let f = Device::from_queries(f, DevicePolicy::RESIDENT_TABLES).expect("Profile F");
+    profiles.push((PROFILE_F.to_string(), f.profile().clone()));
+    for (stem, p) in profiles {
         let (Ok(kernel), Ok(fragment)) = (
             compile(&bc, "argument_sampler_sample", &p),
             compile(&bc, "argument_sampler_fragment", &p),
@@ -4698,11 +4558,8 @@ fn only_non_fragment_stages_test_argument_samplers_for_a_cubic_filter() {
         compiled += 1;
         bound += usize::from(reach == StatusReach::Binding);
     }
-    assert!(compiled > 0, "no committed profile has the heap");
-    assert!(
-        bound > 0,
-        "no committed profile with the heap but no addresses"
-    );
+    assert!(compiled > 0, "no profile has the heap");
+    assert!(bound > 0, "no profile with the heap but no addresses");
 }
 
 /// Whether `a` tests an argument buffer's sampler for a cubic filter.
@@ -4713,26 +4570,31 @@ fn tests_cubic(a: &FunctionArtifact) -> bool {
 }
 
 /// Where the cubic test's binding of the status would take a kernel past its storage buffers (a
-/// device that does not address buffers, `lunarg-desktop-baseline-2023` with its limit lowered
-/// step by step), the kernel gives the binding back: it compiles without the test, as a fragment
-/// function does, so the planner refuses a listed cubic sampler beside it. Every compile stays
-/// within the limit, and at the full kernel's own count of storage buffers the kernel keeps the
-/// binding.
+/// device that does not address buffers, Profile F with its limit lowered step by step from room
+/// for the binding), the kernel gives the binding back: it compiles without the test, as a
+/// fragment function does, so the planner refuses a listed cubic sampler beside it. Every compile
+/// stays within the limit, and at the full kernel's own count of storage buffers the kernel keeps
+/// the binding.
 #[test]
 fn the_cubic_tests_binding_gives_way_to_the_storage_buffer_limit() {
     let Some(bc) = argument_samplers_fixture() else {
         return;
     };
-    let stem = "lunarg-desktop-baseline-2023";
-    let full = profile(stem, DevicePolicy::default()).expect("profile");
+    let stem = PROFILE_F;
+    let with_storage = |limit: u32| {
+        let mut desc = crate::pipeline::testing::description_f().expect("Profile F");
+        desc.limits.max_per_stage_descriptor_storage_buffers = limit;
+        let dev = Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES).expect("profile");
+        dev.profile().clone()
+    };
+    let full = with_storage(32);
     assert!(has_sampled_heap(&full), "{stem}");
     let kernel = compile(&bc, "argument_sampler_sample", &full).expect("kernel");
     assert_eq!(status_reach(&kernel), StatusReach::Binding);
     let with = storage_buffers(&kernel);
     let mut given_back = None;
     for limit in (0..=with).rev() {
-        let p =
-            profile_with_storage_buffers(stem, DevicePolicy::default(), limit).expect("profile");
+        let p = with_storage(limit);
         let a = match compile(&bc, "argument_sampler_sample", &p) {
             Ok(a) => a,
             Err(Error::Unsupported(u)) if u.feature == Feature::DescriptorCount => break,

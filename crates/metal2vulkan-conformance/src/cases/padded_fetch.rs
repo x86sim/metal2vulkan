@@ -3,14 +3,13 @@
 //!
 //! `R10Unorm_X6`, `RG10Unorm_X12`, their `_sRGB` twins and `RGB10A2Unorm_sRGB` hold 10-bit
 //! normalized codes ([`super::padded_blends`]). No Vulkan format holds them, so the runtime renders
-//! such a target as its raw unsigned words and a fetch reads the words over an ordered read of the
-//! attachment (the pixel interlock or a rasterization-order input attachment), decoding each code
+//! such a target as its raw unsigned words and a fetch reads the words over a read of the
+//! attachment, decoding each code
 //! to its value rounded to `half`. Metal's fetch reads so for a loaded code, a `float4` input and a
 //! `half4` one alike (the M3 Max under macOS 27.0.1, `probes/padded_fetch.m`), and the missing
 //! lanes of a one- or two-channel format as `(0, 0, 1)`. After a clear, or an earlier draw of the
 //! same pass, Metal's tile holds the clear's `half`, or the draw's output rounded to `half` toward
-//! zero, unclamped, which the stored codes do not keep: the runtime announces
-//! `extended-range-blends-stored-codes` there, and those cases record the difference.
+//! zero, unclamped, which the stored codes do not keep; those cases record the difference.
 //!
 //! Each case is a 128 x 64 target, color 0 of the padded format, beside an `RGBA32Float` color 1;
 //! the owned fixture `pfx_fetch`'s `pfx_fetch_read` (a `float4` input) or `pfx_fetch_read_half`
@@ -32,7 +31,6 @@
 //! Nothing here can fault a GPU: single-sampled targets of the case's own extent, one or two
 //! full-screen triangles a pass, no loop, and every fetch inside its buffer.
 
-use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Input, MetalSource, Side};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -41,7 +39,6 @@ use crate::render::{
 };
 use crate::transcript::{Aspect, ByteLayout, Element, Gaps, Node, Observed, Region, Sites, Value};
 use metal2vulkan::metal::{ColorWriteMask, PixelFormat};
-use metal2vulkan_runtime::Degradation;
 
 use super::extended_range_targets::{
     fixture, fixture_inputs, float_bytes, not_read, program, shape, Format, HEIGHT, WIDTH,
@@ -228,31 +225,6 @@ impl Case for PaddedFetch {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). A pass that loads and
-        // stores a padded colour attachment announces `extended-range-bits-kept` (color 0's words
-        // are not compared). A read after a clear or an earlier draw of the pass announces
-        // `extended-range-blends-stored-codes`, and a draw that reads in the interlock what the
-        // fill wrote may split the pass (`render-pass-split`, the venue's). Each loosens the
-        // notices site alone: every value read still compares exactly, and a read the stored codes
-        // move is a known gap.
-        let mut named = vec![
-            crate::replay::shared_memory_notice(),
-            crate::replay::notice_allowance(Degradation::ExtendedRangeBitsKept.code()),
-        ];
-        if self.leg != Leg::Load {
-            named.push(crate::replay::notice_allowance(
-                Degradation::ExtendedRangeBlendsStoredCodes.code(),
-            ));
-        }
-        if self.leg == Leg::Draw {
-            named.push(crate::replay::interlocked_split_notice());
-        }
-        named
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

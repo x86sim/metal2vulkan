@@ -1,0 +1,1025 @@
+#!/usr/bin/env python3
+"""The per-commit matrix: one commit's checks on every lab GPU, lavapipe and the Windows host,
+run through potluck, with the results attached to the commit as a git note
+(refs/notes/matrix, one JSON document per commit; local, never pushed).
+
+    scripts/matrix/matrix run [SHA] [--legs LEG,...] [--dry-run]
+    scripts/matrix/matrix show [SHA]
+
+SHA defaults to development's tip. Both print each leg's verdict line, then every harness row's
+time, GPU time and instructions (results.harness_rows). A leg is a GPU, named by its PCI
+vendor:device (`1002:744c`), or `lavapipe`. docs/VALIDATION.md ("The matrix") has the legs, the
+records and the rules; CONTRIBUTING.md has how to run it.
+
+The cluster's own facts come from potluck (its nodes, their GPUs and CPUs) and from
+~/.config/metal2vulkan/matrix.json:
+
+    {"builders": [{"node": "A", "gate": "SHELL COMMAND", "portable": true}, {"node": "B"}],
+     "setup": {"A": "SHELL"},
+     "skip_gpus": ["vendor:device"],
+     "record_nodes": {"vendor:device": "A"},
+     "validation_layer": "PATH"}
+
+The first builder whose gate command exits 0 (no gate: always) builds the GPU legs' test archive
+and runs the lavapipe leg. Its archive runs on every Linux node when it is `portable`, else only
+on nodes of its CPU model; any other node builds its own. `setup` is shell each job on that node
+runs first. A GPU in `skip_gpus` gets no leg. A card in `record_nodes` has its leg of record on
+that node, named by the card, and runs as an extra leg, `vendor:device@node`, on each other node
+that holds it, judged like any leg. `validation_layer` is the carry
+`scripts/validation-layer make` made (default ~/.cache/metal2vulkan-matrix/validation-layer):
+every job that runs rt's device tests (each GPU leg's, lavapipe's, the Windows host's) unpacks
+its OS's directory in its workspace and points the loader at it, and its note gives the layer's
+version (`layer`); the harness's timing jobs run without it.
+"""
+
+import fcntl
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import results  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[2]
+#: The golden hash table, compiled through `Device::from_queries`: results.golden_table_moved.
+GOLDEN_TABLE = "crates/metal2vulkan/tests/golden_hashes.tsv"
+CONFIG = Path.home() / ".config/metal2vulkan/matrix.json"
+STATE = Path.home() / ".cache/metal2vulkan-matrix"
+TREE = STATE / "tree"
+NOTES = "refs/notes/matrix"
+#: The validation layer's carry where the config names none (scripts/validation-layer).
+LAYER = STATE / "validation-layer"
+ARCHIVE = "m2v-matrix-gpu.tar.zst"
+HARNESS = "m2v-matrix-harness"
+#: The runtime the harness command times (`harness --runtime new`, harness_runs). The process is
+#: the leg's one suite, HARNESS_SUITE; a failure names its runtime (`M2V-FAILED
+#: harness-<runtime>/<row>`).
+HARNESS_RUNTIME = "new"
+HARNESS_SUITE = "harness"
+#: A node's Vulkan driver manifest by PCI vendor, and whether Mesa's device select picks the GPU.
+ICDS = {"1002": ("radeon", True), "10de": ("nvidia", False), "8086": ("intel", False)}
+#: (RAM GiB, minutes) of each job kind before a run of it was measured; the minutes stay its floor.
+#: The Windows build's, from its measured runs on the mini: a peak of 6.7 GiB, 29 s to 4 min a run
+#: (m3-max-48387, -48266, -48124), and 6m45s the longest build of the 50 runs kept (29 crates).
+#: The Windows rt suite's, 8: at 4 its run in round 951b93a645 went over 4 GiB in 34 s
+#: (m3-max-51691), and a kill at the default leaves no room to retry at twice its RAM.
+DEFAULTS = {"build": (16, 30), "gpu": (4, 15), "time": (4, 20), "lavapipe": (32, 60), "lint": (16, 60), "winbuild": (10, 15),
+            "winrun": (8, 15), "wintime": (4, 20)}
+#: The awk filter between nextest and the job's log: every line up to the summary, then only the
+#: captured output of tests that did not pass, and the records of those that did.
+KEEP = r"""f == 0 { print; if ($0 ~ /^ *Summary \[/) f = 1; next }
+/^ +[A-Z][A-Z-]* +\[ *[0-9.]+s\]/ { k = ($1 != "PASS") }
+k || /M2V-MATRIX / { print }"""
+NEXTEST_OUT = "--no-fail-fast --success-output final --failure-output final"
+#: The packages of the GPU legs' device-test archive, and the tests of it a leg runs:
+#: `metal2vulkan-runtime`'s, and the replay player's stream device tests (`metal2vulkan-validation`'s
+#: `replay::rt_replay`), each of which writes and plays its own small stream. A break in the player
+#: or in the runtime's stream path that only a GPU shows would otherwise wait for a lane's play of a
+#: recorded stream to find it.
+DEVICE_TEST_PACKAGES = ("metal2vulkan-runtime", "metal2vulkan-validation")
+DEVICE_TEST_FILTER = ("package(metal2vulkan-runtime) | (package(metal2vulkan-validation)"
+                      " & test(/^replay::rt_replay::/))")
+#: The observations a Linux job's tree carries: Metal's alone (37 MiB of the 1.5 GiB), from which
+#: the stream device tests take their public cases' Metal outputs.
+METAL_OBSERVATIONS = "crates/metal2vulkan-validation/corpus/observations/metal"
+#: A failed allocation in a job's output: a device or host allocation Vulkan refused, or Rust's.
+STARVED = re.compile(r"OUT_OF_(DEVICE|HOST)_MEMORY|memory allocation of \d+ bytes failed")
+DEVICE_LINES = (r"""vulkaninfo --summary 2>/dev/null | tr -d '\r' | sed -n 's/^[[:space:]]*\(deviceName\|driverName\|driverInfo\|driverVersion\)[[:space:]]*= */M2V-DEVICE '"{leg}"' \1 /p'""")
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def git(*args, cwd=REPO, check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode:
+        sys.exit(f"git {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def potluck(*args, cwd=None):
+    return subprocess.run(["potluck", *args], cwd=cwd or TREE, capture_output=True, text=True, errors="replace")
+
+
+def dispatched(r):
+    """`potluck dispatch --json`'s reply: the job, or the error."""
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return dict(error=(r.stderr or r.stdout).strip())
+
+
+def load(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+# --- notes -------------------------------------------------------------------------------------
+
+def note(sha):
+    r = subprocess.run(["git", "notes", f"--ref={NOTES}", "show", sha], cwd=REPO, capture_output=True, text=True)
+    return json.loads(r.stdout) if r.returncode == 0 else None
+
+
+def base_of(sha, leg_id):
+    """The nearest first-parent ancestor of SHA whose note has leg LEG_ID: (sha, that leg)."""
+    noted = {line.split()[1] for line in git("notes", f"--ref={NOTES}", "list").splitlines() if line}
+    for commit in git("rev-list", "--first-parent", "--max-count=500", f"{sha}~1", check=False).splitlines():
+        if commit in noted:
+            leg = (note(commit) or {}).get("legs", {}).get(leg_id)
+            if leg:
+                return commit, leg
+    return None, None
+
+
+def harness_tree(sha):
+    """The harness crate's tree at SHA. Its times measure through the harness's own warm-up and
+    windows, so two commits' times compare only when one harness measured both."""
+    return git("rev-parse", f"{sha}:crates/metal2vulkan-harness", check=False)
+
+
+def base_times(sha, base_sha, base):
+    """The times of BASE (the leg at BASE_SHA) that SHA's are judged against: none when the
+    harness changed between them, and the run then sets the base for the next."""
+    if not base or harness_tree(base_sha) != harness_tree(sha):
+        return {}
+    return (base.get("records") or {}).get("time", {})
+
+
+# --- the plan ------------------------------------------------------------------------------------
+
+class Leg:
+    def __init__(self, leg_id, node, gpu=None, icd=None, select=False):
+        self.id, self.node, self.gpu, self.icd, self.select = leg_id, node, gpu, icd, select
+        self.jobs, self.parsed = [], dict(device={}, suites={})
+        # The rows its harness's second pass re-times alone for a cross-GPU outlier (results.alone_rows).
+        self.alone = []
+        self.started = self.ended = None
+
+
+#: The legs that need no GPU, both run on the builder.
+CPU_LEGS = ("lavapipe", "lint")
+
+
+def plan(nodes, cfg, only):
+    """The legs: each lab GPU on one node, the nodes' loads kept even (the GPUs on fewest nodes
+    placed first), each Windows GPU on its host, lavapipe and the lint. A card in the config's
+    `record_nodes` runs on every node that holds it: its leg of record on the node named, an extra
+    leg (results.extra_leg_id) on each other; with its node of record away, it has no leg of
+    record that run."""
+    skip = set(cfg.get("skip_gpus", []))
+    record_nodes = cfg.get("record_nodes", {})
+    linux = {n: f for n, f in nodes.items() if f["os"] == "linux"}
+    where = {}
+    for name, facts in sorted(linux.items()):
+        for g in facts["gpus"]:
+            vd = f"{g['vendor']}:{g['device']}"
+            if g["vendor"] in ICDS and vd not in skip:
+                where.setdefault(vd, []).append((name, g["id"]))
+    load_of, legs = {n: 0 for n in linux}, []
+    for vd, places in sorted(where.items(), key=lambda item: (len(item[1]), item[0])):
+        icd, select = ICDS[vd.split(":")[0]]
+        taken = {(leg.node, leg.icd) for leg in legs if not leg.select}
+        places = [p for p in places if select or (p[0], icd) not in taken]
+        if not places:
+            log(f"{vd}: every node holding it already runs a leg on its driver, which cannot pick between two")
+            continue
+        recorded = record_nodes.get(vd)
+        if recorded is not None:
+            if recorded not in {node for node, _ in places}:
+                log(f"{vd}: its node of record {recorded} is not among its nodes, so it has no leg of record")
+            for node, gpu in places:
+                load_of[node] += 1
+                leg_id = vd if node == recorded else results.extra_leg_id(vd, node)
+                legs.append(Leg(leg_id, node, gpu, icd, select))
+            continue
+        node, gpu = min(places, key=lambda p: (load_of[p[0]], p[0]))
+        load_of[node] += 1
+        legs.append(Leg(vd, node, gpu, icd, select))
+    for name, facts in sorted(nodes.items()):
+        if facts["os"] == "windows":
+            legs += [Leg(f"{g['vendor']}:{g['device']}", name, g["id"]) for g in facts["gpus"]
+                     if f"{g['vendor']}:{g['device']}" not in skip]
+    legs += [Leg(leg_id, None) for leg_id in CPU_LEGS]
+    if only:
+        unknown = set(only) - {leg.id for leg in legs}
+        if unknown:
+            sys.exit(f"no such leg: {', '.join(sorted(unknown))}")
+        legs = [leg for leg in legs if leg.id in only]
+    return legs
+
+
+def builder(cfg, nodes):
+    for b in cfg["builders"]:
+        if b["node"] in nodes and (not b.get("gate") or subprocess.run(b["gate"], shell=True).returncode == 0):
+            return b
+    sys.exit("no builder is up with its gate open")
+
+
+# --- job scripts ---------------------------------------------------------------------------------
+
+def layer_lines(layer, os_name, leg):
+    """Shell that unpacks the carried validation layer's OS_NAME directory in the job's workspace,
+    points the loader at it and prints its version as a device fact of LEG (`validationLayer`).
+    Where there is none, it says so there and points the loader at a directory with no layer, so
+    the device tests, which check that a validation tool is active, fail rather than run under
+    another version the node has."""
+    none = (f'export VK_LAYER_PATH="$PWD/.no-validation-layer"; '
+            f'echo "M2V-DEVICE {leg} validationLayer missing: ')
+    if not layer:
+        return none + 'the matrix has no layer carry (scripts/validation-layer)"'
+    mirror, rev = layer
+    point = ('export VK_LAYER_PATH="$(cygpath -w "$L")" PATH="$L:$PATH"' if os_name == "windows"
+             else 'export VK_LAYER_PATH="$L"')
+    return (f'L="$PWD/.validation-layer"; rm -rf "$L"; mkdir -p "$L" && '
+            f'git --git-dir="${mirror}" archive "{rev}" {os_name} | tar -x -C "$L" && L="$L/{os_name}" && '
+            f'test -f "$L/VERSION" && {point} && echo "M2V-DEVICE {leg} validationLayer $(head -1 "$L/VERSION")" || '
+            f'{{ {none}the carry\'s {os_name} directory did not unpack"; }}')
+
+
+def linux_head(short, setup):
+    """Every Linux job: the per-commit source path the GPU legs' archive is built and run at (the
+    archive holds the build's paths, so every node lays the tree out at the same one), with the
+    Metal observations alone (the stream device tests read the public cases' Metal outputs from
+    them) and none of the other backends', which nothing it runs reads."""
+    return f"""set -u
+M="$HOME/.cache/metal2vulkan-matrix"; S="$M/src-{short}"; mkdir -p "$M"
+find "$M" -maxdepth 1 -name 'src-*' ! -name 'src-{short}' -mmin +720 -exec rm -rf {{}} +
+{setup}
+lay_out() {{
+  flock "$M/.lock" sh -c 'test -d "$1" || {{ t="$1.tmp.$$" && rm -rf "$t" && mkdir -p "$t" && git archive HEAD -- . ":(exclude)crates/metal2vulkan-validation/corpus/observations" | tar -x -C "$t" && git archive HEAD -- {METAL_OBSERVATIONS} | tar -x -C "$t" && mv "$t" "$1"; }}' sh "$S"
+}}
+"""
+
+
+def build_script(short, setup, harness):
+    """The GPU legs' files: the device tests' nextest archive, built at the per-commit path, and,
+    where the commit has the harness, its release command, built in the workspace (it finds the
+    tree through `CARGO_MANIFEST_DIR` where it runs)."""
+    timed = (f"""
+cargo build --release -p metal2vulkan-harness --bin harness && cp -f target/release/harness {HARNESS}
+h=$?""" if harness else "\nh=0")
+    return linux_head(short, setup) + f"""W=$PWD
+lay_out || exit 3
+cd "$S" && RUSTFLAGS='--cfg m2v_gpu' CARGO_TARGET_DIR="$S/target/gpucfg" cargo nextest archive {" ".join(f"-p {p}" for p in DEVICE_TEST_PACKAGES)} --all-features --archive-file "$W/{ARCHIVE}"
+a=$?
+cd "$W" && rm -rf "$S"{timed}
+echo "M2V-BUILD exit $a $h"
+[ $a -eq 0 ] && [ $h -eq 0 ]
+"""
+
+
+def gpu_script(short, setup, legs, mirror, rev, suite, last, layer=None):
+    """A node's legs in turn, running SUITE: `rt` (the device tests, under the validation layer
+    LAYER carries, layer_lines) or `harness` (the timed workloads, harness_runs, without it). The
+    node's LAST job removes the tree and its carry's mirror there
+    (no other job reads it; potluck never prunes one), and any left by a job that never ran."""
+    runs = "\n".join(" ".join(["leg", leg.id, leg.icd, shlex.quote(results.card_of(leg.id) + "!" if leg.select else ""),
+                               shlex.quote(" ".join(leg.alone))])
+                     for leg in legs)
+    if suite == "rt":
+        file, body = ARCHIVE, f"""{layer_lines(layer, 'linux', '$1')}
+    cargo nextest run --archive-file "$F" --workspace-remap "$S" -E '{DEVICE_TEST_FILTER}' {NEXTEST_OUT} 2>&1 | awk "$KEEP"
+    exit ${{PIPESTATUS[0]}}"""
+    else:
+        file, body = HARNESS, harness_runs('"$S/crates/metal2vulkan-harness"', '"$F"', '$1')
+    tidy = """rm -rf "$S"
+m="${mirror}"; rm -rf "$m" "${{m%.git}}.lock" "${{m%.git}}.worktrees.lock"
+find "$POTLUCK_HOME/mirrors" -maxdepth 1 -name 'm2v-matrix-*' -mmin +720 -exec rm -rf {{}} +""".format(mirror=mirror) if last else ""
+    return linux_head(short, setup) + f"""lay_out || exit 3
+F="$PWD/{file}"
+git --git-dir="${mirror}" cat-file blob "{rev}:{file}" > "$F" && chmod +x "$F" || exit 3
+KEEP='{KEEP}'
+all=0
+leg() {{
+  echo "M2V-LEG $1 begin"
+  (
+    export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/$2_icd.json"
+    if [ -n "$3" ]; then export MESA_VK_DEVICE_SELECT="$3"; fi
+    export M2V_ALONE="$4"
+    {DEVICE_LINES.format(leg="$1")}
+    {body}
+  )
+  rc=$?
+  {'echo "M2V-SUITE $1 rt exit $rc"' if suite == "rt" else ""}
+  [ $rc -eq 0 ] || all=1
+}}
+{runs}
+rm -f "$F"
+{tidy}
+exit $all
+"""
+
+
+def harness_runs(manifest_dir, command, leg, windows=False):
+    """The harness command on leg LEG, its one suite (HARNESS_SUITE); the shell's status is 1
+    where it failed. The rows are timed in one process on HARNESS_RUNTIME, with a fresh empty driver
+    shader cache (Mesa's MESA_SHADER_CACHE_DIR, NVIDIA's __GL_SHADER_DISK_CACHE_PATH; on WINDOWS,
+    the Intel driver's, which follows LOCALAPPDATA and USERPROFILE), so its first uses compile
+    cold whatever ran on the node before. A short second run on the same cache follows, before the
+    suite's line, and its first-use records are kept under harness-<runtime>-warm/: the same first
+    uses with the driver's cache warm. These runs skip the creation rows (results.HARNESS_CREATES):
+    those run after them in a process of their own on a fresh empty driver cache and store, so no
+    row before them warms the driver for them, its devices' records (totals and gauges at drop)
+    apart (results.CREATES_APART). In a cross-GPU outlier's second pass, the rows M2V_ALONE names
+    (results.alone_rows) are each run alone in results.RETIME_PAIRS processes, every one on a fresh
+    empty driver cache and store, their times kept (results.ALONE_KEEP) for results.time_outliers,
+    which judges such a row by its lowest level; a frames workload's latency from idle row
+    (results.FROM_IDLE) by its workload's runs. A row whose size follows the device is sized by the
+    first run, and every later run, warm and alone ones included, is given that size (`--size`),
+    so each times the same work. The process has a fresh empty store for its pipelines (`--store`),
+    so its first uses and its `create_state` row are cold; the warm run takes the same store, warm.
+    The loader's VK_LOADER_LAYERS_DISABLE (loader 1.3.234 and later) names the validation layer,
+    and that layer alone, since Mesa's device-select layer picks the card: whatever the node has
+    installed, every harness row is a release build without the layer."""
+    runtime = HARNESS_RUNTIME
+    profile = unprofile = ""
+    store = '"$(cygpath -w "$store")"' if windows else '"$store"'
+    point = ""
+    if windows:
+        point = r"""      mkdir -p "$cache/AppData/Local" && w=$(cygpath -w "$cache") || exit 3
+      export LOCALAPPDATA="$w\AppData\Local" USERPROFILE="$w"
+"""
+        profile = "    saved_local=$LOCALAPPDATA saved_profile=$USERPROFILE\n" + point
+        unprofile = '\n    export LOCALAPPDATA="$saved_local" USERPROFILE="$saved_profile"'
+    creates = f"'{results.HARNESS_CREATES}*'"
+    rename = r"s#^M2V-MATRIX \([a-z]*\) harness-$runtime/\([a-z]*\)/first_use_#M2V-MATRIX \1 harness-$runtime-warm/\2/first_use_#p"
+    sized = r"s#^\([a-z0-9_]*\)  *[a-z]*  *sized to \([0-9][0-9]*\) .*#--size \1=\2#p"
+    return f"""out=$(mktemp -d) || exit 3
+    cache=$(mktemp -d) && store=$(mktemp -d) || exit 3
+    export MESA_SHADER_CACHE_DIR="$cache" __GL_SHADER_DISK_CACHE_PATH="$cache"
+    export VK_LOADER_LAYERS_DISABLE=VK_LAYER_KHRONOS_validation
+{profile}    CARGO_MANIFEST_DIR={manifest_dir} {command} --runtime {runtime} --skip {creates} --store {store} 2>&1 | tee "$out/timed"
+    r=${{PIPESTATUS[0]}}
+    sizes=$(sed -n "{sized}" "$out/timed" | sort -u | tr '\\n' ' ')
+    runtime={runtime}
+    CARGO_MANIFEST_DIR={manifest_dir} {command} --runtime $runtime $sizes --skip {creates} --store {store} --runs 5 --warmup 1 --no-settle 2>&1 |
+      sed -n "{rename}"
+    rm -rf "$cache" "$store"
+    cache=$(mktemp -d) && store=$(mktemp -d) || exit 3
+    export MESA_SHADER_CACHE_DIR="$cache" __GL_SHADER_DISK_CACHE_PATH="$cache"
+{point}    CARGO_MANIFEST_DIR={manifest_dir} {command} --runtime $runtime --only {creates} --store {store} 2>&1 |
+      sed "{results.CREATES_APART}" | tee -a "$out/timed"
+    [ ${{PIPESTATUS[0]}} -eq 0 ] || r=1
+    timed=$runtime
+    for row in ${{M2V_ALONE:-}}; do
+      workload=${{row%%/*}}
+      for pair in $(seq {results.RETIME_PAIRS}); do
+        rm -rf "$cache" "$store"
+        cache=$(mktemp -d) && store=$(mktemp -d) || exit 3
+        export MESA_SHADER_CACHE_DIR="$cache" __GL_SHADER_DISK_CACHE_PATH="$cache"
+{point}        CARGO_MANIFEST_DIR={manifest_dir} {command} --runtime $timed $sizes --only "${{workload%{results.FROM_IDLE}}}" --store {store} 2>&1 | sed -n "{results.ALONE_KEEP}"
+      done
+    done
+    unset MESA_SHADER_CACHE_DIR __GL_SHADER_DISK_CACHE_PATH{unprofile}
+    rm -rf "$cache" "$store" "$out"
+    echo "M2V-SUITE {leg} {HARNESS_SUITE} exit $r"
+    exit $r"""
+
+
+def lavapipe_script(setup, layer=None):
+    """The gate's suites and the CPU-ICD device tests in one build: `m2v_cpu_icd` adds the device
+    tests to every test the plain build has; rt's run under the validation layer LAYER carries."""
+    return f"""set -u
+{setup}
+export RUSTFLAGS='--cfg m2v_cpu_icd' RUSTDOCFLAGS='--cfg m2v_cpu_icd' CARGO_TARGET_DIR=target/cpuicd
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json LP_NUM_THREADS=1
+KEEP='{KEEP}'
+echo "M2V-LEG lavapipe begin"
+{DEVICE_LINES.format(leg="lavapipe")}
+{layer_lines(layer, 'linux', 'lavapipe')}
+cargo nextest run --workspace --all-features {NEXTEST_OUT} 2>&1 | awk "$KEEP"
+a=${{PIPESTATUS[0]}}
+echo "M2V-SUITE lavapipe workspace exit $a"
+cargo test --workspace --all-features --doc 2>&1 | grep -E '^(test result:|error)|FAILED|panicked'
+d=${{PIPESTATUS[0]}}
+echo "M2V-SUITE lavapipe doctests exit $d"
+[ $a -eq 0 ] && [ $d -eq 0 ]
+"""
+
+
+def lint_script(setup):
+    """The gate's format check, clippy in each configuration and Rustdoc, each its own suite, in a
+    tree of its own so they run beside the builder's other jobs."""
+    show = "awk 'n < 40 && /^(error|warning)|^ *--> / { print; n++ }'"
+    return f"""set -u
+{setup}
+echo "M2V-LEG lint begin"
+all=0
+step() {{
+  name=$1; shift
+  "$@" 2>&1 | {show}
+  rc=${{PIPESTATUS[0]}}
+  echo "M2V-SUITE lint $name exit $rc"
+  [ $rc -eq 0 ] || all=1
+}}
+step fmt cargo fmt --all --check
+step clippy cargo clippy --workspace --all-targets --all-features -- -D warnings
+step clippy-gpu env RUSTFLAGS='--cfg m2v_gpu' CARGO_TARGET_DIR=target/gpucfg cargo clippy --workspace --all-targets --all-features -- -D warnings
+step clippy-cpu-icd env RUSTFLAGS='--cfg m2v_cpu_icd' CARGO_TARGET_DIR=target/cpuicd cargo clippy --workspace --all-targets --all-features -- -D warnings
+step rustdoc env RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+exit $all
+"""
+
+
+def windows_head():
+    """Windows jobs build and run under MSYS2 CLANG64 with the pinned nightly's gnullvm host
+    toolchain; `scripts/rustc-wrapper` is a shell script, which cargo cannot run there."""
+    return """set -u
+export PATH="/c/msys64/clang64/bin:$PATH" RUSTC_WRAPPER=
+export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\\(.*\\)"$/\\1/p' rust-toolchain.toml)-x86_64-pc-windows-gnullvm"
+export RUSTFLAGS='--cfg m2v_gpu' CARGO_TARGET_DIR=target/gpucfg
+"""
+
+
+def winbuild_script(harness):
+    timed = "\ncargo build --release -p metal2vulkan-harness --bin harness\nh=$?" if harness else "\nh=0"
+    return windows_head() + f"""cargo nextest run -p metal2vulkan-runtime --all-features --no-run
+a=$?{timed}
+echo "M2V-BUILD exit $a $h"
+[ $a -eq 0 ] && [ $h -eq 0 ]
+"""
+
+
+def winrun_script(leg, suite, layer=None):
+    if suite == "rt":
+        body = f"""{layer_lines(layer, 'windows', leg.id)}
+cargo nextest run -p metal2vulkan-runtime --all-features {NEXTEST_OUT} 2>&1 | awk "$KEEP"
+rc=${{PIPESTATUS[0]}}"""
+    else:
+        body = f"""(
+export M2V_ALONE={shlex.quote(" ".join(leg.alone))}
+{harness_runs('"$PWD/crates/metal2vulkan-harness"', "target/gpucfg/release/harness", leg.id, windows=True)}
+)
+rc=$?"""
+    return windows_head() + f"""KEEP='{KEEP}'
+echo "M2V-LEG {leg.id} begin"
+{DEVICE_LINES.format(leg=leg.id)}
+{body}
+{f'echo "M2V-SUITE {leg.id} rt exit $rc"' if suite == "rt" else ""}
+exit $rc
+"""
+
+
+# --- running jobs --------------------------------------------------------------------------------
+
+def layer_carry(path):
+    """The validation layer's carry at PATH, a git repository (scripts/validation-layer): its
+    (--carry value, mirror variable, commit), or None where there is none."""
+    if not (path / ".git").is_dir():
+        return None
+    rev = git("rev-parse", "HEAD", cwd=path)
+    return f"{path}@{rev}", "POTLUCK_MIRROR_" + re.sub(r"[^A-Za-z0-9_]", "_", path.name), rev
+
+
+class Run:
+    def __init__(self, sha, cfg, nodes, legs, build_node, rdir):
+        self.sha, self.short, self.cfg, self.nodes = sha, sha[:12], cfg, nodes
+        self.legs, self.build_node, self.rdir = legs, build_node, rdir
+        self.stats = load(STATE / "stats.json", {})
+        self.spaces = load(STATE / "workspaces.json", {})
+        self.lock = threading.Lock()
+        self.jobs, self.carries, self.failures = [], [], {}
+        #: Each Linux GPU node's carry, (--carry value, mirror variable, commit), once its legs
+        #: started: a leg's harness timed once more for a cross-GPU outlier (retime) takes it.
+        self.carried = {}
+        self.build_info = None
+        #: Whether the commit has the harness, whose timed workloads each GPU leg runs.
+        #: Whether the commit has the lock budget, which a node naming its event must measure.
+        self.lock_budget = subprocess.run(["git", "cat-file", "-e", f"{sha}:crates/metal2vulkan-runtime/src/tests/locks.rs"],
+                                          cwd=REPO, capture_output=True).returncode == 0
+        self.harness = subprocess.run(["git", "cat-file", "-e", f"{sha}:crates/metal2vulkan-harness/Cargo.toml"],
+                                      cwd=REPO, capture_output=True).returncode == 0
+        #: The validation layer's carry: (--carry value, mirror variable, commit), or None.
+        self.layer = layer_carry(Path(cfg.get("validation_layer", LAYER)).expanduser())
+        #: The messages of the commits since the golden table's last bless, which
+        #: results.golden_table_moved reads for the one phrase that lets the table's output move.
+        blessed = git("log", "-1", "--format=%H", sha, "--", GOLDEN_TABLE)
+        self.since_bless = [m for m in git("log", "--format=%B%x00", f"{blessed}..{sha}").split("\0")
+                            if m.strip()]
+
+    def setup(self, node):
+        return self.cfg.get("setup", {}).get(node, "")
+
+    def size(self, kind, node, legs=1):
+        """RAM and timeout from this kind's last measured runs on NODE, for a job of LEGS legs run in
+        turn: a run's minutes are kept per leg, and the timeout is LEGS times one leg's. RAM: 1.3x the largest
+        peak of the last three that started in a fresh workspace (a run that peaked at its
+        reservation keeps it; one that ended for want of RAM gets 2x), else the kind's default. For
+        a kind that keeps a workspace that is a whole build: an incremental build's peak says
+        nothing of one, and a kept workspace can rebuild most of the tree; every run of a kind that
+        keeps none starts fresh. Minutes: 1.5x the longest of the last three, never below the
+        kind's default: an incremental run's minutes say nothing of a full rebuild's."""
+        ram, minutes = DEFAULTS[kind]
+        runs = self.stats.get(f"{kind}@{node}", [])
+        whole = [r for r in runs if r.get("full")][-3:]
+        if whole:
+            ram = max(2 * r["ram"] if r["killed"] else
+                      r["ram"] if r["peak"] >= 0.95 * r["ram"] else math.ceil(r["peak"] * 1.3 + 0.5)
+                      for r in whole)
+        if runs:
+            minutes = max(minutes, math.ceil(1.5 * max(r["minutes"] for r in runs[-3:])))
+        return max(ram, 2), minutes * legs
+
+    def job(self, kind, node, script, name, gpus=(), carries=(), space=None, exclusive=False, room=None, legs=1):
+        """Dispatch SCRIPT on NODE, wait for it, and return (exit code, output, job record).
+        SPACE names a workspace kept for this kind on this node across runs (incremental builds,
+        and no fresh checkout of the tree). A job that times anything is EXCLUSIVE. It is sized as
+        a whole build (size). A job that ended for want of RAM runs again with twice its room, up
+        to the kind's default (ROOM, the room of that run again): the leg is not the job's to
+        lose. Wanting RAM is a peak at the reservation and either a kill over it or a failed
+        allocation in the output: a driver that pins host memory for a device allocation can
+        answer the job's limit with an out-of-memory error rather than the kill."""
+        key = f"{space}@{node}" if space else None
+        with self.lock:
+            ws = self.spaces.get(key) if key else None
+        ram, minutes = self.size(kind, node, legs)
+        if room:
+            ram = room
+        args = ["dispatch", "--json", "--priority", "5", "--kill-on-stall", "--label", "agent=matrix",
+                "--label", f"matrix={self.short}", "--on", f"node={node}", "--ram", str(ram),
+                "--timeout", f"{minutes}m"]
+        if self.nodes[node]["os"] == "windows":
+            args += ["--on", "os=windows"]
+        for gpu in gpus:
+            args += ["--gpu", gpu]
+        for carry in carries:
+            args += ["--carry", carry]
+        if exclusive:
+            args += ["--exclusive"]
+        if key:
+            args += ["--hold", "24h"]
+        # The script travels in the job's environment, never on its command line: Windows starts a
+        # job's command through a command line cut at 8,191 characters, and the harness legs'
+        # scripts are longer (their per-row limits), so bash read a truncated script there.
+        args += ["--env", f"M2V_JOB={script}"]
+        cmd = ["--", "bash", "-c", 's=$M2V_JOB; unset M2V_JOB; eval "$s"']
+        r = potluck(*args, *(["--workspace", ws, "--advance"] if ws else []), *cmd)
+        if ws and "job" not in dispatched(r):
+            log(f"{name}: workspace {ws} refused ({dispatched(r).get('error', '')[:200]}); a fresh one")
+            potluck("release", ws)
+            with self.lock:
+                self.spaces.pop(key, None)
+            ws = None
+            r = potluck(*args, *cmd)
+        reply = dispatched(r)
+        if "job" not in reply:
+            return None, f"dispatch failed: {reply.get('error', '')[:500]}", None
+        jid = reply["job"]
+        log(f"{name}: job {jid} on {node} ({ram} GiB, {minutes} min)")
+        with self.lock:
+            self.jobs.append(jid)
+        w = subprocess.run(["potluck", "wait", jid], cwd=TREE, capture_output=True, text=True, errors="replace")
+        out = w.stdout + w.stderr
+        (self.rdir / f"{name}.log").write_text(out)
+        rec = self.record(jid)
+        killed = False
+        if rec and rec.get("started_at") and rec.get("ended_at"):
+            peak = rec.get("usage", {}).get("peak_mem_bytes", 0) / 2**30
+            took = (rec.get("ended_at", 0) - rec.get("started_at", 0)) / 60000
+            code = rec.get("exit_code")
+            killed = peak >= 0.95 * ram and (code == 137 or (code != 0 and bool(STARVED.search(out))))
+            with self.lock:
+                self.stats.setdefault(f"{kind}@{node}", []).append(
+                    dict(ram=ram, peak=round(peak, 2), minutes=round(took / legs, 2), killed=killed,
+                         full=ws is None))
+                self.stats[f"{kind}@{node}"] = self.stats[f"{kind}@{node}"][-6:]
+                if key and rec.get("workspace"):
+                    self.spaces[key] = rec["workspace"]
+        log(f"{name}: job {jid} ended {w.returncode}")
+        cap = max(DEFAULTS[kind][0], ram)
+        if killed and ram < cap:
+            log(f"{name}: wanted more than its {ram} GiB; again with {min(2 * ram, cap)} GiB")
+            return self.job(kind, node, script, name, gpus, carries, space, exclusive,
+                            room=min(2 * ram, cap), legs=legs)
+        return w.returncode, out, rec
+
+    def record(self, jid):
+        r = potluck("status", "--json")
+        try:
+            status = json.loads(r.stdout)
+        except ValueError:
+            return None
+        for kind in ("recent", "running"):
+            for j in status.get(kind, []):
+                if j.get("id") == jid:
+                    return j
+        return None
+
+    def carry(self, node, rec):
+        """Copy a finished build's files out of its workspace into a git repository of its own,
+        which GPU jobs name with --carry. Returns (--carry value, mirror variable, commit)."""
+        name = f"m2v-matrix-{self.short}-{re.sub(r'[^A-Za-z0-9]', '', node)[-12:]}"
+        cdir = STATE / "carry" / name
+        shutil.rmtree(cdir, ignore_errors=True)
+        cdir.mkdir(parents=True)
+        git("init", "-q", cwd=cdir)
+        files = [ARCHIVE] + ([HARNESS] if self.harness else [])
+        for file in files:
+            if potluck("cp", f"{rec['workspace']}:{file}", str(cdir / file)).returncode:
+                return None
+        git("add", *files, cwd=cdir)
+        git("-c", "user.name=matrix", "-c", "user.email=matrix@localhost", "commit", "-q", "-m", self.sha, cwd=cdir)
+        for file in files:
+            (cdir / file).unlink()
+        with self.lock:
+            self.carries.append(name)
+        rev = git("rev-parse", "HEAD", cwd=cdir)
+        return f"{cdir}@{rev}", "POTLUCK_MIRROR_" + re.sub(r"[^A-Za-z0-9_]", "_", name), rev
+
+    def fail(self, legs, why, rec=None):
+        with self.lock:
+            for leg in legs:
+                self.failures.setdefault(leg.id, []).append(why)
+                if rec:
+                    leg.jobs.append(rec.get("id"))
+
+    def linux_build(self, node, label):
+        """Build the GPU legs' archive on NODE (no GPU held) and carry it: (carry, mirror, rev)."""
+        code, out, rec = self.job("build", node, build_script(self.short, self.setup(node), self.harness), label,
+                                  space="build")
+        if code != 0 or not rec:
+            return None, f"the build ({label}, job {rec and rec.get('id')}) failed: exit {code}"
+        if node == self.build_node["node"]:
+            self.build_info = dict(node=node, job=rec["id"])
+        made = self.carry(node, rec)
+        return made, None if made else f"the archive of job {rec['id']} could not be copied"
+
+    def gpu_node(self, node, legs, ready):
+        """One node's GPU legs: their device tests in turn, in one job holding their GPUs, then
+        their harnesses in turn, in ONE job that holds the node alone, so the node drains once for
+        all its timings; each leg still times its one GPU with nothing else running. The node's
+        last planned job tidies its tree and its carry's mirror. READY gives the carry."""
+        made, why = ready()
+        if not made:
+            return self.fail(legs, why)
+        carry, mirror, rev = made
+        with self.lock:
+            self.carried[node] = made
+        for leg in legs:
+            leg.started = time.time()
+        jobs = [("rt", legs, f"rt-{node}")] + ([("harness", legs, f"harness-{node}")] if self.harness else [])
+        while jobs:
+            suite, these, name = jobs.pop(0)
+            layer = self.layer if suite == "rt" else None
+            script = gpu_script(self.short, self.setup(node), these, mirror, rev, suite, not jobs,
+                                layer and layer[1:])
+            code, out, rec = self.job("gpu" if suite == "rt" else "time", node, script, name,
+                                      gpus=[leg.gpu for leg in these],
+                                      carries=[carry] + ([layer[0]] if layer else []), space="gpu",
+                                      exclusive=suite == "harness", legs=len(these) if suite == "harness" else 1)
+            self.finish(these, code, out, rec, suite)
+
+    def retime(self, legs):
+        """Each of LEGS's harness timed once more, after every leg is in: a leg whose one pass has
+        a harness row's cross-GPU outlier (results.outliers_to_retime), which then fails it only
+        where both passes agree (results.time_outliers). The second pass's records take the
+        first's. A Linux node's legs in turn in ONE job holding the
+        node alone, as a timing does, which lays the tree out again and tidies, as the node's last
+        job had; a Windows node's leg in its own; the nodes at once."""
+        by_node = {}
+        for leg in legs:
+            by_node.setdefault(leg.node, []).append(leg)
+
+        def chain(node, these):
+            batches = ([[leg] for leg in these] if self.nodes[node]["os"] == "windows" else [these])
+            for batch in batches:
+                try:
+                    if self.nodes[node]["os"] == "windows":
+                        leg = batch[0]
+                        code, out, rec = self.job("wintime", node, winrun_script(leg, "harness"),
+                                                  f"winharness-{leg.id}-outlier", gpus=[leg.gpu], space="win",
+                                                  exclusive=True)
+                    elif node in self.carried:
+                        carry, mirror, rev = self.carried[node]
+                        script = gpu_script(self.short, self.setup(node), batch, mirror, rev, "harness",
+                                            True, None)
+                        code, out, rec = self.job("time", node, script, f"harness-{node}-outlier",
+                                                  gpus=[leg.gpu for leg in batch], carries=[carry], space="gpu",
+                                                  exclusive=True, legs=len(batch))
+                    else:
+                        self.fail(batch, f"its cross-GPU outlier's re-time found no carry on {node}")
+                        continue
+                    self.finish(batch, code, out, rec, "harness")
+                except Exception as error:  # a re-time's own failure fails its legs, not the run
+                    log(f"retime {node}: {error!r}")
+                    self.fail(batch, f"its cross-GPU outlier's re-time failed: {error!r}")
+
+        threads = [threading.Thread(target=chain, args=(node, these)) for node, these in sorted(by_node.items())]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def finish(self, legs, code, out, rec, suite):
+        """Merge one job's legs into theirs: a leg it did not run, or whose suite never reported its
+        exit, fails. A job killed after it named a leg (its device lines) but before that leg's
+        `M2V-SUITE` line ran nothing of it: on 248d41074f the 3090 and the UHD 630 passed that way,
+        their rt jobs killed for RAM, on their harness suites alone."""
+        parsed = results.parse_job(out or "")
+        for leg in legs:
+            leg.ended = time.time()
+            if rec:
+                leg.jobs.append(rec.get("id"))
+            if leg.id not in parsed or not parsed[leg.id]["suites"]:
+                if leg.id in parsed:
+                    leg.parsed["device"].update(parsed[leg.id]["device"])
+                self.fail([leg], f"{suite}: job {rec and rec.get('id')} reported no suite of leg {leg.id} "
+                                 f"(exit {code}): {(out or '').strip()[-300:]}")
+                continue
+            leg.parsed["device"].update(parsed[leg.id]["device"])
+            leg.parsed["suites"].update(parsed[leg.id]["suites"])
+            if suite == "harness" and HARNESS_SUITE not in parsed[leg.id]["suites"]:
+                self.fail([leg], f"harness: job {rec and rec.get('id')} reported no suite {HARNESS_SUITE} "
+                                 f"of leg {leg.id} (exit {code})")
+
+    def windows(self, leg):
+        code, out, rec = self.job("winbuild", leg.node, winbuild_script(self.harness), f"winbuild-{leg.id}",
+                                  space="win")
+        if code != 0:
+            return self.fail([leg], f"the Windows build (job {rec and rec.get('id')}) failed: exit {code}", rec)
+        leg.started = time.time()
+        suites = ["rt"] + (["harness"] if self.harness else [])
+        while suites:
+            suite = suites.pop(0)
+            layer = self.layer if suite == "rt" else None
+            name = f"win{suite}-{leg.id}"
+            code, out, rec = self.job("winrun" if suite == "rt" else "wintime", leg.node,
+                                      winrun_script(leg, suite, layer and layer[1:]), name,
+                                      gpus=[leg.gpu], carries=[layer[0]] if layer else [], space="win",
+                                      exclusive=suite == "harness")
+            self.finish([leg], code, out, rec, suite)
+
+    def lavapipe(self, leg):
+        leg.node = self.build_node["node"]
+        leg.started = time.time()
+        layer = self.layer
+        code, out, rec = self.job("lavapipe", leg.node, lavapipe_script(self.setup(leg.node), layer and layer[1:]),
+                                  "lavapipe", carries=[layer[0]] if layer else [], space="lavapipe")
+        self.finish([leg], code, out, rec, "lavapipe")
+
+    def lint(self, leg):
+        leg.node = self.build_node["node"]
+        leg.started = time.time()
+        code, out, rec = self.job("lint", leg.node, lint_script(self.setup(leg.node)), "lint", space="lint")
+        self.finish([leg], code, out, rec, "lint")
+
+    def go(self):
+        """Every chain of jobs at once: the builder (its build, its GPU legs if any, lavapipe), the
+        lint beside it on the builder, each other Linux GPU node (its own build where the builder's archive cannot run there,
+        then its legs), and each Windows host (build, then its leg)."""
+        b = self.build_node["node"]
+        by_node = {}
+        for leg in self.legs:
+            if leg.id not in CPU_LEGS and self.nodes[leg.node]["os"] == "linux":
+                by_node.setdefault(leg.node, []).append(leg)
+        built = threading.Event()
+        box = {}
+
+        def from_builder():
+            built.wait()
+            return box.get("made", (None, "the build did not finish"))
+
+        threads = []
+
+        def start(legs, fn, *args):
+            def chain():
+                try:
+                    fn(*args)
+                except Exception as error:  # a chain's own failure fails its legs, not the run
+                    log(f"{fn.__name__}: {error!r}")
+                    self.fail(legs, f"the runner failed: {error!r}")
+            t = threading.Thread(target=chain)
+            t.start()
+            threads.append(t)
+
+        def builder_chain():
+            try:
+                box["made"] = self.linux_build(b, "build") if by_node else (None, "no GPU leg on Linux")
+            finally:
+                built.set()
+            if b in by_node:
+                self.gpu_node(b, by_node[b], from_builder)
+            if lavapipe:
+                self.lavapipe(lavapipe[0])
+
+        lavapipe = [leg for leg in self.legs if leg.id == "lavapipe"]
+        start(by_node.get(b, []) + lavapipe, builder_chain)
+        for leg in self.legs:
+            if leg.id == "lint":
+                start([leg], self.lint, leg)
+        cpu = self.nodes[b]["cpu_model"]
+        for node, legs in sorted(by_node.items()):
+            if node == b:
+                continue
+            if self.build_node.get("portable") or self.nodes[node]["cpu_model"] == cpu:
+                start(legs, self.gpu_node, node, legs, from_builder)
+            else:
+                start(legs, self.gpu_node, node, legs, lambda node=node: self.linux_build(node, f"build-{node}"))
+        for leg in self.legs:
+            if leg.id not in CPU_LEGS and self.nodes[leg.node]["os"] == "windows":
+                start([leg], self.windows, leg)
+        for t in threads:
+            t.join()
+
+    def cleanup(self):
+        save(STATE / "stats.json", self.stats)
+        save(STATE / "workspaces.json", self.spaces)
+        mirrors = Path.home() / ".local/state/potluck/mirrors"
+        for name in self.carries:
+            shutil.rmtree(STATE / "carry" / name, ignore_errors=True)
+            for m in mirrors.glob(f"{name}-*"):
+                shutil.rmtree(m) if m.is_dir() else m.unlink()
+
+
+# --- commands ------------------------------------------------------------------------------------
+
+def leg_entry(run, leg):
+    """A leg's document in the note, judged against its base where only one leg is needed."""
+    parsed = leg.parsed
+    records, problems = results.leg_records(parsed)
+    base_sha, base = base_of(run.sha, leg.id)
+    problems += run.failures.get(leg.id, [])
+    base_records = base and results.base_records(base["records"], harness_tree(base_sha) == harness_tree(run.sha))
+    problems += results.leg_problems(parsed, records, base_records)
+    problems += results.golden_table_moved(parsed, run.since_bless)
+    if leg.id not in CPU_LEGS and run.lock_budget:
+        problems += results.lock_budget_missing(records, results.names_lock_event(run.setup(leg.node)))
+    cpu = run.nodes.get(leg.node, {}).get("cpu_model")
+    budget, budget_parked = results.harness_budget(leg.id, parsed)
+    problems += budget
+    if not parsed["suites"] and leg.id not in run.failures:
+        problems.append("no suite reported")
+    dev = parsed["device"]
+    layer = dev.get("validationLayer")
+    if layer and layer.startswith("missing"):
+        problems.append(f"validation layer {layer}")
+    return dict(
+        node=leg.node, cpu=cpu, gpu=leg.id if leg.id not in CPU_LEGS else None, jobs=leg.jobs,
+        device=dev.get("deviceName"), driver=" ".join(v for v in (dev.get("driverName"), dev.get("driverInfo"))
+                                                if v) + (f" ({dev['driverVersion']})" if dev.get("driverVersion") else "") or None,
+        layer=layer,
+        started=leg.started and datetime.fromtimestamp(leg.started, timezone.utc).isoformat(timespec="seconds"),
+        minutes=leg.started and leg.ended and round((leg.ended - leg.started) / 60, 2),
+        suites={name: {k: s[k] for k in ("exit", "run", "passed", "failed")} for name, s in parsed["suites"].items()},
+        records=records, base=base_sha, base_records=base and base["records"],
+        problems=problems, uncounted=results.leg_uncounted(parsed),
+        parked=results.leg_parked(parsed, records) + budget_parked)
+
+
+def cross_gpu(sha, doc, entries):
+    """The GPU legs' times and their bases' times that the cross-GPU rule compares
+    (results.outlier_keys): this run's ENTRIES' and the note DOC's other GPU legs'. The median
+    takes every GPU leg of the note, so a run of some legs (--legs) is judged against the GPUs it
+    did not run again; only this run's legs are judged."""
+    times, bases = {}, {}
+    for leg_id, e in doc["legs"].items():
+        if e.get("gpu") and leg_id not in entries:
+            times[leg_id] = e["records"]["time"]
+            bases[leg_id] = base_times(sha, *base_of(sha, leg_id))
+    for leg_id, e in entries.items():
+        if e["gpu"]:
+            times[leg_id] = e["records"]["time"]
+            bases[leg_id] = base_times(sha, e["base"], e["base_records"] and {"records": e["base_records"]})
+    return times, bases
+
+
+def run_cmd(sha, only, dry):
+    cfg = load(CONFIG, None)
+    if not cfg or not cfg.get("builders"):
+        sys.exit(f"{CONFIG}: missing or without builders (see {__file__}'s header)")
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("another matrix run is live: runs share their workspaces, so they never overlap")
+    if not (TREE / ".git").exists():
+        subprocess.run([str(REPO / "scripts/lean-tree"), "worktree", str(TREE), "matrix/tree", sha], check=True)
+        git("switch", "-q", "--detach", sha, cwd=TREE)
+        git("branch", "-q", "-D", "matrix/tree")
+    git("switch", "-q", "--detach", sha, cwd=TREE)
+    if git("status", "--porcelain", cwd=TREE):
+        sys.exit(f"{TREE} has changes: it must be a clean checkout of {sha}")
+    nodes_json = json.loads(potluck("nodes", "--json").stdout)
+    nodes = {n["facts"]["node"]: n["facts"] for n in nodes_json["nodes"] if n.get("alive")}
+    legs = plan(nodes, cfg, only)
+    b = builder(cfg, nodes)
+    for leg in legs:
+        log(f"leg {leg.id}: {leg.node or b['node']}" + (f" ({leg.icd})" if leg.icd else ""))
+    log(f"builder {b['node']}{' (portable)' if b.get('portable') else ''}")
+    if dry:
+        return
+    started = time.time()
+    rdir = STATE / "runs" / f"{sha[:12]}-{time.strftime('%m%d-%H%M%S')}"
+    rdir.mkdir(parents=True)
+    run = Run(sha, cfg, nodes, legs, b, rdir)
+    doc = note(sha) or dict(sha=sha, runs=[], legs={})
+    try:
+        run.go()
+        entries = {leg.id: leg_entry(run, leg) for leg in legs}
+        # A harness row's cross-GPU outlier in one pass fails nothing yet: once every leg is in,
+        # the legs that have one are timed once more, each such row also alone in fresh processes
+        # (results.alone_rows), and an outlier fails a leg only where both passes agree and its
+        # lowest level is still out (results.time_outliers).
+        found = results.outlier_keys(*cross_gpu(sha, doc, entries))
+        first = results.outliers_to_retime({leg_id: keys for leg_id, keys in found.items() if leg_id in entries})
+        if first:
+            log(f"cross-GPU outliers in one pass on {', '.join(sorted(first))}: timed once more")
+            again = [leg for leg in legs if leg.id in first]
+            for leg in again:
+                leg.alone = results.alone_rows(first[leg.id])
+            run.retime(again)
+            entries.update({leg.id: leg_entry(run, leg) for leg in again})
+    finally:
+        run.cleanup()
+    outliers, parked = results.time_outliers(*cross_gpu(sha, doc, entries), first)
+    for leg_id, problems in outliers.items():
+        if leg_id in entries:
+            entries[leg_id]["problems"] += problems
+    for leg_id, lines in parked.items():
+        if leg_id in entries:
+            entries[leg_id]["parked"] += lines
+    for leg_id, e in entries.items():
+        e.pop("base_records")
+        e["verdict"] = "fail" if e["problems"] else "pass"
+        doc["legs"][leg_id] = e
+    wall = round((time.time() - started) / 60, 2)
+    doc["runs"].append(dict(started=datetime.fromtimestamp(started, timezone.utc).isoformat(timespec="seconds"),
+                            minutes=wall, legs=sorted(entries), build=run.build_info, jobs=sorted(run.jobs)))
+    path = rdir / "note.json"
+    path.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    git("notes", f"--ref={NOTES}", "add", "-f", "-F", str(path), sha)
+    for leg_id in sorted(entries):
+        print_leg(leg_id, doc["legs"][leg_id])
+    failed = sum(1 for e in entries.values() if e["verdict"] == "fail")
+    print(f"matrix {sha[:12]}: {len(entries) - failed} of {len(entries)} legs pass, {wall} min wall; note {NOTES}")
+    print("harness rows: release build, validation layer disabled (VK_LOADER_LAYERS_DISABLE)")
+    return 1 if failed else 0
+
+
+def print_leg(leg_id, leg):
+    """A leg's verdict line, then each of its harness rows' time, GPU time and instructions."""
+    print(results.verdict_line(leg_id, leg))
+    for line in results.harness_rows(leg["records"]):
+        print(f"  {line}")
+
+
+def show_cmd(sha):
+    doc = note(sha)
+    if not doc:
+        sys.exit(f"no matrix note on {sha}")
+    for leg_id in sorted(doc["legs"]):
+        print_leg(leg_id, doc["legs"][leg_id])
+    last = doc["runs"][-1]
+    print(f"matrix {sha[:12]}: last run {last['started']}, {last['minutes']} min wall, jobs {' '.join(last['jobs'])}")
+
+
+def main(argv):
+    """Parse ARGV and run its command. Anything the usage does not name (`--help` among them, an
+    option `show` does not take, a second SHA, `--legs` without its list) prints the usage and
+    exits, so a mistyped command never starts a run."""
+    if not argv or argv[0] not in ("run", "show"):
+        sys.exit(__doc__)
+    command, rest, only, dry_run = argv[0], [], None, False
+    args = iter(argv[1:])
+    for arg in args:
+        if command == "run" and arg == "--legs":
+            legs = next(args, "")
+            if not legs or legs.startswith("-"):
+                sys.exit(f"--legs takes LEG,...\n\n{__doc__}")
+            only = legs.split(",")
+        elif command == "run" and arg == "--dry-run":
+            dry_run = True
+        elif arg.startswith("-") or rest:
+            sys.exit(f"unknown argument {arg!r}\n\n{__doc__}")
+        else:
+            rest.append(arg)
+    sha = git("rev-parse", "--verify", f"{rest[0] if rest else 'development'}^{{commit}}")
+    if command == "show":
+        return show_cmd(sha)
+    return run_cmd(sha, only, dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -13,8 +13,8 @@ use crate::spirv::error::{
 use crate::spirv::ids::{ConstId, GlobalId, TypeId};
 use crate::spirv::ir::{
     natural_layout, ConstBits, Constant, Decl, Dim, ExecMode, ExecModel, ImageType, ImageUsage,
-    Inst, IoDecor, IoDir, LayoutRule, MemAccess, MemberLayout, Scope, StorageClass, StructLayout,
-    Terminator, Type, TypedModule, ValueOrigin,
+    Inst, IoDecor, IoDir, LayoutRule, MemAccess, MemberLayout, Scope, SpecOp, StorageClass,
+    StructLayout, Terminator, Type, TypedModule, ValueOrigin,
 };
 use std::collections::BTreeSet;
 
@@ -87,6 +87,7 @@ impl T {
             layout: Some(StructLayout {
                 rule,
                 block: false,
+                non_writable: false,
                 members: offsets
                     .iter()
                     .map(|o| MemberLayout {
@@ -362,6 +363,7 @@ fn runtime_arrays_only_end_blocks_or_index_descriptors() {
             members: [u, rta].into(),
             layout: Some(StructLayout {
                 block: false,
+                non_writable: false,
                 ..not_last
             }),
         }),
@@ -441,19 +443,20 @@ fn pointer_classes_admit_only_their_layouts() {
     assert!(!ok(&mut t, StorageClass::Uniform, rblock));
     assert!(!ok(&mut t, StorageClass::PushConstant, rblock));
     assert!(ok(&mut t, StorageClass::PhysicalStorageBuffer, laid));
-    // A laid-out member of a `Workgroup` block is addressable (access chains), but a `Workgroup`
-    // variable itself must be a `Block` when laid out.
-    assert!(ok(&mut t, StorageClass::Workgroup, laid));
-    assert!(ok(&mut t, StorageClass::Workgroup, block));
+    // `Workgroup` memory is implicitly laid out: no explicitly laid-out pointee or variable there,
+    // `Block` or not.
+    assert!(ok(&mut t, StorageClass::Workgroup, implicit));
+    assert!(!ok(&mut t, StorageClass::Workgroup, laid));
+    assert!(!ok(&mut t, StorageClass::Workgroup, block));
     assert!(!ok(&mut t, StorageClass::Workgroup, rblock));
-    assert_eq!(
-        t.b.plain_global(StorageClass::Workgroup, laid, None),
-        Err(BuildError::Type(TypeRule::PointeeForClass(
-            StorageClass::Workgroup
-        )))
-    );
-    t.b.plain_global(StorageClass::Workgroup, block, None)
-        .expect("workgroup block");
+    for laid_out in [laid, block] {
+        assert_eq!(
+            t.b.plain_global(StorageClass::Workgroup, laid_out, None),
+            Err(BuildError::Type(TypeRule::PointeeForClass(
+                StorageClass::Workgroup
+            )))
+        );
+    }
     assert!(!ok(&mut t, StorageClass::UniformConstant, f));
     assert!(ok(&mut t, StorageClass::Image, f));
     assert!(!ok(&mut t, StorageClass::Image, implicit));
@@ -477,6 +480,7 @@ fn matrix_members_need_a_valid_matrix_stride() {
         layout: Some(StructLayout {
             rule,
             block: false,
+            non_writable: false,
             members: [MemberLayout {
                 offset: 0,
                 matrix_stride: ms,
@@ -507,6 +511,7 @@ fn matrix_members_need_a_valid_matrix_stride() {
         layout: Some(StructLayout {
             rule: LayoutRule::Std430,
             block: false,
+            non_writable: false,
             members: [MemberLayout {
                 offset: 0,
                 matrix_stride: Some(16),
@@ -664,6 +669,38 @@ fn constants_are_checked_and_deduped() {
         Err(BuildError::Constant(ConstRule::NullType))
     );
     t.b.constant(Constant::Null { ty: v2 }).expect("null uvec2");
+}
+
+/// The null of an array whose length an `OpSpecConstantOp` gives, as a threadgroup arena whose
+/// regions specialization sizes, is a constant like any other array's null, and initializes a
+/// `Workgroup` variable of that type; a runtime array has none.
+#[test]
+fn a_specialization_sized_array_has_a_null() {
+    let mut t = T::new();
+    let u = t.u32();
+    let len =
+        t.b.spec(SpecKey::TgLength(0), u, ConstBits(16))
+            .expect("spec");
+    let four = t.uconst(4);
+    let sized = t.b.spec_op(SpecOp::IAdd, u, &[len, four]).expect("spec op");
+    let wg = t.ty(Type::Array {
+        elem: u,
+        len: sized,
+        stride: None,
+    });
+    let null =
+        t.b.constant(Constant::Null { ty: wg })
+            .expect("null of a spec-op array");
+    t.b.plain_global(StorageClass::Workgroup, wg, Some(null))
+        .expect("an initialized workgroup array");
+    let runtime = t.ty(Type::RuntimeArray {
+        elem: u,
+        stride: Some(4),
+    });
+    assert_eq!(
+        t.b.constant(Constant::Null { ty: runtime }),
+        Err(BuildError::Constant(ConstRule::NullType))
+    );
 }
 
 #[test]
@@ -830,57 +867,6 @@ fn only_storage_images_are_volatile_and_never_under_the_vulkan_model() {
     );
 }
 
-/// `coherent` decorates the one storage image it names `Coherent`, leaving the module's other
-/// shared resources plain, and refuses a sampled image.
-#[test]
-fn coherent_decorates_one_storage_image_alone() {
-    let texture = |index| ResourceSlot {
-        stage: Stage::Fragment,
-        kind: ResourceKind::Texture,
-        index,
-    };
-    let image = |t: &mut T, usage, format| {
-        let u = t.u32();
-        t.ty(Type::Image(ImageType {
-            sampled_type: u,
-            dim: Dim::D2,
-            depth: false,
-            arrayed: false,
-            multisampled: false,
-            usage,
-            format,
-        }))
-    };
-    let mut t = T::new();
-    let storage = image(
-        &mut t,
-        ImageUsage::Storage,
-        crate::spv::ImageFormat::Rgba32ui,
-    );
-    let sampled = image(
-        &mut t,
-        ImageUsage::Sampled,
-        crate::spv::ImageFormat::Unknown,
-    );
-    let one =
-        t.b.resource(texture(0), StorageClass::UniformConstant, storage)
-            .expect("image");
-    let other =
-        t.b.resource(texture(1), StorageClass::UniformConstant, storage)
-            .expect("other image");
-    let read =
-        t.b.resource(texture(2), StorageClass::UniformConstant, sampled)
-            .expect("sampled");
-    t.b.coherent(one).expect("a storage image");
-    assert_eq!(
-        t.b.coherent(read).err(),
-        Some(BuildError::Global(GlobalRule::CoherentTarget))
-    );
-    let m = finish_compute(t.b).expect("a GLSL450 module with one coherent image");
-    assert_eq!(m.coherent, BTreeSet::from([one]));
-    assert!(!m.coherent.contains(&other));
-}
-
 /// `coherent_resources` decorates every storage buffer and storage image resource of the module
 /// `Coherent` (a descriptor array of storage images included, those declared after it too), and no
 /// uniform buffer or sampled image; a module under the Vulkan memory model, which bans the
@@ -1028,11 +1014,10 @@ fn a_push_block_that_is_not_std430_uses_scalar_layout() {
     assert_eq!(m.push_members().len(), 2);
 }
 
-/// Only the `Position` output (Metal `[[invariant]]`), the `ClipDistance` output (a rate-mapped
-/// pass's copies) and a fragment's per-fragment outputs (the variants of a render pipeline's
-/// color groups) can be decorated `Invariant`.
+/// Only the `Position` output (Metal `[[invariant]]`) and the `ClipDistance` output (a
+/// rate-mapped pass's copies) can be decorated `Invariant`.
 #[test]
-fn only_the_position_clip_distances_and_per_fragment_outputs_are_invariant() {
+fn only_the_position_and_clip_distances_are_invariant() {
     let mut t = T::new();
     let f = t.f32();
     let v4 = t.vec(f, 4);
@@ -1053,9 +1038,7 @@ fn only_the_position_clip_distances_and_per_fragment_outputs_are_invariant() {
         t.b.io(key("color"), IoDir::Output, v4, IoDecor::default())
             .expect("varying");
     assert_eq!(t.b.invariant(pos), Ok(()));
-    assert_eq!(t.b.invariant(clips), Ok(()));
-    assert_eq!(t.b.invariant(depth), Ok(()));
-    for g in [size, color] {
+    for g in [clips, depth, size, color] {
         assert_eq!(
             t.b.invariant(g),
             Err(BuildError::Global(GlobalRule::InvariantTarget))
@@ -1189,7 +1172,7 @@ fn a_shared_struct_dag_finalizes_reading_each_type_once() {
     t.b.plain_global(StorageClass::Private, s, None)
         .expect("private");
     let m = finish_compute(t.b).expect("finalize");
-    assert!(m.requirements().spirv_capabilities.contains(
+    assert!(m.requirements.spirv_capabilities.contains(
         &crate::device::requirements::SpirvCapability::of(crate::spv::Capability::Int16)
     ));
 }
@@ -1352,6 +1335,7 @@ fn operand_rules_are_enforced() {
             layout: Some(StructLayout {
                 rule: LayoutRule::Std430,
                 block: true,
+                non_writable: false,
                 members: [MemberLayout {
                     offset: 0,
                     matrix_stride: None,

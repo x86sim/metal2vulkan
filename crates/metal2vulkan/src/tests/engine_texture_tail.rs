@@ -10,17 +10,17 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bind::{SparseTileMap, TileMapping};
 use crate::device::profile::DeviceProfile;
 use crate::device::DevicePolicy;
 use crate::error::{Error, Feature, LowerFamily, Unsupported};
 use crate::library::FunctionArtifact;
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
 use crate::pipeline::testing::{
     compile, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
 };
+use crate::pipeline::tile_map;
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
@@ -86,16 +86,11 @@ fn refused_texture(r: Result<std::sync::Arc<FunctionArtifact>, Error>, what: &st
 /// Resources of a dispatch of 1x1x1 threadgroups, `[[buffer(i)]]` holding `init[i]`.
 fn resources(plan: &Plan, init: &[Vec<u8>]) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -413,7 +408,7 @@ fn status_words_with_another_bit_observed_are_refused() {
         .chain([stored])
         .collect();
     for stem in ["moltenvk-m3", "lavapipe"] {
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         for (name, merge) in &observing {
             let Some(bc) = assemble(name, &merged_reads(merge, "")) else {
                 return;
@@ -601,19 +596,8 @@ fn residency_of_status_words_is_lowered() {
                     imgs[0].texels[0] = [0xDEAD_BEEF; 4];
                     imgs[1].texels[3] = [0xDEAD_BEEF; 4];
                     for (index, unmapped) in [(0u32, [0, 0, 0]), (1, [1, 1, 0])] {
-                        let mut map = SparseTileMap::new(
-                            crate::metal::TextureType::Type2D,
-                            [2, 2, 1],
-                            1,
-                            1,
-                            [1; 3],
-                            1,
-                        )
-                        .expect("tile map");
-                        map.update(TileMapping::Map, 0, 0, [0; 3], [2, 2, 1])
-                            .expect("map");
-                        map.update(TileMapping::Unmap, 0, 0, unmapped, [1; 3])
-                            .expect("unmap");
+                        let map =
+                            tile_map::one_level_map([2, 2, 1], 1, [1; 3], |_, t| t != unmapped);
                         res.buffers.push(Buffer {
                             slot: Some(ResourceSlot {
                                 stage: Stage::Kernel,
@@ -621,7 +605,7 @@ fn residency_of_status_words_is_lowered() {
                                 index,
                             }),
                             address: None,
-                            bytes: map.to_bytes(),
+                            bytes: map,
                         });
                     }
                     imgs
@@ -693,7 +677,7 @@ fn without_robust_images(stem: &str) -> DeviceProfile {
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
     desc.features.remove(&VkFeature::RobustImageAccess);
     desc.features.remove(&VkFeature::RobustImageAccess2);
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -742,17 +726,7 @@ fn a_read_outside_a_sparse_texture_is_resident() {
                 // with column x = 1 unmapped.
                 img.texels[1] = [0xDEAD_BEEF; 4];
                 img.texels[3] = [0xDEAD_BEEF; 4];
-                let mut map = SparseTileMap::new(
-                    crate::metal::TextureType::Type2D,
-                    [2, 2, 1],
-                    1,
-                    1,
-                    [1; 3],
-                    1,
-                )
-                .expect("tile map");
-                map.update(TileMapping::Map, 0, 0, [0; 3], [1, 2, 1])
-                    .expect("map");
+                let map = tile_map::one_level_map([2, 2, 1], 1, [1; 3], |_, [x, _, _]| x == 0);
                 res.buffers.push(Buffer {
                     slot: Some(ResourceSlot {
                         stage: Stage::Kernel,
@@ -760,7 +734,7 @@ fn a_read_outside_a_sparse_texture_is_resident() {
                         index: 0,
                     }),
                     address: None,
-                    bytes: map.to_bytes(),
+                    bytes: map,
                 });
                 if !checked {
                     img.robust = Some([0; 4]);
@@ -958,11 +932,25 @@ const LANE0: &str =
 
 /// `atomic_fetch_max` is `OpAtomicUMax` (uint) or `OpAtomicSMax` (int) on the texel pointer of an
 /// `R32ui` / `R32i` storage image, with and without `.i16` coordinates, its result unread or read
-/// at lane 0; a texel outside the image is guarded exactly without `robustImageAccess`, and
-/// the slot's interface reads and writes it.
+/// at lane 0; a texel outside the image is guarded exactly without `robustImageAccess` (on
+/// `runtime-floor` without it, below the runtime's floor), and the slot's interface reads and
+/// writes it.
 #[test]
 fn texture_atomic_max_is_an_image_atomic() {
     let (mut guarded_n, mut plain_n) = (0, 0);
+    let mut profiles = committed_profiles().expect("profiles");
+    profiles.push((
+        "runtime-floor without image robustness".into(),
+        crate::pipeline::testing::profile_without(
+            "runtime-floor",
+            &[
+                crate::device::requirements::VkFeature::RobustImageAccess,
+                crate::device::requirements::VkFeature::RobustImageAccess2,
+            ],
+            crate::device::DevicePolicy::RESIDENT_TABLES,
+        )
+        .expect("below the runtime's floor"),
+    ));
     for (signed, short, tail) in [
         (false, false, LANE0),
         (false, true, LANE0),
@@ -973,7 +961,7 @@ fn texture_atomic_max_is_an_image_atomic() {
         let Some(bc) = assemble("atomic", &text) else {
             return;
         };
-        for (stem, p) in committed_profiles().expect("profiles") {
+        for (stem, p) in &profiles {
             let what = format!("{stem} signed={signed} short={short}");
             let format = if signed {
                 crate::vk::Format::R32_SINT
@@ -987,13 +975,13 @@ fn texture_atomic_max_is_an_image_atomic() {
                     Feature::Format,
                     crate::error::Capability::Format { format, usage },
                 );
-                match compile(&bc, "k", &p) {
+                match compile(&bc, "k", p) {
                     Err(Error::Unsupported(u)) => assert_eq!(u.needs, want.needs, "{what}"),
                     other => panic!("{what}: {:?}", other.map(|_| ())),
                 }
                 continue;
             }
-            let a = ok(compile(&bc, "k", &p), &p, &what);
+            let a = ok(compile(&bc, "k", p), p, &what);
             let guarded = !p.fields().images.robust_image_access;
             if guarded {
                 guarded_n += 1;
@@ -1047,7 +1035,7 @@ fn texture_atomic_max_is_an_image_atomic() {
 /// refusal; a storage choice other than the `R32` format of the texel's type is not representable.
 #[test]
 fn texture_atomic_lanes_lower_and_unestablished_operands_are_refused() {
-    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
+    let p = profile("moltenvk-m3", DevicePolicy::RESIDENT_TABLES).expect("profile");
     let wide =
         "%o = extractelement <4 x i32> %old, i64 1\n  store i32 %o, ptr addrspace(1) %out, align 4";
     let whole = "%o = bitcast <4 x i32> %old to <2 x i64>\n  %w = extractelement <2 x i64> %o, i64 0\n  %n = trunc i64 %w to i32\n  store i32 %n, ptr addrspace(1) %out, align 4";
@@ -1423,19 +1411,7 @@ fn a_functions_writes_to_a_sparse_texture_are_dropped() {
             // The tile-map arm: the image's unmapped texel the device's value, which the module
             // must not read, and a map of one-texel tiles.
             t.texels[3] = [0xDEAD_BEEF; 4];
-            let mut map = SparseTileMap::new(
-                crate::metal::TextureType::Type2D,
-                [2, 2, 1],
-                1,
-                1,
-                [1; 3],
-                1,
-            )
-            .expect("tile map");
-            map.update(TileMapping::Map, 0, 0, [0; 3], [2, 2, 1])
-                .expect("map");
-            map.update(TileMapping::Unmap, 0, 0, [1, 1, 0], [1; 3])
-                .expect("unmap");
+            let map = tile_map::one_level_map([2, 2, 1], 1, [1; 3], |_, t| t != [1, 1, 0]);
             res.buffers.push(Buffer {
                 slot: Some(ResourceSlot {
                     stage: Stage::Kernel,
@@ -1443,7 +1419,7 @@ fn a_functions_writes_to_a_sparse_texture_are_dropped() {
                     index: 0,
                 }),
                 address: None,
-                bytes: map.to_bytes(),
+                bytes: map,
             });
         }
         let before = t.texels.clone();

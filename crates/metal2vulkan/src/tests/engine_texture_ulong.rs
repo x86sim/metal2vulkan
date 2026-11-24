@@ -20,59 +20,33 @@
 //! storage format) refuses it with the typed device gap, which the tests accept and count.
 //!
 //! Metal's `ulong` `atomic_{min,max}` (the owned fixture `unk_ulong_atomics`) compare the texel's
-//! unsigned 64-bit value and return nothing. A slot they update is declared `R64ui` and carries
-//! `RuntimeFact::UlongAtomicView`, which the binder answers with an `R64_UINT` view of the
-//! `RG32Uint` texture (a texel view for a texture buffer); a `ulong` slot only read or written in
-//! the same function stays a plain `RG32` image. The CPU interpreter does not model image texel
-//! pointers, so those tests check the emitted instructions, the facts, the device gaps (a profile
-//! without `shaderImageInt64Atomics`, `shaderInt64`, or the `R64_UINT` storage-atomic format bit
-//! refuses with exactly what it lacks, never an `RG32` declaration), and the plan.
+//! unsigned 64-bit value and return nothing. Their one exact form is a 64-bit image atomic, which
+//! no runtime enables, so they are refused on every profile (`Unsupported{ImageAtomics}`, not
+//! implemented).
 //!
 //! `llvm-as` assembles the fixtures; without them the tests skip visibly.
 
 use std::collections::BTreeMap;
 
-use crate::bind::{
-    BindState, BoundBuffer, BoundTexture, NeutralResource, StageTable, TextureFacts, WriteSource,
-};
-use crate::budget::Budget;
-use crate::device::profile::{Containment, DeviceProfile, Robustness};
-use crate::device::requirements::{FormatUsage, VkFeature};
+use crate::device::profile::DeviceProfile;
+use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy};
-use crate::error::{Capability, Error, Feature, Needs};
-use crate::library::Library;
+use crate::error::{Error, Feature, Needs, Unsupported};
 use crate::lower::select::Plan;
-use crate::metal::{PixelFormat, TextureType, TextureUsage};
-use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{PushLoc, SlotInterface};
-use crate::pipeline::layout::BindingSource;
-use crate::pipeline::sym::{
-    Axis, PushField, ResourceKind, ResourceSlot, SampledType, SlotClass, SlotRef, SpecKey, Stage,
-};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, SampledType, SlotClass, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, typed_module, AssembleError,
-};
-use crate::pipeline::{
-    ComputePipeline, ComputePipelineDescriptor, FunctionDescriptor, StageSource,
 };
 use crate::spirv::interp::{run_with_images, Buffer, Config, Image, Order, Resources};
 use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::committed_profiles;
-use crate::vk;
 
 const OP_TYPE_INT: u16 = 21;
-const OP_TYPE_VECTOR: u16 = 23;
 const OP_TYPE_IMAGE: u16 = 25;
 const OP_CAPABILITY: u16 = 17;
-const OP_IMAGE_TEXEL_POINTER: u16 = 60;
-const OP_IMAGE_READ: u16 = 98;
-const OP_ATOMIC_U_MIN: u16 = 237;
-const OP_ATOMIC_U_MAX: u16 = 239;
 const FORMAT_UNKNOWN: u32 = 0;
 const FORMAT_RG32UI: u32 = 35;
-const FORMAT_R64UI: u32 = 40;
-/// `Int64Atomics`.
-const CAPABILITY_INT64_ATOMICS: u32 = 12;
 /// `Int64ImageEXT`.
 const CAPABILITY_INT64_IMAGE: u32 = 5016;
 
@@ -97,7 +71,7 @@ fn without(stem: &str, drop: &[VkFeature]) -> DeviceProfile {
     for f in drop {
         desc.features.remove(f);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
@@ -111,33 +85,32 @@ fn profiles() -> Vec<(String, DeviceProfile)> {
         "moltenvk-m3 robust1".into(),
         without("moltenvk-m3", &[VkFeature::RobustImageAccess2]),
     ));
-    let all = [
-        VkFeature::RobustImageAccess,
-        VkFeature::RobustImageAccess2,
-        VkFeature::RobustBufferAccess,
-        VkFeature::RobustBufferAccess2,
-    ];
+    let all = [VkFeature::RobustImageAccess, VkFeature::RobustImageAccess2];
     for stem in ["moltenvk-m3", "lavapipe"] {
         out.push((format!("{stem} unrobust"), without(stem, &all)));
     }
+    // A device that holds 64-bit values as two words (below the runtime's floor).
+    out.push((
+        "lavapipe without shaderInt64".into(),
+        without("lavapipe", &[VkFeature::ShaderInt64]),
+    ));
     out
 }
 
 /// What the interpreter's image does outside itself on `p`: the device's texel for an `RG32` view,
-/// `(0, 0, 0, 1)`, and its discarded write where the device's robustness covers the access; a
-/// poisoned texel where the device discards writes but the shader checks reads; a trap where the
-/// shader contains both.
+/// `(0, 0, 0, 1)`, and its discarded write where the device's image robustness covers the access;
+/// a poisoned texel where the device discards writes but the shader checks reads; a trap where the
+/// shader contains both, as it does for every texel buffer (`buffer`).
 fn robust(p: &DeviceProfile, buffer: bool) -> Option<[u32; 4]> {
     let f = p.fields();
-    let Containment::On { robust } = f.containment else {
-        panic!("containment off")
-    };
-    match (buffer, robust) {
-        (true, Robustness::Rba2) => Some([0, 0, 0, 1]),
-        (true, _) => None,
-        (false, _) if f.images.robust_image_access2 => Some([0, 0, 0, 1]),
-        (false, _) if f.images.robust_image_access => Some([0xDEAD_BEEF; 4]),
-        (false, _) => None,
+    if buffer {
+        None
+    } else if f.images.robust_image_access2 {
+        Some([0, 0, 0, 1])
+    } else if f.images.robust_image_access {
+        Some([0xDEAD_BEEF; 4])
+    } else {
+        None
     }
 }
 
@@ -159,16 +132,11 @@ fn module(bc: &[u8], entry: &str, stem: &str, p: &DeviceProfile) -> Option<(Plan
 /// Resources of a dispatch of 1x1x1 threadgroups, `[[buffer(0)]]` holding `out` bytes.
 fn resources(plan: &Plan, out: usize) -> Resources {
     let mut spec = BTreeMap::new();
-    for axis in [Axis::X, Axis::Y, Axis::Z] {
-        spec.insert(SpecKey::LocalSize(axis), 1);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 1);
+    spec.extend(crate::pipeline::threadgroup_constants([1, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         match (f.field, f.loc) {
             (PushField::SlotBindOffset(_) | PushField::DispatchRegion, PushLoc::Push { .. }) => {}
-            // A bound value read as data, which the interpreter writes from `spec`.
-            (PushField::Specialized(_), PushLoc::Push { .. }) => {}
             other => panic!("unexpected push field {other:?}"),
         }
     }
@@ -355,13 +323,13 @@ fn ulong_reads_join_the_two_words_and_writes_split_them() {
         }
         ran += 1;
     }
-    // Only `vk12-floor` (six storage images, four allowed; no declared `Rg32ui` and no formatless
-    // access) refuses it.
+    // Only `runtime-floor` (six storage images, four allowed; no declared `Rg32ui` and no
+    // formatless access) refuses it.
     assert!(
         ran > 0 && wide > 0,
         "ran {ran}, wide {wide}, device gaps {gaps:?}"
     );
-    assert!(gaps.iter().all(|g| g == "vk12-floor"), "{gaps:?}");
+    assert!(gaps.iter().all(|g| g == "runtime-floor"), "{gaps:?}");
 }
 
 /// A sample-access `ulong` read is a fetch of the sampled `RG32` view, a read-access one at
@@ -498,443 +466,29 @@ fn ulong_slots_are_rg32_images_of_ulong_texels() {
     assert!(compiled > 0);
 }
 
-/// What `p` lacks for a `ulong` slot a `ulong` atomic updates (`buffer`: a texture buffer), in
-/// the order the refusal names them: 64-bit image atomics, 64-bit integers, and the `R64_UINT`
-/// storage-atomic format bit.
-fn ulong_atomic_gaps(p: &DeviceProfile, buffer: bool) -> Vec<Capability> {
-    let leaf = &p.fields().leaf;
-    let mut gaps = Vec::new();
-    if !leaf.image_int64_atomics {
-        gaps.push(Capability::Feature(VkFeature::ShaderImageInt64Atomics));
-    }
-    if !leaf.int64 {
-        gaps.push(Capability::Feature(VkFeature::ShaderInt64));
-    }
-    let usage = if buffer {
-        FormatUsage::StorageTexelBufferAtomic
-    } else {
-        FormatUsage::StorageImageAtomic
-    };
-    if !p.supports_format(vk::Format::R64_UINT, usage) {
-        gaps.push(Capability::Format {
-            format: vk::Format::R64_UINT,
-            usage,
-        });
-    }
-    gaps
-}
-
-fn tslot(index: u32) -> SlotRef {
-    SlotRef {
-        stage: Stage::Kernel,
-        class: SlotClass::Texture,
-        index,
-    }
-}
-
-/// The result type of every instruction of `opcode` whose result type is word 1.
-fn result_types(words: &[u32], opcode: u16) -> Vec<u32> {
-    insts(words)
-        .into_iter()
-        .filter(|(o, _)| *o == opcode)
-        .map(|(_, w)| w[1])
-        .collect()
-}
-
-/// `unk_ulong_atomics`: every `ulong` `atomic_max` and `atomic_min` (1D, 1D array, 2D at 16-bit
-/// coordinates, 2D array, 3D, buffer) is one `OpAtomicUMax` / `OpAtomicUMin` of a 64-bit unsigned
-/// integer on an `OpImageTexelPointer` of an `R64ui` image, whose slot carries
-/// `UlongAtomicView`, and the module needs `Int64ImageEXT`, `Int64Atomics`, and
-/// `shaderImageInt64Atomics`. A profile without what the slots need refuses with exactly what it
-/// lacks, `Unsupported{ImageAtomics}`: MoltenVK among them, which has no 64-bit image atomics and
-/// no `R64_UINT` atomic format.
+/// `unk_ulong_atomics`: a `ulong` texture's `atomic_max` and `atomic_min` (1D, 1D array, 2D at
+/// 16-bit coordinates, 2D array, 3D, buffer) are refused on every profile,
+/// `Unsupported{ImageAtomics}` not implemented, as is `unk_ulong_atomic_rw`, which also reads and
+/// writes another `ulong` slot, where no device gap of that slot comes first.
 #[test]
-fn ulong_atomics_are_64_bit_unsigned_min_and_max_on_r64_images() {
+fn ulong_atomics_are_refused_on_every_device() {
     let Some(bc) = fixture("unk_ulong_atomics") else {
         return;
     };
-    let (mut compiled, mut refused) = (Vec::new(), Vec::new());
-    for (stem, p) in profiles() {
-        // The first slot the plan declares is the 1D image; the texture buffer is the last.
-        let gaps = ulong_atomic_gaps(&p, false);
-        let buffer_gaps = ulong_atomic_gaps(&p, true);
-        let a = match compile(&bc, "unk_ulong_atomics", &p) {
-            Ok(a) => a,
-            Err(Error::Unsupported(u)) if u.feature == Feature::ImageAtomics => {
-                let want = if gaps.is_empty() { buffer_gaps } else { gaps };
-                assert!(!want.is_empty(), "{stem}: refused {u:?}");
-                assert_eq!(u.needs, Needs::AnyOf(vec![want]), "{stem}");
-                refused.push(stem);
-                continue;
+    let refusal = |u: &Unsupported| {
+        u.feature == Feature::ImageAtomics && matches!(u.needs, Needs::NotImplemented)
+    };
+    let profiles = profiles();
+    let mut refused = 0;
+    for (stem, p) in &profiles {
+        for entry in ["unk_ulong_atomics", "unk_ulong_atomic_rw"] {
+            match compile(&bc, entry, p) {
+                Err(Error::Unsupported(u)) if refusal(&u) => refused += 1,
+                Err(Error::Unsupported(u))
+                    if entry == "unk_ulong_atomic_rw" && matches!(u.needs, Needs::AnyOf(_)) => {}
+                other => panic!("{stem}: {entry}: {:?}", other.map(|_| ())),
             }
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        assert!(
-            gaps.is_empty() && buffer_gaps.is_empty(),
-            "{stem}: compiled"
-        );
-        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
-        let words = &a.module.words;
-        let ints: BTreeMap<u32, (u32, u32)> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_TYPE_INT)
-            .map(|(_, w)| (w[1], (w[2], w[3])))
-            .collect();
-        let images: Vec<&[u32]> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_TYPE_IMAGE)
-            .map(|(_, w)| w)
-            .collect();
-        assert_eq!(images.len(), 6, "{stem}: {images:?}");
-        for w in &images {
-            assert_eq!(ints.get(&w[2]), Some(&(64, 0)), "{stem}: {w:?}");
-            assert_eq!((w[7], w[8]), (2, FORMAT_R64UI), "{stem}: {w:?}");
-        }
-        for op in [OP_ATOMIC_U_MAX, OP_ATOMIC_U_MIN] {
-            let tys = result_types(words, op);
-            assert_eq!(tys.len(), 6, "{stem}: opcode {op}");
-            assert!(
-                tys.iter().all(|t| ints.get(t) == Some(&(64, 0))),
-                "{stem}: opcode {op}"
-            );
-        }
-        assert_eq!(
-            result_types(words, OP_IMAGE_TEXEL_POINTER).len(),
-            12,
-            "{stem}"
-        );
-        let caps: Vec<u32> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_CAPABILITY)
-            .map(|(_, w)| w[1])
-            .collect();
-        assert!(caps.contains(&CAPABILITY_INT64_IMAGE), "{stem}: {caps:?}");
-        assert!(caps.contains(&CAPABILITY_INT64_ATOMICS), "{stem}: {caps:?}");
-        assert!(
-            a.requirements
-                .features
-                .contains(&VkFeature::ShaderImageInt64Atomics),
-            "{stem}"
-        );
-        for index in 0..6 {
-            assert!(
-                a.facts
-                    .contains(&RuntimeFact::UlongAtomicView { slot: tslot(index) }),
-                "{stem}: slot {index}"
-            );
-        }
-        compiled.push(stem);
-    }
-    assert!(!compiled.is_empty(), "refused everywhere: {refused:?}");
-    assert!(refused.iter().any(|s| s == "moltenvk-m3"), "{refused:?}");
-}
-
-/// A device with 64-bit image atomics but without the `R64_UINT` format's storage-atomic bit (an
-/// image's, or a texel buffer's) refuses the slot naming that bit alone: no guessed `RG32`
-/// declaration stands in, since no image atomic takes one.
-#[test]
-fn a_device_lacking_only_the_r64_atomic_format_bit_refuses_typed() {
-    let Some(bc) = fixture("unk_ulong_atomics") else {
-        return;
-    };
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles/amd-rdna3-radv.json");
-    let text = std::fs::read_to_string(path).expect("profile");
-    for (usage, buffer) in [
-        (FormatUsage::StorageImageAtomic, false),
-        (FormatUsage::StorageTexelBufferAtomic, true),
-    ] {
-        let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-        let props = desc
-            .formats
-            .formats
-            .get_mut(&vk::Format::R64_UINT)
-            .expect("R64_UINT");
-        let flags = if buffer {
-            &mut props.buffer
-        } else {
-            &mut props.optimal_tiling
-        };
-        let bit = if buffer {
-            vk::FormatFeatureFlags2::STORAGE_TEXEL_BUFFER_ATOMIC
-        } else {
-            vk::FormatFeatureFlags2::STORAGE_IMAGE_ATOMIC
-        };
-        *flags = vk::FormatFeatureFlags2::from_raw(flags.as_raw() & !bit.as_raw());
-        let p = Device::new(desc, DevicePolicy::default())
-            .expect("device")
-            .profile()
-            .clone();
-        assert!(p.fields().leaf.image_int64_atomics && p.fields().leaf.int64);
-        match compile(&bc, "unk_ulong_atomics", &p) {
-            Err(Error::Unsupported(u)) => {
-                assert_eq!(u.feature, Feature::ImageAtomics, "{usage:?}");
-                assert_eq!(
-                    u.needs,
-                    Needs::AnyOf(vec![vec![Capability::Format {
-                        format: vk::Format::R64_UINT,
-                        usage,
-                    }]]),
-                    "{usage:?}"
-                );
-            }
-            other => panic!("{usage:?}: {:?}", other.map(|_| ())),
         }
     }
-}
-
-/// `unk_ulong_atomic_rw`: the slot a `ulong` atomic updates is declared `R64ui`, carries
-/// `UlongAtomicView`, and is read with a 64-bit `OpImageRead`; the slot the function only reads
-/// and writes stays an `RG32` unsigned image (`Rg32ui`, or formatless) without the fact. On a
-/// profile without 64-bit image atomics the function is refused for the atomic slot alone.
-#[test]
-fn only_the_atomic_ulong_slot_is_an_r64_image() {
-    let Some(bc) = fixture("unk_ulong_atomics") else {
-        return;
-    };
-    let mut compiled = 0;
-    for (stem, p) in profiles() {
-        let a = match compile(&bc, "unk_ulong_atomic_rw", &p) {
-            Ok(a) => a,
-            Err(Error::Unsupported(u)) if u.feature == Feature::ImageAtomics => {
-                assert!(!ulong_atomic_gaps(&p, false).is_empty(), "{stem}");
-                continue;
-            }
-            Err(Error::Unsupported(u)) if matches!(u.needs, Needs::AnyOf(_)) => continue,
-            Err(e) => panic!("{stem}: {e}"),
-        };
-        link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem}: L3: {e}"));
-        assert!(
-            a.facts
-                .contains(&RuntimeFact::UlongAtomicView { slot: tslot(0) }),
-            "{stem}"
-        );
-        assert!(
-            !a.facts
-                .contains(&RuntimeFact::UlongAtomicView { slot: tslot(1) }),
-            "{stem}"
-        );
-        let words = &a.module.words;
-        let ints: BTreeMap<u32, (u32, u32)> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_TYPE_INT)
-            .map(|(_, w)| (w[1], (w[2], w[3])))
-            .collect();
-        let vectors: BTreeMap<u32, u32> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_TYPE_VECTOR)
-            .map(|(_, w)| (w[1], w[2]))
-            .collect();
-        let mut images: Vec<(u32, u32)> = insts(words)
-            .into_iter()
-            .filter(|(o, _)| *o == OP_TYPE_IMAGE)
-            .map(|(_, w)| (ints[&w[2]].0, w[8]))
-            .collect();
-        images.sort_unstable();
-        let plain = if p.fields().images.storage_extended_formats {
-            FORMAT_RG32UI
-        } else {
-            FORMAT_UNKNOWN
-        };
-        assert_eq!(images, vec![(32, plain), (64, FORMAT_R64UI)], "{stem}");
-        // One read of each slot: a 64-bit texel from the `R64` image, a 32-bit one from `RG32`.
-        let mut reads: Vec<u32> = result_types(words, OP_IMAGE_READ)
-            .iter()
-            .map(|t| ints[&vectors[t]].0)
-            .collect();
-        reads.sort_unstable();
-        assert_eq!(reads, vec![32, 64], "{stem}");
-        compiled += 1;
-    }
-    assert!(compiled > 0);
-}
-
-fn device(stem: &str) -> Device {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
-    let text = std::fs::read_to_string(path).expect("profile");
-    let desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    Device::new(desc, DevicePolicy::default()).expect("device")
-}
-
-fn pipeline(dev: &Device, bc: &[u8], entry: &str) -> ComputePipeline {
-    let lib = Library::from_air(bc).expect("library");
-    let f = FunctionDescriptor::new(lib.function(entry).expect("function"));
-    let d = ComputePipelineDescriptor::new(StageSource::Function(f));
-    dev.compile_compute_pipeline(&d, &Budget::standard())
-        .unwrap_or_else(|e| panic!("{entry}: {e}"))
-}
-
-/// A bind state with `RG32Uint` textures of `types` at texture slots 0, 1, ... (`None`: left
-/// unbound), Metal's usage for atomics, and a buffer at slot 0.
-fn ulong_state(types: &[Option<TextureType>]) -> BindState {
-    let mut t = StageTable::default();
-    t.buffers.insert(
-        0,
-        BoundBuffer::Bytes {
-            len: 4096,
-            attribute_stride: None,
-        },
-    );
-    for (i, ty) in types.iter().enumerate() {
-        let Some(ty) = *ty else { continue };
-        let mut facts = TextureFacts::new(ty, PixelFormat::RG32Uint);
-        facts.usage =
-            TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC;
-        t.textures.insert(
-            i as u32,
-            BoundTexture::Texture {
-                facts,
-                resource_id: None,
-            },
-        );
-    }
-    let mut s = BindState::default();
-    s.stages.insert(Stage::Kernel, t);
-    s
-}
-
-/// The plan's write of texture slot `index` of `pipe`.
-fn texture_write(
-    pipe: &ComputePipeline,
-    plan: &crate::bind::BindingPlan,
-    index: u32,
-) -> WriteSource {
-    let (set, binding) = pipe
-        .layout
-        .sets
-        .iter()
-        .flat_map(|s| s.bindings.iter().map(move |b| (s.set, b)))
-        .find(|(_, b)| b.source == BindingSource::Texture(tslot(index)))
-        .map(|(set, b)| (set, b.binding))
-        .expect("the texture binding");
-    let writes: Vec<_> = plan
-        .descriptors
-        .iter()
-        .filter(|w| (w.set, w.binding) == (set, binding))
-        .collect();
-    assert_eq!(writes.len(), 1);
-    writes[0].source.clone()
-}
-
-/// A texture buffer made with a swizzle at a slot the function reads as `ulong` texels is refused
-/// (`Unsupported { feature: TextureSwizzle }`): the read applies no swizzle, and Metal's swizzled
-/// `ulong` texel is not measured. Unswizzled, it binds.
-#[test]
-fn a_swizzled_texture_buffer_read_as_ulong_is_refused() {
-    use crate::metal::{TextureSwizzle as S, TextureSwizzleChannels as C};
-    let Some(bc) = fixture("unk_ulong_rw") else {
-        return;
-    };
-    let dev = device("amd-rdna3-radv");
-    let rw = pipeline(&dev, &bc, "unk_ulong_rw");
-    let state = |swizzle| {
-        let mut t = ulong_state(&[]);
-        t.stages
-            .get_mut(&Stage::Kernel)
-            .expect("kernel")
-            .textures
-            .insert(
-                5,
-                BoundTexture::Buffer {
-                    pixel_format: PixelFormat::RG32Uint,
-                    offset: 0,
-                    length: 256,
-                    bytes_per_row: 256,
-                    resource_id: None,
-                    swizzle,
-                },
-            );
-        t
-    };
-    rw.plan(&dev, &state(C::DEFAULT).shape()).expect("plan");
-    let bgr1 = C::new(S::Blue, S::Green, S::Red, S::One);
-    match rw.plan(&dev, &state(bgr1).shape()) {
-        Err(crate::error::BindError::Unsupported(u)) => assert_eq!(
-            u,
-            crate::error::Unsupported::not_implemented(Feature::TextureSwizzle)
-        ),
-        other => panic!("{other:?}"),
-    }
-}
-
-/// The binder answers `UlongAtomicView`: on a device with 64-bit image atomics the slot a `ulong`
-/// atomic updates binds an `R64_UINT` view of its `RG32Uint` texture (an `R64_UINT` texel view
-/// of a texture buffer's), and its neutral is an `R64_UINT` storage image, while the slot only
-/// read and written binds its texture's own `RG32_UINT` view; no slot asks for a variant.
-#[test]
-fn the_binder_views_an_atomically_updated_ulong_texture_as_r64() {
-    let Some(bc) = fixture("unk_ulong_atomics") else {
-        return;
-    };
-    let dev = device("amd-rdna3-radv");
-    let rw = pipeline(&dev, &bc, "unk_ulong_atomic_rw");
-    let plan = rw
-        .plan(
-            &dev,
-            &ulong_state(&[Some(TextureType::Type2D), Some(TextureType::Type2D)]).shape(),
-        )
-        .expect("plan");
-    assert!(plan.variant.is_empty(), "{:?}", plan.variant);
-    match texture_write(&rw, &plan, 0) {
-        WriteSource::Texture { view, .. } => assert_eq!(view.format, vk::Format::R64_UINT),
-        other => panic!("{other:?}"),
-    }
-    match texture_write(&rw, &plan, 1) {
-        WriteSource::Texture { view, .. } => assert_eq!(view.format, vk::Format::R32G32_UINT),
-        other => panic!("{other:?}"),
-    }
-    let unbound = rw
-        .plan(&dev, &ulong_state(&[None, None]).shape())
-        .expect("plan");
-    match texture_write(&rw, &unbound, 0) {
-        WriteSource::Neutral(n) => assert_eq!(n.format(), Some(vk::Format::R64_UINT)),
-        other => panic!("{other:?}"),
-    }
-    match texture_write(&rw, &unbound, 1) {
-        WriteSource::Neutral(n @ NeutralResource::Image { .. }) => {
-            assert_eq!(n.format(), Some(vk::Format::R32G32_UINT))
-        }
-        other => panic!("{other:?}"),
-    }
-    let all = pipeline(&dev, &bc, "unk_ulong_atomics");
-    let types = [
-        TextureType::Type1D,
-        TextureType::Type1DArray,
-        TextureType::Type2D,
-        TextureType::Type2DArray,
-        TextureType::Type3D,
-        TextureType::TextureBuffer,
-    ];
-    let mut t = ulong_state(&types[..5].iter().copied().map(Some).collect::<Vec<_>>());
-    t.stages
-        .get_mut(&Stage::Kernel)
-        .expect("kernel")
-        .textures
-        .insert(
-            5,
-            BoundTexture::Buffer {
-                pixel_format: PixelFormat::RG32Uint,
-                offset: 0,
-                length: 256,
-                bytes_per_row: 256,
-                resource_id: None,
-                swizzle: crate::metal::TextureSwizzleChannels::DEFAULT,
-            },
-        );
-    let plan = all.plan(&dev, &t.shape()).expect("plan");
-    assert!(plan.variant.is_empty(), "{:?}", plan.variant);
-    for index in 0..5 {
-        match texture_write(&all, &plan, index) {
-            WriteSource::Texture { view, .. } => {
-                assert_eq!(view.format, vk::Format::R64_UINT, "slot {index}")
-            }
-            other => panic!("slot {index}: {other:?}"),
-        }
-    }
-    match texture_write(&all, &plan, 5) {
-        WriteSource::TexelBuffer { format, .. } => assert_eq!(format, vk::Format::R64_UINT),
-        other => panic!("{other:?}"),
-    }
+    assert!(refused >= profiles.len(), "{refused}");
 }

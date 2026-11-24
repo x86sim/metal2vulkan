@@ -9,6 +9,7 @@ use crate::hash::sha256_bytes;
 use crate::observation::{MetalStatus, ReferenceGap};
 use crate::observation_contract::ComparisonClass;
 use crate::refusal::Refusal;
+use metal2vulkan::pipeline::PrecisionNote;
 
 const METAL_ENV: &str = "metal-test";
 const ENV: &str = "lavapipe-test";
@@ -119,11 +120,10 @@ fn row(
         air_sha256: case.air_sha256.clone(),
         input_sha256: case.computed_input_sha256().unwrap(),
         golden_output_sha256: sha256_bytes(golden),
-        spv_sha256: "33".repeat(32),
+        spv_sha256: Some("33".repeat(32)),
         translator_fingerprint: "44".repeat(32),
         candidate_output_sha256: sha256_bytes(output),
         output_b64: b64(output),
-        backend: Backend::Vulkan,
         environment_id: environment_id.into(),
         environment: serde_json::json!({}),
         executor_abi: "v1".into(),
@@ -134,31 +134,46 @@ fn row(
         } else {
             CandidateStatus::Mismatch
         },
+        held_open_by: None,
     }
 }
 
-/// A refusal of `case` in the slot `environment_id` that ran in `leg`: a feature the device did
-/// not enable.
-fn refusal(case: &AuthoredCase, environment_id: &str, leg: &str) -> RefusalObservation {
+/// `row` under a class unbounded by `note`, with the status the executor gives it: a difference
+/// is a noted one unless the answer gap `held_open_by` keeps it a mismatch.
+fn under_note(
+    mut row: CandidateObservation,
+    note: PrecisionNote,
+    held_open_by: Option<crate::c3::AnswerGap>,
+) -> CandidateObservation {
+    row.comparison = ComparisonClass::Unbounded([note].into());
+    row.status = match held_open_by {
+        Some(_) => CandidateStatus::Mismatch,
+        None => CandidateStatus::NotedDifference,
+    };
+    row.held_open_by = held_open_by;
+    row
+}
+
+/// A refusal of `case` in the slot `environment_id`: a feature the device did not enable.
+fn refusal(case: &AuthoredCase, environment_id: &str) -> RefusalObservation {
     RefusalObservation {
         timing: Some(crate::observation::test_timing()),
         case_id: case.case_id.clone(),
         air_sha256: case.air_sha256.clone(),
         input_sha256: case.computed_input_sha256().unwrap(),
         translator_fingerprint: "44".repeat(32),
-        backend: Backend::Vulkan,
         environment_id: environment_id.into(),
-        environment: serde_json::json!({"robustness": {"leg": leg}}),
+        environment: serde_json::json!({"executor": "engine-compute"}),
         executor_abi: "v1".into(),
         refusal: Refusal::of(&NotSupported::NotEnabled(vec!["rayQuery".into()])),
         artifact: None,
     }
 }
 
-fn done(case: &AuthoredCase, leg: Leg, outcome: Outcome, seconds: f64, detail: &str) -> DoneRun {
+fn done(case: &AuthoredCase, pass: Pass, outcome: Outcome, seconds: f64, detail: &str) -> DoneRun {
     DoneRun {
         case_id: case.case_id.clone(),
-        pass: Pass::Leg(leg),
+        pass,
         outcome,
         ended: "exit=0".into(),
         seconds,
@@ -207,19 +222,19 @@ fn only_cases_with_a_current_metal_row_are_selected() {
     assert_eq!(selected, expected);
 }
 
-/// A rerun skips every (case, leg) the done-list holds, and `limit` bounds the cases (not the
+/// A rerun skips every (case, pass) the done-list holds, and `limit` bounds the cases (not the
 /// runs) of one invocation.
 #[test]
 fn a_plan_skips_done_runs_and_bounds_its_cases() {
     let cases = [case(1, "a"), case(2, "b"), case(3, "c")];
-    let legs = [Leg::Stated, Leg::RobustnessOff].map(Pass::Leg);
+    let passes = [Pass::Engine, Pass::Metal];
     let finished = [
-        done(&cases[0], Leg::Stated, Outcome::Match, 1.0, ""),
-        done(&cases[2], Leg::Stated, Outcome::Timeout, 1.0, ""),
-        done(&cases[2], Leg::RobustnessOff, Outcome::Failed, 1.0, ""),
+        done(&cases[0], Pass::Engine, Outcome::Match, 1.0, ""),
+        done(&cases[2], Pass::Engine, Outcome::Timeout, 1.0, ""),
+        done(&cases[2], Pass::Metal, Outcome::Failed, 1.0, ""),
     ];
     let runs = |limit| {
-        plan(&cases, &legs, &finished, limit)
+        plan(&cases, &passes, &finished, limit)
             .into_iter()
             .map(|run| (run.case_id, run.pass))
             .collect::<Vec<_>>()
@@ -227,16 +242,13 @@ fn a_plan_skips_done_runs_and_bounds_its_cases() {
     assert_eq!(
         runs(None),
         [
-            (cases[0].case_id.clone(), Pass::Leg(Leg::RobustnessOff)),
-            (cases[1].case_id.clone(), Pass::Leg(Leg::Stated)),
-            (cases[1].case_id.clone(), Pass::Leg(Leg::RobustnessOff)),
+            (cases[0].case_id.clone(), Pass::Metal),
+            (cases[1].case_id.clone(), Pass::Engine),
+            (cases[1].case_id.clone(), Pass::Metal),
         ]
     );
-    assert_eq!(
-        runs(Some(1)),
-        [(cases[0].case_id.clone(), Pass::Leg(Leg::RobustnessOff))]
-    );
-    assert!(plan(&cases[2..], &legs, &finished, None).is_empty());
+    assert_eq!(runs(Some(1)), [(cases[0].case_id.clone(), Pass::Metal)]);
+    assert!(plan(&cases[2..], &passes, &finished, None).is_empty());
 }
 
 /// A done-list line round-trips; a last line cut short (no newline) is not a finished run.
@@ -247,12 +259,12 @@ fn the_done_list_round_trips_and_drops_a_cut_line() {
     assert!(read_done_list(&path).unwrap().is_empty());
     let first = done(
         &case(1, "a"),
-        Leg::RobustnessOff,
+        Pass::Engine,
         Outcome::NotSupported,
         2.5,
         "not_supported{x}",
     );
-    let second = done(&case(2, "b"), Leg::Stated, Outcome::Match, 0.25, "");
+    let second = done(&case(2, "b"), Pass::Engine, Outcome::Match, 0.25, "");
     let cut = second.line();
     fs::write(
         &path,
@@ -266,7 +278,7 @@ fn the_done_list_round_trips_and_drops_a_cut_line() {
     // An append after the cut starts its own line: opening drops the cut line first.
     let third = done(
         &case(3, "c"),
-        Leg::Stated,
+        Pass::Engine,
         Outcome::Mismatch,
         1.0,
         "Mismatch c",
@@ -308,7 +320,7 @@ fn the_done_list_round_trips_and_drops_a_cut_line() {
 /// refusal or not (one before a device opened records none).
 #[test]
 fn an_outcome_reads_the_exit_and_the_row_together() {
-    use CandidateStatus::{Match, Mismatch};
+    use CandidateStatus::{Match, Mismatch, NotedDifference};
     for (ended, row, expected) in [
         (
             Ended::Code(exit_status::NOT_SUPPORTED),
@@ -336,6 +348,12 @@ fn an_outcome_reads_the_exit_and_the_row_together() {
     let cases = [
         (Ended::Code(0), Some(Match), Outcome::Match),
         (Ended::Code(1), Some(Mismatch), Outcome::Mismatch),
+        (
+            Ended::Code(1),
+            Some(NotedDifference),
+            Outcome::NotedDifference,
+        ),
+        (Ended::Code(0), Some(NotedDifference), Outcome::Failed),
         (
             Ended::Code(exit_status::NOT_SUPPORTED),
             None,
@@ -382,6 +400,7 @@ fn an_outcome_reads_the_exit_and_the_row_together() {
         assert_eq!(Outcome::parse(outcome.label()), Some(outcome));
     }
     assert_eq!(Outcome::NotSupported.class(), Class::Refusal);
+    assert_eq!(Outcome::NotedDifference.class(), Class::NotedDifference);
     assert_eq!(Outcome::DeviceCrash.class(), Class::Failure);
     assert_eq!(Outcome::VenueMismatch.class(), Class::Failure);
     assert_eq!(Outcome::VenueMismatch.label(), "venue_mismatch");
@@ -418,7 +437,6 @@ id=
 while [ $# -gt 0 ]; do
   case "$1" in
     --case-id) id=$2; shift 2 ;;
-    --robustness-off) shift ;;
     *) shift 2 ;;
   esac
 done
@@ -432,7 +450,7 @@ exit {code}
         ),
     );
     let cases = [first.clone(), second.clone()];
-    let runs = plan(&cases, &[Pass::Leg(Leg::Stated)], &[], None);
+    let runs = plan(&cases, &[Pass::Engine], &[], None);
     for config in [
         BatchConfig {
             jobs: 1,
@@ -458,7 +476,7 @@ exit {code}
             "{}",
             listed[0].detail
         );
-        let resumed = plan(&cases, &[Pass::Leg(Leg::Stated)], &listed, None);
+        let resumed = plan(&cases, &[Pass::Engine], &listed, None);
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].case_id, second.case_id);
         if let BatchDevice::Gpu(tripwire) = &config.device {
@@ -523,7 +541,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
-/// A batch runs each (case, leg) through the executor on its device type in a job store of its
+/// A batch runs each (case, pass) through the executor on its device type in a job store of its
 /// own (links to the corpus, its private sources included, its own candidate and refusal shards,
 /// its own TMPDIR), naming each case's AIR so the executor reads only its case shard and naming no
 /// source index when it has none, records its build in the out directory, keeps the rows of matches
@@ -563,7 +581,6 @@ while [ $# -gt 0 ]; do
     --corpus) store=$2; shift 2 ;;
     --case-id) id=$2; shift 2 ;;
     --air-sha256) air=$2; shift 2 ;;
-    --robustness-off) slot={ENV}@engine+robustness-off; shift ;;
     --gpu-wait-timeout) wait=$2; shift 2 ;;
     --device-type) device=$2; shift 2 ;;
     --metal-environment-id|--environment-id) shift 2 ;;
@@ -587,8 +604,8 @@ case "$id" in
   {m}) row match {ms}; echo "Match $id"; exit 0 ;;
   {x}) row mismatch {xs}; echo "Mismatch $id"; echo "candidate output does not match" >&2; exit 1 ;;
   {r})
-    # The stated leg refuses after the device opened (a refusal record); the other before.
-    [ "$slot" = {ENV}@engine ] && printf '{{"case_id":"%s","environment_id":"%s"}}\n' \
+    # The run refuses after the device opened: a refusal record.
+    printf '{{"case_id":"%s","environment_id":"%s"}}\n' \
       "$id" "$slot" >> "$store/observations/refusals/vulkan/{rs}"
     echo "not_supported{{product: test}}"; exit 4 ;;
 esac
@@ -607,34 +624,34 @@ exit 9
     );
     let config = config(scratch.path(), executor, Duration::from_secs(60));
     let cases = [matching.clone(), mismatching.clone(), refused.clone()];
-    let legs = [Leg::Stated, Leg::RobustnessOff].map(Pass::Leg);
-    let runs = plan(&cases, &legs, &[], None);
-    assert_eq!(runs.len(), 6);
+    let passes = [Pass::Engine];
+    let runs = plan(&cases, &passes, &[], None);
+    assert_eq!(runs.len(), 3);
     let seen = Mutex::new(0usize);
     let finished = run_batch(&config, &runs, |_| *seen.lock().unwrap() += 1).unwrap();
-    assert_eq!(*seen.lock().unwrap(), 6);
-    assert_eq!(finished.len(), 6);
+    assert_eq!(*seen.lock().unwrap(), 3);
+    assert_eq!(finished.len(), 3);
 
     let listed = read_done_list(&config.out.join(DONE_LIST)).unwrap();
-    let outcome_of = |case: &AuthoredCase, leg: Pass| {
+    let outcome_of = |case: &AuthoredCase, pass: Pass| {
         let runs = listed
             .iter()
-            .filter(|run| run.case_id == case.case_id && run.pass == leg)
+            .filter(|run| run.case_id == case.case_id && run.pass == pass)
             .collect::<Vec<_>>();
         assert_eq!(runs.len(), 1);
         (runs[0].outcome, runs[0].detail.clone())
     };
-    for leg in legs {
-        assert_eq!(outcome_of(&matching, leg), (Outcome::Match, String::new()));
+    for pass in passes {
+        assert_eq!(outcome_of(&matching, pass), (Outcome::Match, String::new()));
         assert_eq!(
-            outcome_of(&mismatching, leg),
+            outcome_of(&mismatching, pass),
             (
                 Outcome::Mismatch,
                 format!("Mismatch {}", mismatching.case_id)
             )
         );
         assert_eq!(
-            outcome_of(&refused, leg),
+            outcome_of(&refused, pass),
             (Outcome::NotSupported, "not_supported{product: test}".into())
         );
     }
@@ -646,12 +663,10 @@ exit 9
     rows.sort();
     let mut expected = Vec::new();
     for (case, status) in [(&matching, "match"), (&mismatching, "mismatch")] {
-        for slot in ["@engine", "@engine+robustness-off"] {
-            expected.push(format!(
-                r#"{{"case_id":"{}","environment_id":"{ENV}{slot}","status":"{status}"}}"#,
-                case.case_id
-            ));
-        }
+        expected.push(format!(
+            r#"{{"case_id":"{}","environment_id":"{ENV}@engine","status":"{status}"}}"#,
+            case.case_id
+        ));
     }
     expected.sort();
     assert_eq!(rows, expected);
@@ -673,109 +688,15 @@ exit 9
     logs.sort();
     let mut expected_logs = [&mismatching, &refused]
         .iter()
-        .flat_map(|case| {
-            ["stated", "robustness-off"].map(|leg| format!("{}.{leg}.txt", case.case_id))
-        })
+        .map(|case| format!("{}.engine.txt", case.case_id))
         .collect::<Vec<_>>();
     expected_logs.sort();
     assert_eq!(logs, expected_logs);
     // Every run wrote its job store: the corpus is byte for byte what it was.
     assert_eq!(snapshot(&corpus), before);
 
-    let rerun = plan(&cases, &legs, &listed, None);
+    let rerun = plan(&cases, &passes, &listed, None);
     assert!(rerun.is_empty(), "{rerun:?}");
-}
-
-/// A MoltenVK batch runs its executor in job stores of MoltenVK's own: their candidate and refusal
-/// shards are MoltenVK's, the Vulkan rows are linked like the Metal rows, and the rows and
-/// refusals it keeps are the MoltenVK slots'. A batch given a source index names it to every run,
-/// with each case's AIR.
-#[cfg(unix)]
-#[test]
-fn a_moltenvk_batch_records_moltenvk_rows() {
-    let scratch = ScratchDir::new("batch-moltenvk").unwrap();
-    let corpus = scratch.path().join("corpus");
-    let store = CorpusStore::new(&corpus);
-    let (matching, refused) = (case(1, "a"), case(3, "c"));
-    for case in [&matching, &refused] {
-        store.put_case(case.clone()).unwrap();
-    }
-    fs::create_dir_all(corpus.join("observations/vulkan")).unwrap();
-    let shard = |case: &AuthoredCase| shard_name_for_hash(&case.air_sha256).unwrap();
-    let index = scratch.path().join("corpus-index.sqlite");
-    let executor = scratch.path().join("fake-corpus-moltenvk");
-    executable(
-        &executor,
-        &format!(
-            r#"#!/bin/sh
-store= id= index= slot={ENV}@engine
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --corpus) store=$2; shift 2 ;;
-    --case-id) id=$2; shift 2 ;;
-    --source-index) index=$2; shift 2 ;;
-    --robustness-off) slot={ENV}@engine+robustness-off; shift ;;
-    --device-type) [ "$2" = gpu ] || exit 9; shift 2 ;;
-    --metal-environment-id|--environment-id|--gpu-wait-timeout|--air-sha256) shift 2 ;;
-    *) echo "unexpected $1" >&2; exit 9 ;;
-  esac
-done
-[ "$index" = {index} ] || {{ echo "source index '$index'" >&2; exit 9; }}
-[ -L "$store/observations/vulkan" ] && [ ! -e "$store/observations/refusals/vulkan" ] || exit 9
-[ -d "$store/observations/moltenvk" ] && [ ! -L "$store/observations/moltenvk" ] || exit 9
-[ -d "$store/observations/refusals/moltenvk" ] || exit 9
-case "$id" in
-  {m}) printf '{{"case_id":"%s","environment_id":"%s","status":"match"}}\n' "$id" "$slot" \
-    >> "$store/observations/moltenvk/{ms}"; echo "Match $id"; exit 0 ;;
-  {r}) printf '{{"case_id":"%s","environment_id":"%s"}}\n' "$id" "$slot" \
-    >> "$store/observations/refusals/moltenvk/{rs}"
-    echo "not_supported{{product: test}}"; exit 4 ;;
-esac
-exit 9
-"#,
-            m = matching.case_id,
-            ms = shard(&matching),
-            r = refused.case_id,
-            rs = shard(&refused),
-            index = index.display(),
-        ),
-    );
-    let config = BatchConfig {
-        backend: BatchBackend::Moltenvk,
-        source_index: Some(index.clone()),
-        ..gpu_config(scratch.path(), executor, Duration::from_secs(60))
-    };
-    let runs = plan(
-        &[matching.clone(), refused.clone()],
-        &[Pass::Leg(Leg::Stated)],
-        &[],
-        None,
-    );
-    let finished = run_batch(&config, &runs, |_| {}).unwrap();
-    assert_eq!(
-        finished
-            .iter()
-            .map(|run| run.outcome)
-            .collect::<std::collections::BTreeSet<_>>(),
-        [Outcome::Match, Outcome::NotSupported].into()
-    );
-    assert_eq!(
-        fs::read_to_string(config.out.join(ROWS)).unwrap(),
-        format!(
-            "{{\"case_id\":\"{}\",\"environment_id\":\"{ENV}@engine\",\"status\":\"match\"}}\n",
-            matching.case_id
-        )
-    );
-    assert_eq!(
-        fs::read_to_string(config.out.join(REFUSALS)).unwrap(),
-        format!(
-            "{{\"case_id\":\"{}\",\"environment_id\":\"{ENV}@engine\"}}\n",
-            refused.case_id
-        )
-    );
-    let recorded = BatchBuild::read(&config.out).unwrap().unwrap();
-    assert_eq!(recorded.backend, BatchBackend::Moltenvk);
-    assert_eq!(recorded, BatchBuild::of(&config));
 }
 
 /// A restricted batch runs every case under `--profiles-layer P` and keeps the rows and refusals
@@ -795,29 +716,26 @@ fn a_restricted_batch_runs_every_case_under_its_profile() {
         &format!(
             r#"#!/bin/sh
 store= id= slot= profile=
-leg=
 while [ $# -gt 0 ]; do
   case "$1" in
     --corpus) store=$2; shift 2 ;;
     --case-id) id=$2; shift 2 ;;
     --profiles-layer) profile=$2; shift 2 ;;
-    --robustness-off) leg=+robustness-off; shift ;;
     *) shift 2 ;;
   esac
 done
-[ "$profile" = vk12-floor ] || exit 9
-printf '{{"case_id":"%s","environment_id":"%s","status":"match"}}\n' "$id" "{ENV}@engine@$profile$leg" \
+[ "$profile" = runtime-floor ] || exit 9
+printf '{{"case_id":"%s","environment_id":"%s","status":"match"}}\n' "$id" "{ENV}@engine@$profile" \
   >> "$store/observations/vulkan/{shard}"
 echo "Match $id"
 "#
         ),
     );
     let config = BatchConfig {
-        restricted_to: Some("vk12-floor".into()),
+        restricted_to: Some("runtime-floor".into()),
         ..config(scratch.path(), executor, Duration::from_secs(60))
     };
-    let legs = [Leg::Stated, Leg::RobustnessOff].map(Pass::Leg);
-    let runs = plan(std::slice::from_ref(&matching), &legs, &[], None);
+    let runs = plan(std::slice::from_ref(&matching), &[Pass::Engine], &[], None);
     let finished = run_batch(&config, &runs, |_| {}).unwrap();
     assert!(
         finished.iter().all(|run| run.outcome == Outcome::Match),
@@ -831,10 +749,10 @@ echo "Match $id"
     rows.sort();
     assert_eq!(
         rows,
-        ["@engine@vk12-floor", "@engine@vk12-floor+robustness-off"].map(|slot| format!(
-            r#"{{"case_id":"{}","environment_id":"{ENV}{slot}","status":"match"}}"#,
+        [format!(
+            r#"{{"case_id":"{}","environment_id":"{ENV}@engine@runtime-floor","status":"match"}}"#,
             matching.case_id
-        ))
+        )]
     );
     assert_eq!(
         BatchBuild::read(&config.out)
@@ -842,7 +760,7 @@ echo "Match $id"
             .unwrap()
             .restricted_to
             .as_deref(),
-        Some("vk12-floor")
+        Some("runtime-floor")
     );
 }
 
@@ -867,12 +785,7 @@ fn a_timed_out_run_takes_its_whole_session_with_it() {
         ),
     );
     let config = config(scratch.path(), executor, Duration::from_secs(2));
-    let runs = plan(
-        std::slice::from_ref(&stuck),
-        &[Pass::Leg(Leg::Stated)],
-        &[],
-        None,
-    );
+    let runs = plan(std::slice::from_ref(&stuck), &[Pass::Engine], &[], None);
     let finished = run_batch(&config, &runs, |_| {}).unwrap();
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].outcome, Outcome::Timeout);
@@ -904,13 +817,13 @@ fn session_member_is_zombie(_pid: libc::pid_t) -> bool {
     false
 }
 
-/// The report counts each leg's runs by class and outcome, and each family's by class, names
-/// every run that did not match, gives a mismatch its comparison and differing words against
-/// Metal and a typed refusal its recorded class, and counts the selected cases a leg has not run
-/// as pending.
+/// The report counts the engine pass's runs by class and outcome, and each family's by class,
+/// names every run that did not match, gives a mismatch its comparison and differing words
+/// against Metal and a typed refusal its recorded class, and counts the selected cases the pass
+/// has not run as pending.
 #[test]
-fn the_report_counts_by_leg_family_and_class_and_names_each_non_match() {
-    let (matching, mismatching) = (case(1, "a"), case(2, "b"));
+fn the_report_counts_by_family_and_class_and_names_each_non_match() {
+    let (matching, mismatching, noted) = (case(1, "a"), case(2, "b"), case(5, "e"));
     let mut refused = case(3, "c");
     refused.public_source = Some("crates/metal2vulkan-validation/fixtures/public/c.ll".into());
     let mut vertex = case(4, "d");
@@ -923,40 +836,51 @@ fn the_report_counts_by_leg_family_and_class_and_names_each_non_match() {
         metal(&mismatching, METAL_ENV, ORACLE_ABI, &golden),
         metal(&refused, METAL_ENV, ORACLE_ABI, &[0; 4]),
         metal(&vertex, METAL_ENV, ORACLE_ABI, &[0; 4]),
+        metal(&noted, METAL_ENV, ORACLE_ABI, &golden),
     ];
-    let slot = engine_slot(ENV, None, Leg::Stated);
-    let rows = [row(&mismatching, &slot, &output, &golden)];
+    let slot = engine_slot(ENV, None);
+    let gap = crate::c3::AnswerGap::ClippedPrimitiveSplit;
+    let held = under_note(
+        row(&mismatching, &slot, &output, &golden),
+        PrecisionNote::ClippedCoverageSplit,
+        Some(gap),
+    );
+    let differs = under_note(
+        row(&noted, &slot, &output, &golden),
+        PrecisionNote::DeviceSampling,
+        None,
+    );
+    let rows = [held.clone(), differs.clone()];
     let runs = [
-        done(&matching, Leg::Stated, Outcome::Failed, 9.0, "first try"),
-        done(&matching, Leg::Stated, Outcome::Match, 1.0, ""),
+        done(&matching, Pass::Engine, Outcome::Failed, 9.0, "first try"),
+        done(&matching, Pass::Engine, Outcome::Match, 1.0, ""),
         done(
             &mismatching,
-            Leg::Stated,
+            Pass::Engine,
             Outcome::Mismatch,
             2.0,
             "Mismatch",
         ),
         done(
             &refused,
-            Leg::Stated,
+            Pass::Engine,
             Outcome::NotSupported,
             0.5,
             "not_supported{x}",
         ),
         done(
             &vertex,
-            Leg::Stated,
+            Pass::Engine,
             Outcome::DeviceCrash,
             3.0,
             "device_crash{SIGSEGV}",
         ),
-        done(&matching, Leg::RobustnessOff, Outcome::Match, 1.5, ""),
         done(
-            &refused,
-            Leg::RobustnessOff,
-            Outcome::NotSupported,
-            0.5,
-            "not_supported{y}",
+            &noted,
+            Pass::Engine,
+            Outcome::NotedDifference,
+            1.5,
+            "NotedDifference",
         ),
     ];
     let lines = report(
@@ -966,6 +890,7 @@ fn the_report_counts_by_leg_family_and_class_and_names_each_non_match() {
                 mismatching.clone(),
                 refused.clone(),
                 vertex.clone(),
+                noted.clone(),
             ],
             &metals,
             METAL_ENV,
@@ -974,52 +899,56 @@ fn the_report_counts_by_leg_family_and_class_and_names_each_non_match() {
         METAL_ENV,
         ENV,
         None,
-        &[Leg::Stated, Leg::RobustnessOff],
         &BatchOutput {
             done: runs.to_vec(),
             rows: rows.to_vec(),
-            refusals: vec![refusal(&refused, &slot, "stated")],
+            refusals: vec![refusal(&refused, &slot)],
         },
     );
     let expect = |line: &str| assert!(lines.iter().any(|l| l == line), "{line}\n{lines:#?}");
     expect(
-        "batch-report leg=stated selected=4 ran=4 pending=0 match=1 mismatch=1 refusal=1 \
-         failure=1 not_supported=1 refused=0 device_crash=1 needs_metal=0 venue_mismatch=0 \
-         wait_timeout=0 timeout=0 failed=0",
+        "batch-report selected=5 ran=5 pending=0 match=1 mismatch=1 noted_difference=1 \
+         refusal=1 failure=1 not_supported=1 refused=0 device_crash=1 needs_metal=0 \
+         venue_mismatch=0 wait_timeout=0 timeout=0 failed=0",
     );
     expect(
-        "batch-family leg=stated family=kernel.buffers cases=3 match=1 mismatch=1 refusal=1 \
-         failure=0",
+        "batch-family family=kernel.buffers cases=4 match=1 mismatch=1 noted_difference=1 \
+         refusal=1 failure=0",
     );
     expect(
-        "batch-family leg=stated family=vertex.buffers cases=1 match=0 mismatch=0 refusal=0 \
+        "batch-family family=vertex.buffers cases=1 match=0 mismatch=0 noted_difference=0 \
+         refusal=0 failure=1",
+    );
+    expect(
+        "batch-scope scope=private cases=4 match=1 mismatch=1 noted_difference=1 refusal=0 \
          failure=1",
     );
-    expect("batch-scope leg=stated scope=private cases=3 match=1 mismatch=1 refusal=0 failure=1");
-    expect("batch-scope leg=stated scope=public cases=1 match=0 mismatch=0 refusal=1 failure=0");
+    expect(
+        "batch-scope scope=public cases=1 match=0 mismatch=0 noted_difference=0 refusal=1 \
+         failure=0",
+    );
+    let class = |row: &CandidateObservation| serde_json::to_string(&row.comparison).unwrap();
     expect(&format!(
-        "batch-run case={} leg=stated scope=private family=kernel.buffers outcome=mismatch \
-         seconds=2.000 name=b detail=Mismatch comparison=\"exact\" words=1/2 \
-         first=1:00000002/00000003",
-        mismatching.case_id
+        "batch-run case={} scope=private family=kernel.buffers outcome=mismatch \
+         seconds=2.000 name=b detail=Mismatch comparison={} held_open_by=clipped_primitive_split \
+         words=1/2 first=1:00000002/00000003",
+        mismatching.case_id,
+        class(&held)
     ));
     expect(&format!(
-        "batch-run case={} leg=stated scope=public family=kernel.buffers \
+        "batch-run case={} scope=private family=kernel.buffers outcome=noted_difference \
+         seconds=1.500 name=e detail=NotedDifference comparison={} words=1/2 \
+         first=1:00000002/00000003",
+        noted.case_id,
+        class(&differs)
+    ));
+    expect(&format!(
+        "batch-run case={} scope=public family=kernel.buffers \
          outcome=not_supported seconds=0.500 name=c detail=not_supported{{x}} refusal=device",
         refused.case_id
     ));
     expect(&format!(
-        "batch-run case={} leg=robustness-off scope=public family=kernel.buffers \
-         outcome=not_supported seconds=0.500 name=c detail=not_supported{{y}} refusal=unrecorded",
-        refused.case_id
-    ));
-    expect(
-        "batch-report leg=robustness-off selected=4 ran=2 pending=2 match=1 mismatch=0 refusal=1 \
-         failure=0 not_supported=1 refused=0 device_crash=0 needs_metal=0 venue_mismatch=0 \
-         wait_timeout=0 timeout=0 failed=0",
-    );
-    expect(&format!(
-        "batch-slowest case={} leg=stated seconds=3.000 outcome=device_crash",
+        "batch-slowest case={} pass=engine seconds=3.000 outcome=device_crash",
         vertex.case_id
     ));
     assert!(
@@ -1067,8 +996,8 @@ fn a_report_narrowed_to_requested_cases_counts_only_them() {
         "{error}"
     );
     let runs = [
-        done(&wanted, Leg::Stated, Outcome::Match, 1.0, ""),
-        done(&other, Leg::Stated, Outcome::Failed, 2.0, "other failed"),
+        done(&wanted, Pass::Engine, Outcome::Match, 1.0, ""),
+        done(&other, Pass::Engine, Outcome::Failed, 2.0, "other failed"),
     ];
     let lines = report(
         &selected,
@@ -1076,7 +1005,6 @@ fn a_report_narrowed_to_requested_cases_counts_only_them() {
         METAL_ENV,
         ENV,
         None,
-        &[Leg::Stated],
         &BatchOutput {
             done: runs.to_vec(),
             rows: Vec::new(),
@@ -1085,9 +1013,9 @@ fn a_report_narrowed_to_requested_cases_counts_only_them() {
     );
     assert!(
         lines.iter().any(|line| line
-            == "batch-report leg=stated selected=1 ran=1 pending=0 match=1 mismatch=0 \
-                refusal=0 failure=0 not_supported=0 refused=0 device_crash=0 needs_metal=0 \
-                venue_mismatch=0 wait_timeout=0 timeout=0 failed=0"),
+            == "batch-report selected=1 ran=1 pending=0 match=1 mismatch=0 \
+                noted_difference=0 refusal=0 failure=0 not_supported=0 refused=0 device_crash=0 \
+                needs_metal=0 venue_mismatch=0 wait_timeout=0 timeout=0 failed=0"),
         "{lines:#?}"
     );
     assert!(
@@ -1096,22 +1024,22 @@ fn a_report_narrowed_to_requested_cases_counts_only_them() {
     );
 }
 
-/// Installing writes, for each (case, leg), the evidence of its last run that recorded any,
+/// Installing writes, for each case, the evidence of its last run that recorded any,
 /// through the store's validated writes: the slot's last row after a match or a mismatch, its last
 /// refusal after a typed refusal (which replaces a row the store held), nothing after a refusal
-/// before a device opened, and nothing no finished run lists. A row that is not of the backend
-/// installed is refused, and so is an out directory whose record names the other backend; the
-/// record comes back with what was installed (an out directory without one is Vulkan's).
+/// before a device opened, and nothing no finished run lists. An out directory whose record names
+/// another backend is refused; the record comes back with what was installed (an out directory
+/// without one is Vulkan's).
 #[test]
 fn installed_evidence_is_each_slots_last_run() {
     let scratch = ScratchDir::new("batch-install").unwrap();
     let store = CorpusStore::new(scratch.path().join("corpus"));
     let (first, second, third) = (case(1, "a"), case(2, "b"), case(3, "c"));
-    for case in [&first, &second, &third] {
+    let unlisted = case(4, "d");
+    for case in [&first, &second, &third, &unlisted] {
         store.put_case(case.clone()).unwrap();
     }
-    let stated = engine_slot(ENV, None, Leg::Stated);
-    let off = engine_slot(ENV, None, Leg::RobustnessOff);
+    let stated = engine_slot(ENV, None);
     // The store holds a row the second case's last run replaces with a refusal.
     store
         .upsert_candidate(row(&second, &stated, &[0; 4], &[0; 4]))
@@ -1119,12 +1047,16 @@ fn installed_evidence_is_each_slots_last_run() {
     let out = scratch.path().join("out");
     fs::create_dir_all(&out).unwrap();
     let stale = row(&first, &stated, &[9, 0, 0, 0], &[0; 4]);
-    let fresh = row(&first, &stated, &[0; 4], &[0; 4]);
-    let cut = row(&first, &off, &[0; 4], &[0; 4]);
+    let fresh = under_note(
+        row(&first, &stated, &[9, 0, 0, 0], &[0; 4]),
+        PrecisionNote::DeviceSampling,
+        None,
+    );
+    let cut = row(&unlisted, &stated, &[0; 4], &[0; 4]);
     let replaced = row(&second, &stated, &[0; 4], &[0; 4]);
     let after_refusal = row(&third, &stated, &[0; 4], &[0; 4]);
-    let refused = refusal(&second, &stated, "stated");
-    let superseded = refusal(&third, &stated, "stated");
+    let refused = refusal(&second, &stated);
+    let superseded = refusal(&third, &stated);
     fs::write(
         out.join(ROWS),
         [&stale, &replaced, &fresh, &cut, &after_refusal]
@@ -1138,14 +1070,13 @@ fn installed_evidence_is_each_slots_last_run() {
     )
     .unwrap();
     let runs = [
-        done(&first, Leg::Stated, Outcome::Mismatch, 1.0, ""),
-        done(&second, Leg::Stated, Outcome::Match, 1.0, ""),
-        done(&first, Leg::Stated, Outcome::Match, 1.0, ""),
-        done(&third, Leg::Stated, Outcome::NotSupported, 1.0, ""),
-        done(&second, Leg::Stated, Outcome::NotSupported, 1.0, ""),
-        done(&second, Leg::RobustnessOff, Outcome::NotSupported, 1.0, ""),
-        done(&third, Leg::Stated, Outcome::Match, 1.0, ""),
-        done(&third, Leg::Stated, Outcome::Timeout, 1.0, ""),
+        done(&first, Pass::Engine, Outcome::Mismatch, 1.0, ""),
+        done(&second, Pass::Engine, Outcome::Match, 1.0, ""),
+        done(&first, Pass::Engine, Outcome::NotedDifference, 1.0, ""),
+        done(&third, Pass::Engine, Outcome::NotSupported, 1.0, ""),
+        done(&second, Pass::Engine, Outcome::NotSupported, 1.0, ""),
+        done(&third, Pass::Engine, Outcome::Match, 1.0, ""),
+        done(&third, Pass::Engine, Outcome::Timeout, 1.0, ""),
     ];
     fs::write(
         out.join(DONE_LIST),
@@ -1153,61 +1084,26 @@ fn installed_evidence_is_each_slots_last_run() {
     )
     .unwrap();
     assert_eq!(
-        install(&out, &store, Backend::Vulkan).unwrap(),
+        install(&out, &store).unwrap(),
         Installed {
             rows: 2,
             refusals: 1,
             build: None,
         }
     );
-    let mut installed = store.read_candidates(Backend::Vulkan).unwrap();
+    let mut installed = store.read_candidates().unwrap();
     installed.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     let mut expected = vec![fresh, after_refusal];
     expected.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     assert_eq!(installed, expected);
-    assert_eq!(store.read_refusals(Backend::Vulkan).unwrap(), [refused]);
+    assert_eq!(store.read_refusals().unwrap(), [refused]);
 
-    let mut moltenvk = row(&second, &stated, &[0; 4], &[0; 4]);
-    moltenvk.backend = Backend::Moltenvk;
-    fs::write(out.join(ROWS), line(&moltenvk)).unwrap();
-    assert!(install(&out, &store, Backend::Vulkan)
-        .unwrap_err()
-        .contains("not a vulkan row"));
-    // Without a record the runs are Vulkan's: MoltenVK installs none of them.
-    assert!(install(&out, &store, Backend::Moltenvk)
-        .unwrap_err()
-        .contains("runs of the vulkan backend"));
-
-    // A MoltenVK batch's record: its rows install as MoltenVK's, and Vulkan refuses them.
-    let build = BatchBuild::current(
-        BatchBackend::Moltenvk,
-        METAL_ENV,
-        ENV,
-        None,
-        DeviceType::Gpu,
-    );
+    // A Metal batch's record: the Vulkan backend installs none of its runs.
+    let build = BatchBuild::current(BatchBackend::Metal, METAL_ENV, ENV, None, DeviceType::Gpu);
     fs::write(out.join(BUILD), serde_json::to_vec(&build).unwrap()).unwrap();
-    fs::write(
-        out.join(DONE_LIST),
-        done(&second, Leg::Stated, Outcome::Match, 1.0, "").line(),
-    )
-    .unwrap();
-    fs::write(out.join(REFUSALS), "").unwrap();
-    assert!(install(&out, &store, Backend::Vulkan)
+    assert!(install(&out, &store)
         .unwrap_err()
-        .contains("runs of the moltenvk backend"));
-    assert_eq!(
-        install(&out, &store, Backend::Moltenvk).unwrap(),
-        Installed {
-            rows: 1,
-            refusals: 0,
-            build: Some(build),
-        }
-    );
-    assert_eq!(
-        store.read_candidates(Backend::Moltenvk).unwrap(),
-        [moltenvk]
-    );
+        .contains("runs of the metal backend"));
 }
 
 /// The store line of a row or a refusal.
@@ -1248,7 +1144,7 @@ fn an_out_directory_resumes_only_its_own_build() {
     assert_eq!(recorded.device_type, "cpu");
     fs::write(
         config.out.join(DONE_LIST),
-        done(&case(1, "a"), Leg::Stated, Outcome::Match, 1.0, "").line(),
+        done(&case(1, "a"), Pass::Engine, Outcome::Match, 1.0, "").line(),
     )
     .unwrap();
     BatchBuild::claim(&config).unwrap();
@@ -1268,19 +1164,19 @@ fn an_out_directory_resumes_only_its_own_build() {
     };
     assert!(BatchBuild::claim(&other_device).is_err());
     let other_backend = BatchConfig {
-        backend: BatchBackend::Moltenvk,
+        backend: BatchBackend::Metal,
         ..config.clone()
     };
     assert!(BatchBuild::claim(&other_backend).is_err());
     let restricted = BatchConfig {
-        restricted_to: Some("vk12-floor".into()),
+        restricted_to: Some("runtime-floor".into()),
         ..config.clone()
     };
     assert!(BatchBuild::claim(&restricted).is_err());
     // A restricted batch's record names its profile; an unrestricted one's has no field for it.
     assert_eq!(
         BatchBuild::of(&restricted).restricted_to.as_deref(),
-        Some("vk12-floor")
+        Some("runtime-floor")
     );
     assert!(!serde_json::to_string(&recorded)
         .unwrap()
@@ -1399,7 +1295,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --case-id) id=$2; shift 2 ;;
     --device-type) device=$2; shift 2 ;;
-    --robustness-off) shift ;;
     *) shift 2 ;;
   esac
 done
@@ -1413,7 +1308,7 @@ echo "$id" >> '{started}'
         )
     };
     let cases = [first.clone(), second.clone()];
-    let runs = plan(&cases, &[Pass::Leg(Leg::Stated)], &[], None);
+    let runs = plan(&cases, &[Pass::Engine], &[], None);
     let jobs = BatchConfig {
         jobs: 2,
         ..gpu_config(scratch.path(), executor.clone(), Duration::from_secs(60))
@@ -1461,7 +1356,7 @@ echo "$id" >> '{started}'
         assert_eq!(record.case_id.as_deref(), Some(first.case_id.as_str()));
 
         // While the tripwire exists, a resumed batch starts no run; an existing one is kept.
-        let resumed = plan(&cases, &[Pass::Leg(Leg::Stated)], &listed, None);
+        let resumed = plan(&cases, &[Pass::Engine], &listed, None);
         let error = run_batch(&config, &resumed, |_| {}).unwrap_err();
         assert!(error.contains("GPU hang tripwire"), "{error}");
         assert_eq!(
@@ -1537,7 +1432,7 @@ fn a_metal_outcome_reads_the_exit_and_the_row_together() {
     assert_eq!(Outcome::ReferenceGap.class(), Class::Refusal);
     assert_eq!(Outcome::parse("reference_gap"), Some(Outcome::ReferenceGap));
     assert_eq!(Pass::parse("metal"), Ok(Pass::Metal));
-    let line = done(&case(1, "a"), Leg::Stated, Outcome::Qualified, 1.5, "");
+    let line = done(&case(1, "a"), Pass::Engine, Outcome::Qualified, 1.5, "");
     let metal_line = DoneRun {
         pass: Pass::Metal,
         ..line
@@ -1754,7 +1649,7 @@ exit 9
     let mut expected_rows = vec![row, gap_row];
     expected_rows.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     assert_eq!(target_rows, expected_rows);
-    let error = install(&config.out, &target, Backend::Vulkan).unwrap_err();
+    let error = install(&config.out, &target).unwrap_err();
     assert!(error.contains("not vulkan"), "{error}");
     let vulkan_out = scratch.path().join("vulkan-out");
     fs::create_dir_all(&vulkan_out).unwrap();
@@ -1776,7 +1671,7 @@ fn a_metal_batch_is_a_gpu_batch_of_metal_passes() {
     };
     let cases = [case(1, "a")];
     let metal_runs = plan(&cases, &[Pass::Metal], &[], None);
-    let leg_runs = plan(&cases, &[Pass::Leg(Leg::Stated)], &[], None);
+    let engine_runs = plan(&cases, &[Pass::Engine], &[], None);
     for (config, runs, expected) in [
         (
             BatchConfig {
@@ -1794,7 +1689,11 @@ fn a_metal_batch_is_a_gpu_batch_of_metal_passes() {
             &metal_runs,
             "restricts its device to no profile",
         ),
-        (metal_config.clone(), &leg_runs, "Metal qualifications only"),
+        (
+            metal_config.clone(),
+            &engine_runs,
+            "Metal qualifications only",
+        ),
         (
             gpu_config(scratch.path(), executor.clone(), Duration::from_secs(60)),
             &metal_runs,

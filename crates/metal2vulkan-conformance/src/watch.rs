@@ -4,7 +4,7 @@
 //! does: [`crate::validated`] announces the call's name so the parent process can attribute
 //! Metal's own output to it, and [`crate::times`] measures what the call cost. Both want the same
 //! narrow span — around the Metal or Vulkan call and nothing else — and neither wants to reach
-//! inside `metal_side::MetalSide` or [`crate::runtime_side::RuntimeSide`], because a span
+//! inside `metal_side::MetalSide` or a runtime's side, because a span
 //! placed separately in each of them is two spans that can drift apart, and a cost comparison of
 //! two legs measured in different places is not a comparison.
 //!
@@ -33,7 +33,8 @@ use crate::case::{
     Answer, ArgumentSlot, Bindings, CoordinateProbe, Fill, FragmentFill, FragmentFilled, Handle,
     IndirectReadBack, MappedCoordinates, MeshCommand, MeshFunctions, MeshReflectionSpec, MeshStep,
     PassOutcome, PlaneTexture, RateMapFacts, RateMapRequest, SamplerSpec, ShaderSource, Side,
-    StageInRegion, StageInput, TextureSpec, TileFacts, TilePipelineSpec, TileStep, Venue,
+    StageInRegion, StageInput, SurfaceTexture, TextureSpec, TileFacts, TilePipelineSpec, TileStep,
+    Venue,
 };
 use crate::function_bindings::BindingFacts;
 use crate::indirect_commands::{CommandsMade, EncodedCommand, IcbDescriptor};
@@ -118,6 +119,17 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
     fn compute_pipeline(&mut self, library: Handle, entry: &str) -> Answer<Handle> {
         let _span = self.watch("compute_pipeline");
         self.inner.compute_pipeline(library, entry)
+    }
+
+    fn compute_pipeline_with_constants(
+        &mut self,
+        library: Handle,
+        entry: &str,
+        constants: &[crate::function_facts::ConstantValue],
+    ) -> Answer<Handle> {
+        let _span = self.watch("compute_pipeline_with_constants");
+        self.inner
+            .compute_pipeline_with_constants(library, entry, constants)
     }
 
     fn static_threadgroup_memory_length(&mut self, pipeline: Handle) -> Answer<u64> {
@@ -548,6 +560,11 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.fragment_fill(fill)
     }
 
+    fn encoded_range(&mut self, run: &crate::case::EncodedRange<'_>) -> Answer<FragmentFilled> {
+        let _span = self.watch("encoded_range");
+        self.inner.encoded_range(run)
+    }
+
     fn mesh_pipeline(&mut self, library: Handle, functions: &MeshFunctions<'_>) -> Answer<Handle> {
         let _span = self.watch("mesh_pipeline");
         self.inner.mesh_pipeline(library, functions)
@@ -630,6 +647,11 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
     fn plane_texture(&mut self, buffer: Handle, over: &PlaneTexture) -> Answer<Handle> {
         let _span = self.watch("plane_texture");
         self.inner.plane_texture(buffer, over)
+    }
+
+    fn surface_texture(&mut self, surface: &SurfaceTexture) -> Answer<Handle> {
+        let _span = self.watch("surface_texture");
+        self.inner.surface_texture(surface)
     }
 
     fn fill_texture(&mut self, texture: Handle, fill: &Fill) -> Answer<Value> {
@@ -927,6 +949,14 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.event_wait_behind_a_running_signal(shared)
     }
 
+    fn fence_order(
+        &mut self,
+        shape: crate::fence_orders::FenceShape,
+    ) -> Answer<crate::fence_orders::FenceOrder> {
+        let _span = self.watch("fence_order");
+        self.inner.fence_order(shape)
+    }
+
     fn scheduled_handler_order(
         &mut self,
     ) -> Answer<crate::scheduled_handlers::ScheduledHandlerOrder> {
@@ -957,7 +987,7 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
     fn heap_purgeable_state(
         &mut self,
         heap: Handle,
-        state: metal2vulkan_runtime::PurgeableState,
+        state: crate::values::PurgeableState,
     ) -> Answer<u64> {
         let _span = self.watch("heap_purgeable_state");
         self.inner.heap_purgeable_state(heap, state)
@@ -981,6 +1011,11 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
         self.inner.resource_facts(of, heap)
     }
 
+    fn resource_storage_mode(&mut self, of: crate::heap_query::QueriedResource) -> Answer<u64> {
+        let _span = self.watch("resource_storage_mode");
+        self.inner.resource_storage_mode(of)
+    }
+
     fn set_resource_label(
         &mut self,
         of: crate::heap_query::QueriedResource,
@@ -998,7 +1033,7 @@ impl<S: Side, W: Watcher> Side for Watching<S, W> {
     fn resource_purgeable_state(
         &mut self,
         of: crate::heap_query::QueriedResource,
-        state: metal2vulkan_runtime::PurgeableState,
+        state: crate::values::PurgeableState,
     ) -> Answer<u64> {
         let _span = self.watch("resource_purgeable_state");
         self.inner.resource_purgeable_state(of, state)

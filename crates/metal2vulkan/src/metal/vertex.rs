@@ -1,16 +1,18 @@
 //! Vertex-format and step-function mapping.
 //!
 //! A Metal vertex attribute is fetched by fixed-function vertex input when its format and step
-//! function have an exact Vulkan equivalent on the profile and the profile bounds fixed-function
-//! input (buffer robustness, or containment off), and **pulled** (fetched and decoded in the
-//! shader from its buffer) otherwise. There is no third representation: widening a 3-component
+//! function have an exact Vulkan equivalent on the profile and containment is off (the identity
+//! domains), and **pulled** (fetched and decoded in the shader from its buffer) otherwise. There is no third representation: widening a 3-component
 //! 8/16-bit format to 4 components reads past the attribute, which at the end of a buffer is
 //! out of bounds and may replace the whole attribute.
+//!
+//! Under the identity domains there is only the first: every attribute is fetched in fixed
+//! function, bounded only as the device bounds it, and what fixed-function input cannot take is
+//! refused ([`attribute_fetch`]).
 
-use crate::device::requirements::FormatUsage;
+use crate::device::requirements::{FormatUsage, VkFeature, VkLimit};
 use crate::device::DeviceProfile;
-use crate::error::{DescriptorError, Error, Feature, Unsupported};
-use crate::memory::contain::{self, Check};
+use crate::error::{Capability, DescriptorError, Error, Feature, Unsupported};
 use crate::metal::{VertexFormat, VertexStepFunction};
 use crate::vk;
 
@@ -116,15 +118,6 @@ pub(crate) fn vk_scaled_vertex_format(format: VertexFormat) -> Option<vk::Format
     })
 }
 
-/// The bytes an attribute of `format` takes in its element: its Vulkan format's block, the bytes
-/// a fixed-function fetch of it reads and the bytes a pulled one decodes
-/// (`lower::stage_io::fetch::Encoding::bytes`, which `tests::stage_in_element_bytes` holds equal
-/// to this for every format). `None` for `Invalid`, which no fetch decodes.
-pub(crate) fn vertex_bytes(format: VertexFormat) -> Option<u32> {
-    let f = vk_vertex_format(format).ok()?;
-    f.block().map(|b| b.size)
-}
-
 /// The alignment in bytes Vulkan's fixed-function vertex input requires of an attribute's address
 /// in `format` ("Vertex Input Address Calculation", `VUID-vkCmdDraw-format-10389`/`-10390`): the
 /// [`vk::FormatBlock::vertex_alignment`] of its Vulkan format, the component size or the whole
@@ -151,7 +144,8 @@ pub const MAX_VERTEX_ALIGNMENT: u32 = 4;
 pub enum AttributeFetch {
     /// Fixed-function vertex input of this format, with this binding input rate and divisor
     /// (divisor 1 when not divided, and 0 -- the same element for every instance -- for Metal's
-    /// constant step, whose binding link emits with a stride of 0).
+    /// constant step at instance rate). Link emits a constant step's binding with a stride of 0
+    /// at either rate.
     FixedFunction {
         format: vk::Format,
         input_rate: vk::VertexInputRate,
@@ -165,43 +159,39 @@ pub enum AttributeFetch {
 /// `profile`, read into an attribute of the format's own numeric class (an integer format read into
 /// a float attribute is fetched in its `USCALED` or `SSCALED` form).
 ///
-/// - `PerVertex`: vertex rate. `PerInstance` with rate 1: instance rate. `PerInstance` with rate
-///   `n > 1`: instance rate with divisor `n` when the profile has
-///   `vertexAttributeInstanceRateDivisor`, `n ≤ maxVertexAttribDivisor`, and
-///   `supportsNonZeroFirstInstance` (a Metal draw may have a nonzero base instance, and without
-///   it Vulkan requires `firstInstance == 0` for any divisor other than 1), else pulled. Vulkan
-///   fetches at `firstInstance + (instance - firstInstance) / n`, the same element MoltenVK maps
-///   Metal's step rate to (expected, not verified on Metal).
-/// - `Constant`: instance rate with divisor 0, on a binding `pipeline::link::vertex` emits with a
-///   **stride of 0**; pulled where that binding is not available. Metal fetches the layout's first
-///   element whatever the base instance, and Vulkan's zero divisor fetches at
-///   `firstInstance * stride` ("Vertex Input Extraction":
-///   `effectiveVertexOffset = firstInstance * stride` when `divisor` is 0), so the two name the
-///   same element for every draw exactly when that binding's stride is 0 -- which it can be,
-///   because a fetch that reads one element has no use for the layout's own stride. The binding
-///   needs `vertexAttributeInstanceRateZeroDivisor` and `vertexAttributeInstanceRateDivisor`
-///   (`VUID-VkVertexInputBindingDivisorDescription-vertexAttributeInstanceRateZeroDivisor-02228`
-///   and `-vertexAttributeInstanceRateDivisor-02229`), and, being a divisor other than 1 under a
-///   Metal draw that may carry a nonzero base instance, `supportsNonZeroFirstInstance`
-///   (VUID-vkCmdDraw-pNext-09461); and a stride of 0 must be legal, which the portability
-///   subset's `minVertexInputBindingStrideAlignment` forbids
-///   (`VUID-VkVertexInputBindingDescription-stride-04456`: at least as large as the alignment).
-///   Under `robustBufferAccess` a stride of 0 bounds the fetch at the bound range itself, which is
-///   the attribute extent the pulled fetch reads.
-/// - A format the profile cannot fetch as `VERTEX_BUFFER`: pulled.
-/// - `FloatRGB9E5` (`E5B9G9R9_UFLOAT_PACK32`): pulled on every profile
-///   (`fixed_function_format`).
-/// - Every attribute on a profile whose buffer containment is checked in the shader
-///   (`contain::encoding` is `Check::InShader`: containment on, neither `robustBufferAccess`
-///   nor `robustBufferAccess2` enabled): pulled. Vulkan bounds fixed-function vertex input only
-///   under robust buffer access ("Shader Out-of-Bounds Memory Access": the device feature, or
-///   `VK_EXT_pipeline_robustness`'s `vertexInputs`, which no profile models); without it a draw
-///   must not fetch past a vertex buffer binding (`VUID-vkCmdDraw-None-02721`), and a Metal draw
-///   may, so containment moves the fetch into the shader, where it reads through the normative
-///   check. Under `Containment::UnsafeOff` the consumer opted out of containment and input stays
-///   fixed function.
+/// - Every attribute outside the identity domains: pulled. Vulkan bounds fixed-function vertex
+///   input only under robust buffer access ("Shader Out-of-Bounds Memory Access": the device
+///   feature, or `VK_EXT_pipeline_robustness`'s `vertexInputs`), which no profile enables; without
+///   it a draw must not fetch past a vertex buffer binding (`VUID-vkCmdDraw-None-02721`), and a
+///   Metal draw may, so its bounds move the fetch into the shader, where it reads through the
+///   normative check.
 /// - `PerPatch`/`PerPatchControlPoint`: tessellation, refused. A `PerInstance` rate of 0 is an
 ///   invalid descriptor.
+///
+/// Under the identity domains (`Device::from_queries`' profile) nothing is pulled: the pulled
+/// fetch reads through a descriptor, which those domains hold none of. Every attribute is fetched
+/// in fixed function, and the containment rule above does not move it: the device bounds the
+/// fetch as it bounds any (with no buffer robustness, a fetch outside its buffer reads what the
+/// device gives). `PerVertex` is vertex rate, `PerInstance` with rate 1 instance rate, and
+/// `PerInstance` with rate `n > 1` instance rate with divisor `n` where the profile has
+/// `vertexAttributeInstanceRateDivisor` and `n ≤ maxVertexAttribDivisor`: Vulkan fetches at
+/// `firstInstance + (instance - firstInstance) / n`, the same element MoltenVK maps Metal's step
+/// rate to (expected, not verified on Metal). `Constant` is there a **vertex-rate** binding of stride 0, on every device,
+/// with no divisor: Vulkan computes a vertex-rate attribute's address as
+/// `bufferBindingAddress + vertexIndex * stride + attribDesc.offset` ("Vertex Input Address
+/// Calculation"), so a stride of 0 reads the layout's first element for every vertex and every
+/// instance, Metal's constant step; and a binding's stride has no lower bound but the portability
+/// subset's (`VUID-VkVertexInputBindingDescription-stride-00619` bounds it above by
+/// `maxVertexInputBindingStride` and is the only other rule on it, and
+/// `VUID-vkCmdBindVertexBuffers2-pStrides-06209` names 0 as a stride a bind may set), where link
+/// refuses it as `Feature::VertexInputLayout`. What fixed-function input cannot take is refused by
+/// what it needs: a per-instance rate above 1 ([`Feature::VertexStepRate`], with the missing
+/// `vertexAttributeInstanceRateDivisor` feature or the `maxVertexAttribDivisor` limit; a device
+/// that lacks only `supportsNonZeroFirstInstance` takes the divisor, and the consumer refuses a
+/// draw through it at a base instance other than 0), a format
+/// the profile cannot fetch as `VERTEX_BUFFER` ([`Feature::Format`], with that format usage), and
+/// `FloatRGB9E5`, whose fixed-function fetch a conformant device's answer differs from
+/// (`Feature::Format`, not implemented).
 pub fn attribute_fetch(
     format: VertexFormat,
     step: VertexStepFunction,
@@ -221,6 +211,12 @@ pub(crate) fn fetch_as(
     profile: &DeviceProfile,
 ) -> Result<AttributeFetch, Error> {
     let f = profile.fields();
+    // Under the identity domains the pulled fetch is not taken, and its case is refused.
+    let identity = crate::lower::access::identity(profile);
+    let pulled = |refusal: Unsupported| match identity {
+        true => Err(Error::from(refusal)),
+        false => Ok(AttributeFetch::Pulled),
+    };
     let (input_rate, divisor) = match step {
         VertexStepFunction::PerVertex => (vk::VertexInputRate::VERTEX, 1),
         VertexStepFunction::PerInstance => match step_rate {
@@ -230,42 +226,44 @@ pub(crate) fn fetch_as(
                 }))
             }
             1 => (vk::VertexInputRate::INSTANCE, 1),
-            // A Metal draw may have a nonzero base instance, so a divisor is usable only where
-            // `firstInstance` may then be nonzero (VUID-vkCmdDraw-pNext-09461).
-            n if f.fragment.vertex_attribute_divisor
-                && f.limits.supports_non_zero_first_instance
-                && n <= f.limits.max_vertex_attrib_divisor =>
-            {
+            // A Metal draw may have a nonzero base instance, and a divisor other than 1 takes a
+            // nonzero `firstInstance` only where the device reports `supportsNonZeroFirstInstance`
+            // (VUID-vkCmdDraw-pNext-09461). Where it does not, the divisor still: the consumer
+            // refuses each draw through it at a base instance other than 0.
+            n if f.fragment.vertex_attribute_divisor && n <= f.limits.max_vertex_attrib_divisor => {
                 (vk::VertexInputRate::INSTANCE, n)
             }
-            _ => return Ok(AttributeFetch::Pulled),
+            n => return pulled(divided(profile, n)),
         },
-        // Metal's constant step reads the layout's first element whatever the base instance, and a
-        // zero divisor reads element `firstInstance`: the same element for every draw exactly on a
-        // binding of stride 0, which link emits for this fetch and the portability subset forbids.
-        // A divisor other than 1 also needs a nonzero `firstInstance` to be legal at all, as a
-        // Metal draw may carry a base instance (the `PerInstance` arm above).
-        VertexStepFunction::Constant
-            if f.fragment.vertex_attribute_divisor
-                && f.fragment.vertex_attribute_zero_divisor
-                && f.limits.supports_non_zero_first_instance
-                && f.limits.portable_vertex_stride(0) =>
-        {
-            (vk::VertexInputRate::INSTANCE, 0)
-        }
-        VertexStepFunction::Constant => return Ok(AttributeFetch::Pulled),
+        // Under the identity domains, a vertex-rate binding that link emits with a stride of 0:
+        // its address is `bufferBindingAddress + vertexIndex * 0 + attribDesc.offset` for every
+        // vertex and instance (the Vulkan specification's "Vertex Input Address Calculation"),
+        // the layout's first element, which is what Metal's constant step reads. A stride of 0 is
+        // legal on any binding outside the portability subset: its only other rule,
+        // VUID-VkVertexInputBindingDescription-stride-00619, bounds it above, and
+        // VUID-vkCmdBindVertexBuffers2-pStrides-06209 names 0 among the strides a bind may set.
+        VertexStepFunction::Constant => (vk::VertexInputRate::VERTEX, 1),
         VertexStepFunction::PerPatch | VertexStepFunction::PerPatchControlPoint => {
             return Err(Unsupported::not_implemented(Feature::Tessellation).into())
         }
     };
-    // Without buffer robustness nothing bounds fixed-function input (VUID-vkCmdDraw-None-02721).
-    if contain::encoding(profile) == Check::InShader {
+    // No buffer robustness is enabled, so nothing bounds fixed-function input
+    // (VUID-vkCmdDraw-None-02721): outside the identity domains every attribute is pulled. Under
+    // them the device's own bounds stand: there is no pulled fetch to move the attribute to.
+    if !identity {
         return Ok(AttributeFetch::Pulled);
     }
-    if !fixed_function_format(vk_format)
-        || !profile.supports_format(vk_format, FormatUsage::VertexBuffer)
-    {
-        return Ok(AttributeFetch::Pulled);
+    if !fixed_function_format(vk_format) {
+        return pulled(Unsupported::not_implemented(Feature::Format));
+    }
+    if !profile.supports_format(vk_format, FormatUsage::VertexBuffer) {
+        return pulled(Unsupported::needs(
+            Feature::Format,
+            Capability::Format {
+                format: vk_format,
+                usage: FormatUsage::VertexBuffer,
+            },
+        ));
     }
     Ok(AttributeFetch::FixedFunction {
         format: vk_format,
@@ -274,10 +272,27 @@ pub(crate) fn fetch_as(
     })
 }
 
+/// The refusal of Metal's per-instance step at rate `n` above 1 where fixed-function input cannot
+/// divide the instance index on `profile`. It names what the profile lacks:
+/// `vertexAttributeInstanceRateDivisor`, else the rate past `maxVertexAttribDivisor`. Only the
+/// identity domains read it: elsewhere every attribute is pulled.
+fn divided(profile: &DeviceProfile, n: u32) -> Unsupported {
+    let f = profile.fields();
+    let needs = match f.fragment.vertex_attribute_divisor {
+        false => Capability::Feature(VkFeature::VertexAttributeInstanceRateDivisor),
+        true => Capability::Limit {
+            limit: VkLimit::MaxVertexAttribDivisor,
+            required: u64::from(n),
+            available: u64::from(f.limits.max_vertex_attrib_divisor),
+        },
+    };
+    Unsupported::needs(Feature::VertexStepRate, needs)
+}
+
 /// Whether fixed-function input delivers an attribute of `vk_format` where the profile reports
 /// the format's `VERTEX_BUFFER`: every format but the shared-exponent `E5B9G9R9_UFLOAT_PACK32`
-/// (`FloatRGB9E5`), which is pulled on every profile. Vulkan requires no device to fetch that
-/// format as vertex input (its mandatory features are a sampled image's, "Mandatory Format
+/// (`FloatRGB9E5`), which is never fetched in fixed function. Vulkan requires no device to fetch
+/// that format as vertex input (its mandatory features are a sampled image's, "Mandatory Format
 /// Support: 64-bit/uneven Components"), and its decode has no rounding to leave to the device:
 /// each component `m · 2^(e - 24)` is an `f32`, and the missing fourth one is 1, Metal's and
 /// Vulkan's alike. So the module's decode (`lower::stage_io::fetch`) answers what a conformant
@@ -442,11 +457,13 @@ mod tests {
     fn floor() -> crate::device::DeviceDescription {
         committed_descriptions()
             .into_iter()
-            .find(|(s, _)| s == "vk12-floor")
+            .find(|(s, _)| s == "runtime-floor")
             .unwrap()
             .1
     }
 
+    /// Under the identity domains an attribute is fixed function exactly where the profile fetches
+    /// it as stated, and refused, by what it needs, elsewhere.
     #[test]
     fn fetch_is_fixed_function_only_when_exact() {
         let mut desc = floor();
@@ -460,18 +477,19 @@ mod tests {
         );
         desc.features
             .remove(&VkFeature::VertexAttributeInstanceRateDivisor);
-        let plain = Device::new(desc.clone(), DevicePolicy::default()).unwrap();
+        let plain = Device::from_queries(desc.clone(), DevicePolicy::default()).unwrap();
         desc.features
             .insert(VkFeature::VertexAttributeInstanceRateDivisor);
         // Listed with the extension that exposes it below Vulkan 1.4.
         desc.extensions
             .insert(VkExtension::KhrVertexAttributeDivisor);
         desc.limits.max_vertex_attrib_divisor = 4;
-        // No nonzero first instance with a divisor (VUID-vkCmdDraw-pNext-09461): pulled.
+        // No nonzero first instance with a divisor (VUID-vkCmdDraw-pNext-09461): the divisor
+        // still, the consumer refusing a draw through it at a base instance other than 0.
         desc.limits.supports_non_zero_first_instance = false;
-        let zero_first = Device::new(desc.clone(), DevicePolicy::default()).unwrap();
+        let zero_first = Device::from_queries(desc.clone(), DevicePolicy::default()).unwrap();
         desc.limits.supports_non_zero_first_instance = true;
-        let divisor = Device::new(desc, DevicePolicy::default()).unwrap();
+        let divisor = Device::from_queries(desc, DevicePolicy::default()).unwrap();
         use VertexStepFunction as S;
         let fetch = |dev: &Device, f, s, r| attribute_fetch(f, s, r, dev.profile());
         let fixed = |rate, divisor| {
@@ -492,7 +510,7 @@ mod tests {
         );
         assert_eq!(
             fetch(&plain, float3, S::PerInstance, 3),
-            Ok(AttributeFetch::Pulled)
+            Err(divided(plain.profile(), 3).into())
         );
         assert_eq!(
             fetch(&divisor, float3, S::PerInstance, 3),
@@ -500,7 +518,7 @@ mod tests {
         );
         assert_eq!(
             fetch(&zero_first, float3, S::PerInstance, 3),
-            Ok(AttributeFetch::Pulled)
+            fixed(vk::VertexInputRate::INSTANCE, 3)
         );
         assert_eq!(
             fetch(&zero_first, float3, S::PerInstance, 1),
@@ -508,17 +526,17 @@ mod tests {
         );
         assert_eq!(
             fetch(&divisor, float3, S::PerInstance, 5),
-            Ok(AttributeFetch::Pulled)
+            Err(divided(divisor.profile(), 5).into())
         );
         assert_eq!(
             fetch(&divisor, float3, S::Constant, 0),
-            Ok(AttributeFetch::Pulled)
+            fixed(vk::VertexInputRate::VERTEX, 1)
         );
         // Not a vertex-buffer format on this device.
-        assert_eq!(
+        assert!(matches!(
             fetch(&plain, VertexFormat::UChar3, S::PerVertex, 1),
-            Ok(AttributeFetch::Pulled)
-        );
+            Err(Error::Unsupported(u)) if u.feature == Feature::Format
+        ));
         assert!(matches!(
             fetch(&plain, float3, S::PerInstance, 0),
             Err(Error::InvalidDescriptor(DescriptorError::VertexStepRate {
@@ -531,11 +549,11 @@ mod tests {
         );
     }
 
-    /// `FloatRGB9E5` is pulled at every step on a device that reports `E5B9G9R9_UFLOAT_PACK32`'s
-    /// `VERTEX_BUFFER` (`fixed_function_format`), while `FloatRG11B10`, the other packed float
-    /// format, stays fixed function there.
+    /// Under the identity domains `FloatRGB9E5` is refused at every step on a device that reports
+    /// `E5B9G9R9_UFLOAT_PACK32`'s `VERTEX_BUFFER` (`fixed_function_format`), while `FloatRG11B10`,
+    /// the other packed float format, is fixed function there.
     #[test]
-    fn shared_exponent_attributes_are_pulled_where_the_device_fetches_them() {
+    fn shared_exponent_attributes_are_not_fixed_function_where_the_device_fetches_them() {
         let mut desc = floor();
         for f in [
             vk::Format::E5B9G9R9_UFLOAT_PACK32,
@@ -549,7 +567,7 @@ mod tests {
                 },
             );
         }
-        let dev = Device::new(desc, DevicePolicy::default()).unwrap();
+        let dev = Device::from_queries(desc, DevicePolicy::default()).unwrap();
         assert!(dev.profile().supports_format(
             vk::Format::E5B9G9R9_UFLOAT_PACK32,
             FormatUsage::VertexBuffer
@@ -558,7 +576,7 @@ mod tests {
         for (step, rate) in [(S::PerVertex, 1), (S::PerInstance, 1)] {
             assert_eq!(
                 attribute_fetch(VertexFormat::FloatRGB9E5, step, rate, dev.profile()),
-                Ok(AttributeFetch::Pulled),
+                Err(Unsupported::not_implemented(Feature::Format).into()),
                 "{step:?}"
             );
             assert!(matches!(
@@ -571,43 +589,18 @@ mod tests {
         }
     }
 
-    /// Without buffer robustness Vulkan does not bound fixed-function vertex input
-    /// (`VUID-vkCmdDraw-None-02721`), so every attribute is pulled and read through the in-shader
-    /// check, whatever its format and step; with `robustBufferAccess` or `robustBufferAccess2` it
-    /// stays fixed function, and so it does under `Containment::UnsafeOff`, where the consumer
-    /// opted out. The descriptor errors and the tessellation refusal come first in every case.
+    /// Vulkan bounds fixed-function vertex input only under robust buffer access
+    /// (`VUID-vkCmdDraw-None-02721`), which no profile enables, so outside the identity domains
+    /// every attribute is pulled and read through the in-shader check, whatever its format and
+    /// step. The descriptor errors and the tessellation refusal come first in every case.
     #[test]
-    fn fixed_function_input_needs_buffer_robustness() {
-        use crate::device::policy::ContainmentPolicy;
-        use crate::device::profile::GuestIsolation;
+    fn fixed_function_input_is_pulled_outside_the_identity_domains() {
         use VertexStepFunction as S;
-        let robust = floor();
-        assert!(robust.features.contains(&VkFeature::RobustBufferAccess));
-        let mut bare = robust.clone();
-        bare.features.remove(&VkFeature::RobustBufferAccess);
-        bare.features.remove(&VkFeature::RobustBufferAccess2);
-        let unsafe_off = DevicePolicy {
-            containment: ContainmentPolicy::UnsafeOff,
-            isolation: GuestIsolation::Off,
-            ..DevicePolicy::UNTRUSTED
-        };
-        let checked = Device::new(bare.clone(), DevicePolicy::default()).unwrap();
-        let off = Device::new(bare, unsafe_off).unwrap();
-        let robust = Device::new(robust, DevicePolicy::default()).unwrap();
-        assert_eq!(contain::encoding(checked.profile()), Check::InShader);
-        assert_eq!(contain::encoding(robust.profile()), Check::None);
-        assert_eq!(contain::encoding(off.profile()), Check::None);
+        let checked = Device::from_queries(floor(), DevicePolicy::RESIDENT_TABLES).unwrap();
         let float4 = VertexFormat::Float4;
         for (step, rate) in [(S::PerVertex, 1), (S::PerInstance, 1)] {
-            let fetch = |dev: &Device| attribute_fetch(float4, step, rate, dev.profile());
-            assert_eq!(fetch(&checked), Ok(AttributeFetch::Pulled), "{step:?}");
-            for dev in [&robust, &off] {
-                assert!(
-                    matches!(fetch(dev), Ok(AttributeFetch::FixedFunction { .. })),
-                    "{step:?}: {:?}",
-                    fetch(dev)
-                );
-            }
+            let fetch = attribute_fetch(float4, step, rate, checked.profile());
+            assert_eq!(fetch, Ok(AttributeFetch::Pulled), "{step:?}");
         }
         assert!(matches!(
             attribute_fetch(float4, S::PerInstance, 0, checked.profile()),
@@ -621,8 +614,8 @@ mod tests {
         );
     }
 
-    /// Vulkan's mandatory vertex-buffer formats are fixed function on every committed profile
-    /// that reports them.
+    /// Vulkan's mandatory vertex-buffer formats are fixed function under the identity domains on
+    /// every committed profile that reports them and opens those domains.
     #[test]
     fn mandatory_vertex_formats_are_fixed_function() {
         for (stem, desc) in committed_descriptions() {
@@ -633,7 +626,9 @@ mod tests {
             {
                 continue;
             }
-            let dev = Device::new(desc, DevicePolicy::default()).unwrap();
+            let Ok(dev) = Device::from_queries(desc, DevicePolicy::default()) else {
+                continue;
+            };
             for v in [
                 VertexFormat::Float,
                 VertexFormat::Float2,

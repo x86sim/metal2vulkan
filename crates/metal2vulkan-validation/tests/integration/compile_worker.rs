@@ -9,8 +9,7 @@ use metal2vulkan::pipeline::ComputePipeline;
 use metal2vulkan_devtools::{engine_dir, llvm_assemble, AssembleError};
 use metal2vulkan_validation::acceptance::{
     compile_draw_in_worker, compile_pipeline, compile_row_in_worker, retained, row,
-    AcceptancePipeline, PipelineRequest, Projection, RequestFunction, RowCompile, RowPipeline,
-    RowStage,
+    AcceptancePipeline, PipelineRequest, RequestFunction, RowCompile, RowPipeline, RowStage,
 };
 use metal2vulkan_validation::engine::{load_description, RowSource};
 use metal2vulkan_validation::worker::compile::{
@@ -48,12 +47,8 @@ fn device(stem: &str) -> WorkerDevice {
 
 /// Every binary that compiles through the worker serves it (and installs the allocator it
 /// refuses to serve without).
-fn serving() -> [PathBuf; 3] {
-    [
-        bin_exe!("corpus-pipeline"),
-        bin_exe!("corpus-vulkan"),
-        bin_exe!("corpus-moltenvk"),
-    ]
+fn serving() -> [PathBuf; 2] {
+    [bin_exe!("corpus-pipeline"), bin_exe!("corpus-vulkan")]
 }
 
 #[test]
@@ -67,9 +62,7 @@ fn every_device_tool_serves_the_compile_worker_with_the_public_apis_pipeline() {
         constants: FunctionConstantValues::defaults(),
     };
     let AcceptancePipeline::Compute(expected) =
-        compile_pipeline(&[&bitcode], &request, device.device(), None)
-            .unwrap()
-            .pipeline
+        compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap()
     else {
         panic!("a kernel compiles to a compute pipeline");
     };
@@ -85,8 +78,7 @@ fn every_device_tool_serves_the_compile_worker_with_the_public_apis_pipeline() {
         )
         .unwrap_or_else(|failure| panic!("{program}: {}", failure.message()));
         let compiled_pipeline = compiled.result.unwrap();
-        assert_eq!(compiled_pipeline.pipeline, *expected, "{program}");
-        assert!(compiled_pipeline.handles.is_empty(), "{program}");
+        assert_eq!(compiled_pipeline, *expected, "{program}");
         assert!(
             compiled.allocator_peak.is_some_and(|peak| peak > 0),
             "{program}"
@@ -129,12 +121,9 @@ fn a_logged_draw_compiles_in_the_worker_as_in_process() {
         vertex: RequestFunction::new("stage_io_vertex", undefined.clone()),
         fragment: RequestFunction::new("stage_io_fragment", undefined),
         template: template.clone(),
-        shape: None,
     };
     let AcceptancePipeline::Render(expected) =
-        compile_pipeline(&[&bitcode, &bitcode], &request, device.device(), None)
-            .unwrap()
-            .pipeline
+        compile_pipeline(&[&bitcode, &bitcode], &request, device.device(), None).unwrap()
     else {
         panic!("a draw compiles to a render pipeline");
     };
@@ -157,7 +146,7 @@ fn a_logged_draw_compiles_in_the_worker_as_in_process() {
         panic!("a draw came back as another kind");
     };
     assert_eq!(pipeline.stages.len(), 2);
-    assert_eq!(pipeline, *expected);
+    assert_eq!(*pipeline, *expected);
     assert!(measured.is_some());
 }
 
@@ -178,13 +167,10 @@ fn a_vertex_function_and_a_refusal_cross_the_worker_boundary() {
         let request = PipelineRequest::Row {
             entry: entry.into(),
             stage,
-            projection: Projection::Derived,
             constants: FunctionConstantValues::defaults(),
         };
         let AcceptancePipeline::Render(expected) =
-            compile_pipeline(&[&bitcode], &request, device.device(), None)
-                .unwrap()
-                .pipeline
+            compile_pipeline(&[&bitcode], &request, device.device(), None).unwrap()
         else {
             panic!("{entry} compiles to a render pipeline");
         };
@@ -194,7 +180,6 @@ fn a_vertex_function_and_a_refusal_cross_the_worker_boundary() {
             &retained(&bitcode),
             entry,
             stage,
-            Projection::Derived,
             &FunctionConstantValues::defaults(),
         );
         let RowCompile::Compiled(pipeline) = compiled else {
@@ -203,7 +188,7 @@ fn a_vertex_function_and_a_refusal_cross_the_worker_boundary() {
         let RowPipeline::Render { pipeline, .. } = *pipeline else {
             panic!("{entry} came back as another kind");
         };
-        assert_eq!(pipeline, *expected);
+        assert_eq!(*pipeline, *expected);
         assert_eq!(pipeline.stages.len(), stages);
         assert!(measured.unwrap().elapsed < DEADLINE);
     }
@@ -225,7 +210,7 @@ fn a_vertex_function_and_a_refusal_cross_the_worker_boundary() {
 
 #[test]
 fn a_program_that_does_not_serve_the_worker_is_a_worker_failure() {
-    let device = device("vk12-floor");
+    let device = device("runtime-floor");
     // `true` exits successfully without a result: the result cannot be read.
     match compile_compute(
         &CompileWorker::program("true"),
@@ -291,12 +276,17 @@ define void @blob(ptr addrspace(1) %out, i32 %t) {{
 
 /// Compile [`blob_kernel`] `depth` levels deep for `lavapipe` through `corpus-pipeline`'s compile
 /// worker (the child assembles the text): the compile, and its blob's length, `2^(depth+2)`.
+/// Under the resident-table domains: the identity domains refuse constant data over 64 KiB.
 fn compile_blob(depth: u32) -> (WorkerCompile<ComputePipeline>, u64) {
     let worker = worker(&bin_exe!("corpus-pipeline"));
     let text = blob_kernel(depth);
     let compiled = compile_compute(
         &worker,
-        &device("lavapipe"),
+        &WorkerDevice::new(
+            load_description("lavapipe").unwrap(),
+            DevicePolicy::RESIDENT_TABLES,
+        )
+        .unwrap(),
         &RowSource::Text(text.as_str().into()),
         "blob",
         &FunctionConstantValues::defaults(),
@@ -304,7 +294,6 @@ fn compile_blob(depth: u32) -> (WorkerCompile<ComputePipeline>, u64) {
     .unwrap_or_else(|failure| panic!("{depth} levels: {}", failure.message()));
     let blob = match &compiled.result {
         Ok(compiled) => compiled
-            .pipeline
             .stage
             .constant_blob
             .as_ref()

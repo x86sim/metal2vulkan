@@ -13,18 +13,22 @@
 //! barrier rule (`BarrierRule::Vulkan`: a returned invocation while others wait at a barrier
 //! traps), in both scheduling orders, at several threadgroup sizes and subgroup widths, giving
 //! the words the predicated reading predicts. A kernel whose barriers are all uniform is not
-//! predicated. No GPU is used.
+//! predicated. An invocation that leaves a predicated loop before the others keeps the value it
+//! reads after the loop: the walk runs the loop's later trips for it too, so `spirv::carry` ends
+//! no value at their tops. No GPU is used.
 //!
 //! `llvm-as` assembles the kernels; a missing tool skips visibly.
 
 use std::collections::BTreeMap;
+
+use metal2vulkan_devtools::loop_kernels;
 
 use crate::device::subgroup::Tier;
 use crate::device::DevicePolicy;
 use crate::lower::select::Plan;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, engine_dir, link_and_validate, llvm_assemble, profile, typed_module, AssembleError,
     Scratch,
@@ -34,14 +38,14 @@ use crate::spirv::ir::TypedModule;
 use crate::spirv::testing::barriers::workgroup_barriers;
 
 /// Profiles whose kernels run on subgroups (`moltenvk-m3`, Intel, AMD, NVIDIA) and whose
-/// simdgroups are emulated (`lavapipe`, `vk12-floor`).
+/// simdgroups are emulated (`lavapipe`, `roadmap-2022`).
 const PROFILES: [&str; 6] = [
     "moltenvk-m3",
     "intel-irisxe-rplp-anv",
-    "amd-rdna3-radv",
+    "amd-780m-radv",
     "nvidia-rtx50-linux",
     "lavapipe",
-    "vk12-floor",
+    "runtime-floor",
 ];
 
 /// The poison every output word starts as.
@@ -60,52 +64,9 @@ fn assemble_file(path: &std::path::Path, what: &str) -> Option<Vec<u8>> {
 
 /// `body` (the kernel `name`'s definition, parameters `%limits`, `%out`, `%t`) in a module with
 /// the threadgroup arrays `@a` and `@b`, the barrier and simd declarations, and the kernel's AIR
-/// metadata, assembled.
-fn kernel(name: &str, body: &str) -> Option<Vec<u8>> {
-    let text = format!(
-        r#"target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
-target triple = "air64_v28-apple-macosx26.0.0"
-
-@a = internal unnamed_addr addrspace(3) global [128 x i32] undef, align 4
-@b = internal unnamed_addr addrspace(3) global [128 x i32] undef, align 4
-
-define void @{name}(ptr addrspace(1) noundef readonly %limits, ptr addrspace(1) noundef %out, i32 noundef %t) #0 {{
-{body}
-}}
-
-declare void @air.wg.barrier(i32, i32) #1
-declare i32 @air.simd_sum.u.i32(i32) #1
-
-attributes #0 = {{ convergent mustprogress nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "stack-protector-buffer-size"="8" }}
-attributes #1 = {{ convergent mustprogress nounwind willreturn }}
-
-!llvm.module.flags = !{{!0, !1, !2, !3, !4, !5, !6, !7, !8}}
-!air.kernel = !{{!9}}
-!air.compile_options = !{{!15, !16}}
-!air.version = !{{!19}}
-!air.language_version = !{{!20}}
-
-!0 = !{{i32 2, !"SDK Version", [2 x i32] [i32 26, i32 5]}}
-!1 = !{{i32 1, !"wchar_size", i32 4}}
-!2 = !{{i32 7, !"frame-pointer", i32 2}}
-!3 = !{{i32 7, !"air.max_device_buffers", i32 31}}
-!4 = !{{i32 7, !"air.max_constant_buffers", i32 31}}
-!5 = !{{i32 7, !"air.max_threadgroup_buffers", i32 31}}
-!6 = !{{i32 7, !"air.max_textures", i32 128}}
-!7 = !{{i32 7, !"air.max_read_write_textures", i32 8}}
-!8 = !{{i32 7, !"air.max_samplers", i32 16}}
-!9 = !{{ptr @{name}, !10, !11}}
-!10 = !{{}}
-!11 = !{{!12, !13, !14}}
-!12 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"limits"}}
-!13 = !{{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}}
-!14 = !{{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"t"}}
-!15 = !{{!"air.compile.denorms_disable"}}
-!16 = !{{!"air.compile.fast_math_enable"}}
-!19 = !{{i32 2, i32 8, i32 0}}
-!20 = !{{!"Metal", i32 4, i32 0, i32 0}}
-"#
-    );
+/// metadata (`loop_kernels::module`), assembled.
+pub(super) fn kernel(name: &str, body: &str) -> Option<Vec<u8>> {
+    let text = loop_kernels::module(name, body);
     let scratch = Scratch::new(&format!("m2v-divergent-barriers-{name}"));
     let dir = scratch.path();
     let path = dir.join("kernel.ll");
@@ -280,9 +241,9 @@ done:
 
 /// The threads of a threadgroup of `n`, and the limits each case passes.
 #[derive(Clone, Copy, Debug)]
-struct Case {
-    n: u32,
-    limits: [u32; 2],
+pub(super) struct Case {
+    pub(super) n: u32,
+    pub(super) limits: [u32; 2],
 }
 
 /// Thread `t`'s expected word of `kernel` in `c`, by the predicated reading: the threads that
@@ -298,6 +259,7 @@ fn expected(kernel: &str, c: Case, t: u32) -> u32 {
             }
         }
         "loop_barrier_k" => (0..(t & 3)).map(|i| ((t ^ 4) << 4) + i).sum(),
+        "loop_leaver_k" => loop_kernels::loop_leaver(t),
         "continue_barrier_k" => {
             if t & 3 == 3 {
                 0
@@ -345,7 +307,7 @@ fn cases(kernel: &str, tier: Tier) -> Vec<Case> {
         let limits: Vec<[u32; 2]> = match kernel {
             "continue_barrier_k" => vec![[0, 0], [1, 0], [3, 0]],
             "uniform_barriers_k" => vec![[0, n]],
-            "loop_barrier_k" => vec![[0, 0]],
+            "loop_barrier_k" | "loop_leaver_k" => vec![[0, 0]],
             "a3_early_return_barrier" => {
                 vec![[n, n], [n - n / 4, n / 3 + 1], [n, 1], [n / 2 + 1, n / 2]]
             }
@@ -370,12 +332,9 @@ fn words(b: &[u8]) -> Vec<u32> {
 
 /// The output words after one workgroup of `c.n` threads ran `m` (planned as `plan`) with
 /// `lanes`-wide subgroups under Vulkan's barrier rule, identical in both scheduling orders.
-fn run_case(plan: &Plan, m: &TypedModule, c: Case, lanes: SubgroupSize) -> Vec<u32> {
+pub(super) fn run_case(plan: &Plan, m: &TypedModule, c: Case, lanes: SubgroupSize) -> Vec<u32> {
     let mut spec = BTreeMap::new();
-    for (a, v) in [Axis::X, Axis::Y, Axis::Z].into_iter().zip([c.n, 1, 1]) {
-        spec.insert(SpecKey::LocalSize(a), u64::from(v));
-    }
-    spec.insert(SpecKey::FlatLocalSize, u64::from(c.n));
+    spec.extend(crate::pipeline::threadgroup_constants([c.n, 1, 1]));
     let push = vec![0u8; plan.push.push_range.map_or(0, |(_, end)| end as usize)];
     for f in &plan.push.fields {
         assert!(matches!(f.loc, PushLoc::Push { .. }), "{f:?}");
@@ -429,7 +388,7 @@ fn run_case(plan: &Plan, m: &TypedModule, c: Case, lanes: SubgroupSize) -> Vec<u
 /// Compile `kernel` on `stem`, validate it, check its barriers against the module's own
 /// uniformity, and run every case at every width its tier allows.
 fn check(stem: &str, bc: &[u8], kernel: &str, predicated: bool) {
-    let p = profile(stem, DevicePolicy::default()).expect("profile");
+    let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
     let a = compile(bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
     link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
     let (plan, m) = typed_module(bc, kernel, &p).unwrap_or_else(|e| panic!("{stem} {kernel}: {e}"));
@@ -437,12 +396,6 @@ fn check(stem: &str, bc: &[u8], kernel: &str, predicated: bool) {
         plan.families.simd.predication.is_some(),
         predicated,
         "{stem} {kernel}: predicated"
-    );
-    assert!(
-        plan.estimate.words >= a.module.words.len() as u64,
-        "{stem} {kernel}: estimate {} < emitted {}",
-        plan.estimate.words,
-        a.module.words.len()
     );
     let report = workgroup_barriers(&m).expect("check");
     assert!(report.barriers > 0, "{stem} {kernel}: no barrier");
@@ -489,6 +442,18 @@ fn divergent_barriers_run_predicated_on_every_profile() {
     }
 }
 
+/// A thread that leaves a predicated loop before the others reads the value of its own last trip
+/// after the loop: no store at a later trip's top, which it runs not live, ends that value.
+#[test]
+fn a_thread_that_leaves_a_vote_loop_early_keeps_its_last_trips_value() {
+    let Some(bc) = kernel("loop_leaver_k", loop_kernels::LOOP_LEAVER) else {
+        return;
+    };
+    for stem in PROFILES {
+        check(stem, &bc, "loop_leaver_k", true);
+    }
+}
+
 /// The owned fixture: threads returning before the first and between the two barriers.
 #[test]
 fn early_returns_before_barriers_run_predicated_on_every_profile() {
@@ -512,7 +477,7 @@ fn uniform_barriers_are_not_predicated() {
     };
     for stem in PROFILES {
         check(stem, &bc, "uniform_barriers_k", false);
-        let p = profile(stem, DevicePolicy::default()).expect("profile");
+        let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
         let (plan, _) = typed_module(&bc, "uniform_barriers_k", &p).expect("plan");
         assert!(
             !plan.facts.contains(&RuntimeFact::PredicationVote),
@@ -533,7 +498,7 @@ fn only_a_barrier_in_a_loop_takes_the_vote_word() {
     ] {
         let Some(bc) = kernel(name, body) else { return };
         for stem in PROFILES {
-            let p = profile(stem, DevicePolicy::default()).expect("profile");
+            let p = profile(stem, DevicePolicy::RESIDENT_TABLES).expect("profile");
             let (plan, _) = typed_module(&bc, name, &p).expect("plan");
             let vote = plan.facts.contains(&RuntimeFact::PredicationVote);
             let emulated = plan.simd.1 == Tier::Emulated;

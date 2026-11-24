@@ -17,17 +17,16 @@ use std::sync::Arc;
 
 use crate::budget::SPIRV_WORDS;
 use crate::device::{DevicePolicy, DeviceProfile};
-use crate::error::{Error, RuntimeInput};
+use crate::error::Error;
 use crate::library::{FunctionArtifact, FunctionConstantValue, FunctionConstantValues};
 use crate::lower::select::Plan;
-use crate::metal::{DataType, PixelFormat};
+use crate::metal::DataType;
 use crate::pipeline::compile::{compile_bitcode, EntryRef};
-use crate::pipeline::descriptor::ColorAttachmentDescriptor;
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::lower_inputs::{FramebufferFetchInputs, LoweringInputs};
+use crate::pipeline::lower_inputs::LoweringInputs;
 use crate::pipeline::stage_io::{IoRole, StageBuiltin};
-use crate::pipeline::sym::{Axis, PushField, ResourceKind, ResourceSlot, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     engine_dir, link_and_validate, llvm_assemble, meter, profile, typed_module_specialized,
     AssembleError,
@@ -48,7 +47,7 @@ fn assemble(stem: &str) -> Option<Vec<u8>> {
 }
 
 fn prof(stem: &str) -> DeviceProfile {
-    profile(stem, DevicePolicy::default()).expect("committed profile")
+    profile(stem, DevicePolicy::RESIDENT_TABLES).expect("committed profile")
 }
 
 /// The boolean constants `on` true, every other constant undefined (so its gate is off).
@@ -82,10 +81,7 @@ fn compile_with(
 /// `out` filled with a sentinel first; identical in both scheduling orders.
 fn run_kernel(plan: &Plan, m: &TypedModule) -> Vec<u32> {
     let mut spec = BTreeMap::new();
-    for (axis, v) in [(Axis::X, 4), (Axis::Y, 1), (Axis::Z, 1)] {
-        spec.insert(SpecKey::LocalSize(axis), v);
-    }
-    spec.insert(SpecKey::FlatLocalSize, 4);
+    spec.extend(crate::pipeline::threadgroup_constants([4, 1, 1]));
     // Zero push bytes: each buffer is bound at its start, and the dispatch is one region at the
     // grid's origin.
     for f in &plan.push.fields {
@@ -175,7 +171,7 @@ fn an_absent_vertex_attribute_is_not_declared() {
         return;
     };
     let entry = "fca_vertex_absent_attribute";
-    for stem in ["moltenvk-m3", "vk12-floor"] {
+    for stem in ["moltenvk-m3", "runtime-floor"] {
         let p = prof(stem);
         for (on, want) in [(false, vec![0]), (true, vec![0, 1])] {
             let gates: &[u32] = if on { &[0] } else { &[] };
@@ -279,42 +275,13 @@ fn each_fragment_input_gated_on_is_declared() {
         barycentric.interface.io.builtins
     );
     link_and_validate(&barycentric, &p).expect("has_barycentric: L3");
-    // `moltenvk-m3` orders a fetch only through the pixel interlock: the color input reads its
-    // attachment in the interlocked storage form under its pipeline's state, which a standalone
-    // compile does not have.
-    match compile_with(&bc, entry, &[HAS_PRIOR], &p) {
-        Err(Error::NeedsInput(RuntimeInput::FramebufferFetch)) => {}
-        other => panic!("declared color input: {:?}", other.map(|_| ())),
-    }
-    let mut inputs = LoweringInputs::new();
-    inputs.framebuffer_fetch = Some(FramebufferFetchInputs::of(
-        [0],
-        &[Some(ColorAttachmentDescriptor::new(
-            PixelFormat::RGBA8Unorm,
-        ))],
-        false,
-        false,
-        1,
-    ));
-    let prior = compile_bitcode(
-        &bc,
-        EntryRef::Name(entry),
-        &constants(&[HAS_PRIOR]),
-        &p,
-        &inputs,
-        &mut meter(),
-        SPIRV_WORDS,
-    )
-    .expect("has_prior");
+    // The color input reads its input attachment.
+    let prior = compile_with(&bc, entry, &[HAS_PRIOR], &p).expect("has_prior");
     assert!(
-        prior.facts.iter().any(|f| matches!(
-            f,
-            RuntimeFact::InterlockedFramebufferFetch {
-                color: 0,
-                writes: true,
-                ..
-            }
-        )),
+        prior
+            .facts
+            .iter()
+            .any(|f| matches!(f, RuntimeFact::FramebufferFetch { color: 0 })),
         "{:?}",
         prior.facts
     );

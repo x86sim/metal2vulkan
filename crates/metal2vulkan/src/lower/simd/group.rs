@@ -1,6 +1,9 @@
 //! Emission of the simd strategies per tier, their operation classes, and their word bounds. See
 //! the module documentation of `lower::simd`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::air::intrinsics::{GroupOp, GroupScope};
 use crate::air::ir::{InstId, InstKind, Value};
 use crate::device::subgroup::{OpBits, Tier};
@@ -10,7 +13,7 @@ use crate::lower::emit::EmitCx;
 use crate::spirv::builder::ops::group::GroupMode;
 use crate::spirv::builder::FunctionBuilder;
 use crate::spirv::error::{BResult, BuildError, Dangling};
-use crate::spirv::ids::{GlobalId, Value as SValue};
+use crate::spirv::ids::{BlockId, GlobalId, Value as SValue};
 use crate::spirv::ir::{
     BinOp, ConstBits, Constant, ConvOp, GlslOp, GroupArith, MemAccess, QuadDirection, ShuffleOp,
     Type, UnOp,
@@ -114,14 +117,16 @@ pub fn cluster_ops(g: &GroupPlan) -> OpBits {
 
 /// Quads are the same in every tier: aligned groups of four subgroup lanes. A reduction, a
 /// prefix sum or product and the first active lane's broadcast read the quad's lanes by shuffles
-/// under the ballot of its active lanes, in Metal's order; a vote is the quad's bits of the ballot.
-/// A broadcast or shuffle-xor by a constant lane or mask is Vulkan's quad class where the stage
-/// takes it, and a shuffle elsewhere.
+/// under the ballot of its active lanes, in Metal's order, and a vote, `is_first`, the ballot and
+/// the active mask are the quad's bits of the ballot; a fragment's are quad instructions alone
+/// ([`fragment_quad`]). A broadcast or shuffle-xor by a constant lane or mask is Vulkan's quad
+/// class where the stage takes it, and a shuffle elsewhere.
 fn quad_ops(g: &GroupPlan) -> OpBits {
     use GroupOp as G;
     match (g.op, g.konst) {
         (G::ShuffleXor, Some(0)) => OpBits::NONE,
         (G::Broadcast | G::ShuffleXor, Some(_)) if g.quad_instructions => OpBits::QUAD,
+        _ if fragment_quad(g) => OpBits::QUAD,
         (G::BroadcastFirst, _) => OpBits::BALLOT.union(OpBits::SHUFFLE),
         (op, _) if combines(op) => OpBits::BALLOT.union(OpBits::SHUFFLE),
         (G::All | G::Any | G::Ballot | G::IsFirst | G::ActiveThreadsMask, _) => OpBits::BALLOT,
@@ -131,14 +136,17 @@ fn quad_ops(g: &GroupPlan) -> OpBits {
 
 /// Whether `g` reads another lane's value by that lane's index: a shuffle, shuffle-xor, relative
 /// shuffle, rotation, broadcast by lane or fill, in either scope (not a quad shuffle-xor by the
-/// constant 0, which is the value itself). Such a read names a lane that may not take part, so
-/// where its group may be partly live it reads through the ballot of the live lanes
-/// ([`Lane::read_from`], `super::partly_live`). The other operations read only active lanes: the
-/// first active lane's broadcast, the reductions, prefix sums, votes and ballots.
+/// constant 0, which is the value itself, nor a fragment's read within its quad, which reads a
+/// lane only where that lane's quad vote says it takes part, [`fragment_quad`]). Such a read names
+/// a lane that may not take part, so where its group may be partly live it reads through the
+/// ballot of the live lanes ([`Lane::read_from`], `super::partly_live`). The other operations
+/// read only active lanes: the first active lane's broadcast, the reductions, prefix sums, votes
+/// and ballots.
 pub fn reads_lanes(g: &GroupPlan) -> bool {
     use GroupOp as G;
     match (g.op, g.scope, g.konst) {
         (G::ShuffleXor, GroupScope::Quad, Some(0)) => false,
+        _ if fragment_quad(g) => false,
         (
             G::Broadcast
             | G::Shuffle
@@ -154,6 +162,18 @@ pub fn reads_lanes(g: &GroupPlan) -> bool {
         ) => true,
         _ => false,
     }
+}
+
+/// Whether `g` is a fragment's quad operation that reads only its own quad, as every one does but
+/// a fill by a constant modulo whose segment ([`constant_fill_width`]) is wider than the quad. It
+/// reads the quad through quad instructions alone ([`quad_votes`], [`quad_lanes`]).
+pub(super) fn fragment_quad(g: &GroupPlan) -> bool {
+    let wide = matches!(
+        (g.op, g.konst),
+        (GroupOp::ShuffleAndFillUp | GroupOp::ShuffleAndFillDown, Some(m))
+            if constant_fill_width(m) > 4
+    );
+    g.helpers && g.scope == GroupScope::Quad && !wide
 }
 
 /// The census name of a group strategy. A float sum or product and a float prefix sum or product,
@@ -234,11 +254,18 @@ pub(super) fn words(g: &GroupPlan) -> u32 {
     frame
         + match g.op {
             op if scan(op) => 2048 + 32 * round,
+            // A fragment's fill reads two values from its quad ([`quad_read`]).
+            G::ShuffleAndFillUp | G::ShuffleAndFillDown if fragment_quad(g) => 1024,
             G::ShuffleAndFillUp | G::ShuffleAndFillDown => 160,
-            // A quad's four reads under its ballot bits, three combinations and the result's
-            // rounding ([`quad_tree`]).
+            // A quad's four reads with whether each lane takes part (by its ballot bits, or a
+            // fragment's quad votes), three combinations and the result's rounding
+            // ([`quad_tree`]).
             op if combines(op) && g.scope == GroupScope::Quad => 512 + 4 * round,
             op if combines(op) => 64 + round,
+            G::All | G::Any => 128,
+            // A fragment's quad's four votes and their bits, or four reads and their selects
+            // ([`quad_votes`], [`quad_lanes`]).
+            _ if fragment_quad(g) => 512,
             _ => 128,
         }
 }
@@ -257,6 +284,37 @@ pub(super) struct Lane {
     /// live lane read ([`Lane::live_lanes`]): there the subgroup may be narrower than the 32 Metal
     /// lanes a read names.
     size: Option<GlobalId>,
+    /// The function's [`QuadSeen`].
+    quad: Rc<RefCell<QuadSeen>>,
+    /// The operation is a fragment's quad operation whose quad is whole (`SimdPlan::whole_quads`):
+    /// its four lanes take part.
+    whole: bool,
+}
+
+/// What a fragment's quad operations made in one SPIR-V block, for the block's later ones
+/// ([`quad_votes`], [`quad_lanes`]): the votes of which quad lanes take part, and the four lanes of
+/// the last [`QUAD_SEEN_VALUES`] values read. Every operation of a block runs on the same active
+/// lanes, so they share these; another block starts afresh.
+#[derive(Default)]
+pub(crate) struct QuadSeen {
+    block: Option<BlockId>,
+    on: Vec<SValue>,
+    lanes: Vec<(SValue, Vec<SValue>)>,
+}
+
+/// The values a block's [`QuadSeen`] keeps the four lanes of.
+const QUAD_SEEN_VALUES: usize = 8;
+
+impl QuadSeen {
+    /// The record of block `here`, emptied first where it was another block's.
+    fn at(&mut self, here: Option<BlockId>) -> &mut QuadSeen {
+        if self.block != here {
+            self.block = here;
+            self.on.clear();
+            self.lanes.clear();
+        }
+        self
+    }
 }
 
 /// The lanes executing a partly live lane read ([`Lane::live_lanes`]): the ballot of `true`, and
@@ -296,23 +354,6 @@ fn true_(fb: &mut FunctionBuilder<'_>) -> BResult<SValue> {
 
 pub(super) fn shuffle(fb: &mut FunctionBuilder<'_>, v: SValue, src: SValue) -> BResult<SValue> {
     fb.group_shuffle(ShuffleOp::Shuffle, v, src)
-}
-
-/// All-zero bits of `like`'s type: the cell a multiply-add reads for a lane that does not take
-/// part (`+0`, Metal's sign), every tier's one constant, and the value an emulated shuffle reads
-/// from a lane past the thread count (`workgroup::Emu::read_lane`).
-pub(super) fn zero_cell(fb: &mut FunctionBuilder<'_>, like: SValue) -> BResult<SValue> {
-    let ty = fb.value_ty(like)?;
-    let zero = fb.module().constant(Constant::Null { ty })?;
-    fb.module().const_value(zero)
-}
-
-/// Where a multiply-add reads one owner lane's cells, or a partly live group operation its
-/// source's value ([`Lane::cell_source`]): the lane a read names, and, on a subgroup whose live
-/// lanes the operation balloted, whether that lane takes part (`None`: it does).
-pub(super) struct CellSource {
-    at: SValue,
-    on: Option<SValue>,
 }
 
 impl Lane {
@@ -407,21 +448,25 @@ impl Lane {
         Ok(Live { ballot, size })
     }
 
-    /// Where a multiply-add (`matrix::tile_mad`) or a partly live group operation
-    /// ([`Lane::read_from`]) reads lane `src`. On a subgroup with `live` (its
-    /// [`Lane::live_lanes`]) `src` takes part exactly when its ballot bit is set, and an inactive
-    /// `src` is read through the calling lane, which is active, so no shuffle names an inactive
-    /// invocation. On the `PartialFragment` tier a Metal lane at or above the subgroup's size is
-    /// permanently inactive: it takes no part, and the bit extract reads the calling lane's bit
-    /// instead, so no index reaches the size (the bit extract and the shuffle are poison there).
-    /// Without `live` (a block that every lane of a whole subgroup executes), and in the emulated
-    /// tier, whose exchange carries its own active flags, `src` is read as it is.
+    /// The lane a multiply-add (`matrix::tile_mad`) or a partly live group operation
+    /// ([`Lane::read_from`]) reads for lane `src`. On a subgroup with `live` (its
+    /// [`Lane::live_lanes`]) `src` takes part exactly when its ballot bit is set, and a `src` that
+    /// takes no part is read through the calling lane, which does, so no shuffle names an
+    /// invocation outside its tangle: SPIR-V makes such a shuffle's result poison, and a branch or
+    /// an index that consumes poison is undefined behavior. On the `PartialFragment` tier a Metal
+    /// lane at or above the subgroup's size takes no part, and the bit extract reads the calling
+    /// lane's bit instead, so no index reaches the size (the bit extract and the shuffle are
+    /// poison there too). What a lane reads in place of one that takes no part is unspecified:
+    /// MSL leaves such a read undefined (section 6.10.2), and the value is not promised. Without
+    /// `live` (a block that every lane of a whole subgroup executes), and in the emulated tier,
+    /// whose exchange carries its own active flags (`workgroup::Emu::read`), `src` is read as it
+    /// is.
     pub(super) fn cell_source(
         &self,
         fb: &mut FunctionBuilder<'_>,
         live: Option<Live>,
         src: SValue,
-    ) -> BResult<CellSource> {
+    ) -> BResult<SValue> {
         match live {
             Some(live) if self.emu.is_none() => {
                 let on = match live.size {
@@ -433,32 +478,9 @@ impl Lane {
                     }
                     None => fb.group_ballot_bit_extract(live.ballot, src)?,
                 };
-                let at = fb.select(on, src, self.l)?;
-                Ok(CellSource { at, on: Some(on) })
+                fb.select(on, src, self.l)
             }
-            _ => Ok(CellSource { at: src, on: None }),
-        }
-    }
-
-    /// A multiply-add's cell `i` of `ex` as the lane `src` names published it
-    /// (`matrix::tile_mad`). A lane that does not take part reads a [`zero_cell`]: on a subgroup,
-    /// a lane whose ballot bit is clear ([`Lane::cell_source`]); in the emulated tier, one past the
-    /// thread count or not live in a divergent block (`workgroup::Emu::read_cell`).
-    pub(super) fn read_cell(
-        &self,
-        fb: &mut FunctionBuilder<'_>,
-        ex: &Exchange,
-        i: usize,
-        src: &CellSource,
-    ) -> BResult<SValue> {
-        match (ex, &self.emu, src.on) {
-            (Exchange::Workgroup(p), Some(e), _) => e.read_cell(fb, self.l, p, i, src.at),
-            (Exchange::Subgroup(vals), None, Some(on)) => {
-                let x = shuffle(fb, nth(vals, i)?, src.at)?;
-                let zero = zero_cell(fb, x)?;
-                fb.select(on, x, zero)
-            }
-            _ => self.read(fb, ex, i, src.at),
+            _ => Ok(src),
         }
     }
 
@@ -487,9 +509,9 @@ impl Lane {
     }
 
     /// Value `v` of lane `src`. With `live` (a partly live group operation's
-    /// [`Lane::live_lanes`], `super::partly_live`), a lane that does not take part reads all-zero
-    /// bits, Metal's answer, through the calling lane ([`Lane::cell_source`]), so no shuffle names
-    /// an inactive invocation; without it, the plain shuffle.
+    /// [`Lane::live_lanes`], `super::partly_live`), a lane that does not take part is read through
+    /// the calling lane ([`Lane::cell_source`]), so no shuffle names an invocation outside its
+    /// tangle; without it, the plain shuffle.
     fn read_from(
         &self,
         fb: &mut FunctionBuilder<'_>,
@@ -498,20 +520,7 @@ impl Lane {
         src: SValue,
     ) -> BResult<SValue> {
         let at = self.cell_source(fb, live, src)?;
-        self.read_at(fb, v, &at)
-    }
-
-    /// Value `v` at the source [`Lane::cell_source`] gave: all-zero bits where it does not take
-    /// part.
-    fn read_at(&self, fb: &mut FunctionBuilder<'_>, v: SValue, at: &CellSource) -> BResult<SValue> {
-        let x = shuffle(fb, v, at.at)?;
-        match at.on {
-            Some(on) => {
-                let zero = zero_cell(fb, x)?;
-                fb.select(on, x, zero)
-            }
-            None => Ok(x),
-        }
+        shuffle(fb, v, at)
     }
 }
 
@@ -580,6 +589,8 @@ pub(super) fn lane(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>) -> BResult
         cluster,
         emu,
         size,
+        quad: Rc::clone(&cx.quad),
+        whole: false,
     })
 }
 
@@ -603,7 +614,10 @@ pub(super) fn emit(
         }
         SimdStrategy::Group(g) => {
             let a = args(cx, fb, at)?;
-            let lane = lane(cx, fb)?;
+            let lane = Lane {
+                whole: super::whole_quad_at(cx, at),
+                ..lane(cx, fb)?
+            };
             // A lane read where the group may be partly live reads through its live lanes; the
             // emulated tier's exchange carries its own active flags.
             let live = if lane.emu.is_none() && super::partly_live_at(cx, at) {
@@ -788,8 +802,9 @@ fn simd_op(
 /// only keeps the wrap arithmetic from underflowing (old-engine authored cases
 /// `shift-a-whole-simd-cluster-out-through-the-fill`, `filter_error_map_SIMD`).
 ///
-/// A partly live fill (`live`) reads both values of a source that does not take part as all-zero
-/// bits (Metal's answer past the thread count).
+/// A partly live fill (`live`) reads both values of a source that does not take part through the
+/// calling lane ([`Lane::cell_source`]), and a fragment's fill within its quad reads them by quad
+/// instructions ([`quad_read`]): MSL leaves the values undefined, and they are not promised.
 fn fill(
     fb: &mut FunctionBuilder<'_>,
     ln: &Lane,
@@ -800,9 +815,13 @@ fn fill(
     let (data, fill, d, modulo) = (nth(a, 0)?, nth(a, 1)?, nth(a, 2)?, nth(a, 3)?);
     let up = g.op == GroupOp::ShuffleAndFillUp;
     let (src, inside) = fill_source(fb, ln, g, up, d, modulo)?;
-    let at = ln.cell_source(fb, live, src)?;
-    let x = ln.read_at(fb, data, &at)?;
-    let y = ln.read_at(fb, fill, &at)?;
+    let (x, y) = if fragment_quad(g) {
+        let q = bin_k(fb, BinOp::BitwiseAnd, src, 3)?;
+        (quad_read(fb, ln, data, q)?, quad_read(fb, ln, fill, q)?)
+    } else {
+        let at = ln.cell_source(fb, live, src)?;
+        (shuffle(fb, data, at)?, shuffle(fb, fill, at)?)
+    };
     fb.select(inside, x, y)
 }
 
@@ -881,8 +900,146 @@ pub(super) fn fill_source(
     Ok((src, inside))
 }
 
-/// A quad reduction in every subgroup tier: the quad's four lanes read under the ballot of its
-/// active lanes ([`quad_tree`]).
+/// A fragment's quad holds helpers, which take part in Metal's quad operations (`full_quads`).
+/// Vulkan runs its quad instructions over a quad's helpers, and its other group operations, a
+/// ballot and a shuffle among them, over them only where the entry maximally reconverges (section
+/// 9.31, "Helper Invocations"), and AMD's open Linux driver leaves the helpers out of a ballot even
+/// there. So a fragment reads its quad through quad instructions alone: quad lane `j` takes part
+/// when `OpGroupNonUniformQuadAnyKHR` of "the quad lane is `j`" (and of `pred`, where given)
+/// holds. The votes without `pred` are the block's ([`QuadSeen`]); where the quad is whole
+/// ([`Lane::whole`]) every lane takes part, with no vote.
+fn quad_votes(
+    fb: &mut FunctionBuilder<'_>,
+    ln: &Lane,
+    pred: Option<SValue>,
+) -> BResult<Vec<SValue>> {
+    if ln.whole && pred.is_none() {
+        let on = true_(fb)?;
+        return Ok(vec![on; 4]);
+    }
+    let here = fb.current_block();
+    if pred.is_none() {
+        let on = ln.quad.borrow_mut().at(here).on.clone();
+        if !on.is_empty() {
+            return Ok(on);
+        }
+    }
+    let q = bin_k(fb, BinOp::BitwiseAnd, ln.l, 3)?;
+    let votes = (0..4)
+        .map(|j| {
+            let me = bin_k(fb, BinOp::IEqual, q, j)?;
+            let me = match pred {
+                Some(p) => fb.binary(BinOp::LogicalAnd, me, p)?,
+                None => me,
+            };
+            fb.group_quad_vote(false, me)
+        })
+        .collect::<BResult<Vec<_>>>()?;
+    if pred.is_none() {
+        ln.quad.borrow_mut().at(here).on.clone_from(&votes);
+    }
+    Ok(votes)
+}
+
+/// The quad's four bits of a fragment's quad `votes` ([`quad_votes`]): bit `j` is quad lane `j`'s.
+fn quad_word(fb: &mut FunctionBuilder<'_>, votes: &[SValue]) -> BResult<SValue> {
+    let zero = k(fb, 0)?;
+    let mut word = zero;
+    for (j, &on) in (0..).zip(votes) {
+        let bit = k(fb, 1 << j)?;
+        let bit = fb.select(on, bit, zero)?;
+        word = fb.binary(BinOp::BitwiseOr, word, bit)?;
+    }
+    Ok(word)
+}
+
+/// A fragment's quad's four lanes of `x` ([`quad_votes`]): for each quad lane `j`, its value,
+/// `OpGroupNonUniformQuadBroadcast` from the constant lane `j`, and whether it takes part, the
+/// block's where it read `x` already ([`QuadSeen`]). A lane that takes no part is read as poison,
+/// which no caller's select takes (SPIR-V's `OpSelect` keeps an operand it does not select from
+/// its result).
+fn quad_lanes(
+    fb: &mut FunctionBuilder<'_>,
+    ln: &Lane,
+    x: SValue,
+) -> BResult<Vec<(SValue, SValue)>> {
+    let on = quad_votes(fb, ln, None)?;
+    let here = fb.current_block();
+    let seen = ln
+        .quad
+        .borrow_mut()
+        .at(here)
+        .lanes
+        .iter()
+        .find(|(v, _)| *v == x)
+        .map(|(_, l)| l.clone());
+    let values = match seen {
+        Some(values) => values,
+        None => {
+            let values = (0..4)
+                .map(|j| {
+                    let i = k(fb, j)?;
+                    fb.group_quad_broadcast(x, i)
+                })
+                .collect::<BResult<Vec<_>>>()?;
+            let mut quad = ln.quad.borrow_mut();
+            let lanes = &mut quad.at(here).lanes;
+            if lanes.len() == QUAD_SEEN_VALUES {
+                lanes.remove(0);
+            }
+            lanes.push((x, values.clone()));
+            values
+        }
+    };
+    Ok(values.into_iter().zip(on).collect())
+}
+
+/// Quad lane `src`'s `x` in a fragment's quad ([`quad_lanes`]), or the calling lane's own `x`
+/// where lane `src` takes no part: MSL leaves such a read undefined (section 6.10.2). In a whole
+/// quad ([`Lane::whole`]) every lane takes part, and `src`, a quad lane, picks its lane by its two
+/// bits: three selects.
+fn quad_read(fb: &mut FunctionBuilder<'_>, ln: &Lane, x: SValue, src: SValue) -> BResult<SValue> {
+    let lanes = quad_lanes(fb, ln, x)?;
+    if ln.whole {
+        let lane = |j: usize| lanes.get(j).map(|&(y, _)| y).ok_or_else(dangling);
+        let zero = k(fb, 0)?;
+        let odd = bin_k(fb, BinOp::BitwiseAnd, src, 1)?;
+        let odd = fb.binary(BinOp::INotEqual, odd, zero)?;
+        let low = bin_k(fb, BinOp::BitwiseAnd, src, 2)?;
+        let low = fb.binary(BinOp::IEqual, low, zero)?;
+        let top = fb.select(odd, lane(1)?, lane(0)?)?;
+        let bottom = fb.select(odd, lane(3)?, lane(2)?)?;
+        return fb.select(low, top, bottom);
+    }
+    let mut r = x;
+    for (j, (y, on)) in (0..).zip(lanes) {
+        let me = bin_k(fb, BinOp::IEqual, src, j)?;
+        let hit = fb.binary(BinOp::LogicalAnd, me, on)?;
+        r = fb.select(hit, y, r)?;
+    }
+    Ok(r)
+}
+
+/// A fragment's quad ballot of `pred` where its quad is whole ([`Lane::whole`]): each lane's bit
+/// at its quad lane, gathered by a horizontal then a vertical `OpGroupNonUniformQuadSwap`, quad
+/// instructions, which run over all four lanes.
+fn whole_ballot(fb: &mut FunctionBuilder<'_>, ln: &Lane, pred: SValue) -> BResult<SValue> {
+    let q = bin_k(fb, BinOp::BitwiseAnd, ln.l, 3)?;
+    let one = k(fb, 1)?;
+    let bit = fb.binary(BinOp::ShiftLeftLogical, one, q)?;
+    let zero = k(fb, 0)?;
+    let own = fb.select(pred, bit, zero)?;
+    let across = fb.group_quad_swap(own, QuadDirection::Horizontal)?;
+    let pair = fb.binary(BinOp::BitwiseOr, own, across)?;
+    let other = fb.group_quad_swap(pair, QuadDirection::Vertical)?;
+    fb.binary(BinOp::BitwiseOr, pair, other)
+}
+
+/// A quad reduction in every subgroup tier: the quad's four lanes, each with whether it takes
+/// part, combined in Metal's order ([`quad_tree`]). A fragment's lanes are its [`quad_lanes`]:
+/// every lane folds the same four values in the same order, bit for bit. Elsewhere lane `j` takes
+/// part when its bit of the ballot of the active lanes is set, and its value is the shuffle from
+/// it, or from the calling lane when it takes no part.
 fn quad_reduce(
     fb: &mut FunctionBuilder<'_>,
     ln: &Lane,
@@ -890,18 +1047,23 @@ fn quad_reduce(
     v: SValue,
 ) -> BResult<SValue> {
     let x = pre(fb, g, v)?;
-    let word = ln.active(fb)?;
-    let act = ln.quad_bits(fb, word)?;
-    let base = bin_k(fb, BinOp::BitwiseAnd, ln.l, !3)?;
-    let zero = k(fb, 0)?;
-    let mut lanes = Vec::with_capacity(4);
-    for j in 0..4 {
-        let bit = bin_k(fb, BinOp::ShiftRightLogical, act, j)?;
-        let bit = bin_k(fb, BinOp::BitwiseAnd, bit, 1)?;
-        let on = fb.binary(BinOp::INotEqual, bit, zero)?;
-        let from = bin_k(fb, BinOp::BitwiseOr, base, j)?;
-        lanes.push((ln.read_or_own(fb, None, x, on, from)?, on));
-    }
+    let lanes = if g.helpers {
+        quad_lanes(fb, ln, x)?
+    } else {
+        let word = ln.active(fb)?;
+        let act = ln.quad_bits(fb, word)?;
+        let base = bin_k(fb, BinOp::BitwiseAnd, ln.l, !3)?;
+        let zero = k(fb, 0)?;
+        let mut lanes = Vec::with_capacity(4);
+        for j in 0..4 {
+            let bit = bin_k(fb, BinOp::ShiftRightLogical, act, j)?;
+            let bit = bin_k(fb, BinOp::BitwiseAnd, bit, 1)?;
+            let on = fb.binary(BinOp::INotEqual, bit, zero)?;
+            let from = bin_k(fb, BinOp::BitwiseOr, base, j)?;
+            lanes.push((ln.read_or_own(fb, None, x, on, from)?, on));
+        }
+        lanes
+    };
     let r = quad_tree(fb, g, &lanes)?;
     post(fb, g, r)
 }
@@ -940,12 +1102,20 @@ fn nth_lane(lanes: &[(SValue, SValue)], i: usize) -> BResult<(SValue, SValue)> {
 }
 
 /// The lanes a [`lane_scan`] reads: the word of the group's active lanes (bit `j` is the group's
-/// lane `j`), the calling lane's index in the group, the group's first lane, and its width.
+/// lane `j`), the calling lane's index in the group, how it reads them, and the group's width.
 struct Span {
     act: SValue,
     m: SValue,
-    base: SValue,
+    reads: LaneReads,
     width: u32,
+}
+
+/// How a [`lane_scan`] reads the group's lane `j`: by a shuffle from the group's first lane
+/// `base` plus `j`, or the calling lane where `j` takes no part; or, in a fragment's quad, as its
+/// [`quad_lanes`] value.
+enum LaneReads {
+    Shuffle { base: SValue },
+    Quad(Vec<SValue>),
 }
 
 /// A `Cluster32` prefix sum or product: [`lane_scan`] over the 32-lane cluster. An exclusive float
@@ -963,7 +1133,7 @@ fn cluster_scan(
     let span = Span {
         act,
         m,
-        base,
+        reads: LaneReads::Shuffle { base },
         width: SIMD_WIDTH,
     };
     lane_scan(fb, ln, g, v, span, true)
@@ -971,16 +1141,36 @@ fn cluster_scan(
 
 /// A quad prefix sum or product in every subgroup tier: [`lane_scan`] over the quad, Metal's order
 /// (measured, in lane order, the exclusive sum of the first active lane `-0` and its product 1, a
-/// `half` rounded at every step).
+/// `half` rounded at every step). A fragment's quad is its [`quad_lanes`], their votes the active
+/// lanes; elsewhere the active lanes are the quad's bits of the ballot.
 fn quad_scan(fb: &mut FunctionBuilder<'_>, ln: &Lane, g: &GroupPlan, v: SValue) -> BResult<SValue> {
-    let word = ln.active(fb)?;
-    let act = ln.quad_bits(fb, word)?;
+    let lanes = if g.helpers {
+        Some(quad_lanes(fb, ln, v)?)
+    } else {
+        None
+    };
+    let act = match &lanes {
+        Some(_) if ln.whole => k(fb, 0xF)?,
+        Some(lanes) => {
+            let votes: Vec<SValue> = lanes.iter().map(|&(_, on)| on).collect();
+            quad_word(fb, &votes)?
+        }
+        None => {
+            let word = ln.active(fb)?;
+            ln.quad_bits(fb, word)?
+        }
+    };
     let m = bin_k(fb, BinOp::BitwiseAnd, ln.l, 3)?;
-    let base = bin_k(fb, BinOp::BitwiseAnd, ln.l, !3)?;
+    let reads = match lanes {
+        Some(lanes) => LaneReads::Quad(lanes.into_iter().map(|(x, _)| x).collect()),
+        None => LaneReads::Shuffle {
+            base: bin_k(fb, BinOp::BitwiseAnd, ln.l, !3)?,
+        },
+    };
     let span = Span {
         act,
         m,
-        base,
+        reads,
         width: 4,
     };
     lane_scan(fb, ln, g, v, span, false)
@@ -989,10 +1179,11 @@ fn quad_scan(fb: &mut FunctionBuilder<'_>, ln: &Lane, g: &GroupPlan, v: SValue) 
 /// A prefix sum or product over a group of lanes read one by one: the sum or product, in
 /// increasing lane order, of the values of the group's active lanes below the calling lane (and
 /// the calling lane itself when inclusive). Each step reads one lane when it is included and the
-/// calling lane otherwise, so no step reads an inactive lane, and inactive lanes contribute
-/// nothing whatever the divergence. The empty answer is the operation's identity: `-0` for a float
-/// sum, or `+0` where `plus_zero` (the cluster's), and 1 for a product, Metal's answer for the
-/// first active lane (measured).
+/// calling lane otherwise, so no step reads an inactive lane (a fragment's quad step takes its
+/// lane's [`quad_lanes`] value, which the step's select keeps only where the lane is included),
+/// and inactive lanes contribute nothing whatever the divergence. The empty answer is the
+/// operation's identity: `-0` for a float sum, or `+0` where `plus_zero` (the cluster's), and 1
+/// for a product, Metal's answer for the first active lane (measured).
 fn lane_scan(
     fb: &mut FunctionBuilder<'_>,
     ln: &Lane,
@@ -1032,8 +1223,13 @@ fn lane_scan(
         let bit = bin_k(fb, BinOp::ShiftRightLogical, include, j)?;
         let bit = bin_k(fb, BinOp::BitwiseAnd, bit, 1)?;
         let on = fb.binary(BinOp::INotEqual, bit, zero)?;
-        let from = bin_k(fb, BinOp::BitwiseOr, span.base, j)?;
-        let x = ln.read_or_own(fb, None, v, on, from)?;
+        let x = match &span.reads {
+            LaneReads::Shuffle { base } => {
+                let from = bin_k(fb, BinOp::BitwiseOr, *base, j)?;
+                ln.read_or_own(fb, None, v, on, from)?
+            }
+            LaneReads::Quad(values) => nth(values, j as usize)?,
+        };
         let sum = fb.binary(add, acc, x)?;
         let sum = if float {
             narrow::round(fb, g.form, sum)?
@@ -1103,7 +1299,8 @@ fn quad_op(
         Some(c) => k(fb, c),
         None => bin_k(fb, BinOp::BitwiseAnd, nth(a, 1)?, 3),
     };
-    let instructions = g.quad_instructions && live.is_none();
+    // A whole quad's broadcast or shuffle-xor by a constant lane or mask is its quad instruction.
+    let instructions = (g.quad_instructions || ln.whole) && live.is_none();
     match (g.op, g.konst) {
         (G::Broadcast, Some(i)) if instructions => {
             let i = k(fb, i)?;
@@ -1117,6 +1314,47 @@ fn quad_op(
                 _ => QuadDirection::Diagonal,
             };
             fb.group_quad_swap(v()?, dir)
+        }
+        // A fragment's read names a lane of its quad ([`quad_read`]): up and down by `d` keep the
+        // calling lane's value past the quad's edge, a rotation wraps within it.
+        (
+            G::Broadcast
+            | G::Shuffle
+            | G::ShuffleXor
+            | G::ShuffleUp
+            | G::ShuffleDown
+            | G::ShuffleRotateDown
+            | G::ShuffleRotateUp,
+            _,
+        ) if g.helpers => {
+            let q = quad_lane(fb)?;
+            let src = match g.op {
+                G::Broadcast | G::Shuffle => operand(fb)?,
+                G::ShuffleXor => {
+                    let m = operand(fb)?;
+                    fb.binary(BinOp::BitwiseXor, q, m)?
+                }
+                G::ShuffleUp => {
+                    let d = nth(a, 1)?;
+                    let ok = fb.binary(BinOp::ULessThanEqual, d, q)?;
+                    let from = fb.binary(BinOp::ISub, q, d)?;
+                    fb.select(ok, from, q)?
+                }
+                G::ShuffleDown => {
+                    let from = fb.binary(BinOp::IAdd, q, nth(a, 1)?)?;
+                    let ok = bin_k(fb, BinOp::ULessThan, from, 4)?;
+                    fb.select(ok, from, q)?
+                }
+                G::ShuffleRotateDown => {
+                    let t = fb.binary(BinOp::IAdd, q, nth(a, 1)?)?;
+                    bin_k(fb, BinOp::BitwiseAnd, t, 3)?
+                }
+                _ => {
+                    let t = fb.binary(BinOp::ISub, q, nth(a, 1)?)?;
+                    bin_k(fb, BinOp::BitwiseAnd, t, 3)?
+                }
+            };
+            quad_read(fb, ln, v()?, src)
         }
         // A lane-varying lane or mask, a constant one where the stage takes no quad
         // instructions, or a partly live read: the shuffle from the lane the quad instruction
@@ -1172,6 +1410,21 @@ fn quad_op(
             ln.read_from(fb, live, v()?, src)
         }
         (G::ShuffleAndFillUp | G::ShuffleAndFillDown, _) => fill(fb, ln, live, g, a),
+        // A whole quad's first lane is its lane 0.
+        (G::BroadcastFirst, _) if ln.whole => {
+            let zero = k(fb, 0)?;
+            fb.group_quad_broadcast(v()?, zero)
+        }
+        // A fragment's quad's first lane that takes part ([`quad_lanes`]), the calling lane at the
+        // latest.
+        (G::BroadcastFirst, _) if g.helpers => {
+            let lanes = quad_lanes(fb, ln, v()?)?;
+            let mut first = v()?;
+            for &(x, on) in lanes.iter().rev() {
+                first = fb.select(on, x, first)?;
+            }
+            Ok(first)
+        }
         // The quad's first active lane, by the ballot of `true` (the calling lane is one).
         (G::BroadcastFirst, _) => {
             let word = ln.active(fb)?;
@@ -1191,7 +1444,10 @@ fn quad_op(
         (G::Sum | G::Product | G::Min | G::Max | G::And | G::Or | G::Xor, _) => {
             quad_reduce(fb, ln, g, v()?)
         }
-        // Over the active lanes: every one's predicate holds, or one's does.
+        // Over the active lanes: every one's predicate holds, or one's does. A fragment's quad
+        // holds helpers, which take part (`full_quads`): there the quad vote, which Vulkan runs
+        // over them whatever the entry's reconvergence (section 9.31, "Helper Invocations").
+        (G::All | G::Any, _) if g.helpers => fb.group_quad_vote(g.op == G::All, v()?),
         (G::All | G::Any, _) => {
             let word = ln.word(fb, v()?)?;
             let held = ln.quad_bits(fb, word)?;
@@ -1203,16 +1459,31 @@ fn quad_op(
             let act = ln.quad_bits(fb, word)?;
             fb.binary(BinOp::IEqual, held, act)
         }
+        // A whole quad's lanes all take part: its first is lane 0, and its ballot is its four
+        // lanes' bits ([`whole_ballot`]).
+        (G::ActiveThreadsMask, _) if ln.whole => k(fb, 0xF),
+        (G::IsFirst, _) if ln.whole => {
+            let q = quad_lane(fb)?;
+            bin_k(fb, BinOp::IEqual, q, 0)
+        }
+        (G::Ballot, _) if ln.whole => whole_ballot(fb, ln, v()?),
         (G::Ballot | G::IsFirst | G::ActiveThreadsMask, _) => {
-            // The quad's four bits of the simdgroup's ballot word (of the predicate for a
-            // ballot, of `true` otherwise; inactive lanes give 0): quads never straddle a word.
-            // Bit `j` is quad lane `j`, as Metal's `quad_vote` numbers them.
-            let word = if g.op == G::Ballot {
-                ln.word(fb, v()?)?
+            // The quad's four bits of the lanes that take part (and whose predicate holds, for a
+            // ballot): a fragment's quad votes ([`quad_votes`]), elsewhere the quad's bits of the
+            // simdgroup's ballot word (of the predicate for a ballot, of `true` otherwise;
+            // inactive lanes give 0), as quads never straddle a word. Bit `j` is quad lane `j`,
+            // as Metal's `quad_vote` numbers them.
+            let pred = if g.op == G::Ballot { Some(v()?) } else { None };
+            let bits = if g.helpers {
+                let votes = quad_votes(fb, ln, pred)?;
+                quad_word(fb, &votes)?
             } else {
-                ln.active(fb)?
+                let word = match pred {
+                    Some(p) => ln.word(fb, p)?,
+                    None => ln.active(fb)?,
+                };
+                ln.quad_bits(fb, word)?
             };
-            let bits = ln.quad_bits(fb, word)?;
             if g.op != G::IsFirst {
                 return Ok(bits);
             }

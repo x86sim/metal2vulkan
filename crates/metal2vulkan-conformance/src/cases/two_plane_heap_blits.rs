@@ -1,13 +1,11 @@
-//! Blits between Apple's two-plane extended-range textures placed in a heap, ported from
-//! `runtime_lane::two_plane_heap_blits`.
+//! Blits between Apple's two-plane extended-range textures placed in a heap.
 //!
 //! The probe (`tph`): a placement heap of Metal's size, shared or private, every byte of it a byte
 //! of the case's seed written through a buffer over the whole heap; two one-level 2D textures of
 //! `RGB10A8_2P_XR10` or its sRGB twin placed where the probe placed them; one blit of the case's
 //! region from one into the other; the heap's bytes read back through the buffer.
 //!
-//! **The split between the run shape and the bytes is deliberate, and it is the lane's.** Each
-//! case holds two sites:
+//! **The split between the run shape and the bytes is deliberate.** Each case holds two sites:
 //!
 //! - `runs`, a **typed** list of the runs the blit changed — each an offset and a length — which is
 //!   what a blit-geometry bug moves: a copy that reads or writes the wrong rows, lands on the
@@ -39,10 +37,9 @@
 //! recovered under MoltenVK, which is *our* answer, not Metal's — so until record mode ran, that
 //! site's expectation was never tied to Metal at all.
 
-use crate::allowance::Allowance;
 use crate::case::{call, Abort, Case, Input, MetalSource, Side};
 use crate::measured::public_fixture;
-use crate::replay::{notice_allowance, NOTICES_SITE};
+use crate::replay::NOTICES_SITE;
 use crate::transcript::{Digest, DigestKind, Node, Observed, Sites, Transcript, Value};
 use crate::work::{Resource, Step, Storage, TextureSpec, Work};
 
@@ -367,7 +364,7 @@ pub struct HeapBlits {
     name: &'static str,
 }
 
-/// The ported case.
+/// The case.
 pub fn heap_blits() -> HeapBlits {
     HeapBlits { name: HEAP_BLITS }
 }
@@ -571,30 +568,6 @@ impl Case for HeapBlits {
             Input::bytes("blit-geometry", geometry.as_bytes()),
             Input::bytes("metal-runs", public_fixture(METAL_RUNS)?.as_bytes()),
         ])
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // A copy whose alpha bytes land past the destination's alpha plane, on the heap's other
-        // bytes, and in `end255` past the heap's end, is what Metal's blit writes and what the
-        // device announces. Metal announces nothing, so the notices site differs and that notice
-        // is what justifies it.
-        //
-        // These textures are also shadowed, and the notice's own definition names this exact
-        // shape: a heap's 2D texture of one level of `RGB10A8_2P_XR10` or its sRGB twin has an
-        // image that is a shadow of its two planes in the heap's bytes, where Metal lays them out.
-        // Declaring it loosens no byte -- every heap byte the case reads compares exactly.
-        [
-            metal2vulkan_runtime::Degradation::TwoPlaneTextureCopy,
-            metal2vulkan_runtime::Degradation::ShadowedTexture,
-        ]
-        .into_iter()
-        .map(|kind| notice_allowance(kind.code()))
-        .chain([
-            // The buffer the case reads the blitted planes back through is `Shared`
-            // ([`crate::replay::shared_memory_notice`]).
-            crate::replay::shared_memory_notice(),
-        ])
-        .collect()
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {

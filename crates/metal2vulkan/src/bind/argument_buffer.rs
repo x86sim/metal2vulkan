@@ -9,7 +9,7 @@
 //! says where each argument goes, by its Metal argument index (`[[id(n)]]`), so an encoder over it
 //! writes exactly the bytes the function reads.
 //!
-//! A layout comes from one of three sources, each Metal's own rule:
+//! A layout comes from one of two sources, each Metal's own rule:
 //!
 //! - **A function's argument buffer** (`newArgumentEncoderWithBufferIndex:`,
 //!   [`Function::argument_buffer_layout`](crate::library::Function::argument_buffer_layout)): the
@@ -31,33 +31,6 @@
 //!   larger of the alignment set and its type's. The encoder's `alignment` is the largest type
 //!   alignment (never the block alignment), and `encodedLength` the end rounded up to it. Every
 //!   rule here is measured on an M3 Max and an M4 (probes).
-//! - **A reflected buffer binding** (`newArgumentEncoderWithBufferBinding:`,
-//!   [`ArgumentBufferLayout::from_buffer_binding`]): the binding's struct type as its reflection
-//!   states it, not the function's AIR, by one of two rules. Each member sits at its `offset`,
-//!   element `k` of an array at `k` times the array's `stride` further and `k` times its
-//!   `argumentIndexStride` more ids, and a struct member's members at their ids plus the
-//!   struct's; `encodedLength` is the end of the last element rounded up to the alignment, a
-//!   struct element's size being its members' end rounded up to their largest alignment.
-//!   - An argument buffer's: a constant takes its MSL size and alignment (as above), the
-//!     alignment is the binding's `bufferAlignment`, and a pointer to an argument buffer nests
-//!     by the same rule at the pointer's alignment. A library's binding thus gives the function's
-//!     layout, while a pipeline's, whose arrays of textures, samplers and pointers, and of structs
-//!     of them only, reflect stride 0, gives an encoder that writes every element of such an array at element
-//!     0's place, in fewer bytes.
-//!   - A plain buffer's (a struct pointee that is no argument buffer): every constant takes 8
-//!     bytes aligned to 8, whatever its type; the alignment is the members' largest; an array
-//!     whose `argumentIndexStride` is 0 gives element `k` the ids `k` times the element's span;
-//!     every member's id is 0, so index 0 is the last member's.
-//!   - A binding that states no struct type (a plain buffer of a scalar, vector or matrix) has
-//!     no arguments: an encoder of no bytes, alignment 1.
-//!
-//!   These are Metal's answers on an M3 Max (macOS 26.7) and an M4 (macOS 27.0.1) over
-//!   `validation/fixtures/public/reflection/`'s `argument_buffers`, `buffers`, `encoders` and
-//!   `encoder_types` (every scalar, vector, matrix and atomic type alone in a plain buffer and
-//!   after a texture in an argument buffer), and API validation lets every one of these encoders be
-//!   made. They differ in one rule: in a plain buffer the M4 gives an integer or `bool` scalar its
-//!   own size aligned to 1. This takes the M3 Max's, whose encoder is never shorter or less
-//!   aligned, so memory sized and aligned by it holds the encoder under either.
 //!
 //! An index that two descriptors claim (the same index, or one inside another's array) is
 //! resolved to the later descriptor, as Metal's encoder resolves it.
@@ -67,11 +40,10 @@ use std::sync::Arc;
 
 use crate::air::abi::{AbiInt, ArgTypeInfo, MemberKind, ParamBinding, ParamRole, StructInfo};
 use crate::air::abi::{Slot, StructRef};
-use crate::air::error::{AbiError, DiagName, InputError, InputErrorKind, Location};
+use crate::air::error::{AbiError, InputError, InputErrorKind, Location};
 use crate::budget::Meter;
-use crate::error::{Error, Feature, Limit, Unsupported};
+use crate::error::{Error, Limit};
 use crate::metal::{BindingAccess, DataType, TextureType};
-use crate::reflection::{BufferBinding, PointerType, StructType};
 
 /// Bytes of every argument that is no constant: an address or a resource ID.
 pub const ARGUMENT_HANDLE_BYTES: u64 = 8;
@@ -133,20 +105,6 @@ pub struct ArgumentMember {
     /// members, at indices and offsets from the element's (its `encoded_length` the element's
     /// size, its `alignment` 1: Metal makes no encoder for it). `None` otherwise.
     pub layout: Option<Arc<ArgumentBufferLayout>>,
-}
-
-/// Where one argument index lands ([`ArgumentBufferLayout::argument`]).
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ArgumentPlace {
-    pub ty: ArgumentType,
-    /// Byte offset in the argument buffer.
-    pub offset: u64,
-    /// Bytes the argument holds.
-    pub size: u64,
-    /// The layout of the argument buffer a [`ArgumentType::Buffer`] points to, when its pointee
-    /// holds arguments.
-    pub nested: Option<Arc<ArgumentBufferLayout>>,
 }
 
 /// The layout of one argument buffer: its length, alignment and members (the module docs).
@@ -371,15 +329,29 @@ impl ArgumentBufferLayout {
         })
     }
 
+    /// One past the highest argument index the layout's members take (0 for none): a struct of
+    /// this layout's index span.
+    pub fn id_span(&self) -> u32 {
+        self.members
+            .iter()
+            .map(|m| {
+                m.id.saturating_add(m.count.saturating_mul(m.ids_per_element.max(1)))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Where argument `index` lands: in the last member whose indices hold it, inside a struct
     /// member's element as that element's layout says. `None` when no member holds it.
-    pub fn argument(&self, index: u32) -> Option<ArgumentPlace> {
+    #[cfg(test)]
+    pub(crate) fn argument(&self, index: u32) -> Option<ArgumentPlace> {
         self.place(index, 0)
     }
 
     /// [`argument`](Self::argument) for a layout whose byte 0 is at `base`. A struct element
     /// that does not hold the index leaves it to the members before; the recursion is as deep as
     /// the layout's struct nesting, which the build capped.
+    #[cfg(test)]
     fn place(&self, index: u32, base: u64) -> Option<ArgumentPlace> {
         self.members.iter().rev().find_map(|m| {
             let rel = index.checked_sub(m.id)?;
@@ -402,229 +374,6 @@ impl ArgumentBufferLayout {
             }
         })
     }
-
-    /// One past the highest argument index the layout's members take (0 for none): a struct of
-    /// this layout's index span.
-    pub fn id_span(&self) -> u32 {
-        self.members
-            .iter()
-            .map(|m| {
-                m.id.saturating_add(m.count.saturating_mul(m.ids_per_element.max(1)))
-            })
-            .max()
-            .unwrap_or(0)
-    }
-}
-
-impl ArgumentBufferLayout {
-    /// The layout `newArgumentEncoderWithBufferBinding:` makes of reflected buffer binding
-    /// `binding` (a library's, [`Function::reflection`](crate::library::Function::reflection), or
-    /// a pipeline's): from its struct type as the reflection states it, by the argument buffer's
-    /// rule or the plain buffer's (the module docs). A binding with no struct type answers
-    /// Metal's encoder of no bytes, alignment 1, with or without API validation. Refused, as
-    /// `Unsupported` ([`Feature::Reflection`]) since Metal's encoder of them is unmeasured: a
-    /// plain buffer's member that is no constant (a pointer, say), a member whose data type no
-    /// argument has, and an argument buffer's struct array whose elements take no ids of their
-    /// own; an array of arrays, as Metal's encoder creation raises.
-    pub fn from_buffer_binding(
-        binding: &BufferBinding,
-    ) -> Result<ArgumentBufferLayout, ArgumentLayoutError> {
-        let Some(st) = binding.buffer_struct_type() else {
-            return Ok(ArgumentBufferLayout {
-                encoded_length: 0,
-                alignment: 1,
-                members: Vec::new(),
-            });
-        };
-        if binding
-            .buffer_pointer_type()
-            .is_some_and(PointerType::element_is_argument_buffer)
-        {
-            reflected_layout(st, Some(binding.buffer_alignment()), Rule::ArgumentBuffer)
-        } else {
-            reflected_layout(st, None, Rule::PlainBuffer)
-        }
-    }
-}
-
-/// Which of Metal's two rules lays out a reflected struct (the module docs).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Rule {
-    /// An argument buffer's: a constant takes its MSL size and alignment, and the encoder the
-    /// binding's alignment.
-    ArgumentBuffer,
-    /// A plain buffer's: every constant takes [`PLAIN_CONSTANT_BYTES`] bytes at that alignment,
-    /// and the encoder its members' largest alignment. An array whose `argumentIndexStride` is 0
-    /// gives element `k` the ids `k` times the element's span.
-    PlainBuffer,
-}
-
-/// The bytes, and the alignment, a plain buffer's encoder gives each constant member whatever its
-/// type: Metal's answer on an M3 Max (macOS 26.7) for every scalar, vector, matrix and atomic
-/// type measured. An M4 (macOS 27.0.1) gives an integer or `bool` scalar its own size aligned to 1
-/// instead, and so never a longer or more aligned encoder: a buffer sized and aligned by this rule
-/// holds the encoder under either.
-const PLAIN_CONSTANT_BYTES: u64 = 8;
-
-/// One element of a reflected member: what it holds, its bytes and alignment, and the layout a
-/// struct element or a pointer to an argument buffer has.
-struct ReflectedElement {
-    ty: ArgumentType,
-    size: u64,
-    alignment: u64,
-    layout: Option<Arc<ArgumentBufferLayout>>,
-}
-
-/// Struct `st` as an encoder's arguments by `rule`, aligned to `alignment` (its members' largest
-/// alignment when `None`): its members, and the end of its last element rounded up to the
-/// alignment.
-fn reflected_layout(
-    st: &StructType,
-    alignment: Option<u64>,
-    rule: Rule,
-) -> Result<ArgumentBufferLayout, ArgumentLayoutError> {
-    let (members, end, natural) = reflected_members(st, rule)?;
-    let alignment = alignment.unwrap_or(natural);
-    let encoded_length = metal_align(end, alignment).ok_or(ArgumentLayoutError::TooLarge)?;
-    Ok(ArgumentBufferLayout {
-        encoded_length,
-        alignment,
-        members,
-    })
-}
-
-/// The members of reflected struct `st` by `rule`, the end of its last element, and its members'
-/// largest alignment. The recursion is as deep as the struct type, which the reflection built
-/// from a decoded layout under the nesting cap.
-fn reflected_members(
-    st: &StructType,
-    rule: Rule,
-) -> Result<(Vec<ArgumentMember>, u64, u64), ArgumentLayoutError> {
-    let mut members = Vec::with_capacity(st.members().len());
-    let (mut end, mut alignment) = (0u64, 1u64);
-    for m in st.members() {
-        let id = m.argument_index();
-        let (element, count, stride, ids_per_element) = match m.array_type() {
-            Some(a) => {
-                if a.element_array_type().is_some() {
-                    return Err(ArgumentLayoutError::ArrayOfArrays { id });
-                }
-                let element = reflected_element(
-                    m.name(),
-                    a.element_type(),
-                    a.element_struct_type(),
-                    a.element_pointer_type(),
-                    rule,
-                )?;
-                let ids = match (a.argument_index_stride(), rule) {
-                    (0, Rule::ArgumentBuffer) if element.ty == ArgumentType::Struct => {
-                        return Err(unmeasured(m.name()));
-                    }
-                    (0, _) => element_ids(&element),
-                    (ids, _) => ids,
-                };
-                (element, a.array_length(), a.stride(), ids)
-            }
-            None => {
-                let element = reflected_element(
-                    m.name(),
-                    m.data_type(),
-                    m.struct_type(),
-                    m.pointer_type(),
-                    rule,
-                )?;
-                let ids = element_ids(&element);
-                let size = element.size;
-                (element, 1, size, ids)
-            }
-        };
-        let last = stride
-            .checked_mul(u64::from(count.saturating_sub(1)))
-            .and_then(|bytes| bytes.checked_add(m.offset()))
-            .and_then(|start| start.checked_add(element.size))
-            .ok_or(ArgumentLayoutError::TooLarge)?;
-        end = end.max(last);
-        alignment = alignment.max(element.alignment);
-        members.push(ArgumentMember {
-            id,
-            count,
-            ids_per_element,
-            offset: m.offset(),
-            stride,
-            size: element.size,
-            ty: element.ty,
-            layout: element.layout,
-        });
-    }
-    Ok((members, end, alignment))
-}
-
-/// The ids one element takes: a struct all its members', anything else one.
-fn element_ids(element: &ReflectedElement) -> u32 {
-    match (element.ty, &element.layout) {
-        (ArgumentType::Struct, Some(l)) => l.id_span(),
-        _ => 1,
-    }
-}
-
-/// One element of reflected type `data_type` (with its struct or pointer type) of member `name`,
-/// by `rule`.
-fn reflected_element(
-    name: &str,
-    data_type: DataType,
-    st: Option<&StructType>,
-    pointer: Option<&PointerType>,
-    rule: Rule,
-) -> Result<ReflectedElement, ArgumentLayoutError> {
-    if let Some(st) = st {
-        let (members, end, alignment) = reflected_members(st, rule)?;
-        let size = metal_align(end, alignment).ok_or(ArgumentLayoutError::TooLarge)?;
-        return Ok(ReflectedElement {
-            ty: ArgumentType::Struct,
-            size,
-            alignment,
-            layout: Some(Arc::new(ArgumentBufferLayout {
-                encoded_length: size,
-                alignment: 1,
-                members,
-            })),
-        });
-    }
-    let (size, alignment, ty) = type_size_align(data_type).ok_or_else(|| unmeasured(name))?;
-    match rule {
-        Rule::ArgumentBuffer => {
-            let nested = match pointer {
-                Some(p) if ty == ArgumentType::Buffer && p.element_is_argument_buffer() => p
-                    .element_struct_type()
-                    .map(|st| {
-                        reflected_layout(st, Some(p.alignment()), Rule::ArgumentBuffer)
-                            .map(Arc::new)
-                    })
-                    .transpose()?,
-                _ => None,
-            };
-            Ok(ReflectedElement {
-                ty,
-                size,
-                alignment,
-                layout: nested,
-            })
-        }
-        Rule::PlainBuffer if ty == ArgumentType::Constant => Ok(ReflectedElement {
-            ty,
-            size: PLAIN_CONSTANT_BYTES,
-            alignment: PLAIN_CONSTANT_BYTES,
-            layout: None,
-        }),
-        Rule::PlainBuffer => Err(unmeasured(name)),
-    }
-}
-
-/// The refusal of a reflected member whose encoder Metal's answer was not measured for.
-fn unmeasured(name: &str) -> ArgumentLayoutError {
-    ArgumentLayoutError::Compile(Error::Unsupported(
-        Unsupported::not_implemented(Feature::Reflection).naming(DiagName::new(name)),
-    ))
 }
 
 /// Why a decoded entry's argument buffer needs the specialized entry: an index or count the AIR
@@ -877,4 +626,19 @@ pub(crate) fn entry_layout(
         Err(Ok(error)) => EntryLayout::Done(Err(error)),
         Err(Err(NeedsSpecialization)) => EntryLayout::Specialize,
     }
+}
+
+/// Where one argument index lands ([`ArgumentBufferLayout::argument`]).
+#[cfg(test)]
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ArgumentPlace {
+    pub ty: ArgumentType,
+    /// Byte offset in the argument buffer.
+    pub offset: u64,
+    /// Bytes the argument holds.
+    pub size: u64,
+    /// The layout of the argument buffer a [`ArgumentType::Buffer`] points to, when its pointee
+    /// holds arguments.
+    pub nested: Option<Arc<ArgumentBufferLayout>>,
 }

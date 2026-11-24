@@ -22,6 +22,13 @@
 //!   0th thread), and so is a vertex or tessellation step in a compute layout
 //!   (`StageInFetch::of`): Metal's compute pipeline creation stops at an assertion for one.
 //!
+//! **A partial threadgroup** (`LoweringInputs::partial_threadgroups`, `lower::dispatch`'s partial
+//! threadgroups) adds nothing to the fetch. An invocation past its threadgroup's threads returns in
+//! `dispatch::emit_entry`, which runs before the fetch, or, where the body is walked predicated for
+//! its barriers, fetches and runs none of the body: its position in the threadgroup is `lin`
+//! unflattened over the threads left, so along x and y, the axes a step reads, it is a thread's of
+//! the grid, and its element is one Metal's thread there fetches too.
+//!
 //! **The stride** of a layout is its descriptor's, compiled in, whatever stride the encoder binds
 //! the buffer with: Metal reads a bound stride only for a layout of
 //! `MTLBufferLayoutStrideDynamic` (an M4 read a fixed 16 under a bound 8).
@@ -51,7 +58,6 @@ use crate::lower::arith::Form;
 use crate::lower::dispatch::Projection;
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
-use crate::memory::contain;
 use crate::metal::{AttributeFormat, IndexType, StepFunction, VertexFormat};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::stage_io::{StageInFetch, StageInInput};
@@ -190,6 +196,9 @@ fn select(
             Stage::Kernel,
             index.buffer,
         )));
+        // The index read's offset is the thread's, not a translation-time constant.
+        let slot = fetch::slot(Stage::Kernel, index.buffer);
+        crate::lower::access::note_variable(cx, slot, false, true);
         cx.families.stage_io.buffers.insert(index.buffer);
     }
     if matches!(step, Step::Grid { .. } | Step::Indexed { .. }) {
@@ -205,6 +214,13 @@ fn select(
         Stage::Kernel,
         f.buffer_index,
     )));
+    // The fetch reads at the thread's element, whose offset is not a translation-time constant.
+    crate::lower::access::note_variable(
+        cx,
+        fetch::slot(Stage::Kernel, f.buffer_index),
+        false,
+        true,
+    );
     // A fixed stride is the descriptor's, whatever the bind's; a dynamic layout's is the one the
     // encoder binds the buffer with, which the binder pushes. A constant step's is `Some(0)`
     // (`StageInFetch::of`): it reads none.
@@ -239,7 +255,6 @@ fn select(
         step,
         stride,
         form,
-        check: contain::encoding(cx.profile),
     })
 }
 

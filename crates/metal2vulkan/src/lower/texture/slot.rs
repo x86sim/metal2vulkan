@@ -3,8 +3,7 @@
 
 use crate::air::abi::Access as AbiAccess;
 use crate::air::intrinsics::{ImageDim, ImageShape};
-use crate::device::profile::Containment;
-use crate::device::requirements::{VkExtension, VkFeature};
+use crate::device::requirements::{FormatUsage, VkFeature};
 use crate::error::{Capability, Error, Feature, LowerFamily, RuntimeInput, Unsupported};
 use crate::lower::select::{DescriptorCounts, SelectCx};
 use crate::memory::contain;
@@ -32,8 +31,7 @@ pub enum TexelClass {
     Sint,
     Uint,
     /// `ulong`: an `RG32Uint` texture, declared as an `RG32` unsigned image whose two words the
-    /// shader joins and splits, or, where a `ulong` atomic updates it, as the `R64ui` image the
-    /// binder views it as.
+    /// shader joins and splits.
     Uint64,
 }
 
@@ -93,22 +91,6 @@ pub struct Uses {
     pub narrow_result: bool,
 }
 
-/// How a slot's accesses read a two-plane YCbCr texture bound there, for its planes read in
-/// place (`sampler::in_place`, `RuntimeFact::YCbCrInPlace`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct InPlaceReads {
-    /// An access the form does not read: anything but a sample or gather it builds
-    /// (`sampler::select`'s `in_place_sample`) and a query of the width, the height or the level
-    /// count.
-    pub blocked: bool,
-    /// The runtime sampler slots the slot's samples and gathers read, bit `n` `[[sampler(n)]]`.
-    pub samplers: u32,
-    /// A sample the device's own sampler Y′CbCr conversion does not take
-    /// (`LoweringInputs::ycbcr_planes_sampled`): one through a constexpr sampler that addresses a
-    /// border, one that places a texel offset by a parent's size, or a gather.
-    pub device_blocked: bool,
-}
-
 /// The `OpTypeImage` a slot is declared as, and the conversion a storage image's class needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageDecl {
@@ -134,20 +116,18 @@ pub struct ImageDecl {
     /// after the class's conversion, its reads take alpha 1 and its writes store green in the
     /// fourth channel.
     pub x_channel: bool,
-    /// The slot's variant reads a two-plane YCbCr texture's planes in place
-    /// (`LoweringInputs::ycbcr_in_place`): the image is the planes' uniform texel buffer of
-    /// unsigned codes (`sampler::in_place`), the texture's size its push field's.
-    pub in_place: bool,
-    /// The slot's variant samples those planes as an image through the device's own sampler
-    /// Y′CbCr conversion (`LoweringInputs::ycbcr_planes_sampled`): the slot is a combined image
-    /// sampler of a sampled 2D `float` image (`ResourceKind::YCbCrPlanes`), whose immutable
-    /// sampler bakes the conversion; `in_place` holds, so its size is still the push field's.
-    pub planes_sampler: Option<crate::bind::YCbCrPlanesSampler>,
-    /// The slot's variant reads and writes a 2D texture's rows in place
-    /// (`LoweringInputs::texel_rows`, `bind::texel_rows`): the image is the rows' texel buffer,
-    /// uniform for a sampled slot and storage for a storage one, texel `(x, y)` its texel
-    /// `first + y · row + x` and the texture's size the push field's.
-    pub rows: bool,
+    /// A texture-buffer slot under its parts variant (`LoweringInputs::texel_buffer_parts`,
+    /// `bind::texel_parts`), declared as an array of its parts' texel buffers.
+    pub parts: Option<Parts>,
+}
+
+/// The parts of a texture-buffer slot under its parts variant (`bind::texel_parts`): `count`
+/// texel buffers, each of `texels` texels but the last, the device's `bind::part_texels`. Texel `i`
+/// is texel `i − k · texels` of part `k = min(⌊i / texels⌋, count − 1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Parts {
+    pub count: u32,
+    pub texels: u32,
 }
 
 impl ImageDecl {
@@ -168,13 +148,7 @@ impl ImageDecl {
                 width: 32,
                 signed: true,
             })?,
-            // A `ulong` slot is an `RG32` unsigned image, or one of 64-bit texels.
-            TexelClass::Uint64 if self.format == crate::spv::ImageFormat::R64ui => {
-                mb.ty(SType::Int {
-                    width: 64,
-                    signed: false,
-                })?
-            }
+            // A `ulong` slot is an `RG32` unsigned image.
             TexelClass::Uint | TexelClass::Uint64 => mb.ty(SType::Int {
                 width: 32,
                 signed: false,
@@ -210,7 +184,8 @@ pub struct SlotPlan {
     /// checks, or a level-view read under any check, past the bound level count.
     pub oob_alpha: bool,
     /// A read of the slot through a sampler may read the border texel, which the slot's
-    /// `BorderTexels` specialization gives (`RuntimeFact::BorderTexels`).
+    /// `BorderTexels` specialization gives (`RuntimeFact::BorderTexels`). Never under the identity
+    /// domains, where the slot's resource ID's word holds the border texels.
     pub border_texels: bool,
     /// The device is left both an out-of-bounds store and an out-of-bounds load of the slot, so
     /// its variable is decorated `Volatile`; set by [`finish`].
@@ -226,19 +201,6 @@ pub struct SlotPlan {
     /// function's writes to a sparse texture (`RuntimeFact::SparseTextureWrites`), set by
     /// [`finish`].
     pub sparse_writes: bool,
-    /// A read, gather, or sample converts the slot's texels to a `half` result by the bound
-    /// format's class, which the slot's `TexelFormat` specialization gives
-    /// (`RuntimeFact::TexelFormat`, `half`).
-    pub half_format: bool,
-    /// The slot declares its `TexelFormat` specialization without the conversion routine: a raw
-    /// linear sample reads the bound format's channels from it (`RuntimeFact::TexelFormat`).
-    /// Implied by `half_format`.
-    pub texel_format: bool,
-    /// A `half` conversion of the slot on a device that samples through Metal's own texture unit
-    /// notes the bound format where its class is unmeasured there
-    /// (`TexelFormat::unmeasured_on_metal_sampler`): the slot declares its `UnmeasuredTexels`
-    /// specialization, which the note's clause tests.
-    pub unmeasured: bool,
     /// A read of the slot, a texture buffer, applies the bound texture buffer's swizzle, which
     /// the slot's `TextureSwizzle` specialization gives (`RuntimeFact::TextureSwizzle`); or the
     /// slot, a storage slot of `LoweringInputs::swizzled_storage`, applies the bound texture's to
@@ -255,12 +217,10 @@ pub struct SlotPlan {
     /// specialization, which states the axes on which the base-level size the rule reads, a
     /// view's parent's, is not a power of two where the bound view's is.
     pub offset_base: bool,
-    /// How its accesses read a two-plane YCbCr texture's planes in place.
-    pub in_place: InPlaceReads,
-    /// An access its texture's rows read in place do not answer (`bind::texel_rows`): anything
-    /// but a read or write of a texel by its coordinate, a query of the width, the height or the
-    /// level count, and a presence test. The uses rule out the rest ([`rows_reads`]).
-    pub not_rows: bool,
+    /// An access a texture buffer's parts do not answer (`bind::texel_parts`): anything but a
+    /// read of a texel by its index (not through a sampler), a write, an atomic, a width query, a
+    /// presence test and a fence. The uses rule out the rest ([`parts_reads`]).
+    pub not_parts: bool,
     /// The declaration, set by [`finish`] for a slot that is read, written, or queried, or
     /// whose faces are fetched.
     pub decl: Option<ImageDecl>,
@@ -282,22 +242,12 @@ impl SlotPlan {
             sparse_arm: false,
             tile_map: false,
             sparse_writes: false,
-            half_format: false,
-            texel_format: false,
-            unmeasured: false,
             swizzle: false,
             constant_lanes: false,
             offset_base: false,
-            in_place: InPlaceReads::default(),
-            not_rows: false,
+            not_parts: false,
             decl: None,
         }
-    }
-
-    /// Whether the slot declares its `TexelFormat` specialization: a conversion by the bound
-    /// format's class takes it.
-    pub fn declares_texel_format(&self) -> bool {
-        self.half_format || self.texel_format
     }
 
     /// Whether the slot is a storage image or storage texel buffer.
@@ -345,6 +295,10 @@ impl SlotPlan {
             sampled_type,
             depth_compare: self.uses.compare,
             access: TextureAccess::new(u.sample, u.read || u.atomic, u.write || u.atomic),
+            storage: self.storage(),
+            declared_format: (self.decl.as_ref()).is_some_and(|d| {
+                d.usage == ImageUsage::Storage && d.format != crate::spv::ImageFormat::Unknown
+            }),
         })
     }
 }
@@ -368,15 +322,6 @@ pub struct HeapPlan {
     /// Some group of its heap class is left out-of-bounds stores and some out-of-bounds loads
     /// by the device, so the class's array is decorated `Volatile`; set by [`finish`].
     pub volatile: bool,
-    /// The shader makes some of its comparisons, reading its members without comparison; set by
-    /// `sampler::select`.
-    pub compares_plain: bool,
-    /// The float class of its shape and its declaration, for a compared group whose comparisons
-    /// the shader makes ([`HeapPlan::compares_plain`]); set by [`finish`]. Its samples without
-    /// comparison read the members there, and its comparisons the depth-comparison class, whose
-    /// depth view ANV clamps into `[0, 1]` and RADV holds a denormal in as zero (runtime lane
-    /// `depth_compares` through argument buffers).
-    pub plain: Option<(ImageHandleClass, ImageDecl)>,
     /// Its float reads decode a member of a form a heap reads (`ExtendedRange::HEAP_READ`) where
     /// the handle's class index names one; set by `select_read`.
     pub reads_raw: bool,
@@ -413,8 +358,6 @@ impl HeapPlan {
             class: None,
             decl: None,
             volatile: false,
-            compares_plain: false,
-            plain: None,
             reads_raw: false,
             raw: None,
             cross_reads: Default::default(),
@@ -487,6 +430,11 @@ fn declare_heap(
     if shape.depth && storage {
         return Err(refuse());
     }
+    // No form of a multisampled storage image is built (no runtime enables
+    // `shaderStorageImageMultisample`).
+    if storage && shape.ms {
+        return Err(Unsupported::not_implemented(Feature::StorageImageMultisample).into());
+    }
     if compare && !matches!(shape.dim, ImageDim::D2 | ImageDim::Cube) {
         return Err(cx.invariant("a compared depth heap group that is neither 2D nor cube"));
     }
@@ -527,19 +475,21 @@ fn declare_heap(
             );
         }
         // A heap's storage classes are declared without a format, and the binder views its
-        // members for every access the device's features grant (`bind::heap`): a device's
-        // formats' own bits do not serve a heap. The features name storage texel buffers too.
+        // members for every access the device's features grant (`bind::heap`). The features name
+        // storage texel buffers too. A read needs `shaderStorageImageReadWithoutFormat`, or the
+        // formats' own bits (`DeviceProfile::storage_reads_by_format_bits`): the binder then
+        // holds a member whose view's format lacks the read bit for its writes alone, flagged,
+        // and a read through its handle reads the null element (`Read::heap_unreadable`), where
+        // no read-write tier format's view lacks it (below).
         need(
-            !h.uses.read || images.storage_read_without_format,
+            !h.uses.read
+                || images.storage_read_without_format
+                || cx.profile.storage_reads_by_format_bits(),
             VkFeature::ShaderStorageImageReadWithoutFormat,
         );
         need(
             !h.uses.write || images.storage_write_without_format,
             VkFeature::ShaderStorageImageWriteWithoutFormat,
-        );
-        need(
-            !shape.ms || images.storage_multisample,
-            VkFeature::ShaderStorageImageMultisample,
         );
     } else if buffer {
         need(
@@ -560,17 +510,7 @@ fn declare_heap(
             VkFeature::DescriptorBindingSampledImageUpdateAfterBind,
         );
     }
-    if !missing.is_empty() {
-        return Err(
-            Unsupported::needs_any_of(Feature::ArgumentBufferTextures, vec![missing]).into(),
-        );
-    }
     let texel = h.texel.unwrap_or(TexelClass::Float);
-    // A heap `ulong` texture would need a heap class of its own (its `RG32` declaration is not
-    // the formatless class's); not implemented.
-    if texel == TexelClass::Uint64 {
-        return Err(refuse());
-    }
     let class = ImageHandleClass {
         dim: sym,
         arrayed: shape.array,
@@ -584,6 +524,34 @@ fn declare_heap(
             StorageFormatClass::NotStorage
         },
     };
+    // Where the formats' own bits grant the read, the class's neutral, which a null handle and
+    // a flagged member read, must have its format's read bit too, and so must the view of every
+    // read-write tier format the class holds, whose read Metal defines.
+    if storage && h.uses.read && cx.profile.storage_reads_by_format_bits() {
+        let format = crate::bind::neutral::storage_neutral(texel.sampled_type());
+        let usage = match buffer {
+            true => FormatUsage::StorageTexelBufferReadWithoutFormat,
+            false => FormatUsage::StorageImageReadWithoutFormat,
+        };
+        if !cx.profile.supports_format(format, usage) {
+            missing.push(Capability::Format { format, usage });
+        }
+        for gap in crate::bind::heap::tier_read_gaps(cx.profile, &class) {
+            if !missing.contains(&gap) {
+                missing.push(gap);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(
+            Unsupported::needs_any_of(Feature::ArgumentBufferTextures, vec![missing]).into(),
+        );
+    }
+    // A heap `ulong` texture would need a heap class of its own (its `RG32` declaration is not
+    // the formatless class's); not implemented.
+    if texel == TexelClass::Uint64 {
+        return Err(refuse());
+    }
     let decl = ImageDecl {
         dim,
         arrayed: shape.array,
@@ -601,9 +569,7 @@ fn declare_heap(
         level_views: None,
         extended: None,
         x_channel: false,
-        in_place: false,
-        planes_sampler: None,
-        rows: false,
+        parts: None,
     };
     Ok((class, decl))
 }
@@ -648,8 +614,6 @@ fn needs(feature: Feature, f: VkFeature) -> Error {
 /// the buffer, so neither is Metal's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReadCheck {
-    /// No containment (`Containment::UnsafeOff`): the access as the function spells it.
-    Off,
     /// The device's robustness returns Metal's texel; the access is left to it.
     Device,
     /// The shader clamps every operand into the bound resource, so the access stays inside it,
@@ -660,9 +624,7 @@ pub enum ReadCheck {
 /// How a read of an image (`buffer`: a texel buffer) returns Metal's out-of-bounds texel on the
 /// profile ([`ReadCheck`]).
 pub(super) fn read_check(cx: &SelectCx<'_>, buffer: bool) -> ReadCheck {
-    if !matches!(cx.profile.fields().containment, Containment::On { .. }) {
-        ReadCheck::Off
-    } else if contain::device_reads_texels(cx.profile, buffer) {
+    if contain::device_reads_texels(cx.profile, buffer) {
         ReadCheck::Device
     } else {
         ReadCheck::Shader
@@ -689,12 +651,8 @@ pub(super) fn write_guard(cx: &SelectCx<'_>, buffer: bool) -> bool {
 /// left to the device where [`write_guard`] does not guard it, a load where [`read_check`] leaves
 /// it to the device, and a texture atomic (which stores and returns the texel) is both where it is
 /// not guarded. A load the shader checks reads a clamped coordinate inside the resource, and a
-/// guarded store never reaches the device, so neither can meet the other out of bounds. Without
-/// containment nothing out of bounds is defined.
+/// guarded store never reaches the device, so neither can meet the other out of bounds.
 fn forwards(cx: &SelectCx<'_>, uses: &Uses, buffer: bool) -> bool {
-    if !matches!(cx.profile.fields().containment, Containment::On { .. }) {
-        return false;
-    }
     let atomic = uses.atomic && !write_guard(cx, buffer);
     let store = (uses.write && !write_guard(cx, buffer)) || atomic;
     let load = (uses.read && read_check(cx, buffer) == ReadCheck::Device) || atomic;
@@ -719,11 +677,12 @@ pub(super) fn stage_stores(cx: &SelectCx<'_>) -> Result<(), Error> {
 
 /// The format a storage slot is declared with and its class: the slot's `StorageImageChoice` from
 /// the lowering inputs, or, without one, a formatless `Identity` declaration where the device's
-/// `shaderStorageImage{Read,Write}WithoutFormat` grant its accesses without a format; otherwise the
-/// format is an input the caller must supply (`NeedsInput`). A choice whose view SPIR-V names no
-/// format for is declared without one wherever the profile accesses storage so at all, by the
-/// features or by the formats' own bits (`DeviceProfile::accesses_without_format`; the choice
-/// checked the view's bits).
+/// `shaderStorageImage{Read,Write}WithoutFormat` grant its accesses without a format, or, under the
+/// identity domains, where the formats' own bits grant its read ([`reads_by_format_bits`]);
+/// otherwise the format is an input the caller must supply (`NeedsInput`). A choice whose view
+/// SPIR-V names no format for is declared without one wherever the profile accesses storage so at
+/// all, by the features or by the formats' own bits (`DeviceProfile::accesses_without_format`; the
+/// choice checked the view's bits).
 ///
 /// A slot that is only queried accesses no texel, so it is declared `Unknown` with class
 /// `Identity` whatever the choice (queries need no format feature, and no format then pairs with
@@ -757,6 +716,18 @@ fn storage_format(
                 crate::spv::ImageFormat::Unknown,
                 StorageImageClass::Identity,
             ));
+        }
+        // Under the identity domains no input names the bound format: a read the formats' own
+        // bits grant is declared without one, as a heap storage class's is; any other formatless
+        // access the device does not take is not lowered yet.
+        if crate::lower::access::identity(cx.profile) {
+            if reads_by_format_bits(cx, s, texel) {
+                return Ok((
+                    crate::spv::ImageFormat::Unknown,
+                    StorageImageClass::Identity,
+                ));
+            }
+            return Err(Unsupported::not_implemented(Feature::IdentityDomains).into());
         }
         return Err(Error::NeedsInput(RuntimeInput::StorageTextureFormat {
             slot: s.slot,
@@ -817,19 +788,59 @@ fn storage_format(
         ));
     }
     // The converting classes exist for 8-bit UNORM color formats, half and small float ones and
-    // 1-bit alpha ones only. A YCbCr write slot's `float` texels are stored as their bits in an
-    // unsigned integer image, whose class `declare_slot` gives it, as an `RGB9E5Float` slot
-    // stores its words in its `R32_UINT` alias.
+    // 1-bit alpha ones only. An `RGB9E5Float` slot stores its words in its `R32_UINT` alias, whose
+    // class `declare_slot` gives it.
     let converting = !matches!(
         choice.class,
-        StorageImageClass::Identity
-            | StorageImageClass::YCbCrWrite
-            | StorageImageClass::SharedExponentBits
+        StorageImageClass::Identity | StorageImageClass::SharedExponentBits
     );
     if converting && texel != TexelClass::Float {
         return Err(Unsupported::not_representable(Feature::Format).into());
     }
     Ok((format, choice.class))
+}
+
+/// Whether storage slot `s` of texel class `texel`, which no input names the bound format of, is
+/// read without a format by the formats' own bits alone, as a heap storage class is
+/// (`DeviceProfile::storage_reads_by_format_bits`: ANV before Gfx12.5): the slot reads, the device
+/// writes without a format where the slot writes, and the class's neutral format, which an unbound
+/// slot reads, and the view of every read-write tier format the slot can hold, whose reads Metal
+/// defines, have the format's read bit (`bind::heap::tier_read_gaps`). A storage cube is the
+/// binder's 2D-array view.
+fn reads_by_format_bits(cx: &SelectCx<'_>, s: &SlotPlan, texel: TexelClass) -> bool {
+    let profile = cx.profile;
+    let Some(shape) = s.shape else {
+        return false;
+    };
+    if !s.uses.read
+        || !profile.storage_reads_by_format_bits()
+        || (s.uses.write && !profile.fields().images.storage_write_without_format)
+    {
+        return false;
+    }
+    let (dim, arrayed) = match shape.dim {
+        ImageDim::D1 => (SymDim::D1, shape.array),
+        ImageDim::D2 => (SymDim::D2, shape.array),
+        ImageDim::D3 => (SymDim::D3, false),
+        ImageDim::Cube => (SymDim::D2, true),
+        ImageDim::Buffer => (SymDim::Buffer, false),
+    };
+    let class = ImageHandleClass {
+        dim,
+        arrayed,
+        multisampled: shape.ms,
+        sampled_type: texel.sampled_type(),
+        depth_compare: false,
+        access: ImageAccess::Storage,
+        format: StorageFormatClass::Unknown,
+    };
+    let usage = match shape.dim {
+        ImageDim::Buffer => FormatUsage::StorageTexelBufferReadWithoutFormat,
+        _ => FormatUsage::StorageImageReadWithoutFormat,
+    };
+    let neutral = crate::bind::neutral::storage_neutral(texel.sampled_type());
+    profile.supports_format(neutral, usage)
+        && crate::bind::heap::tier_read_gaps(profile, &class).is_empty()
 }
 
 /// The format of a `ulong` storage slot that is read or written: Metal binds only an `RG32Uint`
@@ -918,12 +929,7 @@ fn ulong_format(
 /// storage-atomic feature (a texel buffer's storage-texel-buffer-atomic one). The slot's choice,
 /// when there is one, must be that format; without one, Metal's rule gives it (the binder's view of
 /// an `R32` texture, and the `R32` neutral of an unbound storage slot of that numeric type, have
-/// it).
-///
-/// A `ulong` slot is declared `R64ui`, which the binder views its `RG32Uint` texture as
-/// (`RuntimeFact::UlongAtomicView`), where the profile has what that needs
-/// (`DeviceProfile::ulong_atomic_gaps`); elsewhere it is `Unsupported{ImageAtomics}` naming every
-/// missing capability, never an `RG32` declaration, which no image atomic takes.
+/// it). A `ulong` texture's atomics are refused before (`atomic::select`).
 fn atomic_format(
     cx: &SelectCx<'_>,
     s: &SlotPlan,
@@ -933,14 +939,7 @@ fn atomic_format(
     let (format, vk_format) = match texel {
         TexelClass::Uint => (crate::spv::ImageFormat::R32ui, vk::Format::R32_UINT),
         TexelClass::Sint => (crate::spv::ImageFormat::R32i, vk::Format::R32_SINT),
-        TexelClass::Uint64 => {
-            let gaps = cx.profile.ulong_atomic_gaps(buffer);
-            if !gaps.is_empty() {
-                return Err(Unsupported::needs_any_of(Feature::ImageAtomics, vec![gaps]).into());
-            }
-            (crate::spv::ImageFormat::R64ui, vk::Format::R64_UINT)
-        }
-        TexelClass::Float => return Err(refuse()),
+        TexelClass::Uint64 | TexelClass::Float => return Err(refuse()),
     };
     if let Some(choice) = cx.inputs.storage_images.get(&s.slot) {
         if choice.vk_format != vk_format || choice.class != StorageImageClass::Identity {
@@ -981,8 +980,10 @@ pub fn max_levels(profile: &crate::device::DeviceProfile, dim: ImageDim) -> u32 
     d.max(1).ilog2() + 1
 }
 
-/// The level views of storage slot `s`, checked on the profile, with their facts and push field:
-/// `None` for a slot without them.
+/// The level views of storage slot `s`, checked on the profile, with their facts and push fields:
+/// `None` for a slot without them. Under the identity domains the views are the run of set 1's
+/// storage array the slot's `PushField::TextureLevelBase` names, and no fact is stated: the
+/// consumer pushes the bound texture's level count and its run's first element.
 fn level_views(
     cx: &SelectCx<'_>,
     s: &SlotPlan,
@@ -991,8 +992,11 @@ fn level_views(
     push: &mut Vec<PushField>,
 ) -> Result<Option<u32>, Error> {
     let u = &s.uses;
+    let identity = crate::lower::access::identity(cx.profile);
     if u.levels || u.level_views {
-        facts.push(RuntimeFact::StorageTextureLevels { slot: s.slot });
+        if !identity {
+            facts.push(RuntimeFact::StorageTextureLevels { slot: s.slot });
+        }
         push.push(PushField::TextureLevels(s.slot));
     }
     if !u.level_views {
@@ -1011,7 +1015,10 @@ fn level_views(
             VkFeature::ShaderStorageImageArrayNonUniformIndexing,
         ));
     }
-    facts.push(RuntimeFact::StorageTextureLevelViews { slot: s.slot });
+    match identity {
+        true => push.push(PushField::TextureLevelBase(s.slot)),
+        false => facts.push(RuntimeFact::StorageTextureLevelViews { slot: s.slot }),
+    }
     Ok(Some(n))
 }
 
@@ -1056,121 +1063,10 @@ fn declare_slot(
 ) -> Result<ImageDecl, Error> {
     let images = &cx.profile.fields().images;
     let storage = s.storage();
-    // A slot that samples its texture's planes as an image through the device's own sampler
-    // Y′CbCr conversion is a combined image sampler of a 2D `float` image, with the field of the
-    // planes' words for its size (`sampler::in_place`).
-    if let Some(&sampler) = cx.inputs.ycbcr_planes_sampled.get(&s.slot) {
-        if !cx.inputs.ycbcr_in_place.contains(&s.slot) {
-            return Err(cx.invariant("a planes image's slot outside its in-place variant"));
-        }
-        push.push(PushField::YCbCrInPlace(s.slot));
-        counts.sampled_images = counts.sampled_images.saturating_add(1);
-        counts.samplers = counts.samplers.saturating_add(1);
-        return Ok(ImageDecl {
-            dim: Dim::D2,
-            arrayed: false,
-            multisampled: false,
-            depth: false,
-            usage: ImageUsage::Sampled,
-            format: crate::spv::ImageFormat::Unknown,
-            texel: TexelClass::Float,
-            cube_as_array: false,
-            class: StorageImageClass::Identity,
-            level_views: None,
-            extended: None,
-            x_channel: false,
-            in_place: true,
-            planes_sampler: Some(sampler),
-            rows: false,
-        });
-    }
-    // A slot under its in-place variant is the uniform texel buffer of its texture's planes, of
-    // unsigned codes, with the field of their words (`sampler::in_place`).
-    if cx.inputs.ycbcr_in_place.contains(&s.slot) {
-        push.push(PushField::YCbCrInPlace(s.slot));
-        counts.sampled_images = counts.sampled_images.saturating_add(1);
-        return Ok(ImageDecl {
-            dim: Dim::Buffer,
-            arrayed: false,
-            multisampled: false,
-            depth: false,
-            usage: ImageUsage::Sampled,
-            format: crate::spv::ImageFormat::Unknown,
-            texel: TexelClass::Uint,
-            cube_as_array: false,
-            class: StorageImageClass::Identity,
-            level_views: None,
-            extended: None,
-            x_channel: false,
-            in_place: true,
-            planes_sampler: None,
-            rows: false,
-        });
-    }
-    // A slot under its rows variant is the texel buffer of its texture's rows, with the field of
-    // their words (`bind::texel_rows`): a uniform one for a sampled slot, a storage one, declared
-    // as the slot's storage image would be, for a storage slot.
-    if cx.inputs.texel_rows.contains(&s.slot) {
-        if !rows_reads(s) {
-            return Err(cx.invariant("a rows slot whose accesses the rows do not answer"));
-        }
-        push.push(PushField::TexelRows(s.slot));
-        let texel = image_class(cx.inputs, s);
-        let (format, class) = match storage {
-            true => {
-                facts.push(RuntimeFact::StorageTextureFormat { slot: s.slot });
-                storage_format(cx, s, texel)?
-            }
-            false => (
-                crate::spv::ImageFormat::Unknown,
-                StorageImageClass::Identity,
-            ),
-        };
-        if class != StorageImageClass::Identity {
-            return Err(cx.invariant("a rows slot whose storage image converts its texels"));
-        }
-        match storage {
-            true => counts.storage_images = counts.storage_images.saturating_add(1),
-            false => counts.sampled_images = counts.sampled_images.saturating_add(1),
-        }
-        return Ok(ImageDecl {
-            dim: Dim::Buffer,
-            arrayed: false,
-            multisampled: false,
-            depth: false,
-            usage: match storage {
-                true => ImageUsage::Storage,
-                false => ImageUsage::Sampled,
-            },
-            format,
-            texel,
-            cube_as_array: false,
-            class,
-            level_views: None,
-            extended: None,
-            x_channel: false,
-            in_place: false,
-            planes_sampler: None,
-            rows: true,
-        });
-    }
     // A slot bound in an extended-range format holds its raw texels in an unsigned integer
     // image.
     let extended = cx.inputs.extended_range.get(&s.slot).copied();
-    // A slot that only writes a 4:4:4 two-plane YCbCr texture holds each written texel's bits
-    // and mark in an unsigned integer image (`StorageImageClass::YCbCrWrite`): a `float` slot's
-    // writes alone, as the binder chooses it (`bind::plan`); any other use is the format's
-    // refusal.
-    let ycbcr_write = storage
-        && cx
-            .inputs
-            .storage_images
-            .get(&s.slot)
-            .is_some_and(|c| c.class == StorageImageClass::YCbCrWrite);
     let float = image_class(cx.inputs, s) == TexelClass::Float;
-    if ycbcr_write && (s.uses.read || s.uses.atomic || !float) {
-        return Err(Unsupported::not_implemented(Feature::Format).into());
-    }
     // A slot that reads and writes an `RGB9E5Float` texture through its `R32_UINT` alias holds
     // each texel's word there (`StorageImageClass::SharedExponentBits`): a `float` slot's reads
     // and writes, as the binder chooses it (`metal::format::storage_choice`); no atomic.
@@ -1191,22 +1087,21 @@ fn declare_slot(
     }
     let texel = match extended {
         Some(_) => TexelClass::Uint,
-        None if ycbcr_write || words => TexelClass::Uint,
+        None if words => TexelClass::Uint,
         None => image_class(cx.inputs, s),
     };
     if shape.depth && storage {
         // Metal has no writable depth textures.
         return Err(refuse());
     }
-    if storage && shape.ms && !images.storage_multisample {
-        return Err(needs(
-            Feature::StorageImageMultisample,
-            VkFeature::ShaderStorageImageMultisample,
-        ));
+    // No form of a multisampled storage image is built (no runtime enables
+    // `shaderStorageImageMultisample`).
+    if storage && shape.ms {
+        return Err(Unsupported::not_implemented(Feature::StorageImageMultisample).into());
     }
     let cube = shape.dim == ImageDim::Cube;
     // A cube that is read or written, or whose faces are fetched, and every storage cube, is the
-    // binder's 2D-array view.
+    // binder's 2D-array view, or under the identity domains a storage cube's element.
     let cube_as_array = cube && (storage || s.uses.read || s.uses.write || s.uses.faces);
     if cube && shape.array && !cube_as_array && !images.cube_array {
         return Err(needs(Feature::CubeArray, VkFeature::ImageCubeArray));
@@ -1226,9 +1121,16 @@ fn declare_slot(
         None
     };
     let (format, class) = if storage {
-        facts.push(RuntimeFact::StorageTextureFormat { slot: s.slot });
+        // Under the identity domains no input names the bound format: the slot is formatless.
+        if !crate::lower::access::identity(cx.profile) {
+            facts.push(RuntimeFact::StorageTextureFormat { slot: s.slot });
+        }
+        // Under the identity domains the push word is the contract: the consumer writes the bound
+        // texture's channel widths there, as for any slot's push field.
         if s.uses.int_channels {
-            facts.push(RuntimeFact::StorageTextureIntegerChannels { slot: s.slot });
+            if !crate::lower::access::identity(cx.profile) {
+                facts.push(RuntimeFact::StorageTextureIntegerChannels { slot: s.slot });
+            }
             push.push(PushField::TextureIntegerChannels(s.slot));
         }
         storage_format(cx, s, texel)?
@@ -1247,21 +1149,32 @@ fn declare_slot(
             .storage_images
             .get(&s.slot)
             .is_some_and(|c| c.x_channel);
-    if texel == TexelClass::Uint64 && format == crate::spv::ImageFormat::R64ui {
-        // The binder views the slot's `RG32Uint` texture as `R64_UINT`.
-        facts.push(RuntimeFact::UlongAtomicView { slot: s.slot });
-    }
-    if cube_as_array {
+    // Under the identity domains a storage cube's element is already the 2D-array view of its
+    // faces ([`identity_class`]): no binder chooses its view.
+    if cube_as_array && !(storage && crate::lower::access::identity(cx.profile)) {
         facts.push(RuntimeFact::ImageViewShape { slot: s.slot });
     }
-    if shape.dim == ImageDim::Buffer {
+    // Under the identity domains the runtime makes no texture buffer past
+    // `maxTexelBufferElements`: the slot's element is its one view.
+    if shape.dim == ImageDim::Buffer && !crate::lower::access::identity(cx.profile) {
         facts.push(RuntimeFact::TexelBufferRange { slot: s.slot });
     }
+    // A texture-buffer slot under its parts variant is an array of its parts, one texel buffer
+    // each (`bind::texel_parts`).
+    let texels = crate::bind::part_texels(&cx.profile.fields().limits);
+    let parts = match cx.inputs.texel_buffer_parts.get(&s.slot) {
+        Some(&count) if count > 1 && parts_reads(cx, s) => match u32::try_from(texels) {
+            Ok(texels) if texels > 0 => Some(Parts { count, texels }),
+            _ => return Err(cx.invariant("texel buffer parts on a device without them")),
+        },
+        Some(_) => return Err(cx.invariant("a parts slot whose accesses its parts do not answer")),
+        None => None,
+    };
+    let n = views.or(parts.map(|p| p.count)).unwrap_or(1);
     if storage {
-        let n = views.unwrap_or(1);
         counts.storage_images = counts.storage_images.saturating_add(n);
     } else {
-        counts.sampled_images = counts.sampled_images.saturating_add(1);
+        counts.sampled_images = counts.sampled_images.saturating_add(n);
     }
     Ok(ImageDecl {
         dim,
@@ -1280,48 +1193,30 @@ fn declare_slot(
         level_views: views,
         extended,
         x_channel,
-        in_place: false,
-        planes_sampler: None,
-        rows: false,
+        parts,
     })
 }
 
-/// Whether every access of slot `s` is one its texture's planes read in place answer
-/// (`sampler::in_place`), on a profile that takes the form (`ProfileFields::ycbcr_in_place`): a
-/// sampled 2D texture's (not an array, multisampled or depth one), of a `float` class or only
-/// queried, used, and no access blocked ([`InPlaceReads::blocked`]).
-fn in_place_reads(cx: &SelectCx<'_>, s: &SlotPlan) -> bool {
-    let used = s.uses.read || s.uses.query || s.uses.sample;
-    cx.profile.fields().ycbcr_in_place
-        && used
-        && !s.in_place.blocked
-        && !s.storage()
-        && s.shape
-            .is_some_and(|x| x.dim == ImageDim::D2 && !x.array && !x.ms && !x.depth)
-        && matches!(s.texel, None | Some(TexelClass::Float))
-}
-
-/// Whether every access of slot `s` is one its texture's rows read in place answer
-/// (`bind::texel_rows`): a single-sample 2D color texture's (not an array, multisampled or depth
-/// one) of a 32-bit class, read, written or asked its size, every access of a texel at the first
-/// level of a storage slot (no level views), and nothing sampled, gathered, updated by an atomic,
-/// read through a sampler or a switch, its residency observed or its integer channels read; no
-/// access blocked ([`SlotPlan::not_rows`]).
-fn rows_reads(s: &SlotPlan) -> bool {
+/// Whether every access of texture-buffer slot `s` is one its parts answer (`bind::texel_parts`),
+/// on a profile that indexes an array of its kind of texel buffer (storage where the function
+/// writes or updates it, else uniform) by a `NonUniform` value: read, written, updated by an
+/// atomic or asked its width, and nothing read through a sampler or its residency observed; no
+/// access blocked ([`SlotPlan::not_parts`]).
+fn parts_reads(cx: &SelectCx<'_>, s: &SlotPlan) -> bool {
     let u = &s.uses;
-    (u.read || u.write || u.query)
-        && !(u.sample || u.compare || u.atomic || u.level_views || u.residency || u.faces)
-        && !(u.int_channels || u.narrow_result || s.not_rows)
-        && s.shape
-            .is_some_and(|x| x.dim == ImageDim::D2 && !x.array && !x.ms && !x.depth)
-        && matches!(
-            s.texel,
-            None | Some(TexelClass::Float | TexelClass::Sint | TexelClass::Uint)
-        )
+    let d = &cx.profile.fields().descriptors;
+    let indexed = match s.storage() {
+        true => d.non_uniform_storage_texel_buffer,
+        false => d.non_uniform_uniform_texel_buffer,
+    };
+    (u.read || u.write || u.query || u.atomic)
+        && !(u.sample || u.compare || u.level_views || u.residency || u.faces || s.not_parts)
+        && s.shape.is_some_and(|x| x.dim == ImageDim::Buffer)
+        && indexed
 }
 
 /// Whether a slot of `shape` can have a tile map: a single-sample 2D, 2D array, or 3D color texture
-/// (`bind::SparseTileMap`), the sparse types the case model measures.
+/// (`pipeline::tile_map`), the sparse types the case model measures.
 fn tiled_shape(shape: ImageShape) -> bool {
     !shape.ms
         && !shape.depth
@@ -1333,23 +1228,18 @@ fn tiled_shape(shape: ImageShape) -> bool {
 }
 
 /// The device compares a depth texture's texels (a sample or gather with comparison). Metal's
-/// `Depth32Float` texels hold any `float`, which a depth image keeps outside `[0, 1]` only where
-/// the consumer enabled `VK_EXT_depth_range_unrestricted`: without it Vulkan takes no such value
-/// into a depth image, by a copy (`VUID-vkCmdCopyBufferToImage-pRegions-07931`) or by a render
-/// write (clamped to the viewport's depth range), whatever a driver is measured to keep. The
-/// device's comparison reads the texture's depth image, so without the extension the function
-/// records `PrecisionNote::RestrictedDepthRange`. Its reads, samples and gathers record nothing:
-/// the interface's `TextureSlot::access` states them, and the consumer announces an upload its
-/// depth image clamps (`restricted-depth-upload`), which every read of it then reads. No module
+/// `Depth32Float` texels hold any `float`, which a depth image keeps outside `[0, 1]` only under
+/// `VK_EXT_depth_range_unrestricted`, which no runtime enables: without it Vulkan takes no such
+/// value into a depth image, by a copy (`VUID-vkCmdCopyBufferToImage-pRegions-07931`) or by a
+/// render write (clamped to the viewport's depth range), whatever a driver is measured to keep.
+/// The device's comparison reads the texture's depth image, so the function records
+/// `PrecisionNote::RestrictedDepthRange` on every device. Its reads, samples and gathers record
+/// nothing:
+/// the interface's `TextureSlot::access` states them, and the consumer announces an upload into
+/// the depth image (`restricted-depth-upload`), which every read of it then reads. No module
 /// requires the extension, since every value within `[0, 1]` is exact without it.
 pub(crate) fn depth_comparison(cx: &mut SelectCx<'_>) {
-    let enabled = &cx.profile.fields().enabled;
-    if !enabled
-        .extensions
-        .contains(&VkExtension::ExtDepthRangeUnrestricted)
-    {
-        cx.precision.insert(PrecisionNote::RestrictedDepthRange);
-    }
+    cx.precision.insert(PrecisionNote::RestrictedDepthRange);
 }
 
 /// Complete the texture family's plan: declare every slot the function reads, writes, or
@@ -1376,44 +1266,26 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             }
             Err(error) => return Err(error),
         };
-        // A rows slot's every load and store is the function's own test's, inside the view.
-        let volatile = !d.rows && forwards(cx, &s.uses, shape.dim == ImageDim::Buffer);
+        let volatile = forwards(cx, &s.uses, shape.dim == ImageDim::Buffer);
         decls.push((*index, d, volatile));
     }
-    // The slots read, sampled or gathered in any class (a slot only sampled is declared by its
-    // combined bindings, `sampler::finish`).
-    for s in cx.families.texture.slots.values() {
-        if s.shape.is_some_and(|shape| cross_reads(s, shape)) {
-            facts.push(RuntimeFact::CrossClassReads { slot: s.slot });
+    // The variants a slot may take by its bound texture (cross-class reads, a texture buffer's
+    // parts): under the identity domains no variant is chosen, and the slot reads whatever
+    // texture its resource ID names through the plain form.
+    if !crate::lower::access::identity(cx.profile) {
+        // The slots read, sampled or gathered in any class (a slot only sampled is declared by its
+        // combined bindings, `sampler::finish`).
+        for s in cx.families.texture.slots.values() {
+            if s.shape.is_some_and(|shape| cross_reads(s, shape)) {
+                facts.push(RuntimeFact::CrossClassReads { slot: s.slot });
+            }
         }
-    }
-    // The slots whose every access the in-place form reads, on a profile that takes it: their
-    // compile under the form states the same, which its plan holds to.
-    for s in cx.families.texture.slots.values() {
-        let reads = in_place_reads(cx, s);
-        if !reads && cx.inputs.ycbcr_in_place.contains(&s.slot) {
-            return Err(
-                cx.invariant("an in-place texture slot whose accesses the form does not read")
-            );
-        }
-        if s.in_place.device_blocked && cx.inputs.ycbcr_planes_sampled.contains_key(&s.slot) {
-            return Err(cx.invariant(
-                "a planes image's texture slot with a sample the device's sampler does not take",
-            ));
-        }
-        if reads {
-            facts.push(RuntimeFact::YCbCrInPlace {
-                slot: s.slot,
-                samplers: s.in_place.samplers,
-                device: !s.in_place.device_blocked,
-            });
-        }
-    }
-    // The slots whose every access the rows answer: their compile under the rows variant states
-    // the same, which its plan holds to.
-    for s in cx.families.texture.slots.values() {
-        if rows_reads(s) {
-            facts.push(RuntimeFact::TexelRows { slot: s.slot });
+        // The texture-buffer slots whose every access their parts answer: their compile under the
+        // parts variant states the same, which its plan holds to.
+        for s in cx.families.texture.slots.values() {
+            if parts_reads(cx, s) {
+                facts.push(RuntimeFact::TexelBufferParts { slot: s.slot });
+            }
         }
     }
     let mut heap = Vec::new();
@@ -1444,16 +1316,33 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         }
     }
     // A storage class the function reads: the planner refuses a texture whose writes Metal drops
-    // or stores through its write shadow that the stage reaches there, whose read is not measured.
+    // that the stage reaches there, whose read is not measured. The identity domains' arrays hold
+    // no such neutral (the binder's heap does, `bind::heap`).
+    let identity = crate::lower::access::identity(cx.profile);
     for (class, u) in &class_uses {
-        if class.access == ImageAccess::Storage && u.read {
+        if class.access == ImageAccess::Storage && u.read && !identity {
             facts.push(RuntimeFact::HeapStorageReads {
                 stage: cx.stage,
                 class: *class,
             });
         }
     }
-    let volatile_classes: Vec<ImageHandleClass> = class_uses
+    // Under the identity domains a slot's texture is an element of its class's array too, so a
+    // load through a slot may meet a store through any slot or group of its class.
+    let mut shared = class_uses.clone();
+    if identity {
+        for (index, d, _) in &decls {
+            let (Some(class), Some(s)) = (identity_class(d), cx.families.texture.slots.get(index))
+            else {
+                continue;
+            };
+            let u = shared.entry(class).or_default();
+            u.read |= s.uses.read;
+            u.write |= s.uses.write;
+            u.atomic |= s.uses.atomic;
+        }
+    }
+    let volatile_classes: Vec<ImageHandleClass> = shared
         .iter()
         .filter(|(class, u)| forwards(cx, u, class.dim == SymDim::Buffer))
         .map(|(class, _)| *class)
@@ -1463,18 +1352,6 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             h.class = Some(class);
             h.decl = Some(decl);
             h.volatile = volatile_classes.contains(&class);
-            // The float class of the shape, which the binder holds every depth member in too
-            // (`declare_heap`), declared without `Depth`.
-            h.plain = (class.depth_compare && h.compares_plain).then_some((
-                ImageHandleClass {
-                    depth_compare: false,
-                    ..class
-                },
-                ImageDecl {
-                    depth: false,
-                    ..decl
-                },
-            ));
             // The unsigned integer class of a sampled float group whose reads decode raw members.
             let sampled_float = class.access == ImageAccess::Sampled
                 && class.sampled_type == SampledType::Float
@@ -1501,7 +1378,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             }
             h.cross = wanted
                 .into_iter()
-                .filter(|&k| color && own.is_some_and(|own| own != k))
+                .filter(|&k| color && !identity && own.is_some_and(|own| own != k))
                 .filter_map(|k| {
                     let sampled_type = match k {
                         TexelClass::Float => SampledType::Float,
@@ -1522,7 +1399,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
             // member the stage reaches.
             let every_member =
                 h.uncrossed || h.uses.sample || h.uses.write || h.uses.atomic || h.uses.faces;
-            if own.is_some() {
+            if own.is_some() && !identity {
                 facts.push(RuntimeFact::HeapCrossClassNeutral {
                     stage: cx.stage,
                     class,
@@ -1575,8 +1452,12 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     // texel buffer or a 1D texture): Metal drops every write to a sparse texture, which the slot's
     // `SparseTexture` specialization drops, and the binder refuses a sparse texture at a slot
     // updated atomically.
+    // Under the identity domains no texture is sparse (the consumer refuses one), so no write is
+    // dropped.
     let mut written = Vec::new();
-    for (index, s) in &cx.families.texture.slots {
+    let slots =
+        (cx.families.texture.slots.iter()).filter(|_| !crate::lower::access::identity(cx.profile));
+    for (index, s) in slots {
         let sparse_type = s
             .shape
             .is_some_and(|x| !matches!(x.dim, ImageDim::Buffer | ImageDim::D1));
@@ -1611,6 +1492,10 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
         if srgb && written {
             cx.precision.insert(PrecisionNote::DevicePackConversion);
         }
+        let volatile = match crate::lower::access::identity(cx.profile) {
+            true => identity_class(&d).is_some_and(|c| volatile_classes.contains(&c)),
+            false => volatile,
+        };
         if let Some(s) = cx.families.texture.slots.get_mut(&index) {
             s.decl = Some(d);
             s.volatile = volatile;
@@ -1618,6 +1503,98 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
     }
     cx.facts.extend(facts);
     cx.push.extend(push);
-    cx.descriptors = cx.descriptors.plus(&counts);
+    // Under the identity domains a slot's texture is the element of the set-1 array of its
+    // declaration's class ([`identity_class`]) at the index its resource ID holds, which the
+    // slot's push field carries: the slot binds no descriptor of its own.
+    match crate::lower::access::identity(cx.profile) {
+        true => {
+            for s in cx.families.texture.slots.values() {
+                cx.push.insert(PushField::SlotGuestBase(s.slot));
+            }
+        }
+        false => cx.descriptors = cx.descriptors.plus(&counts),
+    }
     Ok(())
+}
+
+impl SlotPlan {
+    /// Whether the identity domains lower the slot: its declaration has an identity array class
+    /// ([`identity_class`]), or it has none (a slot that is only tested for presence), and it reads
+    /// no state of the bound texture but its resource ID's (its presence, its format's missing
+    /// alpha and its border texels). A conversion by the bound format, a swizzle, sparse
+    /// residency, constant lanes and offset bases each read a constant or a binding the slot does
+    /// not have there yet.
+    pub(crate) fn identity_lowered(&self) -> bool {
+        let state = self.sparse_arm
+            || self.tile_map
+            || self.sparse_writes
+            || self.swizzle
+            || self.constant_lanes
+            || self.offset_base;
+        !state
+            && self
+                .decl
+                .as_ref()
+                .is_none_or(|d| identity_class(d).is_some())
+    }
+}
+
+/// Under the identity domains, the class of the set-1 array whose elements texture slot
+/// declaration `decl` takes: its shape, numeric type and depth comparison, sampled, or a storage
+/// image without a format (the floor's `shaderStorageImageWriteWithoutFormat`), of a texture
+/// atomic's `R32ui` / `R32i` ([`atomic_format`]) or of a `ulong` texture's `Rg32ui`
+/// ([`ulong_format`]), each the format Metal requires of the bound texture there, whose storage
+/// element is of that format. A `ulong` slot is an `RG32` unsigned image whose two words the
+/// shader joins and splits, so its class is the unsigned integer one of its shape. A texture
+/// buffer's is a texel buffer's, uniform where the slot reads and storage where it writes, the
+/// element its resource ID holds in the texel-buffer arrays. A storage cube or cube array is
+/// declared as the 2D array of its faces (layer `6 · cube + face`), which is its storage element:
+/// the runtime holds a cube's storage view as that 2D array. A storage slot's level views are
+/// elements of the same array, the run its `PushField::TextureLevelBase` names. `None` for a
+/// declaration the identity arrays hold no element of yet: a sampled cube viewed as an array, a
+/// texture buffer's parts, an extended-range or RGBX form, or a storage image with another format
+/// or a conversion.
+pub(crate) fn identity_class(decl: &ImageDecl) -> Option<ImageHandleClass> {
+    let storage = decl.usage == ImageUsage::Storage;
+    let plain = !(decl.cube_as_array && !storage)
+        && decl.extended.is_none()
+        && !decl.x_channel
+        && decl.parts.is_none()
+        && decl.class == StorageImageClass::Identity;
+    let dim = match decl.dim {
+        Dim::D1 => SymDim::D1,
+        Dim::D2 => SymDim::D2,
+        Dim::D3 => SymDim::D3,
+        Dim::Cube => SymDim::Cube,
+        Dim::Buffer => SymDim::Buffer,
+        _ => return None,
+    };
+    let format = match (storage, decl.format) {
+        (false, _) => StorageFormatClass::NotStorage,
+        (true, crate::spv::ImageFormat::Unknown) => StorageFormatClass::Unknown,
+        (true, crate::spv::ImageFormat::R32ui) => StorageFormatClass::Format(vk::Format::R32_UINT),
+        (true, crate::spv::ImageFormat::R32i) => StorageFormatClass::Format(vk::Format::R32_SINT),
+        (true, crate::spv::ImageFormat::Rg32ui) => {
+            StorageFormatClass::Format(vk::Format::R32G32_UINT)
+        }
+        (true, _) => return None,
+    };
+    if !plain {
+        return None;
+    }
+    Some(ImageHandleClass {
+        dim,
+        arrayed: decl.arrayed,
+        multisampled: decl.multisampled,
+        sampled_type: match decl.texel {
+            TexelClass::Uint64 => SampledType::Uint,
+            texel => texel.sampled_type(),
+        },
+        depth_compare: decl.depth,
+        access: match storage {
+            true => ImageAccess::Storage,
+            false => ImageAccess::Sampled,
+        },
+        format,
+    })
 }

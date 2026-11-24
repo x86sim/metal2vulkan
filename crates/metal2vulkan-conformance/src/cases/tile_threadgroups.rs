@@ -1,17 +1,11 @@
 //! Tile threadgroups: which thread of a tile dispatch is which, and what a tile state answers.
 //!
-//! Ported from the runtime lane `runtime_lane/tile_threadgroups.rs`. That lane is the clearest case
-//! in the survey for porting: its expectations are **formulas** rather than a table —
-//! `position(simdgroup, lane)`, `thread_index(x, y)` and `quad_order(qw, qh)`, each a model of how
-//! Metal places the threads of a tile threadgroup — and the only thing tying those formulas to
-//! Metal is a comment saying a probe measured them on an M4 and on an M3 Max under macOS 26.7.
-//! Both of those measurements are gone, and the second is of an older release.
-//!
-//! So Metal's answer here is **run**, not copied. Record mode runs each case on native Metal on the
+//! The tests hold **formulas** — `position(simdgroup, lane)`, `thread_index(x, y)` and
+//! `quad_order(qw, qh)`, each a model of how Metal places the threads of a tile threadgroup — and
+//! Metal's answer here is **run**, not copied. Record mode runs each case on native Metal on the
 //! chip and build the recording is keyed to, and the case records the words Metal's own threads
-//! wrote. The lane's formulas stay exactly where they are, as the readable model, and this module's
-//! own tests check the recorded words against them: that is the cross-check the port
-//! owes the lane, and it is what turns a comment into evidence.
+//! wrote. The formulas stay as the readable model, and this module's own tests check the recorded
+//! words against them, which is what turns a comment into evidence.
 //!
 //! What a case observes is typed: every call of the pass by the Metal selector it makes, the
 //! command buffer's status and error, the records the tile function wrote as a buffer of 32-bit
@@ -44,6 +38,7 @@ use crate::case::{
     Abort, Case, Failure, Handle, Input, MetalSource, Side, TextureRole, TextureSpec,
     TilePipelineSpec, TileStep, METAL_TILE_THREADS,
 };
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::replay::NOTICES_SITE;
@@ -51,7 +46,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime::Degradation;
 
 /// The tile's side, and the threadgroup's, as the probe drew them.
 const SIDE: u32 = 32;
@@ -78,8 +72,8 @@ const GRID_ATTACHMENTS: [PixelFormat; 3] = [
 /// `ttg_tile_simd_blur`'s one attachment.
 const BLUR_ATTACHMENTS: [PixelFormat; 1] = [PixelFormat::RGBA16Float];
 
-/// The threadgroup shapes of even sides the lane dispatches in a 32x32 tile, each in a pass of its
-/// own over its own attachment and record buffer, as the lane runs them: the ones whose simdgroup
+/// The threadgroup shapes of even sides the case dispatches in a 32x32 tile, each in a pass of its
+/// own over its own attachment and record buffer: the ones whose simdgroup
 /// is a whole row of quads (16x2, 32x2) and the ones whose columns, rows and blocks end partly.
 const EVEN_SHAPES: &[&[[u32; 2]]] = &[
     &[[16, 2]],
@@ -104,14 +98,8 @@ const EVEN_SHAPES: &[&[[u32; 2]]] = &[
 /// answers, such as the NaN encoding it copies the blur's `RGBA16Float` attachment with
 /// (`device-nan-encoding`), are the suite's to declare ([`crate::replay::NATIVE_NOTES`]).
 pub const TILE_PASS_NOTICES: &[Degradation] = &[
-    // The attachments a tile dispatch stages are copied into its scratch before the dispatch and
-    // back after it (`render/tile_dispatch.rs`), which is what a tile dispatch costs on a device
-    // whose imageblock is not Metal's.
-    Degradation::TileDispatchScratch,
-    // The pass is split at the barrier the tile dispatch's scratch needs.
-    Degradation::RenderPassSplit,
-    // A device that splits a fragment quad at a clipped edge where Metal keeps it whole. Announced
-    // on lavapipe. Nothing of these cases reads a quad's grouping -- the tile order is the answer,
+    // A device may split a fragment quad at a clipped edge where Metal keeps it whole. Announced on
+    // every device. Nothing of these cases reads a quad's grouping -- the tile order is the answer,
     // and it compares exactly -- so the kind is declared and no value is loosened.
     Degradation::QuadsSplitByClipping,
 ];
@@ -131,7 +119,7 @@ pub fn tile_notice_allowances() -> Vec<Allowance> {
         .collect()
 }
 
-/// The blur's source extent, its origin in it, and its color scale, as the lane's probe set them.
+/// The blur's source extent, its origin in it, and its color scale.
 const SOURCE: [u32; 2] = [160, 160];
 const ORIGIN: [u32; 2] = [3, 5];
 const SCALE: f32 = 0.5;
@@ -245,7 +233,7 @@ const GRID_AREA: [u32; 2] = [40, 24];
 /// The tile `k10ts_tile_grid`'s pass is in.
 const GRID_TILE: u32 = 16;
 
-/// The blur's twelve weights: 1, 2, 3 repeating, as the lane's `weight`.
+/// The blur's twelve weights: 1, 2, 3 repeating.
 fn weight(tap: u32) -> u32 {
     tap % 3 + 1
 }
@@ -355,10 +343,10 @@ impl TileThreadgroups {
     /// The tile pipeline descriptors the case makes, each under the name its site takes.
     fn specs(&self) -> Vec<(String, TilePipelineSpec<'static>)> {
         match self.shape {
-            // The three states the lane makes of one descriptor: Metal's own maximum, a limit
-            // below it, and a limit that is not a threadgroup of even sides. The lane's first
-            // states no limit; here it states Metal's maximum, which an Apple M3 Max answers for
-            // no limit, as every state here states its limit.
+            // The three states the case makes of one descriptor: Metal's own maximum, a limit
+            // below it, and a limit that is not a threadgroup of even sides. The first states
+            // Metal's maximum, which an Apple M3 Max answers for no limit, as every state here
+            // states its limit.
             Shape::ThreadLimits => vec![
                 (
                     "state-limited-1024".to_owned(),
@@ -400,7 +388,7 @@ impl TileThreadgroups {
             Shape::ThreadLimits => Ok(()),
             Shape::Order { passes, .. } => {
                 // Every shape is its own pass over its own attachment and its own record buffer,
-                // as the lane runs them, so one shape's records cannot reach another's.
+                // so one shape's records cannot reach another's.
                 for dispatches in passes {
                     self.order_pass(side, state, &pass_name(dispatches), dispatches, sites)?;
                 }
@@ -686,16 +674,7 @@ impl Case for TileThreadgroups {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        let mut allowances = tile_notice_allowances();
-        // The record buffer a tile-order or tile-grid pass writes its order into is `Shared`
-        // ([`crate::replay::shared_memory_notice`]), and the RTX 5080 was measured announcing it
-        // for each of those five rows. The thread-limit case answers getters and the two blur
-        // cases were measured announcing nothing of the kind on either venue, so neither declares
-        // it: a declaration no run justifies is one nobody is checking.
-        if matches!(self.shape, Shape::Order { .. } | Shape::Grid) {
-            allowances.push(crate::replay::shared_memory_notice());
-        }
-        allowances
+        tile_notice_allowances()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -816,20 +795,17 @@ impl Case for TileThreadgroups {
 
 #[cfg(test)]
 mod tests {
-    //! The cross-check the port owes the lane: the words Metal's own threads wrote, as the
-    //! recordings hold them, against the lane's formulas for where Metal places a tile
-    //! threadgroup's threads.
+    //! The cross-check: the words Metal's own threads wrote, as the recordings hold them, against
+    //! the formulas for where Metal places a tile threadgroup's threads.
     //!
-    //! The formulas are the lane's (`runtime_lane/tile_threadgroups.rs`), restated here because a
-    //! conformance case may not depend on the validation crate. They are the claim under test, not
-    //! a helper: if a recorded word disagrees with one, either Apple moved or the lane's model was
-    //! never Metal's, and the test says which thread.
+    //! The formulas are the claim under test, not a helper: if a recorded word disagrees with one,
+    //! either Apple moved or the model was never Metal's, and the test says which thread.
 
     use super::*;
     use crate::recording::Recording;
     use crate::transcript::{Node, Transcript};
 
-    /// The lane's `position`: Metal's place of lane `lane` of simdgroup `simdgroup` in a 32x32 tile
+    /// `position`: Metal's place of lane `lane` of simdgroup `simdgroup` in a 32x32 tile
     /// threadgroup. Two columns 16 wide; a column's simdgroup `s` is its 8x4 block
     /// `(s mod 2, s / 2)`, and lane `l` is thread `l mod 4` of the block's quad `l / 4`.
     fn position(simdgroup: u32, lane: u32) -> (u32, u32) {
@@ -841,13 +817,13 @@ mod tests {
         )
     }
 
-    /// The lane's `thread_index`: Metal's `thread_index_in_threadgroup` of (`x`, `y`) in a 32-wide
+    /// `thread_index`: Metal's `thread_index_in_threadgroup` of (`x`, `y`) in a 32-wide
     /// tile threadgroup.
     fn thread_index(x: u32, y: u32) -> u32 {
         ((y / 2) * (SIDE / 2) + x / 2) * 4 + (y % 2) * 2 + x % 2
     }
 
-    /// The lane's `quad_order`: Metal's quad order of a threadgroup of `qw` by `qh` 2x2 quads.
+    /// `quad_order`: Metal's quad order of a threadgroup of `qw` by `qh` 2x2 quads.
     fn quad_order(qw: u32, qh: u32) -> Vec<(u32, u32)> {
         let mut order = Vec::new();
         for c0 in (0..qw).step_by(8) {
@@ -914,10 +890,10 @@ mod tests {
         words(node).into_iter().map(f32::from_bits).collect()
     }
 
-    /// Metal's own 32x32 tile threadgroup, as the recording holds it, is the lane's formula: every
+    /// Metal's own 32x32 tile threadgroup, as the recording holds it, is the formula: every
     /// thread's record at the index the formula gives, and every cell added one once.
     #[test]
-    fn the_recorded_32x32_threadgroup_is_the_lanes_formula() {
+    fn the_recorded_32x32_threadgroup_is_the_formula() {
         let recorded = only_outcome("tile-order-32x32");
         let records = words(at(&recorded, "case/32x32/records"));
         for simdgroup in 0..SIDE {
@@ -941,10 +917,10 @@ mod tests {
         }
     }
 
-    /// Metal's threadgroups of even sides, as the recording holds them, are the lane's quad order,
+    /// Metal's threadgroups of even sides, as the recording holds them, are the quad order,
     /// and the cells outside a threadgroup keep what they held.
     #[test]
-    fn the_recorded_even_threadgroups_are_the_lanes_quad_order() {
+    fn the_recorded_even_threadgroups_are_the_quad_order() {
         let recorded = only_outcome("tile-order-even-threadgroups");
         for shape in EVEN_SHAPES {
             let [w, h] = shape[0];
@@ -988,7 +964,7 @@ mod tests {
     }
 
     /// Metal's tile-sized threadgroup, as the recording holds it, answers the tile as its
-    /// threadgroup and stages every cell of it, which is the lane's claim.
+    /// threadgroup and stages every cell of it.
     #[test]
     fn the_recorded_tile_sized_threadgroup_answers_the_tile() {
         let recorded = only_outcome("tile-grid-threadgroup-is-the-tile");
@@ -1056,50 +1032,6 @@ mod tests {
         }
     }
 
-    /// A dispatch the **bind stage** refuses because the device's threadgroup is too small is the
-    /// device's gap, not ours, so the verdict is `LacksFeature`.
-    ///
-    /// This is the shape lavapipe gives the SIMD blur: its emulated 32-lane simdgroups take 960
-    /// threads of that pipeline, so the 32x32 tile threadgroup Metal runs is refused by
-    /// `check_local` with `Feature::LocalSize` and a `Capability::Limit`. Before the classifier
-    /// read `Error::Bind`, that refusal was neither announced nor counted as a device gap, which
-    /// is exactly what the `LacksFeature` verdict exists to prevent: a venue that honestly cannot
-    /// run a case must be its own outcome rather than a failure or a pass.
-    ///
-    /// The other direction is the half that keeps the fix honest: what the bind stage has **not
-    /// built** stays ours to answer for, so the two mesh rows of `known-gaps.tsv`, whose
-    /// errors are `Error::Bind(Unsupported(MeshShading, NotImplemented))`, remain refusals.
-    #[test]
-    fn a_dispatch_the_device_cannot_take_is_the_devices_gap() {
-        use metal2vulkan::error::{BindError, Feature, RuntimeDriverDefect, Unsupported};
-        use metal2vulkan_runtime::Error;
-        // `Capability`'s payload vocabulary is private to the translator, so a `Needs::AnyOf`
-        // cannot be built from here; the test states the other device-gap `Needs` instead. What
-        // the classifier reads is the `Needs` and the variant that carries it, not which
-        // capability, so this is the same claim.
-        let limited = Unsupported::runtime_driver_defect(
-            Feature::LocalSize { axis: None },
-            RuntimeDriverDefect::NormalizedDepthPastUnitRange,
-        );
-        let lacks = crate::verdict::device_gap(&Error::Bind(BindError::Unsupported(limited)));
-        assert!(
-            lacks
-                .as_deref()
-                .is_some_and(|why| why.contains("LocalSize")),
-            "{lacks:?}"
-        );
-        // Not built is not the device's gap, whichever variant carries it.
-        let not_built = Unsupported::not_implemented(Feature::MeshShading);
-        assert_eq!(
-            crate::verdict::device_gap(&Error::Bind(BindError::Unsupported(not_built.clone()))),
-            None
-        );
-        assert_eq!(
-            crate::verdict::device_gap(&Error::Unsupported(not_built)),
-            None
-        );
-    }
-
     /// Every case of the family states its inputs and its tile descriptors, and loosens **only**
     /// its notices site, by a degrade notice it names.
     ///
@@ -1121,16 +1053,9 @@ mod tests {
             assert_eq!(case.metal_source(), MetalSource::Run);
             case.shaders().unwrap();
             let allowances = case.allowances();
-            // Every case declares the family's own list, and the five that read a record buffer
-            // back declare the notice a device's own memory model provokes besides. Nothing else
-            // is named and nothing is loosened, so a value tolerance added later fails here.
-            let reads_a_buffer = matches!(case.shape, Shape::Order { .. } | Shape::Grid);
-            assert_eq!(
-                allowances.len(),
-                TILE_PASS_NOTICES.len() + usize::from(reads_a_buffer),
-                "{}",
-                case.name()
-            );
+            // Every case declares the family's own list. Nothing else is named and nothing is
+            // loosened, so a value tolerance added later fails here.
+            assert_eq!(allowances.len(), TILE_PASS_NOTICES.len(), "{}", case.name());
             for allowance in &allowances {
                 assert_eq!(
                     allowance.path,
@@ -1141,10 +1066,8 @@ mod tests {
                 assert_eq!(allowance.loosening, Loosening::Unchecked, "{allowance:?}");
                 match &allowance.justified_by {
                     Justification::Degradation(code) => assert!(
-                        TILE_PASS_NOTICES.iter().any(|kind| kind.code() == code)
-                            || code == Degradation::SharedInSystemMemory.code(),
-                        "{}: {code} is neither a tile-pass notice nor the one a device's own \
-                         memory model provokes",
+                        TILE_PASS_NOTICES.iter().any(|kind| kind.code() == code),
+                        "{}: {code} is not a tile-pass notice",
                         case.name()
                     ),
                     other => panic!("{}: an unexpected tolerance: {other:?}", case.name()),

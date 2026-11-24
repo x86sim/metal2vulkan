@@ -2,7 +2,7 @@
 //!
 //! - Dynamic-index kernels whose `i64` GEP indices are `zext`/`sext` of an `i1`, `i8`, `i16`, or
 //!   `i32` value (a loaded index, negative ones included, and `thread_position_in_grid`) compile
-//!   on `vk12-floor` (no `shaderInt64`) and `moltenvk-m3`, in both containment encodings, pass
+//!   on `runtime-floor` without `shaderInt64` (below the runtime's floor) and `moltenvk-m3`, pass
 //!   L3, select the empty `arith.index_extension` strategy, and compute byte-exact results on the
 //!   CPU interpreter.
 //! - An extension defined in another block than its GEPs (the loop-kernel shape: the index is
@@ -11,10 +11,8 @@
 //!   loop-header phi used after the loop, which reads the phi's value from the last iteration even
 //!   when the latch has already written the next one.
 //! - An `i64` index that is not such an extension (a 64-bit load, a shift right of the extended
-//!   value) is a 64-bit value: `moltenvk-m3` holds it as a `u64`, `vk12-floor` as two words, and
-//!   both compile it exactly.
-//! - Push fields that overflow a kernel's push window are read exactly from the stage's
-//!   `ArgumentTable` uniform buffer, whose descriptor counts in the stage's limits.
+//!   value) is a 64-bit value: `moltenvk-m3` holds it as a `u64`, `runtime-floor` without
+//!   `shaderInt64` as two words, and both compile it exactly.
 //!
 //! `llvm-as` assembles the kernels; without it the tests skip visibly.
 
@@ -25,7 +23,7 @@ use crate::device::requirements::VkFeature;
 use crate::device::{Device, DeviceDescription, DevicePolicy, DeviceProfile};
 use crate::lower::select::Plan;
 use crate::pipeline::interface::PushLoc;
-use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage, SyntheticBinding};
+use crate::pipeline::sym::{PushField, ResourceKind, ResourceSlot, Stage};
 use crate::pipeline::testing::{
     compile, link_and_validate, llvm_assemble, typed_module, AssembleError,
 };
@@ -34,38 +32,40 @@ use crate::spirv::interp::{run, Buffer, Config, Resources};
 
 const HEADER: &str = "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32\"\ntarget triple = \"air64_v28-apple-macosx26.0.0\"\n\n";
 
-/// A profile without and one with `shaderInt64`.
-const PROFILES: [&str; 2] = ["vk12-floor", "moltenvk-m3"];
+/// `runtime-floor` without `shaderInt64`: below the runtime's floor, a device that holds a 64-bit
+/// value as two words.
+const NO_INT64: &str = "runtime-floor without shaderInt64";
 
-/// Committed profile `stem`, optionally with buffer robustness disabled (the in-shader encoding).
-fn profile_with(stem: &str, robust: bool) -> DeviceProfile {
+/// A profile without and one with `shaderInt64`.
+const PROFILES: [&str; 2] = [NO_INT64, "moltenvk-m3"];
+
+/// Committed profile `stem` (or [`NO_INT64`]'s device).
+fn profile_with(stem: &str) -> DeviceProfile {
+    let file = if stem == NO_INT64 {
+        "runtime-floor"
+    } else {
+        stem
+    };
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../metal2vulkan-validation/profiles")
-        .join(format!("{stem}.json"));
+        .join(format!("{file}.json"));
     let text = std::fs::read_to_string(path).expect("profile");
     let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("description");
-    if !robust {
-        desc.features.remove(&VkFeature::RobustBufferAccess);
-        desc.features.remove(&VkFeature::RobustBufferAccess2);
+    if stem == NO_INT64 {
+        desc.features.remove(&VkFeature::ShaderInt64);
     }
-    Device::new(desc, DevicePolicy::default())
+    Device::from_queries(desc, DevicePolicy::RESIDENT_TABLES)
         .expect("device")
         .profile()
         .clone()
 }
 
-/// Every tested profile in both encodings.
-fn encodings() -> Vec<(String, DeviceProfile)> {
-    let mut out = Vec::new();
-    for stem in PROFILES {
-        for robust in [true, false] {
-            out.push((
-                format!("{stem} robust={robust}"),
-                profile_with(stem, robust),
-            ));
-        }
-    }
-    out
+/// Every tested profile.
+fn profiles() -> Vec<(String, DeviceProfile)> {
+    PROFILES
+        .into_iter()
+        .map(|stem| (stem.to_owned(), profile_with(stem)))
+        .collect()
 }
 
 fn assemble_text(name: &str, text: &str) -> Option<Vec<u8>> {
@@ -338,7 +338,7 @@ fn extended_loaded_indices_are_exact_without_int64() {
         let Some(bc) = assemble_text(k.name, &k.text()) else {
             return;
         };
-        for (what, p) in encodings() {
+        for (what, p) in profiles() {
             let what = format!("{what} {}", k.name);
             let a = compile(&bc, k.name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
             let names: Vec<&String> = a.strategies.entries.keys().collect();
@@ -382,7 +382,7 @@ fn a_grid_position_index_is_exact_without_int64() {
     let Some(bc) = assemble_text("grid_copy", &kernel("grid_copy", body, ("uint", 4), true)) else {
         return;
     };
-    for (what, p) in encodings() {
+    for (what, p) in profiles() {
         let a = compile(&bc, "grid_copy", &p).unwrap_or_else(|e| panic!("{what}: {e}"));
         assert!(
             a.strategies.entries.contains_key("arith.index_extension"),
@@ -430,7 +430,7 @@ fn an_extension_used_after_a_loop_is_exact_without_int64() {
         let Some(bc) = assemble_text(name, &loop_kernel(name, ext, tid)) else {
             return;
         };
-        for (what, p) in encodings() {
+        for (what, p) in profiles() {
             let what = format!("{what} {name}");
             let a = compile(&bc, name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
             let names: Vec<&String> = a.strategies.entries.keys().collect();
@@ -536,7 +536,7 @@ fn an_extension_of_a_loop_header_phi_used_after_the_loop_is_exact() {
             } else {
                 &[0, 5]
             };
-            for (what, p) in encodings() {
+            for (what, p) in profiles() {
                 let what = format!("{what} {name}");
                 let a = compile(&bc, &name, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
                 assert!(
@@ -592,7 +592,7 @@ type WideCase = (
 );
 
 /// An `i64` index that is not an index extension is a 64-bit value. `moltenvk-m3` holds it as a
-/// native `u64`; `vk12-floor` has no `shaderInt64` and holds it as two words. Both compile it and
+/// native `u64`; [`NO_INT64`] has no `shaderInt64` and holds it as two words. Both compile it and
 /// read the element exactly.
 #[test]
 fn an_i64_index_that_is_not_an_extension_is_a_64_bit_value() {
@@ -617,8 +617,8 @@ fn an_i64_index_that_is_not_an_extension_is_a_64_bit_value() {
         let Some(bc) = assemble_text(name, &kernel(name, body, params, false)) else {
             return;
         };
-        for stem in ["vk12-floor", "moltenvk-m3"] {
-            let p = profile_with(stem, true);
+        for stem in PROFILES {
+            let p = profile_with(stem);
             assert_eq!(p.fields().leaf.int64, stem == "moltenvk-m3");
             let a = compile(&bc, name, &p).unwrap_or_else(|e| panic!("{name} {stem}: {e}"));
             assert!(
@@ -637,129 +637,6 @@ fn an_i64_index_that_is_not_an_extension_is_a_64_bit_value() {
                 run(&m, &Config::default(), res).unwrap_or_else(|e| panic!("{name} {stem}: {e:?}"));
             let at = usize::try_from(index * 4).expect("in range");
             assert_eq!(out.buffers[1][..4], data[at..at + 4], "{name} {stem}");
-        }
-    }
-}
-
-/// A kernel storing `i + 1` to element `t` of each of 31 `device uint *` buffers
-/// (`thread_position_in_grid` `t`, one index extension feeding every GEP).
-fn many_slots_kernel() -> String {
-    let n = 31;
-    let params: Vec<String> = (0..n)
-        .map(|i| format!("ptr addrspace(1) noundef \"air-buffer-no-alias\" %{i}"))
-        .collect();
-    let mut body = format!("  %e = zext i32 %{n} to i64\n");
-    for i in 0..n {
-        body.push_str(&format!(
-            "  %p{i} = getelementptr inbounds i32, ptr addrspace(1) %{i}, i64 %e\n  store i32 {}, ptr addrspace(1) %p{i}, align 4\n",
-            i + 1
-        ));
-    }
-    let mut meta = String::new();
-    let mut refs = Vec::new();
-    for i in 0..n {
-        let id = 100 + i;
-        refs.push(format!("!{id}"));
-        meta.push_str(&format!(
-            "!{id} = !{{i32 {i}, !\"air.buffer\", !\"air.location_index\", i32 {i}, i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"b{i}\"}}\n"
-        ));
-    }
-    refs.push("!99".to_owned());
-    format!(
-        "{HEADER}define void @many_slots({}, i32 noundef %{n}) {{\nentry:\n{body}  ret void\n}}\n\n\
-         !air.kernel = !{{!9}}\n!air.version = !{{!17}}\n!air.language_version = !{{!18}}\n\
-         !9 = !{{ptr @many_slots, !10, !11}}\n!10 = !{{}}\n!11 = !{{{}}}\n{meta}\
-         !99 = !{{i32 {n}, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"t\"}}\n\
-         !17 = !{{i32 2, i32 8, i32 0}}\n!18 = !{{!\"Metal\", i32 4, i32 0, i32 0}}\n",
-        params.join(", "),
-        refs.join(", ")
-    )
-}
-
-/// The bind residual the test gives buffer `i`.
-fn residual(i: u32) -> u32 {
-    4 * (i % 3)
-}
-
-/// 31 residuals and the dispatch region overflow the 128-byte kernel window, so the last seven
-/// `SlotBindOffset`s are placed in the `ArgumentTable`. The table is one more uniform descriptor,
-/// declared at `Synthetic(ArgumentTable)`, and its fields are read exactly: every buffer, bound at
-/// its own residual, gets its stores at elements `t` and nothing else changes.
-#[test]
-fn push_fields_in_the_argument_table_are_read_exactly() {
-    let Some(bc) = assemble_text("many_slots", &many_slots_kernel()) else {
-        return;
-    };
-    let table_slot = ResourceSlot {
-        stage: Stage::Kernel,
-        kind: ResourceKind::Synthetic(SyntheticBinding::ArgumentTable),
-        index: 0,
-    };
-    for stem in ["lavapipe", "moltenvk-m3", "lunarg-desktop-baseline-2023"] {
-        for robust in [true, false] {
-            let what = format!("{stem} robust={robust}");
-            let p = profile_with(stem, robust);
-            let a = compile(&bc, "many_slots", &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            let spilled: Vec<PushField> = a
-                .interface
-                .push
-                .fields
-                .iter()
-                .filter(|f| matches!(f.loc, PushLoc::ArgumentTable { .. }))
-                .map(|f| f.field)
-                .collect();
-            assert_eq!(spilled.len(), 7, "{what}: {spilled:?}");
-            assert_eq!(a.interface.push.argument_table_size, 32, "{what}");
-            let (table, _) = link_and_validate(&a, &p).unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert!(table.bindings.contains_key(&table_slot), "{what}");
-            let (plan, m) = typed_module(&bc, "many_slots", &p).expect("module");
-            assert_eq!(plan.descriptors.uniform_buffers, 1, "{what}");
-            let mut push = vec![0u8; 128];
-            let mut args = vec![0u8; plan.push.argument_table_size as usize];
-            for f in &plan.push.fields {
-                let v = match f.field {
-                    PushField::SlotBindOffset(s) => residual(s.index),
-                    // `MultiRegion` is 0: the region is not read.
-                    PushField::DispatchRegion => continue,
-                    other => panic!("{what}: unexpected {other:?}"),
-                };
-                let (bytes, at) = match f.loc {
-                    PushLoc::Push { offset } => (&mut push, offset as usize),
-                    PushLoc::ArgumentTable { offset } => (&mut args, offset as usize),
-                };
-                bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
-            }
-            let mut buffers: Vec<Buffer> = (0..31u32)
-                .map(|i| {
-                    let mut bytes = vec![0xEEu8; residual(i) as usize];
-                    bytes.extend_from_slice(&pattern(16));
-                    bound(i, &bytes)
-                })
-                .collect();
-            let before: Vec<Vec<u8>> = buffers.iter().map(|b| b.bytes.clone()).collect();
-            buffers.push(Buffer {
-                slot: Some(table_slot),
-                address: None,
-                bytes: args,
-            });
-            let res = Resources {
-                buffers,
-                push,
-                spec: Default::default(),
-            };
-            let cfg = Config {
-                workgroups: [2, 1, 1],
-                ..Config::default()
-            };
-            let out = run(&m, &cfg, res).unwrap_or_else(|e| panic!("{what}: {e:?}"));
-            for i in 0..31u32 {
-                let mut want = before[i as usize].clone();
-                for t in 0..2usize {
-                    let at = residual(i) as usize + 4 * t;
-                    want[at..at + 4].copy_from_slice(&(i + 1).to_le_bytes());
-                }
-                assert_eq!(out.buffers[i as usize], want, "{what} buffer {i}");
-            }
         }
     }
 }

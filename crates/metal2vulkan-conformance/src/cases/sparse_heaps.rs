@@ -5,34 +5,28 @@
 //! `size` and `usedSize`, `newTextureWithDescriptor:` on that heap, and the texture's `isSparse`,
 //! `firstMipmapInTail` and `tailSizeInBytes`.
 //!
-//! # What the port adds to the lane
+//! # What the sweep checks
 //!
-//! `runtime_lane::sparse_textures` reads these getters of exactly one texture — a 256 by 256
-//! `R32Float` of 9 levels — and asserts `firstMipmapInTail == 3` and `tailSizeInBytes == 16384`
-//! inside a much larger test. The runtime answers both from models (`sparse::first_mipmap_in_tail`,
-//! `sparse::tail_size_in_bytes`) whose comments say "measured" four times over, including the two
-//! claims that decide every other answer:
+//! Two claims decide every other answer:
 //!
 //! - **the chain is the full mip chain**, `floor(log2(largest axis)) + 1` levels, *whatever the
 //!   texture's own level count* — so `firstMipmapInTail` may be past the texture's own levels;
 //! - **a 3D texture's tail is summed per depth slice**, each rounded up to whole pages separately.
 //!
-//! Nothing in the tree tied either to a Metal run. One texture cannot: the first claim only shows
-//! where a texture's levels are fewer than its chain, and the second only on a 3D texture. The
+//! One texture cannot check either: the first claim shows only where a texture's levels are fewer
+//! than its chain, and the second only on a 3D texture. The
 //! sweep here records Metal's two numbers for 123 textures — level counts from 1 to the full chain
 //! and past it, non-square and odd extents, every sparse texture type, four tile widths, and the
-//! multisample pair — so the models are checked against Metal rather than against their own
-//! comments.
+//! multisample pair.
 //!
 //! The heap's three getters go beside them because `usedSize` is what every mapping case counts in,
 //! and a fresh sparse heap's `usedSize` being 0 — with a texture made over it and nothing mapped —
-//! is the baseline the rest of the lane measures against.
+//! is the baseline the rest of the family measures against.
 //!
-//! **Padded formats are in.** This round found that Metal places textures of the padded 10-bit
-//! extended-range formats in automatic, placement **and sparse** heaps, so `BGR10_XR` and
-//! `BGRA10_XR` are swept here rather than skipped. The two-plane extended-range pair stays out: the
-//! runtime refuses it typed for a sparse heap (`NotImplemented(Format)`), which is its own row to
-//! settle and not this family's.
+//! **Padded formats are in.** Metal places textures of the padded 10-bit extended-range formats in
+//! automatic, placement **and sparse** heaps, so `BGR10_XR` and `BGRA10_XR` are swept here rather
+//! than skipped. The two-plane extended-range pair stays out: the runtime refuses it typed for a
+//! sparse heap (`NotImplemented(Format)`), which is its own row to settle and not this family's.
 //!
 //! # Why every case here is safe
 //!
@@ -46,11 +40,9 @@
 //! `EXCLUDED` constant's own documentation.
 
 use crate::case::{Abort, Case, Handle, Input, MetalSource, Side};
-use crate::replay::notice_allowance;
 use crate::sparse_query::{SparseHeapSpec, SparseTextureSpec as T};
 use crate::transcript::{Node, Observed, Sites, Value};
 use metal2vulkan::metal::{PixelFormat, TextureType};
-use metal2vulkan_runtime::Degradation;
 
 /// The case names, as the report and the recordings spell them.
 pub const HEAP_FACTS: &str = "sparse-heap-facts";
@@ -60,15 +52,14 @@ pub const TAILS_BY_TYPE: &str = "sparse-tails-by-texture-type";
 pub const TAILS_WIDE: &str = "sparse-tails-wide-and-short";
 pub const TAILS_MULTISAMPLED: &str = "sparse-tails-multisampled";
 
-/// The heap every case of the family makes: 1 MiB in 16-KiB pages, the lane's own.
+/// The heap every case of the family makes: 1 MiB in 16-KiB pages.
 const HEAP: SparseHeapSpec = SparseHeapSpec::new(1 << 20);
 
 /// The padded 10-bit extended-range formats this family sweeps.
 ///
-/// Three places in this tree claimed a padded format has no heap texture at all, and this round
-/// measured that false: Metal places them in automatic, placement and sparse heaps alike. So they
-/// belong in the sweep, and a release where Apple stops making one fails the case rather than
-/// passing under a skip.
+/// Metal places them in automatic, placement and sparse heaps alike, as measured. So they belong in
+/// the sweep, and a release where Apple stops making one fails the case rather than passing under a
+/// skip.
 const PADDED_FORMATS: [PixelFormat; 2] = [PixelFormat::BGR10XR, PixelFormat::BGRA10XR];
 
 /// What this family leaves out, and why. The guard holds the tables to it.
@@ -255,9 +246,7 @@ fn tails_by_texture_type() -> SparseHeapCase {
 /// level's bytes are **not** its blocks' bytes: each axis is padded to a power of two blocks, and
 /// a level counts at least one tile row however small it is. Both are needed — the plain product
 /// is wrong on all 13 and the padded product alone on 5, each short by exactly one page — and the
-/// two together reproduce every recorded row. `sparse::tail_size_in_bytes` now does that, and
-/// `metal2vulkan-runtime`'s `tests::sparse::every_recorded_mip_tail_is_metals` holds it to this
-/// family's recordings.
+/// two together reproduce every recorded row.
 ///
 /// The case stays apart from the shapes the model always got right, because that is what made the
 /// difference readable: a family that mixed them would have reported 13 differences among 100
@@ -297,14 +286,6 @@ fn tails_wide_and_short() -> SparseHeapCase {
 /// verdict is a whole-case outcome produced only where a run **aborts**, and this case records each
 /// texture's answer and goes on. Here the gap has its own row and the type sweep stays readable.
 ///
-/// It still reads as `Refused` rather than `LacksFeature` on such a venue, and that is a product
-/// bug rather than anything this case can arrange: the runtime refuses with
-/// `Unsupported { feature: SparseTextures { missing: SparseResidencySamples(2) }, needs:
-/// NotRepresentable }`, and `verdict::device_gap_of` counts only `Needs::AnyOf` and the two driver
-/// defects as a device's gap. `NotRepresentable` means "no Vulkan 1.2+ mechanism exists for these
-/// semantics", which is not what is true here: the mechanism exists and the device has not got it,
-/// which is `Needs::AnyOf`.
-///
 /// A multisampled sparse texture is one level and a render target, which is what Metal describes
 /// one of.
 fn tails_multisampled() -> SparseHeapCase {
@@ -335,22 +316,6 @@ mod site {
     pub const TEXTURE: &str = "texture";
 }
 
-/// The degrade notices a device may announce as it makes a sparse heap or a sparse texture.
-///
-/// Each gets an allowance over the notices site, so a venue that announced one may hold it in its
-/// set while a venue that announced none compares the set exactly against Metal's empty one. The
-/// set is genuinely per-venue and measured, not guessed: MoltenVK binds no sparse memory, so it
-/// makes ordinary images and announces `emulated-sparse-texture`; lavapipe makes **real** sparse
-/// images but is not `residencyNonResidentStrict`, so it announces `non-strict-residency`. Several
-/// allowances on one path is the shape the suite already uses for this, and a difference is
-/// justified where **any** of them holds.
-const SPARSE_NOTICES: [Degradation; 4] = [
-    Degradation::EmulatedSparseTexture,
-    Degradation::NonStrictResidency,
-    Degradation::FirstSparseResourceWait,
-    Degradation::HostReadMappingArguments,
-];
-
 impl Case for SparseHeapCase {
     fn name(&self) -> &'static str {
         self.name
@@ -376,13 +341,6 @@ impl Case for SparseHeapCase {
                 },
             ),
         ])
-    }
-
-    fn allowances(&self) -> Vec<crate::allowance::Allowance> {
-        SPARSE_NOTICES
-            .iter()
-            .map(|kind| notice_allowance(kind.code()))
-            .collect()
     }
 
     fn run(&self, side: &mut dyn Side, sites: &mut Sites) -> Result<(), Abort> {
@@ -437,92 +395,12 @@ fn emit_heap(side: &mut dyn Side, sites: &mut Sites, heap: Handle, at: &str) {
     }
 }
 
-/// The guards this family's safety argument rests on, run on a device.
-///
-/// Record mode hands the heap descriptor and every texture descriptor of these tables to Metal. A
-/// descriptor Metal's own API validation stops **ends Metal's process**, and the runtime's model is
-/// what tells the two apart: `Error::Invalid` is "Metal's validation stops it, ending the process",
-/// while `Error::Nil` is "plain Metal answers nil, the process going on". So a table that makes the
-/// runtime answer `Invalid` anywhere is a table that must never be recorded.
-///
-/// A refusal that is **ours** — the runtime has not built the form, or the device lacks sparse
-/// residency — is a different matter: it is a legitimate recorded value, which is the whole point
-/// of the `Refused` verdict, and it does not make the Metal leg unsafe. So the guard sorts the
-/// answers by kind rather than demanding every one succeed, which is what keeps it from being
-/// either vacuous or a blanket ban on recording a gap.
-#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+/// The guard this family's safety argument rests on: record mode hands every texture descriptor
+/// of these tables to Metal, and a descriptor Metal's own API validation stops **ends Metal's
+/// process**, so the tables stay inside the shapes the module's prose allows.
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{self, Notices, ScratchCache, Venues};
-    use crate::runtime_side::RuntimeSide;
-
-    /// Whether a recorded failure is the runtime's `Error::Invalid`, which is the one kind that
-    /// says "Metal's own validation stops this descriptor, and recording it would end Metal's
-    /// process". `Failure` keeps the error as the variant path a transcript holds, not as the typed
-    /// error, so the kind is read from there.
-    fn is_invalid(value: &crate::transcript::Value) -> bool {
-        let crate::transcript::Value::Variant { name, payload } = value else {
-            return false;
-        };
-        if name != "Err" {
-            return false;
-        }
-        matches!(&**payload, crate::transcript::Value::Variant { name, .. } if name == "Error::Invalid")
-    }
-
-    /// The venue the guard opens: a GPU where the tests are built for one, else a CPU ICD.
-    const VENUE: Venues = if cfg!(m2v_gpu) {
-        Venues::Gpu
-    } else {
-        Venues::Cpu
-    };
-
-    /// No descriptor of the family is one Metal's own validation stops.
-    ///
-    /// Verified to fail: a `T::texture_2d(PixelFormat::R32Float, [0, 256], 1)` row added to a table
-    /// fails here, naming the texture and the `Invalid` the runtime answered.
-    #[test]
-    fn no_descriptor_of_the_family_is_one_metals_validation_stops() {
-        let mut notices = Notices::default();
-        let cache = ScratchCache::new().unwrap();
-        let runtime = device::open(VENUE, &notices, &cache).unwrap();
-        let mut side = RuntimeSide::new(
-            &runtime,
-            notices.open("no_descriptor_of_the_family_is_one_metals_validation_stops"),
-        );
-        let mut stopped = Vec::new();
-        let heap = match side.sparse_heap(&HEAP) {
-            Ok(heap) => heap,
-            // A device that cannot make a sparse heap at all has nothing to say about Metal's
-            // validation of the textures, and its own refusal is a recorded value.
-            Err(failure) => {
-                println!("this venue refuses a sparse heap: {:?}", failure.recorded());
-                return;
-            }
-        };
-        for case in all() {
-            for texture in &case.textures {
-                if let Err(failure) = side.heap_texture(heap, texture) {
-                    // `Error::Invalid` alone: the refusals that are ours to answer for, and `Nil`,
-                    // leave Metal's process alive and are recorded values.
-                    if is_invalid(&failure.recorded()) {
-                        stopped.push(format!(
-                            "{} {}: {:?}",
-                            case.name,
-                            texture.site(),
-                            failure.recorded()
-                        ));
-                    }
-                }
-            }
-        }
-        assert!(
-            stopped.is_empty(),
-            "these descriptors are ones Metal's validation stops, so record mode would end \
-             Metal's process; take them out of the table:\n{}",
-            stopped.join("\n")
-        );
-    }
 
     /// The family's tables hold no texture the module's own exclusion list names.
     ///

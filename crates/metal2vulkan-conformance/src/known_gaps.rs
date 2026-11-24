@@ -46,15 +46,30 @@
 //!
 //! A row is held only against the cases a run selected, so replaying one case does not read every
 //! other row as fixed.
+//!
+//! # Typed reasons
+//!
+//! Three reasons are the ledger's own vocabulary ([`Reason`]), stated at the head of a row's last
+//! field: `refused: not built yet (<lane>)`, a feature the streams use that a lane is building;
+//! `refused: no stream uses it yet (<census run>)`, a call replay's census found no stream using;
+//! and `refused: the consumer's own (<object>)`, one of a closed list of Metal objects and getters
+//! the runtime keeps no counterpart of by design, which its consumer implements
+//! ([`ConsumerObject`]). A row takes that reason only where the runtime's public API has no item
+//! that could answer it, and leaves it the day the runtime grows one. Every replay prints their
+//! counts ([`open_work`]): the rows not built yet are the cutover's remaining work, and the
+//! consumer's own are counted on a line of their own, outside it.
 
 use crate::case::Venue;
 use crate::replay::Replayed;
 use crate::verdict::Verdict;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The committed ledger, compiled in so the check needs no path and no filesystem: a replay run
 /// inside a container reads the same rows as one on this Mac.
-const LEDGER: &str = include_str!("../known-gaps.tsv");
+const LEDGER: &str = include_str!("../known-gaps-rt.tsv");
+
+/// The ledger's file, as a report names it.
+pub const LEDGER_FILE: &str = "known-gaps-rt.tsv";
 
 /// The venue field of a row that applies to every venue.
 pub const EVERY_VENUE: &str = "*";
@@ -128,6 +143,13 @@ pub struct KnownGap {
 }
 
 impl KnownGap {
+    /// The reason the row states, where the ledger's vocabulary names it ([`Reason`]): its
+    /// waiting-on field's head. [`parse`] refuses a malformed head, so a row read from a ledger
+    /// that names no vocabulary reason is its own words.
+    pub fn reason(&self) -> Reason {
+        Reason::of(&self.waiting_on).unwrap_or(Reason::Words)
+    }
+
     /// What identifies the row within a venue: the case, the verdict it expects, the site and the
     /// answer there.
     fn key(&self) -> (&str, Expects, &str, &str) {
@@ -154,6 +176,217 @@ impl KnownGap {
     }
 }
 
+/// The head of a row waiting on a feature the streams use that a lane is building: the lane follows
+/// in parentheses.
+const NOT_BUILT_YET: &str = "refused: not built yet";
+
+/// The head of a row waiting on a call no stream uses: the census run that found none follows in
+/// parentheses.
+const NO_STREAM_USES_IT: &str = "refused: no stream uses it yet";
+
+/// The head of a row of a Metal object or getter the runtime keeps no counterpart of, which its
+/// consumer implements: the object's name ([`ConsumerObject::name`]) follows in parentheses.
+const THE_CONSUMERS: &str = "refused: the consumer's own";
+
+/// A Metal object or getter family the runtime keeps no counterpart of by design, which its
+/// consumer implements ([`Reason::TheConsumers`]), each named in the runtime's README as the
+/// consumer's. The list is closed: a new one is the planner's ruling, not an edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConsumerObject {
+    /// `MTLRenderPassDescriptor`'s read-back of its own fields: the runtime's
+    /// `RenderPassDescriptor` is a value its consumer fills.
+    RenderPassDescriptor,
+    /// `MTLHeap` and its getters: the runtime's blocks are memory its consumer places resources
+    /// in, and no heap. A heap's size and alignment for a buffer or a texture is the device's
+    /// query, the runtime's own, and not this.
+    Heap,
+    /// `MTLComputeCommandEncoder`'s `dispatchType`: the runtime takes it as the encoder's
+    /// argument and keeps no getter.
+    DispatchType,
+    /// `MTLTexture`'s `cpuCacheMode`, `hazardTrackingMode` and `allowGPUOptimizedContents`: the
+    /// runtime's `TextureDescriptor` states none of them.
+    TextureDescriptorFields,
+    /// A pipeline state's reflection and the `MTLPipelineOption` bits a creation takes, each named:
+    /// the runtime builds no reflection and acts on no option, and its consumer builds reflection
+    /// from the library's AIR. A word with a bit Metal defines no option for is this object too:
+    /// Metal reflects under it as under `MTLPipelineOptionBindingInfo`.
+    PipelineReflection,
+    /// `MTLTexture`'s `parentTexture`, `parentRelativeLevel`, `parentRelativeSlice` and
+    /// `shareable`: the runtime's view keeps the texture whose image it reads and no getter, and
+    /// its consumer keeps the texture it made a view of and what it shared. A view's own shape and
+    /// swizzle are the runtime's, and not this.
+    TextureViewParents,
+    /// The `label` of an object or a descriptor: the runtime keeps no label on anything, and its
+    /// consumer keeps the label it set.
+    Label,
+    /// The `device` of a library or a function: the runtime's library and functions are the
+    /// translator's, which keep no device, and its consumer knows which device it made each on.
+    Device,
+    /// `MTLBinaryArchive` and a pipeline descriptor's `binaryArchives`: the consumer keeps its
+    /// archives in its own bundle, and the device's archive holds only each added function's
+    /// lookup key, so nothing of an archive reaches the runtime.
+    BinaryArchive,
+    /// `MTLResource`'s `label`, `device`, `cpuCacheMode`, `hazardTrackingMode`,
+    /// `resourceOptions`, `heap`, `heapOffset` and `isAliasable`: the runtime's buffers and
+    /// textures keep none of them, and its consumer answers each from what it holds. `label`
+    /// echoes the label the program set; `cpuCacheMode`, `hazardTrackingMode` and
+    /// `resourceOptions` echo the options or descriptor the program made the resource with, each
+    /// default resolved by the consumer; `device` and `heap` are the consumer's own objects, the
+    /// device it made the resource on and the heap it placed it in; `heapOffset` is where the
+    /// consumer's own placement put the resource, and `isAliasable` is what the consumer's own
+    /// record of `makeAliasable` holds. A resource's `storageMode` is the runtime's, and not this.
+    ResourceGetters,
+}
+
+impl ConsumerObject {
+    /// Every object, in the order the count line names them.
+    pub const ALL: [ConsumerObject; 10] = [
+        ConsumerObject::RenderPassDescriptor,
+        ConsumerObject::Heap,
+        ConsumerObject::DispatchType,
+        ConsumerObject::TextureDescriptorFields,
+        ConsumerObject::PipelineReflection,
+        ConsumerObject::TextureViewParents,
+        ConsumerObject::Label,
+        ConsumerObject::Device,
+        ConsumerObject::BinaryArchive,
+        ConsumerObject::ResourceGetters,
+    ];
+
+    /// The name a row states in its parentheses.
+    pub const fn name(self) -> &'static str {
+        match self {
+            ConsumerObject::RenderPassDescriptor => "MTLRenderPassDescriptor",
+            ConsumerObject::Heap => "MTLHeap",
+            ConsumerObject::DispatchType => "dispatchType",
+            ConsumerObject::TextureDescriptorFields => {
+                "cpuCacheMode, hazardTrackingMode, allowGPUOptimizedContents"
+            }
+            ConsumerObject::PipelineReflection => {
+                "MTLComputePipelineReflection, MTLRenderPipelineReflection, \
+                 MTLPipelineOptionFailOnBinaryArchiveMiss, MTLPipelineOptionArgumentInfo, \
+                 MTLPipelineOptionBufferTypeInfo, MTLPipelineOptionBindingInfo"
+            }
+            ConsumerObject::TextureViewParents => {
+                "parentTexture, parentRelativeLevel, parentRelativeSlice, shareable"
+            }
+            ConsumerObject::Label => "label",
+            ConsumerObject::Device => "device",
+            ConsumerObject::BinaryArchive => "MTLBinaryArchive, binaryArchives",
+            ConsumerObject::ResourceGetters => {
+                "label, device, cpuCacheMode, hazardTrackingMode, resourceOptions, heap, \
+                 heapOffset, isAliasable"
+            }
+        }
+    }
+
+    /// The object a row's parenthesis names, or why it names none of the list.
+    fn named(name: &str) -> Result<ConsumerObject, String> {
+        (Self::ALL.into_iter().find(|object| object.name() == name)).ok_or_else(|| {
+            let names: Vec<&str> = Self::ALL.iter().map(|object| object.name()).collect();
+            format!(
+                "a row of the consumer's own names one of the closed list ({}), and \"{name}\" is \
+                 none: a new one is the planner's ruling",
+                names.join("; ")
+            )
+        })
+    }
+}
+
+/// Why a row is open, where the ledger's vocabulary names it: the head of its waiting-on field,
+/// which the replay counts ([`open_work`]). Every other row's reason is its own words.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reason {
+    /// `refused: not built yet (<lane>)`: a feature the streams use that `lane` is building. The
+    /// landing that builds it deletes the row. Their count is the cutover's remaining work, and it
+    /// is zero at the cutover.
+    NotBuiltYet { lane: String },
+    /// `refused: no stream uses it yet (<census>)`: a call the census run `census` of replay's
+    /// streams found no stream using. The day a census finds a use, the row's reason becomes
+    /// [`Reason::NotBuiltYet`] with its lane.
+    NoStreamUsesIt { census: String },
+    /// `refused: the consumer's own (<object>)`: one of the closed list of Metal objects and getters
+    /// the runtime keeps no counterpart of by design ([`ConsumerObject`]). The consumer implements
+    /// what Metal's object answers, so this side has nothing of the runtime's to compare. It is
+    /// outside the cutover's count.
+    TheConsumers { object: ConsumerObject },
+    /// The row's own words: a device's own answer, what Metal does not document, and the like.
+    Words,
+}
+
+impl Reason {
+    /// The reason `waiting_on` states at its head, or why a head that names the vocabulary is
+    /// malformed: a reason without its parenthesis, or with an empty one.
+    fn of(waiting_on: &str) -> Result<Reason, String> {
+        if let Some(lane) = named_after(waiting_on, NOT_BUILT_YET)? {
+            return Ok(Reason::NotBuiltYet { lane });
+        }
+        if let Some(census) = named_after(waiting_on, NO_STREAM_USES_IT)? {
+            return Ok(Reason::NoStreamUsesIt { census });
+        }
+        if let Some(name) = named_after(waiting_on, THE_CONSUMERS)? {
+            let object = ConsumerObject::named(&name)?;
+            return Ok(Reason::TheConsumers { object });
+        }
+        Ok(Reason::Words)
+    }
+}
+
+/// The name in parentheses after `head` where `waiting_on` starts with it, `None` where it does
+/// not, and why where the parenthesis is missing or empty.
+fn named_after(waiting_on: &str, head: &str) -> Result<Option<String>, String> {
+    let Some(rest) = waiting_on.strip_prefix(head) else {
+        return Ok(None);
+    };
+    (rest.strip_prefix(" ("))
+        .and_then(|rest| rest.split_once(')'))
+        .map(|(named, _)| named.trim())
+        .filter(|named| !named.is_empty())
+        .map(|named| Some(named.to_owned()))
+        .ok_or_else(|| format!("a row waiting on \"{head}\" names who: \"{head} (<name>)\""))
+}
+
+/// What `ledger`'s typed reasons count, as two lines of a replay's report: its rows not built yet
+/// by lane, which is the cutover's remaining work, and its rows no stream uses by census run; then,
+/// on a line of their own and outside the cutover's count, its rows of the consumer's own by
+/// object.
+pub fn open_work(ledger: &[KnownGap], file: &str) -> String {
+    let mut lanes = BTreeMap::<String, usize>::new();
+    let mut censuses = BTreeMap::<String, usize>::new();
+    let mut objects = BTreeMap::<&'static str, usize>::new();
+    for row in ledger {
+        match row.reason() {
+            Reason::NotBuiltYet { lane } => *lanes.entry(lane).or_default() += 1,
+            Reason::NoStreamUsesIt { census } => *censuses.entry(census).or_default() += 1,
+            Reason::TheConsumers { object } => *objects.entry(object.name()).or_default() += 1,
+            Reason::Words => {}
+        }
+    }
+    fn each<K: std::fmt::Display>(counted: &BTreeMap<K, usize>, apart: &str) -> String {
+        match counted.is_empty() {
+            true => String::new(),
+            false => {
+                let named: Vec<String> = counted
+                    .iter()
+                    .map(|(name, n)| format!("{name} {n}"))
+                    .collect();
+                format!(" ({})", named.join(apart))
+            }
+        }
+    }
+    format!(
+        "{file}: {} row(s) not built yet{}, the cutover's remaining work; {} row(s) no stream \
+         uses yet{}\n{file}: {} row(s) the consumer's own{}, which its consumer implements and the \
+         cutover does not count",
+        lanes.values().sum::<usize>(),
+        each(&lanes, ", "),
+        censuses.values().sum::<usize>(),
+        each(&censuses, ", "),
+        objects.values().sum::<usize>(),
+        each(&objects, "; "),
+    )
+}
+
 /// Why a run is not what the ledger expects. Each of these fails the run.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expectation {
@@ -164,6 +397,10 @@ pub enum Expectation {
         expects: Expects,
         site: String,
         answer: String,
+        /// The verdict and answer of a row the ledger holds for this venue at the same case and
+        /// site, which the run did not answer: the row differs. None where no row covers this
+        /// venue there.
+        listed: Option<(Expects, String)>,
     },
     /// A listed row the run no longer holds on a venue it names: the gap looks fixed, and the row
     /// must go.
@@ -171,10 +408,50 @@ pub enum Expectation {
         gap: KnownGap,
         /// The venue it was held against.
         venue: String,
+        /// What the venue answers at the row's site now.
+        now: Now,
     },
     /// A failure the ledger has no business covering. A refusal and a divergence are the only
     /// expected gaps; an unrecorded case and a stale recording are never written down.
     NotLedgerable { case: String, why: String },
+}
+
+/// What a venue answers now at the site of a row it no longer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Now {
+    /// The case read as lacking a device feature on the venue: it ran nothing there, so nothing of
+    /// the row can hold, and no row is written for a feature the venue lacks.
+    LacksFeature,
+    /// The site holds no gap: our answer is Metal's there.
+    Matches,
+    /// The site holds another gap, which the run lists as unlisted beside this.
+    Differs,
+}
+
+impl Now {
+    /// The words a report states it in.
+    pub fn words(self) -> &'static str {
+        match self {
+            Now::LacksFeature => "now lacks the feature",
+            Now::Matches => "now matches",
+            Now::Differs => "now answers otherwise",
+        }
+    }
+}
+
+impl Expectation {
+    /// The class a summary groups this under: an unlisted gap with no row for its venue, one whose
+    /// venue's row differs, a row the venue no longer holds by what it answers now, or neither.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Expectation::Unlisted { listed: None, .. } => "no row for this card",
+            Expectation::Unlisted {
+                listed: Some(_), ..
+            } => "row differs",
+            Expectation::NoLongerHeld { now, .. } => now.words(),
+            Expectation::NotLedgerable { .. } => "not ledgerable",
+        }
+    }
 }
 
 impl std::fmt::Display for Expectation {
@@ -186,21 +463,36 @@ impl std::fmt::Display for Expectation {
                 expects,
                 site,
                 answer,
-            } => write!(
+                listed,
+            } => {
+                write!(
+                    out,
+                    "{case} on {venue} is {expects} at {site} and the known-gaps ledger does not \
+                     list it: {answer}\n  "
+                )?;
+                match listed {
+                    None => write!(out, "no row for this card")?,
+                    Some((listed, was)) => write!(
+                        out,
+                        "the row for this card differs: it expects {listed} with {was}"
+                    )?,
+                }
+                write!(
+                    out,
+                    ". A new gap: fix it, or add a row to known-gaps-rt.tsv naming the gap it \
+                     waits on"
+                )
+            }
+            Expectation::NoLongerHeld { gap, venue, now } => write!(
                 out,
-                "{case} on {venue} is {expects} at {site} and the known-gaps ledger does not list \
-                 it: {answer}\n  a new gap. Fix it, or add a row to known-gaps.tsv naming the gap \
-                 it waits on"
-            ),
-            Expectation::NoLongerHeld { gap, venue } => write!(
-                out,
-                "{} on {venue} no longer {} {}, and the known-gaps ledger still lists it\n  the \
-                 gap looks fixed: drop the row from known-gaps.tsv, or scope its venue field if it \
-                 is another venue's. The ledger must not outlive the bug it stands for.\n  the row \
-                 was waiting on: {}",
+                "{} on {venue} no longer {} {}, and the known-gaps ledger still lists it: it {}\n  \
+                 the gap looks fixed: drop the row from known-gaps-rt.tsv, or scope its venue \
+                 field if it is another venue's. The ledger must not outlive the bug it stands \
+                 for.\n  the row was waiting on: {}",
                 gap.case,
                 gap.expects.verb(),
                 gap.site,
+                now.words(),
                 gap.waiting_on
             ),
             Expectation::NotLedgerable { case, why } => write!(
@@ -233,6 +525,7 @@ impl Expectation {
                 expects,
                 site,
                 answer,
+                ..
             } => Some(format!(
                 "{case}\t{venue}\t{expects}\t{site}\t{answer}\t{UNWRITTEN}"
             )),
@@ -241,7 +534,7 @@ impl Expectation {
     }
 }
 
-/// The committed ledger's rows.
+/// The committed ledger's rows: what a replay is held to.
 pub fn ledger() -> Result<Vec<KnownGap>, String> {
     parse(LEDGER)
 }
@@ -260,31 +553,33 @@ pub fn parse(text: &str) -> Result<Vec<KnownGap>, String> {
         let fields: Vec<&str> = line.split('\t').collect();
         let [case, venue, expects, site, answer, waiting_on] = fields.as_slice() else {
             return Err(format!(
-                "known-gaps.tsv line {at}: {} tab-separated fields, and a row has six: the case, \
-                 the venue ({EVERY_VENUE} for every venue), the verdict it expects (refused or \
-                 divergent), the site, our answer there and the gap it waits on",
+                "known-gaps-rt.tsv line {at}: {} tab-separated fields, and a row has six: the \
+                 case, the venue ({EVERY_VENUE} for every venue), the verdict it expects \
+                 (refused or divergent), the site, our answer there and the gap it waits on",
                 fields.len()
             ));
         };
         let Some(expects) = Expects::of(expects.trim()) else {
             return Err(format!(
-                "known-gaps.tsv line {at}: {case} expects {expects:?}, and a row expects either \
+                "known-gaps-rt.tsv line {at}: {case} expects {expects:?}, and a row expects either \
                  refused — a call plain Metal answered and we did not — or divergent, a field that \
                  differs with nothing announced to justify it"
             ));
         };
         if venue.trim().is_empty() {
             return Err(format!(
-                "known-gaps.tsv line {at}: {case} names no venue. A row that holds everywhere says \
-                 so with {EVERY_VENUE}, because an empty field reads as a row nobody scoped"
+                "known-gaps-rt.tsv line {at}: {case} names no venue. A row that holds everywhere \
+                 says so with {EVERY_VENUE}, because an empty field reads as a row nobody scoped"
             ));
         }
         if waiting_on.trim().is_empty() {
             return Err(format!(
-                "known-gaps.tsv line {at}: {case} names no gap. A row is an open bug, so it says \
-                 what Metal does, what we do instead, and where the fix belongs"
+                "known-gaps-rt.tsv line {at}: {case} names no gap. A row is an open bug, so it \
+                 says what Metal does, what we do instead, and where the fix belongs"
             ));
         }
+        Reason::of(waiting_on.trim())
+            .map_err(|why| format!("known-gaps-rt.tsv line {at}: {case}: {why}"))?;
         rows.push(KnownGap {
             case: case.trim().to_owned(),
             venue: venue.trim().to_owned(),
@@ -331,12 +626,19 @@ pub fn against(rows: &[Replayed], ledger: &[KnownGap]) -> Vec<Expectation> {
                     && gap.key() == (case, *expects, site.as_str(), answer.as_str())
             });
             if !listed {
+                let listed = ledger
+                    .iter()
+                    .find(|gap| {
+                        gap.covers_venue(&row.venue) && gap.case == *case && gap.site == *site
+                    })
+                    .map(|gap| (gap.expects, gap.answer.clone()));
                 found.push(Expectation::Unlisted {
                     case: row.case.clone(),
                     venue: row.venue.label(),
                     expects: *expects,
                     site: site.clone(),
                     answer: answer.clone(),
+                    listed,
                 });
             }
         }
@@ -355,9 +657,17 @@ pub fn against(rows: &[Replayed], ledger: &[KnownGap]) -> Vec<Expectation> {
                 (*case, *expects, site.as_str(), answer.as_str()) == gap.key()
             });
             if !still {
+                let now = if matches!(row.verdict, Verdict::LacksFeature { .. }) {
+                    Now::LacksFeature
+                } else if gaps.iter().any(|(_, _, site, _)| *site == gap.site) {
+                    Now::Differs
+                } else {
+                    Now::Matches
+                };
                 found.push(Expectation::NoLongerHeld {
                     gap: gap.clone(),
                     venue: row.venue.label(),
+                    now,
                 });
             }
         }

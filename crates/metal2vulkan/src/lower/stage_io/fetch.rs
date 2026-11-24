@@ -50,9 +50,9 @@
 //! alignment the shader can rely on: Metal's minimum alignment of a layout stride and an
 //! attribute offset is 1 byte on Apple5 and later (4 bytes only on Apple2-Apple4; Metal feature
 //! set tables), and the projection pulls the attributes whose offset or stride fixed-function input
-//! could not align (and every attribute where the profile has no buffer robustness). They are
-//! contained like any descriptor access (the normative in-shader check when the profile has no
-//! buffer robustness, reading at offset 0 and yielding zero bytes out of bounds) and decoded
+//! could not align (and every attribute outside the identity domains). They are contained like
+//! any descriptor access (the normative in-shader check, reading at offset 0 and yielding zero
+//! bytes out of bounds) and decoded
 //! ([`Encoding`]): integers zero- or sign-extended by the format's signedness, normalized integers
 //! by the device's product of the code and its maximum's reciprocal (`c · float(1 / (2^b - 1))`,
 //! signed `max(c · float(1 / (2^(b-1) - 1)), -1)`, within one `f32` ulp of Metal's correctly
@@ -98,7 +98,6 @@ use crate::lower::arith::{narrow, ops, FloatFmt, Form, Held};
 use crate::lower::dispatch;
 use crate::lower::emit::EmitCx;
 use crate::lower::select::SelectCx;
-use crate::memory::contain::{self, Check};
 use crate::memory::leaf::{k32, Leaf, Path};
 use crate::metal::{VertexFormat, VertexStepFunction};
 use crate::pipeline::facts::RuntimeFact;
@@ -434,7 +433,6 @@ pub struct PulledRead {
     pub stride: Stride,
     /// The parameter's form.
     pub form: Form,
-    pub check: Check,
 }
 
 impl PulledRead {
@@ -607,6 +605,9 @@ pub(super) fn select(
     // A view's read adds the bind residual; `access::finish_slots` drops the field for a source
     // buffer it reaches by device address, as for any slot.
     cx.push.insert(PushField::SlotBindOffset(s));
+    // The fetch reads at the vertex's or instance's offset, which is not a translation-time
+    // constant.
+    crate::lower::access::note_variable(cx, s, false, true);
     cx.facts
         .insert(RuntimeFact::VertexFetch { attr: attribute });
     // The access family chooses the source buffer's slot, its facts, and its descriptor.
@@ -629,7 +630,6 @@ pub(super) fn select(
         step,
         stride: Stride::Push(PushField::VertexBufferStride(buffer)),
         form,
-        check: contain::encoding(cx.profile),
     })
 }
 
@@ -852,8 +852,7 @@ fn components(fb: &mut FunctionBuilder<'_>, e: Encoding, raw: SValue) -> BResult
 ///   stored unchanged keeps the field's own bits, as Metal's does.
 /// - `PrecisionNote::DeviceVertexConversion` where the decode's normalized product
 ///   ([`normalized`]) differs from Metal's fetch at some code ([`product_differs`]): the product
-///   is the module's arithmetic, not the fixed-function conversion
-///   `DriverDeviation::MetalNormalizedVertexFetch` measures.
+///   is the module's arithmetic, not the fixed-function conversion.
 pub(crate) fn decode_notes(cx: &mut SelectCx<'_>, encoding: Encoding, form: Form) {
     use crate::pipeline::artifact::PrecisionNote;
     if encoding.widens_narrow_float() && form.float_fmt() == Some(FloatFmt::F32) {
@@ -1007,7 +1006,7 @@ pub(super) fn emit(
             let within = fb.glsl(GlslOp::UMin, &[at, last])?;
             let n = k32(fb, index.bytes)?;
             let m = fb.binary(BinOp::IMul, within, n)?;
-            let read = pulled::prepare(cx, fb, index.buffer, m, index.bytes, r.check)?;
+            let read = pulled::prepare(cx, fb, index.buffer, m, index.bytes)?;
             let element = read.load(fb, &index.leaf())?;
             Some(fb.binary(BinOp::IAdd, element, origin)?)
         }
@@ -1071,8 +1070,8 @@ pub(super) fn emit(
     };
     let m = displacement(fb, element, r.offset)?;
     let read = match fits {
-        Some(fits) => pulled::prepare_within(cx, fb, r.buffer, m, fits, n, r.check)?,
-        None => pulled::prepare(cx, fb, r.buffer, m, n, r.check)?,
+        Some(fits) => pulled::prepare_within(cx, fb, r.buffer, m, fits, n)?,
+        None => pulled::prepare(cx, fb, r.buffer, m, n)?,
     };
     fetch_from(fb, read, r.encoding, r.form)
 }

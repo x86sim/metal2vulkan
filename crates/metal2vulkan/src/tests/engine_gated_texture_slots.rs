@@ -33,8 +33,7 @@ use crate::device::{Device, DeviceDescription, DevicePolicy};
 use crate::error::Error;
 use crate::library::{CompiledFunction, FunctionConstantValue, FunctionConstantValues, Library};
 use crate::metal::DataType;
-use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::sym::{SlotClass, Stage};
+use crate::pipeline::sym::SlotClass;
 use crate::pipeline::testing::{link_and_validate, llvm_assemble, AssembleError};
 use crate::pipeline::{FunctionDescriptor, LoweringInputs};
 use crate::Budget;
@@ -157,7 +156,7 @@ fn device(stem: &str) -> Device {
         .join(format!("{stem}.json"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let description = DeviceDescription::from_khronos_json(&text, None).expect(stem);
-    Device::new(description, DevicePolicy::default()).expect(stem)
+    Device::from_queries(description, DevicePolicy::RESIDENT_TABLES).expect(stem)
 }
 
 /// Profiles that bind textures by descriptor and by heap index.
@@ -278,8 +277,8 @@ fn a_write_through_the_left_out_summed_texture_is_dropped() {
     }
 }
 
-/// A query of the left-out texture is an absent read: Metal gives it no value, so the kernel marks
-/// the command buffer where it runs and takes zero, and the left-out texture takes no slot.
+/// A query of the left-out texture is an absent read: Metal gives it no value, so the kernel takes
+/// zero, states no fact, and the left-out texture takes no slot.
 #[test]
 fn a_read_through_the_left_out_texture_is_an_absent_read() {
     let reading = COMMON
@@ -302,14 +301,6 @@ fn a_read_through_the_left_out_texture_is_an_absent_read() {
             return;
         };
         let compiled = compiled.unwrap_or_else(|e| panic!("{stem}: {e:?}"));
-        let fact = RuntimeFact::AbsentArgumentRead {
-            stage: Stage::Kernel,
-        };
-        assert!(
-            compiled.artifact().facts.contains(&fact),
-            "{stem}: {:?}",
-            compiled.artifact().facts
-        );
         link_and_validate(compiled.artifact(), device.profile())
             .unwrap_or_else(|e| panic!("{stem}: L3: {e:?}"));
         let slots: Vec<u32> = compiled

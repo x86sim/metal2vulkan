@@ -69,7 +69,6 @@
 //!
 //! [`Side::compute_pipeline_for_commands`]: crate::case::Side::compute_pipeline_for_commands
 
-use crate::allowance::Allowance;
 use crate::case::{made, Abort, Case, Failure, Handle, Input, MetalSource, Side};
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::indirect_commands::{ComputeCommandStep, EncodedCommand, IcbDescriptor};
@@ -77,7 +76,6 @@ use crate::recording::ShaderRef;
 use crate::render::RenderWork;
 use crate::transcript::{ByteLayout, Digest, Element, Node, Observed, Sites};
 use metal2vulkan::metal::IndirectCommandType;
-use metal2vulkan_runtime::Degradation;
 
 /// The owned fixture whose kernel writes `params[0] * (tid + 1) + params[1]` to `out[tid]`.
 const FIXTURE: &str = "icb_replay_template";
@@ -180,14 +178,6 @@ impl Call {
     /// Whether the call needs a second buffer of its own to land in.
     const fn has_destination(self) -> bool {
         matches!(self, Call::Copy)
-    }
-
-    /// Whether the call writes a buffer's records on the GPU, which makes the runtime replay a
-    /// later execution of them through its host step and announce it once.
-    ///
-    /// The optimize call records nothing, so it alone does not.
-    const fn replays_on_the_host(self) -> bool {
-        matches!(self, Call::Reset | Call::Copy)
     }
 
     /// The piece of work the call encodes over `leg`, out of the leg's source buffer and, where
@@ -328,39 +318,6 @@ impl Case for BlitIndirectCommands {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every byte of every leg's output compares exactly, on this venue and under this
-        // declaration: the only site loosened is the set of notices, which Metal holds empty.
-        //
-        // Measured on this Apple M3 Max through MoltenVK 1.4.2: the reset and the copy cases
-        // announce `host-replayed-indirect-commands`, because the runtime replays an execution of
-        // commands the **GPU** wrote through its host step, and these two calls write a buffer's
-        // records on the GPU as the command buffer runs. The optimize case records nothing on the
-        // GPU, so it announces nothing and declares nothing — a declaration no run was measured
-        // provoking is a declaration nobody checked.
-        //
-        // The allowance fails the case if the notice did not fire, so a call that stops replaying
-        // on the host has to drop this line rather than carry a stale excuse.
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 3 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        let mut named = vec![crate::replay::shared_memory_notice()];
-        if self.call.replays_on_the_host() {
-            named.push(crate::replay::notice_allowance(
-                Degradation::HostReplayedIndirectCommands.code(),
-            ));
-        }
-        named
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

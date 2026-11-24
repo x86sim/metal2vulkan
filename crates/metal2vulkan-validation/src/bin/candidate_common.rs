@@ -2,7 +2,7 @@ use metal2vulkan_validation::candidate::{engine, exit_status};
 use metal2vulkan_validation::check::admission::ExecutorError;
 use metal2vulkan_validation::gpu::wait::{parse_wait_timeout, set_wait_timeout};
 use metal2vulkan_validation::gpu::DeviceType;
-use metal2vulkan_validation::observation::Backend;
+use metal2vulkan_validation::observation::CandidateStatus;
 use metal2vulkan_validation::source::corpus_root;
 use metal2vulkan_validation::store::CorpusStore;
 use metal2vulkan_validation::worker::alloc::CountingAllocator;
@@ -16,10 +16,10 @@ use std::path::PathBuf;
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-pub fn main(backend: Backend) {
+pub fn main() {
     serve_if_requested();
     device::serve_if_requested();
-    match run(backend) {
+    match run() {
         Ok(()) => {}
         Err(ExecutorError::Refused(refused)) => {
             println!("{refused}");
@@ -42,13 +42,13 @@ pub fn main(backend: Backend) {
             std::process::exit(exit_status::VENUE_MISMATCH);
         }
         Err(ExecutorError::Failed(error)) => {
-            eprintln!("corpus-{}: {error}", backend.directory());
+            eprintln!("corpus-vulkan: {error}");
             std::process::exit(1);
         }
     }
 }
 
-fn run(backend: Backend) -> Result<(), ExecutorError> {
+fn run() -> Result<(), ExecutorError> {
     let mut root = corpus_root();
     let mut case_id = None;
     let mut air_sha256 = None;
@@ -56,8 +56,6 @@ fn run(backend: Backend) -> Result<(), ExecutorError> {
     let mut environment_id = None;
     let mut device_type = None;
     let mut profiles_layer = None;
-    let mut robustness_off = false;
-    let mut without_generated_commands = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,18 +76,15 @@ fn run(backend: Backend) -> Result<(), ExecutorError> {
                 device_type = Some(DeviceType::parse(&required(&mut args, "--device-type")?)?)
             }
             "--profiles-layer" => profiles_layer = Some(required(&mut args, "--profiles-layer")?),
-            "--robustness-off" => robustness_off = true,
-            "--without-generated-commands" => without_generated_commands = true,
             "--gpu-wait-timeout" => set_wait_timeout(parse_wait_timeout(&required(
                 &mut args,
                 "--gpu-wait-timeout",
             )?)?)?,
             "-h" | "--help" => {
                 println!(
-                    "usage: corpus-{} [--corpus DIR] [--private-corpus DIR] --case-id HASH --metal-environment-id ID --environment-id ID --device-type cpu|gpu \\\n\
+                    "usage: corpus-vulkan [--corpus DIR] [--private-corpus DIR] --case-id HASH --metal-environment-id ID --environment-id ID --device-type cpu|gpu \\\n\
                      [--air-sha256 HASH] [--source-index FILE] \\\n\
-                     [--gpu-wait-timeout SECONDS] [--profiles-layer P] \\\n\
-                     [--robustness-off] [--without-generated-commands]\n\
+                     [--gpu-wait-timeout SECONDS] [--profiles-layer P]\n\
                      cpu matches only a CPU Vulkan implementation.\n\
                      --air-sha256 HASH, the case's AIR, reads the case from only the case shard HASH\n\
                      selects (refused if the case there is over another AIR); without it every case\n\
@@ -106,6 +101,8 @@ fn run(backend: Backend) -> Result<(), ExecutorError> {
                      case it cannot run as not_supported{{...}} (exit 4). The device half runs\n\
                      in a child of this executable; a child a signal ends is\n\
                      device_crash{{SIGNAL}} (exit 5).\n\
+                     A row that differs from Metal's exits 1: Mismatch, or NotedDifference\n\
+                     where its bytes differ under precision notes that can explain a difference.\n\
                      --profiles-layer P: run on the device restricted to the committed\n\
                      profile validation/profiles/P.json through VK_LAYER_KHRONOS_profiles, after\n\
                      checking that the device has P and reports exactly P; the row records the layer\n\
@@ -114,19 +111,11 @@ fn run(backend: Backend) -> Result<(), ExecutorError> {
                      states (robustBufferAccess, robustBufferAccess2, robustImageAccess,\n\
                      robustImageAccess2), so the product compiles the robust containment encodings,\n\
                      and a case is not_supported{{not_enabled}} (exit 4) on a device that cannot enable\n\
-                     one it states. --robustness-off enables none of them, so the\n\
-                     product compiles the in-shader encodings; the row is stored in the slot's\n\
-                     +robustness-off form (ID@engine+robustness-off, ID@engine@P+robustness-off).\n\
-                     It enables VK_EXT_device_generated_commands where the device supports it,\n\
-                     so an indirect command buffer's device replay is the extension's token stream.\n\
-                     --without-generated-commands leaves it disabled, so the\n\
-                     replay records one indirect dispatch per command and region (K14c's path); the run is\n\
-                     compared and printed but not stored: the slot holds the default's evidence.\n\
+                     one it states.\n\
                      The executor compares only against the case's Metal observation in the\n\
                      --metal-environment-id environment recorded by the current oracle for the\n\
                      checked case; without one it reports needs_metal_qualification{{...}} (exit 6)\n\
-                     before any device opens.",
-                    backend.directory()
+                     before any device opens."
                 );
                 return Ok(());
             }
@@ -146,39 +135,39 @@ fn run(backend: Backend) -> Result<(), ExecutorError> {
     if let Some(profile) = &profiles_layer {
         metal2vulkan_validation::candidate::restrict_devices_to(profile)?;
     }
-    if robustness_off {
-        metal2vulkan_validation::candidate::run_robustness_off()?;
-    }
-    if without_generated_commands {
-        metal2vulkan_validation::candidate::run_without_generated_commands()?;
-    }
     let observation = engine::execute(
         &root,
         case,
         device_type,
-        backend,
         &metal_environment_id,
         &environment_id,
         &CompileWorker::current()?,
     )?;
     println!(
-        "{:?} {} candidate_output_sha256={}",
-        observation.status, observation.case_id, observation.candidate_output_sha256
+        "{:?} {} candidate_output_sha256={}{}",
+        observation.status,
+        observation.case_id,
+        observation.candidate_output_sha256,
+        observation
+            .held_open_by
+            .map(|gap| format!(" held_open_by={}", gap.as_str()))
+            .unwrap_or_default()
     );
-    if without_generated_commands {
-        println!(
-            "not stored: --without-generated-commands slot={} command_replay={}",
-            observation.environment_id,
-            observation
-                .environment
-                .get("command_replay")
-                .unwrap_or(&serde_json::Value::Null)
-        );
+    if let Some(withheld) = observation.environment.get("withheld_validation_messages") {
+        println!("withheld validation messages: {withheld}");
     }
-    if observation.status == metal2vulkan_validation::observation::CandidateStatus::Mismatch {
-        return Err("candidate output does not match the exact Metal observation".into());
+    match observation.status {
+        CandidateStatus::Match => Ok(()),
+        CandidateStatus::Mismatch => {
+            Err("candidate output does not match the exact Metal observation".into())
+        }
+        CandidateStatus::NotedDifference => Err(format!(
+            "candidate output differs from the Metal observation under the notes of {:?}, which \
+             can explain a difference: a noted difference, never a match",
+            observation.comparison
+        )
+        .into()),
     }
-    Ok(())
 }
 
 fn required(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

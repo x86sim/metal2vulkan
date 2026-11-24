@@ -24,21 +24,10 @@
 //! | [`RENDER_DRAWN`] | two render commands that **rasterize**, each with a vertex and a fragment buffer of its own, into one 8 by 8 target, one of them behind a barrier |
 //! | [`LEFT_RENDER_STATES`] | nine descriptors, one property each, whose buffers are made and never executed |
 //!
-//! # What the rows announce, and on which venue
+//! # What Metal's own API validation says
 //!
-//! Measured on this Apple M3 Max through MoltenVK 1.4.2 and on lavapipe, replaying each row
-//! against its recording: **one** row announces notices, and five announce nothing at all.
-//!
-//! - [`RENDER_DRAWN`] announces `render-pass-split` on both venues, for the barrier its command 1
-//!   keeps: the runtime draws an indirect render command with a barrier in a render pass instance
-//!   of its own. Every texel of the row compared exactly on both venues, so the notice is the whole
-//!   difference the row has and its declaration loosens no value.
-//! - The five other rows announced nothing on either venue, and **declare nothing**. A declaration
-//!   no run was measured provoking is a declaration nobody checked, so none of them carries one,
-//!   however plausible the note would be for its shape.
-//!
-//! Metal's own API validation is the other axis, and it disagrees with plain Metal twice here —
-//! which is the whole reason the recording keeps it:
+//! Metal's own API validation disagrees with plain Metal twice here, which is the whole reason
+//! the recording keeps it:
 //!
 //! - [`RENDER_DRAWN`]: `setBarrier` and `clearBarrier` on a buffer without mesh draws are
 //!   reported ("requires DrawMeshThreadgroups or DrawMeshThreads") while plain Metal takes them
@@ -89,7 +78,6 @@
 //! - **`gpuResourceID`** and the rows a kernel encodes are [`super::mesh_commands`]' gap, named
 //!   there.
 
-use crate::allowance::{Allowance, Justification, Loosening};
 use crate::case::STAGE_OBJECT;
 use crate::case::{
     call, made, Abort, Case, Failure, Handle, Input, MeshFunctions, MetalSource, Side,
@@ -434,21 +422,6 @@ impl Case for ComputeCommands {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // the 5 rows of the family the card could run, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shaders_of(COMPUTE_FIXTURE, COMPUTE_FIXTURE)
     }
@@ -620,13 +593,6 @@ impl Case for ImageblockCommands {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // As every row of the family: the answer is read back through a `Shared` buffer, so a
-        // device without unified memory announces `shared-in-system-memory` and the declaration
-        // covers the notices site alone, leaving every value compared exactly.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -820,21 +786,6 @@ impl Case for StageInCommand {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // the 5 rows of the family the card could run, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1061,21 +1012,6 @@ impl Case for RenderCommands {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // the 5 rows of the family the card could run, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shaders_of(RENDER_FIXTURE, RENDER_FIXTURE)
     }
@@ -1182,9 +1118,8 @@ impl Case for RenderCommands {
 /// lengths.
 pub const MESH_OBJECT_LENGTHS: &str = "indirect-mesh-commands-object-threadgroup-lengths";
 
-/// The owned fixture the row runs, which `runtime_lane/mesh_commands.rs` measured this shape on
-/// first: an object function with threadgroup memory at arguments 0 and 1 and no size of its own
-/// for either.
+/// The owned fixture the row runs: an object function with threadgroup memory at arguments 0 and
+/// 1 and no size of its own for either.
 ///
 /// Its thread 0 writes `0xb` into `b[0]`, then `0xa` into `a[0..63]`, then `b[0]` into word 0 of
 /// object buffer 0 and `a[63]` into word 1. So the **length** is what the words read back: where
@@ -1206,8 +1141,7 @@ const OBJECT_LENGTH_FUNCTIONS: MeshFunctions<'static> = MeshFunctions {
 ///
 /// The first keeps `a` off `b` and the second does not, so the two commands answer differently
 /// with everything else about them equal: a side that set one command's lengths for both, or none
-/// at all, cannot answer both rows. Taken from the lane's own measurement on this M3 Max under
-/// macOS 27.0.1.
+/// at all, cannot answer both rows. Measured on an Apple M3 Max under macOS 27.0.1.
 const OBJECT_LENGTHS: [[u32; 2]; 2] = [[256, 16], [16, 16]];
 
 /// Words one command's slice of the object buffer holds: the function writes words 0 and 1 of its
@@ -1233,9 +1167,8 @@ const OBJECT_LENGTH_SIDE: u32 = 4;
 ///
 /// One object thread because the function's barriers lie where its thread 0 alone reaches them,
 /// which both Metal's and Vulkan's rules allow only where every thread of the threadgroup reaches
-/// them. The lane measured this M3 Max answering alike with 1 thread and with 32, and an NVIDIA
-/// GPU waiting at them for good with 32, so the row states the one count that is defined
-/// everywhere.
+/// them. Measured: an Apple M3 Max answers alike with 1 thread and with 32, and an NVIDIA GPU waits
+/// at them for good with 32, so the row states the one count that is defined everywhere.
 const OBJECT_LENGTH_DRAW: RenderCommandStep = RenderCommandStep::DrawMeshThreadgroups {
     groups: [1, 1, 1],
     object: [1, 1, 1],
@@ -1290,16 +1223,6 @@ impl Case for ObjectLengthCommands {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // A mesh pass's notices, plus the host step a device announces for commands it draws
-        // itself, both named by kind in `mesh_draws`; and the shared-memory note every row of this
-        // family carries, since the answer is read back through a `Shared` buffer. Each declares a
-        // notices site alone, so every value still compares against Metal's exactly.
-        let mut allowances = super::mesh_draws::mesh_notice_allowances();
-        allowances.push(crate::replay::shared_memory_notice());
-        allowances
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1582,13 +1505,6 @@ impl Case for StrideCommands {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // As every row of the family: the answer is read back through a `Shared` buffer, so a
-        // device without unified memory announces `shared-in-system-memory` and the declaration
-        // covers the notices site alone, leaving every value compared exactly.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shaders_of(STRIDE_FIXTURE, STRIDE_FIXTURE)
     }
@@ -1847,23 +1763,6 @@ fn drawn_layout() -> ByteLayout {
 /// The row whose two render commands rasterize into a target.
 pub struct DrawnCommands;
 
-/// The notices this family was measured announcing, and the row each was measured on.
-///
-/// One, [`RENDER_DRAWN`]'s, and **every texel of the row still compared exactly** — the notice is
-/// the whole difference the row has, so the declaration names a code and loosens no value.
-///
-/// - **`render-pass-split`**, announced on **both** venues: the runtime draws the barrier
-///   command 1 of the row keeps in a render pass instance of its own
-///   (`metal2vulkan_runtime`'s `render/executions.rs`).
-///
-/// The row's `RGBA8Unorm` store is the device's own conversion, a native note the suite declares
-/// for every case ([`crate::replay::NATIVE_NOTES`]).
-///
-/// The other five rows were measured announcing **nothing** on either venue, and **declare
-/// nothing**: a declaration no run was measured provoking is a declaration nobody checked.
-const DRAWN_NOTICES: [metal2vulkan_runtime::Degradation; 1] =
-    [metal2vulkan_runtime::Degradation::RenderPassSplit];
-
 impl Case for DrawnCommands {
     fn name(&self) -> &'static str {
         RENDER_DRAWN
@@ -1871,29 +1770,6 @@ impl Case for DrawnCommands {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // the 5 rows of the family the card could run, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        std::iter::once(crate::replay::shared_memory_notice())
-            .chain(DRAWN_NOTICES.iter().map(|kind| {
-                Allowance::new(
-                    format!("case/{}/*", crate::replay::NOTICES_SITE),
-                    Loosening::Unchecked,
-                    Justification::notice(*kind),
-                )
-            }))
-            .collect()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -2119,14 +1995,6 @@ impl Case for DescriptorProperties {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Nothing: the case reads a descriptor's own properties back, never a buffer, so the
-        // notice a card without unified memory announces for a `Shared` buffer cannot reach it.
-        // Measured exact on the RTX 5080 Laptop (615.71.09) and on llvmpipe, which is why it
-        // declares nothing where the other five rows of the family declare the venue's notice.
-        Vec::new()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

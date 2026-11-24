@@ -32,8 +32,8 @@
 //! `finish`), the slots' forms, extra transport, and push-table support
 //! (`access::finish_slots`, `access::accept_placement`), and the accumulators of [`SelectCx`]:
 //! descriptor counts per kind ([`DescriptorCounts`]), the simd class, and tangled instructions.
-//! The generic checks over those accumulators (per-stage descriptor limits, the subgroup tier,
-//! the size estimate) stay here.
+//! The generic checks over those accumulators (per-stage descriptor limits and the subgroup
+//! tier) stay here.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,7 +55,6 @@ use crate::error::{
     Capability, DiagName, Error, Feature, InternalError, InternalKind, LowerFamily, Unsupported,
 };
 use crate::lower::dispatch::DispatchPlan;
-use crate::lower::estimate::{self, SizeEstimate};
 use crate::lower::push;
 use crate::lower::strategy::{FamilyStrategy, Strategy};
 use crate::lower::{
@@ -65,9 +64,9 @@ use crate::lower::{
 use crate::memory::static_root::{self, MemoryPlan};
 use crate::pipeline::artifact::{PrecisionNote, SpecClause, SpecTest, SpecializedNote};
 use crate::pipeline::facts::RuntimeFact;
-use crate::pipeline::interface::{AccessSet, BufferForm, PushPlacement, Window};
+use crate::pipeline::interface::{AccessSet, BufferForm, PushLoc, PushPlacement, Window};
 use crate::pipeline::lower_inputs::LoweringInputs;
-use crate::pipeline::sym::{PushField, SlotRef, SpecKey, Stage};
+use crate::pipeline::sym::{PushField, SlotClass, SlotRef, SpecKey, Stage};
 use crate::spirv::ids::{DemoteTy, ScalarTy};
 
 /// The per-function lowering inputs: exactly the public projection that is part of the compile key.
@@ -401,7 +400,6 @@ pub struct Plan {
     /// The notes of `precision` an access keeps only on the arms its specialization selects,
     /// with their conditions ([`resolve_notes`]).
     pub specialized: Vec<SpecializedNote>,
-    pub estimate: SizeEstimate,
     /// The private memory a thread keeps, in bytes, as selection holds it to the device's
     /// Function storage (`MemoryPlan::private_bytes`).
     pub private_bytes: u64,
@@ -465,11 +463,6 @@ impl Plan {
         {
             tally(&mut out, name.into(), 0, words);
         }
-        // The barriers a device's lockstep stands for: uses, no words.
-        let device = self.families.simd.device_lockstep;
-        if device != 0 {
-            tally(&mut out, simd::DEVICE_LOCKSTEP.into(), device, 0);
-        }
         // A kernel emulated in place of the widest mode's pin: one use, no words.
         if self.families.simd.widest_pin {
             tally(&mut out, simd::WIDEST_PIN.into(), 1, 0);
@@ -526,6 +519,10 @@ pub struct SelectCx<'a> {
     /// Tangled instructions (subgroup/quad ops, derivatives, implicit-LOD samples, barriers),
     /// which the families that select them add.
     pub tangled: BTreeSet<ValueId>,
+    /// The tangled instructions that read other lanes only to take derivatives: `dfdx`, `dfdy`
+    /// and `fwidth`, implicit-LOD samples and LOD queries (`lower::simd`'s module,
+    /// **Reconvergence**).
+    pub derivatives: BTreeSet<ValueId>,
     /// Each family's own plan.
     pub families: FamilyPlans,
     /// The offset shapes the access family has read while selecting this function's typed
@@ -614,8 +611,8 @@ impl SelectCx<'_> {
             // An index word is held as its low word.
             Ok(word)
         } else if access::handle::is_word(&self.families.access, v) {
-            // A handle word is held as its handle index.
-            Ok(DemoteTy::HandleIndex)
+            // A handle word is held as its handle index, or as its resource ID.
+            Ok(access::handle::word_repr(self, v))
         } else if let Some(p) = access::cell::word_pointer(self, v) {
             // A pointer word from a forwarding cell is held as its pointer.
             access::lowered_pointer(self, p)
@@ -879,7 +876,7 @@ fn route_air(cx: &SelectCx<'_>, op: &AirIntrinsic, decl: FuncId) -> Route {
                 .into(),
         ),
         A::Tensor(_) => Route::Refuse(Unsupported::not_implemented(Feature::Tensors).into()),
-        // An encoder operation writes its command's record through device addresses.
+        // An encoder operation is the access family's (`access::object`).
         A::IndirectCommand(_) => Route::Family(LowerFamily::Access),
         A::Mesh(_) => Route::Family(LowerFamily::Mesh),
         // Canonicalization makes every vector data call its element accesses.
@@ -1145,7 +1142,9 @@ pub fn selector_form(
 }
 
 /// Whether `p`'s device holds `e`'s private memory: what a driver backs with scratch, the plan's
-/// `private_bytes` (the private arena, and each typed `alloca`, call stacks among them, and each
+/// `private_bytes` (the private arena where it is not in the runtime's device memory, which a
+/// kernel's past the floor is, `memory::plan::ArenaLayout::device`; and each typed `alloca`, call
+/// stacks among them, and each
 /// constant held as a `Private` variable that an access indexes at run time), may take a thread
 /// up to `device::function_storage::ceiling`: the profile's `function_storage`, or Metal's 192 KiB
 /// for a vertex or fragment function on a device not measured. Past it the entry is
@@ -1219,10 +1218,22 @@ pub fn select(
         stage,
         values: mp.values,
         push: BTreeSet::new(),
-        // A call stack's depth, and OpenCL mode, which a compiled kernel's pipeline must match.
+        // A call stack's depth, and OpenCL mode, which a compiled kernel's pipeline must match,
+        // and the mode's 1D images, which a 1D texture bound there reads in a variant.
         facts: (e.call_stack.into_iter())
             .map(|stack| RuntimeFact::CallStackDepth { depth: stack.depth })
             .chain(inputs.open_cl_mode.then_some(RuntimeFact::OpenClMode))
+            .chain(
+                e.open_cl_1d_images
+                    .iter()
+                    .map(|&index| RuntimeFact::OpenClLineTexture {
+                        slot: SlotRef {
+                            stage,
+                            class: SlotClass::Texture,
+                            index,
+                        },
+                    }),
+            )
             .collect(),
         // Private memory past the floor of a device not measured rests on no measurement, as
         // does a group operation in a branch no measurement says Metal speculates. A rate-map
@@ -1238,6 +1249,7 @@ pub fn select(
         descriptors: DescriptorCounts::default(),
         simd: SimdClass::None,
         tangled: BTreeSet::new(),
+        derivatives: BTreeSet::new(),
         families: FamilyPlans::default(),
         shapes: access::local::Shapes::default(),
         root_sets,
@@ -1258,9 +1270,8 @@ fn select_entry(
     widest_pin: simd::WidestPin,
     m: &mut Meter,
 ) -> Result<Plan, Error> {
-    // The varyings a vertex function writes the same at every vertex of a primitive, which a
-    // fragment function of its pipeline reads flat where it interpolates them, and which decide
-    // where it stores the slice and viewport indices it writes.
+    // The user varyings a vertex function writes the same at every vertex of a primitive, which
+    // a fragment function of its pipeline reads flat where it interpolates them.
     if cx.stage == Stage::Vertex {
         cx.families.stage_io.interface.uniform_outputs =
             stage_io::uniform_varyings(cx.entry, cx.inputs, m)?
@@ -1268,15 +1279,17 @@ fn select_entry(
                 .collect();
     }
     tessellation::plan_entry(&mut cx).map_err(|e| located_param(e, &cx, None))?;
-    // The framebuffer-fetch forms first: an output to a storage-form attachment is no interface
-    // variable.
+    // The framebuffer-fetch forms first: a write the function computes over its input attachment
+    // decides its output's interface variable.
     fragment::plan_entry(&mut cx).map_err(|e| located_param(e, &cx, None))?;
     stage_io::plan_entry(&mut cx).map_err(|e| located_param(e, &cx, None))?;
     mesh::plan_entry(&mut cx).map_err(|e| located_param(e, &cx, None))?;
 
-    // Uses: which parameters are read, and the block of every use (for demotion).
+    // The strategy table, and the walk's scratch: which parameters are read, and the block of
+    // every use (for demotion).
     let n = cx.values.len();
-    let bytes = n.saturating_mul(std::mem::size_of::<Option<Strategy>>() + 8);
+    let table = n.saturating_mul(std::mem::size_of::<Option<Strategy>>());
+    let bytes = table.saturating_add(n.saturating_mul(8));
     m.charge(bytes)?;
     // The pointer phis' incoming values, once per phi, before any use reads them.
     let phis = match access::phis::plan(&cx, m) {
@@ -1299,9 +1312,16 @@ fn select_entry(
     let noted = cx.noted;
     let result = selected.and_then(|sel| finish(cx, sel, widest_pin, &mut fact_bytes, m));
     m.release(noted);
-    m.release(fact_bytes.charged());
-    m.release(bytes);
     m.release(phi_bytes);
+    // The plan holds the strategy table and the facts through emission and serialization: they
+    // stay on the ledger.
+    match &result {
+        Ok(_) => m.release(bytes - table),
+        Err(_) => {
+            m.release(bytes);
+            m.release(fact_bytes.charged());
+        }
+    }
     result
 }
 
@@ -1319,7 +1339,6 @@ struct BodySelection {
     selectors: BTreeMap<ValueId, SelectorForm>,
     cross: Vec<(ValueId, DemoteTy)>,
     phis: Vec<(ValueId, DemoteTy)>,
-    blocks: u64,
 }
 
 /// A texture or sampler family's refusal of an `air.*` call that names nothing names the
@@ -1395,7 +1414,7 @@ fn select_body(
     // The spin reads, before any atomic is selected.
     access::atomic::spin::plan(cx, m)?;
     // The indirect-command object words, before any use of one is selected.
-    access::encode::plan_objects(cx, m)?;
+    access::object::plan_objects(cx, m)?;
     // The encodings each pointer-cell slot group's loads read, before any store.
     access::cell::plan_reads(cx, m)?;
     // The primitive-data stores nothing reads back, before any store.
@@ -1403,15 +1422,10 @@ fn select_body(
     select_params(cx, &used)?;
     // The member-wise phis' representations, before any use of one is selected.
     arith::aggregate::plan_phis(cx, m)?;
-    // A blended extended-range output, whose blend the function computes by the device's
-    // arithmetic.
-    arith::output_precision::note_extended_range_sources(cx)?;
     // The `half` chains' operations held at `float` precision, before any of them is selected.
     cx.families.arith.held_at_float = arith::half_chain::plan(cx, m)?;
 
-    let mut blocks = 0u64;
     for (b, block) in body.blocks.iter() {
-        blocks += 1;
         for id in block.inst_ids() {
             m.tick(1)?;
             let inst = body
@@ -1598,13 +1612,14 @@ fn select_body(
             }
         }
     }
+    // The narrow results whose bits above their width no use reads, unmasked.
+    arith::demand::drop_unread_wraps(body, values, &mut strategy, m)?;
     phis.sort();
     Ok(BodySelection {
         strategy,
         selectors,
         cross: cross.into_iter().collect(),
         phis,
-        blocks,
     })
 }
 
@@ -1619,6 +1634,10 @@ fn finish(
     let stage = cx.stage;
     // The class of the lockstep pass's simdgroup barriers, beside the program's own.
     sync::barrier::lockstep_class(&mut cx);
+    // A kernel whose lockstep pairs the profile leaves unordered answers in the device's order.
+    if cx.entry.lockstep.unordered {
+        cx.precision.insert(PrecisionNote::SimdgroupAccessOrder);
+    }
     // Each family completes its own plan and contributes its descriptors, facts, simd class,
     // and tangled instructions before the combined checks below.
     stage_io::finish(&mut cx)?;
@@ -1630,17 +1649,16 @@ fn finish(
     access::tile::finish(&mut cx)?;
     texture::finish(&mut cx)?;
     sampler::finish(&mut cx)?;
-    // The bound texture and sampler values the function reads as data.
-    crate::lower::specialized::request(&mut cx);
     // The lane reads where some lane may not take part (a kernel's outside workgroup-uniform
     // control flow, every one of another stage), whose subgroup-tier form needs `Ballot`, before
     // the simd class selects the tier; the emulated tier reads a kernel's same analysis below.
     let uniformity = simd::partly_live(&mut cx, &sel.strategy, m)?;
-    simd::finish(&mut cx)?;
+    simd::whole_quads(&mut cx, &sel.strategy, m)?;
+    simd::finish(&mut cx, uniformity.as_ref(), m)?;
     tessellation::finish(&mut cx)?;
     sync::barrier::finish(&mut cx)?;
     sync::memory_model::finish(&mut cx)?;
-    arith::finish(&mut cx)?;
+    arith::finish(&mut cx, m)?;
 
     // An object function's partial threadgroups read its region, which a folded variant's slot
     // plan then reads from its record; so do a kernel's under its input.
@@ -1663,8 +1681,12 @@ fn finish(
     }
 
     stage_io::finish_merged(&mut cx)?;
-    let placement = push::place(stage, &cx.push);
+    let placement = push::place(stage, push::base(&cx), p.push_window(), &cx.push);
     access::accept_placement(&cx, &placement)?;
+    // On the floor every stage that pushes more than one short field ends with its tail, a hole
+    // above the others, so every load a driver widens from them stays inside its upload.
+    push::check_floor(&placement, p.push_window())
+        .map_err(|detail| Error::Internal(InternalError::new(InternalKind::Invariant, detail)))?;
 
     // A kernel compiled for dispatches with a partial simdgroup emulates its simdgroups whatever
     // tier the profile's subgroups give them, and depends on that variant. A kernel whose lockstep
@@ -1675,8 +1697,18 @@ fn finish(
     let model = &p.fields().subgroup;
     let variant = cx.inputs.emulated_simdgroups && stage == Stage::Kernel;
     let lockstep = cx.entry.lockstep.emulated && stage == Stage::Kernel;
+    // A kernel whose every cross-lane operation stays inside its quad takes its quads from the
+    // subgroup at the size the device gives, where the device's narrowest size is below 32: no
+    // pin, so no widest mode to weigh. One with compute derivatives keeps the tier its class
+    // takes: a flattened local size has no derivative quads (`dispatch::plan_kernel`).
+    let quad_free = !variant
+        && !lockstep
+        && !cx.families.barrier.compute_derivatives
+        && simd::quad_only(&sel.strategy)
+        && subgroup::quad_free(&cx.simd, stage, model);
     let widest = !variant
         && !lockstep
+        && !quad_free
         && widest_pin == simd::WidestPin::Weighed
         && simd::widest_pin(&cx, m)?;
     let mut tier = if variant || lockstep || widest {
@@ -1684,9 +1716,12 @@ fn finish(
             cx.facts.insert(RuntimeFact::EmulatedSimdgroups);
         }
         subgroup::emulated_tier(&cx.simd, stage, model)?
+    } else if quad_free {
+        Tier::Direct
     } else {
         subgroup::tier(&cx.simd, stage, model)?
     };
+    cx.families.simd.quad_free = quad_free;
     // A flat grid of the call's threadgroups returns its invocations past the grid before the
     // body (`dispatch::emit_entry`), so the rest of their workgroup cannot meet a workgroup
     // synchronization: a module that would hold one (the emulated tier's exchanges, or a
@@ -1702,7 +1737,7 @@ fn finish(
     // (`simd::divergent::barriers`); the emulated tier's exchanges are not walked so, and its
     // dispatches keep their exact split.
     if cx.inputs.partial_threadgroups && stage == Stage::Kernel && tier == Tier::Emulated {
-        return Err(Unsupported::not_implemented(Feature::GpuEncodedIndirectCommands).into());
+        return Err(Unsupported::not_implemented(Feature::PartialThreadgroups).into());
     }
     if tier == Tier::Emulated {
         match simd::workgroup::check(
@@ -1737,11 +1772,12 @@ fn finish(
     }
     // A fragment function's group operations run full quads, as Metal runs its helpers.
     simd::full_quads(&mut cx)?;
-    let requirement = SubgroupRequirement {
-        // A vertex function's subgroups its driver runs as Metal does without the stage listed: its
-        // module needs that fact in place of the stage.
-        metal_vertex_simdgroups: cx.families.simd.prefix_lane,
-        ..subgroup::requirement(tier, stage, &p.fields().subgroup)
+    // The threadgroup arena's words, now that every access and the tier are known.
+    access::local::choose_words(&mut cx, tier);
+    let requirement = if cx.families.simd.quad_free {
+        subgroup::quad_requirement(stage, &p.fields().subgroup)
+    } else {
+        subgroup::requirement(tier, stage, &p.fields().subgroup)
     };
     let dispatch = match stage {
         Stage::Kernel | Stage::Object | Stage::Mesh => Some(dispatch::plan_kernel(&mut cx, tier)?),
@@ -1752,73 +1788,8 @@ fn finish(
     cx.families.texture.absent_arm =
         texture::absent_arm(cx.entry, cx.body, &sel.strategy, cx.values, m)?;
 
-    let mut estimate = SizeEstimate::default();
-    estimate.add(estimate::MODULE_WORDS);
-    estimate.add(estimate::SLOT_WORDS.saturating_mul(descriptors.descriptors()));
-    estimate.add(estimate::PUSH_FIELD_WORDS.saturating_mul(placement.fields.len() as u64));
-    estimate.add(estimate::BLOCK_WORDS.saturating_mul(sel.blocks));
-    estimate
-        .add(estimate::VARIABLE_WORDS.saturating_mul((sel.cross.len() + sel.phis.len()) as u64));
-    for s in sel.strategy.iter().flatten() {
-        estimate.add(u64::from(s.words()));
-        // The separate form's sampled images.
-        let separate = separate_samplings(&cx.families, s);
-        estimate.add(u64::from(separate) * u64::from(sampler::SEPARATE_WORDS));
-        if tier == Tier::Emulated {
-            estimate.add(u64::from(simd::workgroup::extra_words(s)));
-        }
-    }
-    for v in &cx.families.simd.partly_live {
-        if let Some(s) = sel.strategy.get(v.index()).and_then(Option::as_ref) {
-            estimate.add(u64::from(simd::partly_live_words(s, tier)));
-        }
-    }
-    if let Some(p) = &cx.families.simd.predication {
-        estimate.add(simd::divergent::extra_words(
-            cx.body,
-            cx.values,
-            &sel.strategy,
-            p,
-        ));
-    }
-    let access = access::routine_words(&cx.families.access);
-    let heap = texture::routine_words(&cx.families.texture, &cx.families.access);
-    let sampler = sampler::routine_words(&cx.families.sampler);
-    for (_, words) in arith::routine_words(&cx.families.arith)
-        .chain(access)
-        .chain(heap)
-        .chain(sampler)
-    {
-        estimate.add(words);
-    }
-    estimate.add(stage_io::estimate_words(&cx.families.stage_io));
-    estimate.add(mesh::estimate_words(&cx.families.mesh));
-    if dispatch.as_ref().is_some_and(|d| d.flat_grid) {
-        estimate.add(dispatch::FLAT_GRID_WORDS);
-    }
-    if dispatch.as_ref().is_some_and(|d| d.folded_groups) {
-        estimate.add(dispatch::FOLDED_GROUPS_WORDS);
-    }
-    // A kernel's partial threadgroups: the test before the body, and each builtin parameter's.
-    if let Some(d) = dispatch
-        .as_ref()
-        .filter(|d| d.partial_groups && stage == Stage::Kernel)
-    {
-        let derivations = 1 + d.params.len() as u64;
-        estimate.add(dispatch::PARTIAL_THREADGROUPS_WORDS.saturating_mul(derivations));
-    }
-    estimate.add(tessellation::estimate_words(&cx.families.tessellation));
-    estimate.add(
-        cx.families
-            .access
-            .tile
-            .as_ref()
-            .map_or(0, access::tile::TilePlan::words_estimate),
-    );
-
-    let (entry, body) = (cx.entry, cx.body);
     let (precision, specialized) = resolve_notes(&cx.families, cx.precision, cx.specialized);
-    let mut plan = Plan {
+    let plan = Plan {
         stage,
         values: cx.values,
         strategy: sel.strategy,
@@ -1836,54 +1807,249 @@ fn finish(
         facts: cx.facts.into_iter().collect(),
         precision,
         specialized,
-        estimate,
         private_bytes: cx.memory.private_bytes,
     };
-    let walk = match &plan.families.simd.predication {
-        Some(p) => walk_construct_words(entry, body, &plan, p, m)?,
-        None => 0,
-    };
-    plan.estimate.add(walk);
+    if access::identity(p) {
+        identity_admits(&plan)?;
+    }
     Ok(plan)
 }
 
-/// The words the predicated walk of `plan` adds for the constructs of its structured tree
-/// (`structurize::emit::construct_words`): the tree emission builds from the same view, here
-/// built, measured and released before emission.
-fn walk_construct_words(
-    entry: &Entry,
-    body: &Body,
-    plan: &Plan,
-    p: &simd::divergent::Predication,
-    m: &mut Meter,
-) -> Result<u64, Error> {
-    let view = crate::lower::view::EntryView::new(entry, body, plan);
-    let s = crate::structurize::structurize(&view, m)?;
-    let words = crate::structurize::emit::construct_words(&s.tree, |b| p.syncs(b), m);
-    s.release(m);
-    words
+/// Whether fact `f` names state of a bound texture or sampler the identity domains do not source
+/// yet: anything but a texture's presence, its format's missing alpha and its border texels,
+/// which its resource ID holds.
+fn identity_unsourced(f: &RuntimeFact) -> bool {
+    matches!(
+        f,
+        RuntimeFact::StorageTextureFormat { .. }
+            | RuntimeFact::SamplerCoordinates { .. }
+            | RuntimeFact::SamplerReduction { .. }
+            | RuntimeFact::ImageViewShape { .. }
+            | RuntimeFact::TexelBufferRange { .. }
+            | RuntimeFact::HeapNumericType { .. }
+            | RuntimeFact::StorageTextureNumericType { .. }
+            | RuntimeFact::BicubicTexels { .. }
+            | RuntimeFact::SparseTexture { .. }
+            | RuntimeFact::SrgbTexture { .. }
+            | RuntimeFact::OpenClLineTexture { .. }
+            | RuntimeFact::SparseTextureWrites { .. }
+            | RuntimeFact::TextureSwizzle { .. }
+            | RuntimeFact::ConstantLanes { .. }
+            | RuntimeFact::ConstexprSampled { .. }
+            | RuntimeFact::CubicSampler { .. }
+            | RuntimeFact::CubicArgumentSampler { .. }
+            | RuntimeFact::HeapRawSamples { .. }
+            | RuntimeFact::CrossClassReads { .. }
+            | RuntimeFact::StorageTextureWriteRounding { .. }
+            | RuntimeFact::HeapWriteRounding { .. }
+            | RuntimeFact::HeapCrossClassNeutral { .. }
+            | RuntimeFact::HeapResidency { .. }
+            | RuntimeFact::HeapStorageReads { .. }
+            | RuntimeFact::AnisotropicSampler { .. }
+            | RuntimeFact::StorageTextureIntegerChannels { .. }
+            | RuntimeFact::TexelBufferParts { .. }
+    )
+}
+
+/// Under the identity domains on profile `p`, the plans lowered so far: a kernel, a vertex or a
+/// fragment function that reaches memory only through its buffer slots' device addresses, the
+/// device addresses it loads or makes from integers (`access::dynamic`, no root table), its
+/// textures' and runtime samplers' resource IDs and its constexpr samplers' pushed indices, with no
+/// descriptor and no state of a bound texture or sampler but its resource ID's: a texture's
+/// presence, its format's missing alpha and the border texels a read through a sampler reads
+/// (`SlotPlan::identity_lowered`, [`identity_unsourced`]). The values it reads of the encoder are
+/// pushed: the dispatch's region, a storage texture's integer channel widths, its level count
+/// and the first element of its levels' run in set 1's storage array (`PushField::TextureLevels`,
+/// `PushField::TextureLevelBase`), the compute
+/// encoder's stage-in region (`PushField::StageInRegion`), the stride of a vertex layout whose
+/// attributes the function pulls (`PushField::VertexBufferStride`): a post-tessellation function's
+/// control points and patches, and a plain vertex function's layouts that a pulled-vertex-buffer
+/// variant or the de-indexed and private list forms pull; the render encoder's alpha test
+/// reference code a fragment function under the private alpha test compares with
+/// (`PushField::AlphaTestReference`); the index of the sampled-texture array's element a
+/// fragment function reads a colour attachment through (`PushField::FetchedColor`, framebuffer
+/// fetch on a device with neither ordered form); the render pass's length, at or past which a
+/// vertex function that writes `[[render_target_array_index]]` stores `Layer` 0
+/// (`PushField::RenderTargetArrayLength`); the address of the runtime's memory that holds a
+/// kernel's private arena past the floor (`PushField::PrivateArenaAddress`); the draw's viewport
+/// count, at or past which a vertex function that writes `[[viewport_array_index]]` stores
+/// `ViewportIndex` 0 (`PushField::ViewportCount`); and a vertex function's indirect command buffer
+/// execution range and command (`PushField::IndirectRange`, `PushField::IndirectSequence`,
+/// `PushField::IndirectBase`). Its
+/// fields past the push window are a parameter block, whose address the window holds. Its refusal
+/// names the first form the plan holds that they do not lower ([`identity_refusal`]).
+fn identity_admits(plan: &Plan) -> Result<(), Error> {
+    match identity_refusal(plan) {
+        None => Ok(()),
+        Some(form) => Err(Unsupported::not_implemented(Feature::IdentityDomains)
+            .naming(DiagName::new(form))
+            .into()),
+    }
+}
+
+/// [`identity_refusal`]'s form for a 1D texture's bicubic sample.
+pub(crate) const BICUBIC_LINE_FORM: &str = "a bicubic filter of a 1D texture";
+
+/// The first form plan `plan` holds that the identity domains do not lower yet, as a Metal
+/// program reaches it, which [`identity_admits`]'s refusal names (diagnostics only); `None` where
+/// it holds none.
+fn identity_refusal(plan: &Plan) -> Option<String> {
+    if !matches!(plan.stage, Stage::Kernel | Stage::Vertex | Stage::Fragment) {
+        return Some(
+            "a function of a stage other than a kernel, vertex or fragment function".to_owned(),
+        );
+    }
+    let field = plan.push.fields.iter().find(|f| match (f.field, f.loc) {
+        (PushField::ArgumentTableAddress, loc) => !matches!(loc, PushLoc::Push { .. }),
+        (field, _) => !matches!(
+            field,
+            PushField::SlotGuestBase(_)
+                | PushField::SlotBounds(_)
+                | PushField::ZeroAddress
+                | PushField::DispatchRegion
+                | PushField::TextureIntegerChannels(_)
+                | PushField::TextureLevels(_)
+                | PushField::TextureLevelBase(_)
+                | PushField::BicubicTexels(_)
+                | PushField::ConstexprSampler(_)
+                | PushField::StageInRegion
+                | PushField::VertexBufferStride(_)
+                | PushField::AlphaTestReference
+                | PushField::FetchedColor { .. }
+                | PushField::RenderTargetArrayLength
+                | PushField::PrivateArenaAddress
+                | PushField::ViewportCount
+                | PushField::IndirectRange
+                | PushField::IndirectSequence
+                | PushField::IndirectBase
+        ),
+    });
+    if let Some(f) = field {
+        return Some(format!(
+            "an encoder value the function reads as {:?}",
+            f.field
+        ));
+    }
+    if (plan.slots.iter().flatten()).any(|c| c.form != BufferForm::Psb) {
+        return Some("a buffer argument not reached through its device address".to_owned());
+    }
+    let t = &plan.families.texture;
+    // An argument buffer's texture is the element its resource ID's index names in its class's
+    // array (`access::handle::emit_identity_handle`), with no other class to read it through and
+    // nothing from a handle-table entry but its word's out-of-bounds alpha.
+    for h in t.heap.values() {
+        if h.decl.as_ref().and_then(texture::identity_class) != h.class {
+            return Some(
+                "an argument buffer's texture of a type the identity arrays hold no element of"
+                    .to_owned(),
+            );
+        }
+        if h.raw.is_some() {
+            return Some(
+                "an argument buffer's texture read as the raw texels of an extended-range member"
+                    .to_owned(),
+            );
+        }
+        if !h.cross.is_empty() {
+            return Some(
+                "an argument buffer's texture read through another numeric type than its own"
+                    .to_owned(),
+            );
+        }
+    }
+    let lookup = plan.families.access.lookup();
+    let entry = matches!(
+        lookup,
+        crate::memory::handles::Lookup::Element
+            | crate::memory::handles::Lookup::Flagged {
+                class: false,
+                red_blue: false,
+                unreadable: false,
+                ..
+            }
+    );
+    if !entry {
+        return Some(format!(
+            "a texture handle that reads its table entry beyond its element ({lookup:?})"
+        ));
+    }
+    if !t.heap_raw.is_empty() {
+        return Some(
+            "a read of an argument buffer's texture that decodes an extended-range member"
+                .to_owned(),
+        );
+    }
+    if let Some(s) = t.slots.values().find(|s| !s.identity_lowered()) {
+        return Some(format!(
+            "texture argument {:?}: a type the identity arrays hold no element of, or state of \
+             the bound texture beyond its resource ID",
+            s.slot
+        ));
+    }
+    // Samples only of a texture slot or an argument buffer's texture through a runtime sampler
+    // slot or a constexpr sampler (`sampler::IdentitySampling`, `SamplerPlan::heap_identity`), of
+    // an argument buffer's texture through an argument buffer's sampler (its resource ID the
+    // handle, `access::handle::emit_identity_sampler`), a runtime sampler's word read from its
+    // resource ID, and a 2D texture slot's bicubic sample, the bound format's treatment read from
+    // its push field (`PushField::BicubicTexels`): no bicubic sample of a 1D texture
+    // (`Routine::Line`), and no specialization of a slot's state. Constexpr samplers a lane
+    // chooses among beside an argument buffer's texture read the set-1 sampler array at the chosen
+    // candidate's pushed index (`SamplerPlan::heap_array_identity`) or are a switch over them.
+    use crate::lower::sampler::bicubic::routines::Routine;
+    let sampled = &plan.families.sampler;
+    let refused = [
+        (
+            !(sampled.combined.iter()).all(|k| sampled.identity.contains_key(k))
+                || !sampled.decls.is_empty(),
+            "a texture argument sampled through a sampler the identity sampling does not take",
+        ),
+        (
+            sampled.bicubic_routines.contains(&Routine::Line),
+            BICUBIC_LINE_FORM,
+        ),
+        (
+            (sampled.slots.values()).any(|r| r.min_level || r.emulated),
+            "a sampler argument whose minimum level or emulated filter the function specializes",
+        ),
+    ];
+    if let Some((_, form)) = refused.iter().find(|(refused, _)| *refused) {
+        return Some((*form).to_owned());
+    }
+    if let Some(f) = plan.facts.iter().find(|f| identity_unsourced(f)) {
+        return Some(format!(
+            "state of a bound texture or sampler beyond its resource ID ({f:?})"
+        ));
+    }
+    // The module holds the blob's words (`memory::blob`) up to its bound.
+    if let Some(blob) = &plan.families.access.blob {
+        let bytes = blob.bytes.len() as u64;
+        if bytes > crate::memory::blob::MODULE_BYTES {
+            return Some(format!(
+                "constant data of {bytes} bytes read through memory"
+            ));
+        }
+    }
+    if plan.descriptors.descriptors() != 0 {
+        return Some("a resource bound through a descriptor".to_owned());
+    }
+    None
 }
 
 /// The constant a [`NoteTest`] reads: a sampler slot's `SamplerState` word or its
-/// `NearestPixelSampler` boolean, by the function's slot index, or a texture slot's
-/// `UnmeasuredTexels` boolean, or the class of the format bound at a texture slot, which no
-/// constant carries (`SpecKey::BoundTexelFormat`), or the whole word of the sampler bound at a
-/// sampler slot, which none carries either (`SpecKey::BoundSamplerWord`), or whether a texture a
-/// stage's handles can name is two-plane YCbCr (`SpecKey::HeapYCbCrTextures`) or held by its raw
-/// texels alone (`SpecKey::HeapRawTextures`), or the families of such textures whose texels may
-/// hold a NaN (`SpecKey::HeapNanFamilies`), or whether a sampler state an argument buffer can
-/// name filters (`SpecKey::FilteringArgumentSampler`), which the plan gives.
+/// `NearestPixelSampler` boolean, by the function's slot index, or the class of the format bound
+/// at a texture slot, which no constant carries (`SpecKey::BoundTexelFormat`), or the whole word
+/// of the sampler bound at a sampler slot, which none carries either (`SpecKey::BoundSamplerWord`),
+/// or whether a texture a stage's handles can name is held by its raw texels alone
+/// (`SpecKey::HeapRawTextures`), or the families of such textures whose texels may hold a NaN
+/// (`SpecKey::HeapNanFamilies`), which the plan gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NoteOn {
     Sampler(u32),
     NearestPixel(u32),
-    Unmeasured(u32),
     Bound(u32),
     BoundSampler(u32),
-    HeapYCbCr(Stage),
     HeapRaw(Stage),
     HeapNan(Stage),
-    ArgumentSamplers,
 }
 
 /// A test of one slot's specialization constant `v`: it holds where `(v & mask == bits) == equal`,
@@ -1942,12 +2108,13 @@ pub(crate) fn any_of(tests: impl IntoIterator<Item = NoteTest>) -> Vec<NoteClaus
 /// bound format class (`NoteOn::Bound`) is no constant: its test reads `SpecKey::BoundTexelFormat`,
 /// which the runtime takes from the bound texture; nor is a sampler slot's bound word
 /// (`NoteOn::BoundSampler`), whose test reads `SpecKey::BoundSamplerWord`, which the plan gives.
+/// Under the identity domains every test is `None`, so every note is static (the owner's rule 1).
 fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
+    // Under the identity domains no constant or binder decides a note: each is static.
+    if families.access.identity {
+        return None;
+    }
     let key = match t.on {
-        NoteOn::Unmeasured(index) => {
-            let s = families.texture.slots.get(&index)?;
-            s.unmeasured.then_some(SpecKey::UnmeasuredTexels(s.slot))?
-        }
         // Read from the bound texture by the runtime, never a constant: every slot has one.
         NoteOn::Bound(index) => SpecKey::BoundTexelFormat(families.texture.slots.get(&index)?.slot),
         // Given by the plan from the bound sampler, never a constant: every runtime slot has one.
@@ -1955,10 +2122,8 @@ fn declared(families: &FamilyPlans, t: NoteTest) -> Option<SpecTest> {
             SpecKey::BoundSamplerWord(families.sampler.slots.get(&index)?.slot)
         }
         // Given by the plan from what the command's handles can name, never a constant.
-        NoteOn::HeapYCbCr(stage) => SpecKey::HeapYCbCrTextures(stage),
         NoteOn::HeapRaw(stage) => SpecKey::HeapRawTextures(stage),
         NoteOn::HeapNan(stage) => SpecKey::HeapNanFamilies(stage),
-        NoteOn::ArgumentSamplers => SpecKey::FilteringArgumentSampler,
         NoteOn::Sampler(index) => {
             let r = families.sampler.slots.get(&index)?;
             let fields = r.fields();

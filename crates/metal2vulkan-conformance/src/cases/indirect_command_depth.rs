@@ -41,19 +41,18 @@
 //! here, and this module adds two of its own, both on a measurement rather than on caution:
 //!
 //! - **A command that sets a pipeline on a buffer that inherits one** raises `Invalid` in the
-//!   runtime and **ends plain Metal's process** (`metal2vulkan_runtime`'s
-//!   `IndirectComputeCommand::set_compute_pipeline_state`, measured). So no row crosses
+//!   runtime and **ends plain Metal's process** (measured). So no row crosses
 //!   `inheritPipelineState` with a command's own `setRenderPipelineState:`: the cell cannot be
 //!   recorded at all, and [`INHERITED_STATE`] names it in its own documentation instead.
 //! - **An inherited pipeline state made without `supportIndirectCommandBuffers`** faults the GPU
 //!   at the executing encoder, so the parent pipeline [`INHERITED_STATE`] binds is made with the
 //!   flag exactly as the commands' own are.
 //!
-//! [`BIND_LIMITS`] sets a buffer at an index at and past its descriptor's maximum, which is the
-//! one row here whose answer is a **refusal of ours**: plain Metal keeps such a binding for its
-//! own getters (`metal2vulkan_runtime`'s `IndirectCommandBuffer::set_buffer`, measured on an
-//! M3 Max) where we raise `Invalid`. That row **executes nothing**, so no over-long binding ever
-//! reaches a GPU, and the gap it holds visible is listed in `known-gaps.tsv`.
+//! [`BIND_LIMITS`] sets a buffer at an index at and past its descriptor's maximum, which is the one
+//! row here whose answer is a **refusal of ours**: plain Metal keeps such a binding for its own
+//! getters (measured on an M3 Max) where we raise `Invalid`. That row **executes nothing**, so no
+//! over-long binding ever reaches a GPU, and the gap it holds visible is listed in
+//! `known-gaps-rt.tsv`.
 
 use crate::allowance::Allowance;
 use crate::case::STAGE_VERTEX;
@@ -486,20 +485,7 @@ impl Case for PatchDraws {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        std::iter::once(crate::replay::shared_memory_notice())
-            .chain(tessellation_notices())
-            .collect()
+        tessellation_notices()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -630,16 +616,14 @@ impl Case for PatchDraws {
 ///
 /// Taken from [`super::tessellation_sweeps`], whose own documentation says why each is named:
 /// `tessellation-winding` and `tessellation-factor-edge-cases` are announced unconditionally by
-/// the control stage, and `tessellation-triangle-order` and `emulated-tessellation-draws` by the
-/// venues whose tessellator is not Apple's or which have no `tessellationShader` at all. None can
-/// move a mark, because a mark is a set member and not a position in a triangle stream; they are
-/// named because a notice our run announces that no case names is a divergence.
+/// the control stage, and `tessellation-triangle-order` by the venues whose tessellator is not
+/// Apple's. None can move a mark, because a mark is a set member and not a position in a triangle
+/// stream; they are named because a notice our run announces that no case names is a divergence.
 fn tessellation_notices() -> Vec<Allowance> {
     [
-        metal2vulkan_runtime::Degradation::TessellationWinding,
-        metal2vulkan_runtime::Degradation::TessellationFactorEdgeCases,
-        metal2vulkan_runtime::Degradation::TessellationTriangleOrder,
-        metal2vulkan_runtime::Degradation::EmulatedTessellationDraws,
+        crate::degradation::Degradation::TessellationWinding,
+        crate::degradation::Degradation::TessellationFactorEdgeCases,
+        crate::degradation::Degradation::TessellationTriangleOrder,
     ]
     .into_iter()
     .map(|notice| crate::replay::notice_allowance(notice.code()))
@@ -840,21 +824,6 @@ impl Case for InheritedState {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1219,21 +1188,6 @@ impl Case for ResetRanges {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shaders_of(COMPUTE_FIXTURE, COMPUTE_FIXTURE)
     }
@@ -1436,9 +1390,7 @@ fn drawn_pipeline_spec() -> RenderPipelineSpec<'static> {
 /// buffers, so a command that bound the wrong offset draws the other's rectangle or colour.
 ///
 /// Neither holds a barrier, unlike [`super::indirect_commands::RENDER_DRAWN`]'s: the two
-/// rectangles cover disjoint columns, so the order is immaterial, and leaving the barrier out keeps
-/// this row's answer free of the `render-pass-split` notice that row announces — which is what lets
-/// the pass state here be compared with nothing loosened.
+/// rectangles cover disjoint columns, so the order is immaterial.
 fn drawn_commands(pipeline: Handle, rects: Handle, colors: Handle) -> Vec<EncodedCommand> {
     (0..RECTS.len() as u64)
         .map(|at| {
@@ -1554,21 +1506,6 @@ impl Case for PassStateCommands {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -1822,21 +1759,6 @@ impl Case for ResidencyUsage {
         MetalSource::Run
     }
 
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
-    }
-
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
         shaders_of(COMPUTE_FIXTURE, COMPUTE_FIXTURE)
     }
@@ -1939,10 +1861,9 @@ const DECLARED_BINDS: u32 = 2;
 /// index at the maximum, and one two past it.
 ///
 /// Both are small on purpose. A binding past the slot array lands in the **same command's** record
-/// on plain Metal ("plain Metal keeps it for its private getters", `metal2vulkan_runtime`'s
-/// `IndirectCommandBuffer::set_buffer`), and the row **executes nothing**, so no binding at or past
-/// the count ever reaches a GPU — which is why the indices are 2 and 4 and not something that would reach
-/// another command's record or another page.
+/// on plain Metal, which keeps it for its private getters, and the row **executes nothing**, so no
+/// binding at or past the count ever reaches a GPU — which is why the indices are 2 and 4 and not
+/// something that would reach another command's record or another page.
 const OVER_INDICES: [u32; 2] = [DECLARED_BINDS, DECLARED_BINDS + 2];
 
 /// The row's descriptor: dispatches of threadgroups and [`DECLARED_BINDS`] kernel buffers.
@@ -2015,21 +1936,6 @@ impl Case for BindLimits {
 
     fn metal_source(&self) -> MetalSource {
         MetalSource::Run
-    }
-
-    fn allowances(&self) -> Vec<Allowance> {
-        // Every row reads its answer back through a `Shared` buffer, so on a device without
-        // unified memory the runtime announces `shared-in-system-memory`
-        // (`crate::replay::shared_memory_notice` holds the whole reason). It declares the
-        // notices site alone, so every value of this family still compares against Metal's
-        // exactly.
-        //
-        // Measured on the RTX 5080 Laptop (615.71.09): it fired for
-        // all 6 rows of the family, and each was divergent on that field and
-        // nothing else (replay-nvidia.log). On MoltenVK, where
-        // the chip's GPU shares the CPU's memory, it cannot fire at all, which is why no
-        // recording of this suite declares it.
-        vec![crate::replay::shared_memory_notice()]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

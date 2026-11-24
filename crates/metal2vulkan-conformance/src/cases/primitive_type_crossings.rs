@@ -108,7 +108,7 @@
 //! upper pixel and Metal the lower. Vulkan's Bresenham diamond is open
 //! (`|p - x| + |q - y| < 0.5`), so a line that only touches a diamond vertex exits no diamond and
 //! neither pixel is required of a conforming driver; the two make opposite choices and no Vulkan
-//! control decides it, which is why the cells' remaining `known-gaps.tsv` rows are the driver's
+//! control decides it, which is why the cells' remaining `known-gaps-rt.tsv` rows are the driver's
 //! own. MoltenVK leaves `strictLines` clear and its lines are Metal's own, which is why no Metal
 //! venue could read this switch either.
 //!
@@ -121,11 +121,11 @@
 
 use crate::allowance::Allowance;
 use crate::case::{call, made, Abort, Case, Handle, Input, MetalSource, Side};
+use crate::degradation::Degradation;
 use crate::recording::ShaderRef;
 use crate::render::{ColorState, PassColor, Plane, ReadAt, RenderPass, RenderStep, RenderWork};
 use crate::transcript::{Node, Observed, Sites, Value};
 use metal2vulkan::metal::{IndexType, PrimitiveType};
-use metal2vulkan_runtime::Degradation;
 
 use super::render_draw_forms::{
     fixture_inputs, layout, library, pipeline, plane, positions_buffer, shader_refs, target_spec,
@@ -323,23 +323,19 @@ impl Case for RestartIndices {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        // **Nothing is loosened.** Every draw here is the direct indexed form, which reaches no
-        // bounds pass, and every texel of every cell still compares exactly.
+        // **Nothing is loosened.** Every draw here is the direct indexed form, and every texel of
+        // every cell still compares exactly.
         //
-        // Two kinds are declared over the notices site. The vertex function writes
+        // One kind is declared over the notices site. The vertex function writes
         // `[[point_size]]`, which a device whose largest point is below Metal's announces at the
         // `Point` cells' draws, the only ones it sizes (`device-point-size`; a line or triangle
-        // cell announces nothing of it); and the positions, indices, marks, frames and read-back are all
-        // `Shared`, which a device with no unified memory keeps in system memory because that is
-        // the only memory both sides can reach (`shared-in-system-memory`). Both belong to the
-        // venue -- its point-size guarantee and its memory model -- rather than to a primitive
-        // type or an index type. The vertex stage's arithmetic on a device whose float arithmetic
-        // is not Metal's (`device-arithmetic`) is the device's own answer, which the suite
-        // declares for every case (`crate::replay::NATIVE_NOTES`).
-        vec![
-            crate::replay::notice_allowance(Degradation::DevicePointSize.code()),
-            crate::replay::shared_memory_notice(),
-        ]
+        // cell announces nothing of it). It belongs to the venue's point-size guarantee rather
+        // than to a primitive type or an index type. The vertex stage's arithmetic on a device
+        // whose float arithmetic is not Metal's (`device-arithmetic`) is the device's own answer,
+        // which the suite declares for every case (`crate::replay::NATIVE_NOTES`).
+        vec![crate::replay::notice_allowance(
+            Degradation::DevicePointSize.code(),
+        )]
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {

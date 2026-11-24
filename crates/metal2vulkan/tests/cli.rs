@@ -15,6 +15,7 @@ use metal2vulkan::pipeline::{
     ComputePipelineDescriptor, FunctionDescriptor, StageSource, VertexAttributeDescriptor,
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
+use metal2vulkan::repro::ReproDevice;
 use metal2vulkan::Budget;
 
 fn repo() -> &'static Path {
@@ -164,7 +165,7 @@ fn a_kernel_writes_the_pipeline_the_library_compiles() {
 
     let json = std::fs::read_to_string(profile("moltenvk-m3")).unwrap();
     let description = DeviceDescription::from_khronos_json(&json, None).unwrap();
-    let device = Device::new(description, DevicePolicy::default()).unwrap();
+    let device = Device::from_queries(description, DevicePolicy::default()).unwrap();
     let library = Library::parse(&std::fs::read(&input).unwrap()).unwrap();
     let kernel = FunctionDescriptor::new(library.function("ob3_texture_array").unwrap());
     let descriptor = ComputePipelineDescriptor::new(StageSource::Function(kernel));
@@ -328,7 +329,7 @@ fn spirv_val_runs_unless_skipped_and_a_rejection_is_a_fallback() {
     std::fs::set_permissions(&rejecting, std::fs::Permissions::from_mode(0o700)).unwrap();
     let input = fixture("ob3_texture_array.air");
     let output = scratch.join("kernel.spv");
-    let profile = profile("vk12-floor");
+    let profile = profile("runtime-floor");
     let args = [
         input.as_os_str(),
         output.as_os_str(),
@@ -456,4 +457,62 @@ fn a_bundle_carries_its_descriptor_files_and_replays_the_failure() {
         replayed.contains("VertexAttribute { attribute: 1 }"),
         "{replayed}"
     );
+}
+
+/// `--device` reads a device description and policy (`ReproDevice`'s JSON) in place of
+/// `--profile`, and compiles the same pipeline the profile's device does; the
+/// two together, or `--profile-name` with `--device`, are usage errors.
+#[test]
+fn a_device_file_takes_the_place_of_a_profile() {
+    let scratch = Scratch::new();
+    let json = std::fs::read_to_string(profile("moltenvk-m3")).unwrap();
+    let description = DeviceDescription::from_khronos_json(&json, None).unwrap();
+    let device_file = scratch.join("device.json");
+    std::fs::write(
+        &device_file,
+        ReproDevice::new(description, DevicePolicy::default())
+            .to_json()
+            .unwrap(),
+    )
+    .unwrap();
+    let input = fixture("ob3_texture_array.air");
+    let by_profile = scratch.join("profile.spv");
+    let by_device = scratch.join("device.spv");
+    for (output, flag, file) in [
+        (&by_profile, "--profile", profile("moltenvk-m3")),
+        (&by_device, "--device", device_file.clone()),
+    ] {
+        let result = cli(
+            &scratch,
+            &[
+                input.as_os_str(),
+                output.as_os_str(),
+                os(flag),
+                file.as_os_str(),
+                os("--no-spirv-val"),
+            ],
+            &[],
+        );
+        assert!(result.status.success(), "{}", text(&result.stderr));
+    }
+    assert_eq!(
+        std::fs::read(&by_profile).unwrap(),
+        std::fs::read(&by_device).unwrap()
+    );
+    let profile_path = profile("moltenvk-m3");
+    for extra in [
+        [os("--profile"), profile_path.as_os_str()],
+        [os("--profile-name"), os("any")],
+    ] {
+        let mut args = vec![
+            input.as_os_str(),
+            by_device.as_os_str(),
+            os("--device"),
+            device_file.as_os_str(),
+        ];
+        args.extend(extra);
+        let result = cli(&scratch, &args, &[]);
+        assert_eq!(result.status.code(), Some(2), "{}", text(&result.stderr));
+        assert!(text(&result.stderr).contains("--device"));
+    }
 }

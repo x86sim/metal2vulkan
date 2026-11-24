@@ -90,6 +90,7 @@ use crate::allowance::Allowance;
 use crate::case::{
     call, made, Abort, Case, Failure, Handle, Input, MetalSource, SamplerSpec, Side,
 };
+use crate::degradation::Degradation;
 use crate::fixture::{Fixture, METAL_TEXT, RUNTIME_TEXT};
 use crate::recording::ShaderRef;
 use crate::render::{
@@ -100,7 +101,6 @@ use crate::transcript::{
     Aspect, ByteLayout, Digest, Element, Gaps, Node, Observed, Region, Sites, Value,
 };
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, SamplerMinMagFilter};
-use metal2vulkan_runtime::Degradation;
 
 /// The format both targets of every row carry. Its codes survive a store unchanged, so every texel
 /// of every row is exact.
@@ -397,14 +397,13 @@ impl Case for RenderChain {
         //   measured to interpolate as Metal does. Measured announced by those two rows on
         //   lavapipe, where their texels still compared exactly: the interpolation the note covers
         //   did not move a sampled texel of this geometry.
+        // - `pixel-sampler-scaling`, for every row, because each samples its target through a
+        //   runtime sampler slot, which the runtime's pipelines note as scaled
+        //   (`crate::replay::pixel_sampler_scaling_notice` holds why, and the run it rests on).
         //
         // Every value of every row compared **exactly** on both venues, which is the evidence that
         // these declarations loosen nothing: the whole difference they cover is the announcement.
-        // - `shared-in-system-memory`, for every row, because the buffer the chain reads its
-        //   target back through is `Shared`, which a device with no unified memory keeps in
-        //   system memory because that is the only memory both sides can reach. It belongs to
-        //   the venue's memory model rather than to a chain's shape.
-        let mut named = vec![crate::replay::shared_memory_notice()];
+        let mut named = vec![crate::replay::pixel_sampler_scaling_notice()];
         if self.subject.sample.half_output {
             named.push(crate::replay::notice_allowance(
                 Degradation::HalfOutputFastMathBlend.code(),
@@ -785,7 +784,7 @@ mod tests {
             // The whole set, one declaration a code the row can announce: a code the row
             // announces and declares nowhere is a divergence, and a code it declares but cannot
             // announce is an allowance standing behind nothing, so the set is stated exactly.
-            let mut wanted = vec![Degradation::SharedInSystemMemory.code().to_owned()];
+            let mut wanted = vec![Degradation::PixelSamplerScaling.code().to_owned()];
             if case.subject.sample.half_output {
                 wanted.push(Degradation::HalfOutputFastMathBlend.code().to_owned());
             }

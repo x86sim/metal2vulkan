@@ -1,9 +1,8 @@
 //! What a kernel reads from, writes to and samples of, and what a draw stores into, an
 //! `RGB10A2Unorm_sRGB` (586) texture.
 //!
-//! Eight cases over Apple's padded 10-bit sRGB format: the three of
-//! `runtime_lane::rgb10a2_srgb`'s nine questions a compute pass can ask, and the one a render pass
-//! asks whose answer was truncated:
+//! Eight cases over Apple's padded 10-bit sRGB format, for three questions a compute pass asks and
+//! one a render pass asks:
 //!
 //! - `rgb10a2-srgb-reads`: a 1024 by 1 texture of the words
 //!   `c | (1023 - c) << 10 | (7 c mod 1024) << 20 | (c mod 4) << 30`, every texel read by the owned
@@ -20,39 +19,22 @@
 //!   probe `r.m`'s twenty render specials, which are not the compute write's sixteen) into a new
 //!   4096 by 5 private target, whose 20,480 words are read back whole through a blit.
 //!
-//! **What the port changes, and the defect it found.** The lane states Metal's answer for each of
-//! these as the SHA-256's **first sixteen hexadecimal digits of a printed string** — `read <c> <r>
-//! <g> <b> <a>` a line, and so on. Two things are wrong with that as a conformance claim, and the
-//! second is a real hole:
-//!
-//! - A 64-bit projection of a formatted string is weaker than the bytes. These cases record the
-//!   words and the results themselves, so the comparison names the code or the sample.
-//! - **The writes question compared 4,079 fewer words than the kernel wrote.** The lane dispatches
-//!   a 4096 by 5 grid, so the kernel writes all 20,480 texels, and the lane formatted only
-//!   `got.iter().take(n)` of them, `n` being 16,401 — the 16,385 ramp values plus the sixteen
-//!   specials. The remaining 4,079 texels are written from the input buffer's zero padding and
-//!   appeared in no digest, inside a passing test. This case records all 20,480 words, so what the
-//!   padding stores is Metal's measured answer rather than a gap; the lane now digests the whole
-//!   grid too, against the digest of these recorded words. (It is the same shape batch 1a found in
-//!   `surface_fills`, whose formatter truncated each run at 24 bytes.)
-//!
-//! **The second hole, and what it cost to close.** The stores question had the same shape as the
-//! writes one and was worse off: the lane digested `got.iter().take(16405)` of the 20,480 words the
-//! draw stores, so **4,075 words of each of the two stores were in no comparison**, and unlike the
-//! writes nobody had ever recorded Metal's words there — the writes recording covers the compute
-//! write, not the render store. Closing it needed the thing this module's docs used to say was
-//! missing, a non-mesh render pass in the case vocabulary ([`crate::case::FragmentFill`]): a
-//! classic vertex-and-fragment pipeline, a private render target, one `drawPrimitives:` of three
-//! vertices, and the target read back through a blit. Both store cases record all 20,480 words, so
-//! the tail is Metal's measured answer and the lane's digest now covers the whole target.
+//! **The words themselves, every one.** These cases record the words and the results, not a
+//! digest of a printed string, so the comparison names the code or the sample. The write case's
+//! 4096 by 5 grid holds 20,480 texels, of which the sweep is 16,401 (the 16,385 ramp values plus
+//! the sixteen specials); the remaining 4,079 are written from the input buffer's zero padding,
+//! and all 20,480 words are recorded, so what the padding stores is Metal's measured answer. The
+//! store cases' target is the same 20,480 texels over a sweep of 16,405, and both record all
+//! 20,480 words, through a classic vertex-and-fragment pipeline ([`crate::case::FragmentFill`]): a
+//! private render target, one `drawPrimitives:` of three vertices, and the target read back
+//! through a blit.
 //!
 //! The target is **private** and read back by a blit, as the probe measured it, not shared and read
 //! by `getBytes`: storage mode is part of what a padded format's answer means, and a case that
 //! quietly moved it would be measuring something else.
 //!
-//! Left to the lane, and why: the clears and the loads, whose answers the lane already digests
-//! whole, and the `isRGB10A2GammaSupported` check, which is a device property rather than an
-//! observation.
+//! Not cases: the clears and the loads, and the `isRGB10A2GammaSupported` check, which is a device
+//! property rather than an observation.
 //!
 //! Every word and every sample compares exactly: the cases' allowances are notice declarations
 //! alone, each loosening the notices site and nothing else. A venue that announces another notice
@@ -196,10 +178,8 @@ const STORE_SPECIALS: [f32; 20] = [
 /// from 65520 up to an infinity, which is what a `float` the fragment function returns into a
 /// `half4` output goes through.
 ///
-/// This is `runtime_lane::rgb10a2_srgb`'s own function, and `the_half_bits_are_the_lane_s` pins it
-/// against the values that lane's test states, because the suite may not depend on the validation
-/// crate and a second spelling that drifted would make the `half` case's inputs quietly another
-/// case's.
+/// `the_half_bits_are_pinned` pins it against fixed values, so the `half` case's inputs cannot
+/// drift.
 fn half_bits(value: f32) -> u16 {
     if value.is_nan() {
         return 0x7e00;
@@ -737,24 +717,16 @@ impl Case for Rgb10A2Srgb {
             .collect()
     }
 
-    /// What a store case's pass announced on MoltenVK, measured: a pass that loads nothing into
-    /// the tile, and the `half` fragment's output conversion; and what a linear sample case's
-    /// pipeline announced on every venue run, its module's filter of the decoded taps. The read and write
-    /// cases name no notice of their own.
+    /// What a store case's pass announced on MoltenVK, measured: the `half` fragment's output
+    /// conversion; and what a linear sample case's pipeline announced on every venue run, its
+    /// module's filter of the decoded taps. The read and write cases name no notice of their own.
     fn allowances(&self) -> Vec<Allowance> {
-        use metal2vulkan_runtime::Degradation as D;
-        // Every question reads its answer back through a `Shared` buffer, and a device with no
-        // unified memory keeps a `Shared` allocation in system memory because that is the only
-        // memory both sides can reach: the venue's memory model rather than this format's answer.
-        let mut named = vec![crate::replay::shared_memory_notice()];
+        use crate::degradation::Degradation as D;
+        let mut named = Vec::new();
         match &self.question {
-            Question::Stores {
-                lanes: Lanes::Float,
-            } => named.push(notice_allowance(D::DontCareLoadTiles.code())),
-            Question::Stores { lanes: Lanes::Half } => named.extend([
-                notice_allowance(D::DontCareLoadTiles.code()),
-                notice_allowance(D::HalfOutputFastMathBlend.code()),
-            ]),
+            Question::Stores { lanes: Lanes::Half } => {
+                named.push(notice_allowance(D::HalfOutputFastMathBlend.code()))
+            }
             // A linear sample filters the decoded taps in the module, and that filter's sum is the
             // device's arithmetic (`bicubic-filter-arithmetic`, announced for the two linear
             // cases on the M3 Max, the RTX 5080 and lavapipe), as `two_plane_samples` declares for
@@ -874,8 +846,8 @@ mod tests {
         assert_eq!(padding.len(), 4);
     }
 
-    /// The write case's grid is larger than its sweep, which is the defect the port closed: the
-    /// kernel writes 20,480 texels and the lane's formatter looked at 16,401 of them.
+    /// The write case's grid is larger than its sweep: the kernel writes 20,480 texels, 16,401 of
+    /// them the sweep's, and the site records every one.
     #[test]
     fn the_write_grid_covers_more_texels_than_the_sweep() {
         let texels = (WRITE_WIDTH * WRITE_HEIGHT) as usize;
@@ -885,7 +857,7 @@ mod tests {
         assert_eq!(texels - WRITE_VALUES, 4_079);
         // The input buffer covers the whole grid, so every one of those texels is written.
         assert_eq!(write_values().len(), texels * 16);
-        // The site's layout covers all of them, as the lane's digest now does.
+        // The site's layout covers all of them.
         assert_eq!(
             texture_layout(WRITE_WIDTH, WRITE_HEIGHT).extent(),
             texels * WORD_BYTES as usize
@@ -936,8 +908,8 @@ mod tests {
         assert_eq!(names.len(), 8);
     }
 
-    /// The store cases' target is larger than their sweep, which is the second hole the port
-    /// closes: the draw stores 20,480 texels and the lane's formatter looked at 16,405 of them.
+    /// The store cases' target is larger than their sweep: the draw stores 20,480 texels, 16,405 of
+    /// them the sweep's, and the site records every one.
     #[test]
     fn the_store_target_covers_more_texels_than_the_sweep() {
         let texels = (STORE_WIDTH * STORE_HEIGHT) as usize;
@@ -948,7 +920,7 @@ mod tests {
         // The values buffer covers every texel of the target, so every one of them is drawn.
         assert_eq!(store_values(Lanes::Float).len(), texels * 16);
         assert_eq!(store_values(Lanes::Half).len(), texels * 8);
-        // The site's layout covers all of them, where the lane's digest covered 16,405.
+        // The site's layout covers all of them, not the sweep's 16,405 alone.
         assert_eq!(
             texture_layout(STORE_WIDTH, STORE_HEIGHT).extent(),
             texels * WORD_BYTES as usize
@@ -972,10 +944,9 @@ mod tests {
         assert_eq!(WRITE_SPECIALS.iter().filter(|v| v.is_nan()).count(), 2);
     }
 
-    /// `half_bits` is the lane's, pinned by the values `runtime_lane::rgb10a2_srgb`'s own test
-    /// states: the `half` store case's inputs are that lane's inputs and not merely similar ones.
+    /// `half_bits`, pinned by fixed values, so the `half` store case's inputs cannot drift.
     #[test]
-    fn the_half_bits_are_the_lane_s() {
+    fn the_half_bits_are_pinned() {
         assert_eq!(half_bits(1.0), 0x3c00);
         assert_eq!(half_bits(-2.0), 0xc000);
         assert_eq!(half_bits(65504.0), 0x7bff);

@@ -132,8 +132,6 @@ pub struct SubgroupModel {
     pub vertex: StageSubgroup,
     pub fragment: StageSubgroup,
     pub kernel: StageSubgroup,
-    /// `subgroupQuadOperationsInAllStages`.
-    pub quad_all_stages: bool,
     /// `shaderMaximalReconvergence`.
     pub maximal_reconvergence: bool,
     /// `shaderSubgroupUniformControlFlow`.
@@ -154,10 +152,9 @@ pub struct SubgroupRequirement {
     pub full_subgroups: bool,
     /// Every dispatch region's local size must be a multiple of this (1: no constraint).
     pub local_size_multiple: u32,
-    /// A vertex function's subgroups are the ones its driver runs as Metal does though the device
-    /// does not list the vertex stage (`DriverDeviation::MetalVertexSimdgroups`): its module needs
-    /// `VkProperty::MetalVertexSimdgroups` in place of `SubgroupStage(Vertex)`.
-    pub metal_vertex_simdgroups: bool,
+    /// The subgroup size may vary (`ALLOW_VARYING_SUBGROUP_SIZE`): no size is pinned, and the
+    /// device runs the size it picks, one size over a dispatch (Vulkan 9.5.2).
+    pub varying: bool,
 }
 
 impl SubgroupRequirement {
@@ -166,7 +163,7 @@ impl SubgroupRequirement {
         size: None,
         full_subgroups: false,
         local_size_multiple: 1,
-        metal_vertex_simdgroups: false,
+        varying: false,
     };
 
     /// Add to `r` what this requirement of a `stage` function needs of the device beyond its
@@ -178,11 +175,10 @@ impl SubgroupRequirement {
     ///   `[minSubgroupSize, maxSubgroupSize]`;
     /// - full subgroups (`REQUIRE_FULL_SUBGROUPS`) need the stage flag, whose feature is
     ///   `computeFullSubgroups`;
-    /// - a vertex function's subgroups that the driver runs as Metal does without the device
-    ///   listing the stage (`metal_vertex_simdgroups`) need that measured fact,
-    ///   `VkProperty::MetalVertexSimdgroups`, in place of the stage the module's operations name.
+    /// - a varying size (`ALLOW_VARYING_SUBGROUP_SIZE`) needs the stage flag, whose feature is
+    ///   `subgroupSizeControl`.
     ///
-    /// A requirement that pins nothing and needs no full subgroups adds nothing. A limit `r`
+    /// A requirement that pins nothing and needs neither flag adds nothing. A limit `r`
     /// already names keeps the stricter value.
     pub fn add_device_facts(&self, stage: Stage, r: &mut Requirements) {
         if let Some(size) = self.size {
@@ -199,8 +195,9 @@ impl SubgroupRequirement {
         if self.full_subgroups {
             r.stage_flags.insert(StageCreateFlag::RequireFullSubgroups);
         }
-        if self.metal_vertex_simdgroups && r.properties.remove(&VkProperty::SubgroupStage(stage)) {
-            r.properties.insert(VkProperty::MetalVertexSimdgroups);
+        if self.varying {
+            r.stage_flags
+                .insert(StageCreateFlag::AllowVaryingSubgroupSize);
         }
     }
 }
@@ -220,14 +217,13 @@ impl SubgroupModel {
 
     /// Whether a `stage` function can take Vulkan's quad instructions
     /// (`OpGroupNonUniformQuadBroadcast`, `OpGroupNonUniformQuadSwap`): the stage has subgroups
-    /// of the quad class, and a vertex stage also `subgroupQuadOperationsInAllStages`, as the
-    /// simd tiering asks of the quad class. Without them a constant lane's quad broadcast or
-    /// shuffle-xor is a shuffle (`lower::simd`).
+    /// of the quad class. Without them a constant lane's quad broadcast or shuffle-xor is a
+    /// shuffle, as it is outside kernels (`lower::simd`), so no module needs
+    /// `subgroupQuadOperationsInAllStages`, which Vulkan asks of quad instructions outside the
+    /// fragment and compute stages.
     pub fn quad_instructions(&self, stage: Stage) -> bool {
         let st = self.stage(stage);
-        st.supported
-            && st.ops.contains(OpBits::QUAD)
-            && (stage != Stage::Vertex || self.quad_all_stages)
+        st.supported && st.ops.contains(OpBits::QUAD)
     }
 
     /// The device's `[minSubgroupSize, maxSubgroupSize]`: the range of a stage that can pin a
@@ -277,8 +273,7 @@ fn needed_ops(class: &SimdClass) -> (OpBits, Feature) {
 ///
 /// - `None` needs nothing; compute `LaneArithmetic` derives lanes from the linear index (`Linear`).
 /// - Every other use needs the stage in `subgroupSupportedStages` and the class's operations
-///   (`Unsupported{SubgroupOperations | QuadOperations | SimdgroupMatrix}` otherwise); quads
-///   outside fragment and compute also need `subgroupQuadOperationsInAllStages`.
+///   (`Unsupported{SubgroupOperations | QuadOperations | SimdgroupMatrix}` otherwise).
 /// - Compute (quads included) needs full subgroups and a 32-wide subgroup (`Direct`) or a
 ///   64/128-wide one split into 32-lane clusters (`Cluster32`); else `Unsupported{SimdWidth}`.
 /// - Vertex and fragment: 32 → `Direct`; 64/128 → `Cluster32`; narrower → `PartialFragment` (the
@@ -348,8 +343,7 @@ fn subgroup_tier(
     }
     if !st.ops.contains(ops) {
         // The device's classes are the compute stage's, which Vulkan always lists: a class the
-        // device has but the stage lacks is one measured nowhere in a stage the device does not
-        // list (`DriverDeviation::MetalVertexSimdgroups`), which listing it would give.
+        // device has but the stage lacks is one the stage would have where the device listed it.
         let mut missing = Vec::new();
         for op in SUBGROUP_OPS {
             let bit = OpBits::of(op);
@@ -366,12 +360,6 @@ fn subgroup_tier(
             }
         }
         return Err(Unsupported::needs_any_of(feature, vec![missing]));
-    }
-    if ops.contains(OpBits::QUAD) && stage == Stage::Vertex && !model.quad_all_stages {
-        return Err(Unsupported::needs(
-            Feature::QuadOperations,
-            Capability::Property(VkProperty::SubgroupQuadOperationsInAllStages),
-        ));
     }
     let matrix = class == SimdClass::Matrix;
     let width = || Unsupported::needs_any_of(Feature::SimdWidth, vec![width_needs(stage, st)]);
@@ -462,7 +450,51 @@ pub fn requirement(t: Tier, stage: Stage, model: &SubgroupModel) -> SubgroupRequ
         size: st.pinnable.then_some(size),
         full_subgroups: compute,
         local_size_multiple: if compute { size } else { 1 },
-        metal_vertex_simdgroups: false,
+        varying: false,
+    }
+}
+
+/// Whether a kernel of class `class` whose every cross-lane operation stays inside its quad
+/// (`lower::simd::quad_only`) takes its quads from the subgroup at the size the device gives
+/// (`Tier::Direct` under [`quad_requirement`]): the 32 lanes are needed only by operations that
+/// read outside a quad, so the pin to 32 stays only where 32 is the stage's narrowest size. The
+/// stage runs the class's operations with full subgroups, its narrowest size is below 32, and
+/// every size it runs is a multiple of 4, so a quad is four aligned lanes of one subgroup (Vulkan
+/// 9.27.9). Read from the size range and the operation classes alone.
+pub fn quad_free(class: &SimdClass, stage: Stage, model: &SubgroupModel) -> bool {
+    if stage != Stage::Kernel {
+        return false;
+    }
+    let class = match class {
+        SimdClass::Quad => SimdClass::CrossLane(OpBits::QUAD),
+        SimdClass::CrossLane(ops) => SimdClass::CrossLane(*ops),
+        _ => return false,
+    };
+    let st = model.stage(stage);
+    let (ops, _) = needed_ops(&class);
+    st.supported
+        && st.ops.contains(ops)
+        && st.full_subgroups
+        && st.sizes.min >= 4
+        && st.sizes.min < 32
+}
+
+/// The subgroup requirement of a [`quad_free`] kernel: full subgroups, no pinned size, the size
+/// varying where the stage can pin one (`subgroupSizeControl`), and a local size that is a
+/// multiple of the largest size the stage may run, the only one that guarantees full subgroups of
+/// a size the device picks (`VUID-VkPipelineShaderStageCreateInfo-flags-02758`); without
+/// `subgroupSizeControl` the size is the API's, and the local size a multiple of it.
+pub fn quad_requirement(stage: Stage, model: &SubgroupModel) -> SubgroupRequirement {
+    let st = model.stage(stage);
+    SubgroupRequirement {
+        size: None,
+        full_subgroups: true,
+        local_size_multiple: if st.pinnable {
+            st.sizes.max
+        } else {
+            st.api_size
+        },
+        varying: st.pinnable,
     }
 }
 

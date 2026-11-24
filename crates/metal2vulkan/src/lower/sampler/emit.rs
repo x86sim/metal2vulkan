@@ -1,10 +1,9 @@
 //! Emission of the sampling strategies.
 
 use crate::lower::emit::EmitCx;
-use crate::lower::texture::half::TexelOrigin;
 use crate::lower::texture::{
-    half_class, heap_element, held_texel, live_or_zero, resident_access, sparse_spec, tile_map,
-    tiled_word, with_word, ImageRef,
+    heap_element, held_texel, live_or_zero, resident_access, sparse_spec, tile_map, tiled_word,
+    with_word,
 };
 use crate::spirv::builder::constructs::{ArmEnd, ArmFn, Merged};
 use crate::spirv::builder::ops::image::ArmedOffset;
@@ -19,7 +18,8 @@ use crate::spirv::ir::{
 use crate::air::ir::ValueId;
 use crate::lower::texture::TexelClass;
 use crate::memory::handles::{entry_field, EntryField};
-use crate::metal::sampler::SamplerWord;
+use crate::metal::sampler::{SamplerUse, SamplerWord};
+use crate::pipeline::sym::{CombinedSampler, SamplerRef};
 
 use super::{
     BiasReach, Binding, CombinedImage, CubeFootprint, Hoist, Lod, MinLevel, Offset, Pixel,
@@ -458,29 +458,12 @@ fn scaled_axis_gradients(
 ///   component is zero as `∂s_c / (2 |m_a|)` and `∂t_c / (2 |m_a|)`, so the device reads Metal's
 ///   length whatever its approximation of a vector's (one component is nonzero); its level is its
 ///   own logarithm of it, where Metal's piecewise-linear one minifies only past a footprint of
-///   `1 + 3/2048` (`PrecisionNote::CubeGradientFootprint`). Every known route reads the one
-///   component alike, so a route not measured takes it too (but for a `y` face through
-///   [`CubeFootprint::Projected`]'s fixup, which reads it on both tangents).
+///   `1 + 3/2048` (`PrecisionNote::CubeGradientFootprint`).
 /// - [`CubeFootprint::Face`] (an anisotropic sampler): each gradient with its normal component
 ///   zeroed and Metal's mirroring applied, `(0, ρ g_y, g_z)` and `(0, g_y, ρ g_z)` on an `x` face,
 ///   `(g_x, 0, ρ g_z)` and `(ρ g_x, 0, g_z)` on a `y` face, `(g_x, ρ g_y, 0)` and `(ρ g_x, g_y, 0)`
 ///   on a `z` face (`dPdx`'s and `dPdy`'s), from which Vulkan's rule reads Metal's face gradients;
 ///   the device filters that ellipse by its own anisotropic rule.
-/// - [`CubeFootprint::Projected`] (MoltenVK's graphics route under macOS 27,
-///   `CubeGradientRoute::AppleProjected`): SPIRV-Cross's `spvGradientCube` (MoltenVK 1.4.1's
-///   `adec7acb`) projects each gradient onto the face and writes the two values where Apple's
-///   earlier reading took them: `(d_y, d_y, d_z)` on an `x` face, `(d_x, d_z, d_x)` on a `y` face
-///   and `(d_x, d_y, d_x)` on a `z` face. Metal under macOS 27 reads the tangents of those, so on
-///   an `x` or `z` face the gradient with its normal component zeroed reaches Metal as its own
-///   (the probe: every lane of every sampler equal), and is handed so. On a `y` face Metal reads
-///   `d_x` on both tangents, the `z` tangent lost: the function hands `(64/91 L, 0, 0)`, `L`
-///   Metal's length of `(g_x, g_z)`, whose length on both tangents is `L` again, so an isotropic
-///   sample keeps Metal's footprint up to that division's rounding (the probe: all 6,144 lanes of
-///   each of three isotropic samplers equal, every face); an anisotropic one's ellipse lies on the
-///   diagonal, 922 to 932 of a `y` face's 1,024 lanes differing
-///   (`PrecisionNote::CubeGradientFootprint`).
-/// - [`CubeFootprint::Metal`]: the gradients as the call states them, for a driver that hands them
-///   to Metal's own `gradientcube` unchanged (`CubeGradientRoute::Metal`): exact, no note.
 ///
 /// The major axis is `z` over `y` over `x` at equal magnitudes, which on a direction whose ties are
 /// broken as Metal breaks them (`face::metal_ties`) is Metal's, there being none left. A footprint
@@ -493,14 +476,12 @@ pub(super) fn cube_footprint(
     form: CubeFootprint,
 ) -> BResult<(SValue, SValue)> {
     match form {
-        CubeFootprint::Metal => Ok(grads),
         CubeFootprint::Word => Err(BuildError::Operand {
             op: crate::spv::Op::Select,
             rule: OperandRule::Arity,
         }),
         CubeFootprint::Face => face_gradients(fb, p, grads),
-        CubeFootprint::Length => tangent_length(fb, p, grads, false),
-        CubeFootprint::Projected => tangent_length(fb, p, grads, true),
+        CubeFootprint::Length => tangent_length(fb, p, grads),
     }
 }
 
@@ -576,20 +557,16 @@ fn face_gradients(
 }
 
 /// [`CubeFootprint::Length`]: each gradient's two tangent components' Metal length on the
-/// tangent `(a + 2) mod 3`; or, `projected` ([`CubeFootprint::Projected`]), an `x` or `z` face's
-/// gradient without its normal component and a `y` face's length times `64/91` on `x`.
+/// tangent `(a + 2) mod 3`.
 fn tangent_length(
     fb: &mut FunctionBuilder<'_>,
     p: SValue,
     (dx, dy): (SValue, SValue),
-    projected: bool,
 ) -> BResult<(SValue, SValue)> {
     let f = f32_ty(fb)?;
     let triple = vec(fb, f, 3)?;
     let m = Major::of(fb, p)?;
     let zero = f32_const(fb, 0)?;
-    // Metal's length of a pair of equal components `c` is `91/64 c`.
-    let diagonal = f32_const(fb, (64.0f32 / 91.0).to_bits())?;
     let one = |fb: &mut FunctionBuilder<'_>, g: SValue| -> BResult<SValue> {
         let [gx, gy, gz] = components(fb, g)?;
         // The face's two tangents: `y` and `z` on an `x` face, `x` and `z` on a `y` face, `x`
@@ -597,14 +574,6 @@ fn tangent_length(
         let first = fb.select(m.y_or_z, gx, gy)?;
         let second = fb.select(m.z, gy, gz)?;
         let length = super::anisotropic::metal_length(fb, first, second)?;
-        if projected {
-            let on_y_face = fb.binary(BinOp::FMul, length, diagonal)?;
-            let on_x = fb.select(m.y, on_y_face, gx)?;
-            let on_x = fb.select(m.y_or_z, on_x, zero)?;
-            let on_y = fb.select(m.y, zero, gy)?;
-            let on_z = fb.select(m.y_or_z, zero, gz)?;
-            return fb.composite_construct(triple, &[on_x, on_y, on_z]);
-        }
         // The tangent `(a + 2) mod 3`: `z` for an `x` face, `x` for a `y` face, `y` for a `z`
         // face.
         let on_x = fb.select(m.y, length, zero)?;
@@ -661,17 +630,37 @@ pub(super) fn sampled_image(
     source: Source,
 ) -> BResult<(SValue, CombinedImage, Option<SValue>)> {
     match source {
+        Source::Combined(key) if cx.plan.families.access.identity => {
+            let (si, image) = identity_sampled_image(cx, fb, key)?;
+            Ok((si, image, None))
+        }
         Source::Combined(key) => {
             let Some(&(binding, image)) = cx.decl.families.sampler.combined.get(&key) else {
                 return Err(cx.fail(format!("combined binding {key:?} is not declared")));
             };
             Ok((binding.sampled_image(fb)?, image, None))
         }
+        // Under the identity domains the heap element through the slot's or constexpr sampler's
+        // element of the set-1 sampler array of the use, as a texture slot's sampling reads it.
+        Source::Heap { handle, key } if cx.plan.families.access.identity => {
+            let Some(use_) = cx.plan.families.sampler.heap_identity.get(&key).copied() else {
+                return Err(cx.fail(format!("heap sampler {key:?} has no identity use")));
+            };
+            let element = heap_element(cx, fb, key.group, handle)?;
+            let sampler = identity_sampler(cx, fb, key.sampler, use_)?;
+            let si = fb.sampled_image(element.img, sampler)?;
+            let image = CombinedImage {
+                plane: super::plane_of(element.decl.dim),
+                arrayed: element.decl.arrayed,
+                texel: element.decl.texel,
+            };
+            Ok((si, image, element.live))
+        }
         Source::Heap { handle, key } => {
             let Some(g) = cx.decl.families.sampler.heap.get(&key).copied() else {
                 return Err(cx.fail(format!("heap sampler {key:?} is not declared")));
             };
-            let element = heap_element(cx, fb, (key.group, !key.compare), handle)?;
+            let element = heap_element(cx, fb, key.group, handle)?;
             let ptr = fb.module().global_value(g)?;
             let sampler = fb.load(ptr, MemAccess::default())?;
             let si = fb.sampled_image(element.img, sampler)?;
@@ -680,7 +669,7 @@ pub(super) fn sampled_image(
                 arrayed: element.decl.arrayed,
                 texel: element.decl.texel,
             };
-            Ok((si, image, Some(element.live)))
+            Ok((si, image, element.live))
         }
         Source::HeapSampler {
             handle,
@@ -690,7 +679,7 @@ pub(super) fn sampled_image(
             let Some(g) = cx.decl.families.sampler.heap_samplers.get(&key).copied() else {
                 return Err(cx.fail(format!("argument sampler array {key:?} is not declared")));
             };
-            let element = heap_element(cx, fb, (key.group, !key.compare), handle)?;
+            let element = heap_element(cx, fb, key.group, handle)?;
             // The element of the sampler handle's table entry; a missed or null handle is the null
             // entry's element 0, the neutral sampler.
             let index = heap_sampler_field(cx, fb, sampler, EntryField::Element)?;
@@ -703,17 +692,50 @@ pub(super) fn sampled_image(
                 arrayed: element.decl.arrayed,
                 texel: element.decl.texel,
             };
-            Ok((si, image, Some(element.live)))
+            Ok((si, image, element.live))
+        }
+        // Under the identity domains the heap element through the set-1 sampler array's element
+        // at the pushed index of the candidate the handle names.
+        Source::HeapArray {
+            handle,
+            sampler,
+            key,
+            ..
+        } if cx.plan.families.access.identity => {
+            let Some(use_) = (cx.plan.families.sampler.heap_array_identity)
+                .get(&key)
+                .copied()
+            else {
+                return Err(cx.fail(format!(
+                    "constexpr sampler array {key:?} has no identity use"
+                )));
+            };
+            let Some(g) = cx.decl.families.sampler.identity.get(&use_).copied() else {
+                return Err(cx.fail(format!("the sampler array of {use_:?} is not declared")));
+            };
+            let element = heap_element(cx, fb, key.group, handle)?;
+            let index = identity_element(cx, fb, sampler, key, use_)?;
+            let base = fb.module().global_value(g)?;
+            let p = fb.access_chain_non_uniform(base, index)?;
+            let sampler = fb.load(p, MemAccess::default())?;
+            let si = fb.sampled_image(element.img, sampler)?;
+            let image = CombinedImage {
+                plane: super::plane_of(element.decl.dim),
+                arrayed: element.decl.arrayed,
+                texel: element.decl.texel,
+            };
+            Ok((si, image, element.live))
         }
         Source::HeapArray {
             handle,
             sampler,
             key,
+            ..
         } => {
             let Some(g) = cx.decl.families.sampler.heap_arrays.get(&key).copied() else {
                 return Err(cx.fail(format!("constexpr sampler array {key:?} is not declared")));
             };
-            let element = heap_element(cx, fb, (key.group, !key.compare), handle)?;
+            let element = heap_element(cx, fb, key.group, handle)?;
             // The element the sampler handle names (element 0 where it names none, whose result
             // `sampling_value` makes zero), which may differ between invocations.
             let (index, _) = array_element(cx, fb, sampler, key)?;
@@ -726,7 +748,7 @@ pub(super) fn sampled_image(
                 arrayed: element.decl.arrayed,
                 texel: element.decl.texel,
             };
-            Ok((si, image, Some(element.live)))
+            Ok((si, image, element.live))
         }
     }
 }
@@ -758,6 +780,46 @@ pub(super) fn array_element(
     let zero = fb.u32_const(0)?;
     let zero = fb.module().const_value(zero)?;
     Ok((fb.select(named, i, zero)?, named))
+}
+
+/// Under the identity domains, the index in the set-1 sampler array of `use_` of the candidate of
+/// constexpr sampler array `key` that sampler handle `sampler` names: that candidate's pushed index
+/// (`PushField::ConstexprSampler`), selected among the candidates' at run time, the first's where
+/// the handle names none (whose result `sampling_value` makes zero).
+fn identity_element(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    sampler: ValueId,
+    key: super::HeapArrayKey,
+    use_: SamplerUse,
+) -> BResult<SValue> {
+    let samplers = usize::try_from(key.array)
+        .ok()
+        .and_then(|a| cx.plan.families.sampler.arrays.get(a))
+        .map(|a| a.samplers.clone());
+    let Some(samplers) = samplers else {
+        return Err(cx.fail(format!("constexpr sampler array {key:?} is not planned")));
+    };
+    let (element, _) = array_element(cx, fb, sampler, key)?;
+    let mut index = None;
+    for (k, words) in (0u32..).zip(samplers) {
+        let c = CombinedSampler::new(
+            SamplerRef::Constexpr(words),
+            use_.compare,
+            use_.integer_texture,
+        );
+        let pushed = cx.push_field(fb, crate::pipeline::sym::PushField::ConstexprSampler(c))?;
+        index = Some(match index {
+            None => pushed,
+            Some(v) => {
+                let k = fb.u32_const(k)?;
+                let k = fb.module().const_value(k)?;
+                let is = fb.binary(BinOp::IEqual, element, k)?;
+                fb.select(is, pushed, v)?
+            }
+        });
+    }
+    index.ok_or_else(|| cx.fail("a sampler array without samplers"))
 }
 
 /// The word (`metal::sampler::SamplerWord`) of the constexpr sampler at the element of sampling
@@ -1048,7 +1110,7 @@ pub(super) fn sampled_value(
         let (x, word) = pixel_fetch(cx, fb, s, si, image, offset.as_ref(), arm)?;
         let x = unmapped_value(cx, fb, s, x, word)?;
         let x = live_or_zero(fb, live, x)?;
-        return texel_value(cx, fb, s, image, (x, TexelOrigin::Image), word);
+        return texel_value(cx, fb, s, image, x, word);
     }
     if let SampleOp::Bicubic(b) = &s.op {
         // No sparse form: the slot takes no sparse arm, and the word is 0. The routines return the
@@ -1210,7 +1272,7 @@ pub(super) fn sampled_value(
         None => word,
     };
     let texel = live_or_zero(fb, live, texel)?;
-    texel_value(cx, fb, s, image, (texel, TexelOrigin::Image), word)
+    texel_value(cx, fb, s, image, texel, word)
 }
 
 /// The plane coordinate of `s`, read from the AIR operand as given: the device's sampler, and an
@@ -1291,13 +1353,18 @@ pub(super) fn pixel_coordinates(
 }
 
 /// The word of the runtime sampler `pixel` names: a slot's `SamplerState` specialization (masked by
-/// the fields the function reads), or an argument buffer's sampler table entry's.
+/// the fields the function reads), or under the identity domains its pushed resource ID's high
+/// word, whole; or an argument buffer's sampler table entry's.
 pub(crate) fn sampler_word(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     pixel: Pixel,
 ) -> BResult<SValue> {
     match pixel {
+        Pixel::Spec(n) if cx.plan.families.access.identity => {
+            let id = sampler_id(cx, fb, n)?;
+            fb.composite_extract(id, &[1])
+        }
         Pixel::Spec(n) => match cx.decl.families.sampler.words.get(&n).copied() {
             Some(w) => Ok(w),
             None => Err(cx.fail(format!("sampler slot {n} has no state word"))),
@@ -1307,14 +1374,102 @@ pub(crate) fn sampler_word(
     }
 }
 
+/// Under the identity domains, runtime sampler slot `n`'s resource ID (`uvec2`, the index in the
+/// low word and the word in the high one), from its push field.
+fn sampler_id(cx: &mut EmitCx<'_>, fb: &mut FunctionBuilder<'_>, n: u32) -> BResult<SValue> {
+    let slot = super::select::sampler_slot(cx.plan.stage, n);
+    cx.push_field(fb, crate::pipeline::sym::PushField::SlotGuestBase(slot))
+}
+
+/// Under the identity domains, the image of combined binding `key`, loaded in the open block: the
+/// texture slot's element of its class's set-1 array at the index its pushed resource ID holds,
+/// with the binding's identity sampling ([`super::IdentitySampling`]).
+pub(super) fn identity_image(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    key: super::BindingKey,
+) -> BResult<(SValue, super::IdentitySampling)> {
+    let Some(i) = cx.plan.families.sampler.identity.get(&key).copied() else {
+        return Err(cx.fail(format!("combined binding {key:?} has no identity sampling")));
+    };
+    let slot = cx
+        .plan
+        .families
+        .texture
+        .slots
+        .get(&key.texture)
+        .map(|s| s.slot);
+    let images = cx.decl.families.texture.heap.get(&i.class).copied();
+    let (Some(slot), Some(images)) = (slot, images) else {
+        return Err(cx.fail(format!("combined binding {key:?} is not declared")));
+    };
+    let id = cx.push_field(fb, crate::pipeline::sym::PushField::SlotGuestBase(slot))?;
+    let element = fb.composite_extract(id, &[0])?;
+    let base = fb.module().global_value(images)?;
+    let p = fb.access_chain(base, &[element])?;
+    let img = fb.load(p, MemAccess::default())?;
+    Ok((img, i))
+}
+
+/// Under the identity domains, the sampled image of combined binding `key`: its image
+/// ([`identity_image`]) and its sampler ([`identity_sampler`]), joined by `OpSampledImage`.
+fn identity_sampled_image(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    key: super::BindingKey,
+) -> BResult<(SValue, CombinedImage)> {
+    let (img, i) = identity_image(cx, fb, key)?;
+    let sampler = identity_sampler(cx, fb, key.sampler, i.use_)?;
+    let si = fb.sampled_image(img, sampler)?;
+    Ok((si, i.combined()))
+}
+
+/// Under the identity domains, sampler `sampler` in use `use_`: the element of the set-1 sampler
+/// array of the use at the index a runtime sampler slot's pushed resource ID holds, or at a
+/// constexpr sampler's pushed index (`PushField::ConstexprSampler`), uniform over the call. A
+/// texture slot's sampling and a heap element's read it alike.
+fn identity_sampler(
+    cx: &mut EmitCx<'_>,
+    fb: &mut FunctionBuilder<'_>,
+    sampler: SamplerRef,
+    use_: SamplerUse,
+) -> BResult<SValue> {
+    let Some(samplers) = cx.decl.families.sampler.identity.get(&use_).copied() else {
+        return Err(cx.fail(format!("the sampler array of {use_:?} is not declared")));
+    };
+    let element = match sampler {
+        SamplerRef::Slot(n) => {
+            let id = sampler_id(cx, fb, n)?;
+            fb.composite_extract(id, &[0])?
+        }
+        SamplerRef::Constexpr(_) => {
+            let c = CombinedSampler::new(sampler, use_.compare, use_.integer_texture);
+            cx.push_field(fb, crate::pipeline::sym::PushField::ConstexprSampler(c))?
+        }
+    };
+    let base = fb.module().global_value(samplers)?;
+    let p = fb.access_chain(base, &[element])?;
+    fb.load(p, MemAccess::default())
+}
+
 /// Field `field` of the sampler table entry an argument buffer's sampler handle `handle` names: the
-/// handle is the entry's index, the null entry's 0 for a missed or null id.
+/// handle is the entry's index, the null entry's 0 for a missed or null id. Under the identity
+/// domains the handle is the sampler's resource ID (`access::handle::emit_identity_sampler`): the
+/// element is its guarded index and the flags its word.
 fn heap_sampler_field(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     handle: ValueId,
     field: EntryField,
 ) -> BResult<SValue> {
+    if cx.plan.families.access.identity {
+        let id = cx.operand(fb, handle)?;
+        let word = match field {
+            EntryField::Element => 0,
+            EntryField::Flags => 1,
+        };
+        return fb.composite_extract(id, &[word]);
+    }
     let Some(table) = cx.decl.families.access.sampler_table else {
         return Err(cx.fail("an argument buffer's sampler without its sampler table"));
     };
@@ -1399,6 +1554,13 @@ pub(super) fn centre(
             let Pixel::Spec(n) = s.pixel else {
                 return Err(cx.fail("a specialized texel centre without a runtime sampler slot"));
             };
+            // Under the identity domains the slot's word says whether it is a nearest pixel
+            // sampler, as an argument buffer's sampler's does.
+            if cx.plan.families.access.identity {
+                let mask = SamplerWord::nearest_pixel(image.texel != TexelClass::Float);
+                let word = sampler_word(cx, fb, s.pixel)?;
+                return Ok(Centre::TexelWhere(word_states(fb, word, mask)?));
+            }
             match cx.decl.families.sampler.nearest.get(&n).copied() {
                 Some(c) => Centre::TexelWhere(c),
                 None => return Err(cx.fail(format!("sampler slot {n} has no nearest constant"))),
@@ -1913,13 +2075,13 @@ pub(super) fn word_pixel(s: &Sampling) -> Option<Pixel> {
         (
             _,
             Source::Combined(super::BindingKey {
-                sampler: super::SamplerRef::Slot(n),
+                sampler: SamplerRef::Slot(n),
                 ..
             })
             | Source::Heap {
                 key:
                     super::HeapKey {
-                        sampler: super::SamplerRef::Slot(n),
+                        sampler: SamplerRef::Slot(n),
                         ..
                     },
                 ..
@@ -2131,24 +2293,23 @@ pub(super) fn texel_value(
     fb: &mut FunctionBuilder<'_>,
     s: &Sampling,
     image: super::CombinedImage,
-    (texel, origin): (SValue, TexelOrigin),
+    texel: SValue,
     word: Option<SValue>,
 ) -> BResult<SValue> {
-    let held = held_value(cx, fb, s, image, (texel, origin))?;
+    let held = held_value(cx, fb, s, image, texel)?;
     let held = held_constants(cx, fb, s, held)?;
     with_word(cx, fb, &s.result, held, word)
 }
 
 /// The held texel of sampling `s`'s image texel `texel`: an 8-bit sRGB texel's raw code decoded
-/// by the device's transfer, a slot's `half` or `float` texel converted by the bound format's class,
-/// else the texel held as the result's type holds it; before the lanes Metal reads as constants
-/// are set ([`held_constants`]).
+/// by the device's transfer, else the texel held as the result's type holds it; before the lanes
+/// Metal reads as constants are set ([`held_constants`]).
 pub(super) fn held_value(
     cx: &mut EmitCx<'_>,
     fb: &mut FunctionBuilder<'_>,
     s: &Sampling,
     image: super::CombinedImage,
-    (texel, origin): (SValue, TexelOrigin),
+    texel: SValue,
 ) -> BResult<SValue> {
     let Some(form) = s.texel else {
         return Err(cx.fail("a sample without a texel form"));
@@ -2162,78 +2323,7 @@ pub(super) fn held_value(
         };
         return crate::lower::texture::srgb_texel(fb, form, texel, color);
     }
-    // A `half` texel of a slot converts by the bound format's class: a gather's texel as a read's,
-    // a sample's (nearest, linear, or fetched) filtered value as a sample's, each with the access's
-    // lanes. Not where the sample's texel is the device's (`Sampling::half_texel`): it is held.
-    let half = match s.source {
-        Source::Combined(key) if !s.depth && s.half_texel => {
-            half_class(cx, &ImageRef::Slot(key.texture), form)
-        }
-        Source::Heap { handle, .. }
-        | Source::HeapSampler { handle, .. }
-        | Source::HeapArray { handle, .. }
-            if !s.depth && s.half_texel =>
-        {
-            crate::lower::texture::heap_half_class(cx, fb, handle, form)?
-        }
-        _ => None,
-    };
-    Ok(match half {
-        Some(h) => {
-            let lanes = sample_lanes(cx, fb, s)?;
-            h.convert(fb, texel, lanes, origin)?
-        }
-        None => held_texel(fb, image.texel, form, texel)?,
-    })
-}
-
-/// Whether sampler word `word` states a sampler that reads one texel of one level: nearest min and
-/// mag filters, no anisotropy, and no linear mip filter (a `bool`).
-fn word_reads_one(fb: &mut FunctionBuilder<'_>, word: SValue) -> BResult<SValue> {
-    let filters =
-        fb.u32_const(SamplerWord::MIN_LINEAR | SamplerWord::MAG_LINEAR | SamplerWord::ANISOTROPIC)?;
-    let filters = fb.module().const_value(filters)?;
-    let filters = fb.binary(BinOp::BitwiseAnd, word, filters)?;
-    let zero = fb.u32_const(0)?;
-    let zero = fb.module().const_value(zero)?;
-    let nearest = fb.binary(BinOp::IEqual, filters, zero)?;
-    let mip = fb.u32_const(SamplerWord::MIP_FILTER)?;
-    let mip = fb.module().const_value(mip)?;
-    let mip = fb.binary(BinOp::BitwiseAnd, word, mip)?;
-    let linear_mip = fb.u32_const(2 << SamplerWord::MIP_FILTER_SHIFT)?;
-    let linear_mip = fb.module().const_value(linear_mip)?;
-    let one_level = fb.binary(BinOp::INotEqual, mip, linear_mip)?;
-    fb.binary(BinOp::LogicalAnd, nearest, one_level)
-}
-
-/// The lanes of sampling `s`'s texel for the class's conversion (`half::TexelLanes::code`): a 2D
-/// gather's channel, one texel's lanes, or a value that may be filtered, as [`Sampling::one_texel`]
-/// says; where a runtime or argument buffer's sampler's word decides, one texel's where the word
-/// states nearest min and mag filters, no linear mip filter, and no anisotropy, else filtered.
-pub(super) fn sample_lanes(
-    cx: &mut EmitCx<'_>,
-    fb: &mut FunctionBuilder<'_>,
-    s: &Sampling,
-) -> BResult<SValue> {
-    use crate::lower::texture::half::TexelLanes;
-    use crate::lower::texture::OneTexel;
-    let word = match s.one_texel {
-        OneTexel::Always => {
-            let lanes = match s.op {
-                SampleOp::Gather { component, .. } => TexelLanes::Gathered(component),
-                _ => TexelLanes::Texel,
-            };
-            return lanes.value(fb);
-        }
-        OneTexel::Never => return TexelLanes::Filtered.value(fb),
-        OneTexel::Word(n) => sampler_word(cx, fb, Pixel::Spec(n))?,
-        OneTexel::Heap(h) => sampler_word(cx, fb, Pixel::Heap(h))?,
-        OneTexel::Table(_) => array_word(cx, fb, s)?,
-    };
-    let one = word_reads_one(fb, word)?;
-    let texel = TexelLanes::Texel.value(fb)?;
-    let filtered = TexelLanes::Filtered.value(fb)?;
-    fb.select(one, texel, filtered)
+    held_texel(fb, image.texel, form, texel)
 }
 
 #[cfg(test)]

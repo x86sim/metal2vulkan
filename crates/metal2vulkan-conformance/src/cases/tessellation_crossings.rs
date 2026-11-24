@@ -85,18 +85,21 @@
 //! finite numbers whose products the same ceiling bounds.
 
 use crate::allowance::Allowance;
-use crate::case::{call, made, probe, Abort, Case, Handle, Input, MetalSource, Side};
+use crate::case::{
+    call, drawn_or_refused, made, pipeline_or_refused, refused_leg, Abort, Case, Handle, Input,
+    MetalSource, Side,
+};
+use crate::degradation::Degradation;
 use crate::recording::ShaderRef;
 use crate::render::{RenderPass, RenderStep, RenderWork, TessellationState};
-use crate::transcript::{Node, Observed, Sites, Value};
+use crate::transcript::{Node, Observed, Sites};
 use metal2vulkan::metal::{
     PatchType, TessellationFactorStepFunction as Step, TessellationPartitionMode as Partition,
 };
-use metal2vulkan_runtime::Degradation;
 
 use super::tessellation_sweeps::{
-    air_inputs, domain_pipeline, grid_record, load, medium_layout, quad_factors, raw_quad_factors,
-    read_medium_marks, shaders_of, tessellation_notices, Domain, FINITE, MEDIUM_GRID, MEDIUM_MAX,
+    air_inputs, domain_pipeline, grid_record, load, medium_layout, partition_notices, quad_factors,
+    raw_quad_factors, read_medium_marks, shaders_of, Domain, FINITE, MEDIUM_GRID, MEDIUM_MAX,
     QUAD_FACTOR_BYTES, REGION_BYTES,
 };
 
@@ -298,18 +301,17 @@ impl Cross {
         };
         let mut pipelines = Vec::with_capacity(self.pipelines.len());
         for (site, state) in &self.pipelines {
-            pipelines.push(probe(
+            pipelines.push(pipeline_or_refused(
                 sites,
                 &format!("{site}/pipeline"),
                 side.render_pipeline(library, &domain_pipeline(fixture.entry, *state)),
-                |_| Value::Absent,
             ));
         }
 
         let mut work = Vec::new();
         let mut encoded = Vec::new();
         for (at, leg) in self.legs.iter().enumerate() {
-            let Some(pipeline) = pipelines[leg.pipeline] else {
+            let Ok(&pipeline) = pipelines[leg.pipeline].as_ref() else {
                 continue;
             };
             encoded.push(at);
@@ -325,16 +327,17 @@ impl Cross {
         for (at, leg) in self.legs.iter().enumerate() {
             let site = leg.path.join("/");
             let region = read_medium_marks(side, sites, &site, held.marks, self.region(at))?;
-            let mut leaves = vec![Node::leaf(
+            let marks = Node::leaf(
                 "marks",
                 Observed::bytes(region, medium_layout(self.region(at))),
-            )];
-            if let Some(pass) = encoded.iter().position(|held| *held == at) {
-                if let Some(Some(failure)) = outcome.refused.get(pass) {
-                    leaves.push(Node::leaf("pass", Observed::value(failure.recorded())));
-                }
-            }
-            answered.push((leg.path.clone(), leaves));
+            );
+            let name = leg.path[leg.path.len() - 1];
+            let pass = encoded.iter().position(|held| *held == at);
+            let node = drawn_or_refused(
+                Node::branch(name, vec![marks]),
+                refused_leg(&pipelines[leg.pipeline], &outcome, pass),
+            );
+            answered.push((leg.path.clone(), node));
         }
         for node in grouped(0, &answered) {
             sites.push(node);
@@ -351,9 +354,9 @@ struct Bound {
 }
 
 /// The branches of `answered`, which all share their paths' first `level` names, grouped by the
-/// name at `level`: a leg whose path ends there holds its own leaves, and one that goes deeper
-/// hangs under a branch the legs beside it share.
-fn grouped(level: usize, answered: &[(Vec<&'static str>, Vec<Node>)]) -> Vec<Node> {
+/// name at `level`: a leg whose path ends there is its own node, named so, and one that goes
+/// deeper hangs under a branch the legs beside it share.
+fn grouped(level: usize, answered: &[(Vec<&'static str>, Node)]) -> Vec<Node> {
     let mut out = Vec::new();
     let mut at = 0;
     while at < answered.len() {
@@ -363,11 +366,10 @@ fn grouped(level: usize, answered: &[(Vec<&'static str>, Vec<Node>)]) -> Vec<Nod
             end += 1;
         }
         let group = &answered[at..end];
-        let children = match level + 1 == group[0].0.len() {
+        out.push(match level + 1 == group[0].0.len() {
             true => group[0].1.clone(),
-            false => grouped(level + 1, group),
-        };
-        out.push(Node::branch(name, children));
+            false => Node::branch(name, grouped(level + 1, group)),
+        });
         at = end;
     }
     out
@@ -461,7 +463,7 @@ impl Case for PartitionFactors {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        tessellation_notices()
+        partition_notices()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -545,7 +547,7 @@ impl Case for PartitionDegenerates {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        tessellation_notices()
+        partition_notices()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -627,7 +629,7 @@ impl Case for PartitionInsides {
     }
 
     fn allowances(&self) -> Vec<Allowance> {
-        tessellation_notices()
+        partition_notices()
     }
 
     fn shaders(&self) -> Result<Vec<ShaderRef>, String> {
@@ -722,7 +724,7 @@ impl Case for PartitionScales {
     fn allowances(&self) -> Vec<Allowance> {
         // Every pipeline here enables the factor scale, so every run announces the notice the
         // scale is read under. Nothing observed is loosened.
-        let mut all = tessellation_notices();
+        let mut all = partition_notices();
         all.push(crate::replay::notice_allowance(
             Degradation::TessellationFactorScale.code(),
         ));
@@ -822,7 +824,7 @@ impl Case for PartitionSteps {
     fn allowances(&self) -> Vec<Allowance> {
         // Half the pipelines here state a per-instance factor step, which is what provokes the
         // notice the instance addressing is read under.
-        let mut all = tessellation_notices();
+        let mut all = partition_notices();
         all.push(crate::replay::notice_allowance(
             Degradation::TessellationFactorInstance.code(),
         ));
@@ -866,6 +868,7 @@ pub fn boxed() -> Vec<Box<dyn Case>> {
 mod tests {
     use super::super::tessellation_sweeps::to_words;
     use super::*;
+    use crate::transcript::Value;
 
     /// The bytes the recording of `case` holds at the leaf `path` (node names from the root,
     /// `/`-separated, the reserved `case` root left out), or `None` where it holds no such leaf.

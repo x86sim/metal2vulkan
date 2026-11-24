@@ -1,5 +1,5 @@
 //! Whole-corpus driver acceptance: does the Vulkan driver accept the pipeline we produce? Nothing
-//! is bound, nothing is dispatched, nothing is read back.
+//! is bound or submitted, nothing is read back.
 //!
 //! That question has no other asker in this repository. `spirv-val` checks the module against the
 //! SPIR-V specification; the authored cases put a real pipeline on the device but reach only a
@@ -9,34 +9,32 @@
 //! It runs the engine: `--profile P` compiles every kernel (compute pipeline), vertex function
 //! (rasterization-disabled render pipeline, with a vertex descriptor for the attributes it
 //! declares), and fragment function (drawn with its generated passthrough vertex companion into
-//!   the attachments its outputs imply) with the engine's public compile API for profile P
-//!   (`acceptance::row`), and creates the pipeline from the **binder layout the artifact carries**
-//!   (set layouts, push ranges, specialization, subgroup size, vertex input, graphics state). A
-//!   kernel is created from the region the binder plans for one representative dispatch, a
-//!   threadgroup of whole simdgroups (its specialization, stage flags, and required subgroup size,
-//!   and a representative imageblock extent of one cell per thread where it has an explicit
-//!   imageblock; `acceptance::dispatch`), as the executors create it, never at its stage's
-//!   placeholder local size. The binder's typed refusal of that dispatch is `BIND_REFUSED`,
-//!   counted; any other binder error is `BIND_ERROR` and fails the sweep. A render row's stages are
-//!   created at their default specialization, not the graphics plan's (a limit). A fragment
-//!   function's attachments have no more channels than its outputs write. It times each
-//!   `vkCreate*Pipelines` (`budgets::CreationClock`: its wall time less its thread's wait for a
-//!   CPU), with the drivers' shader disk caches off (`budgets::turn_driver_shader_caches_off`); a
-//!   creation above 5 s is a bug. A row's detail
-//!   prints its own stage's module words, which are what the translation sweep (`corpus-triage
-//!   --audit translation`) counts for it, a render row's other stages' apart as `companion_words`,
-//!   and a kernel's representative imageblock extent as `imageblock=WxH`, then the pipeline's
-//!   precision notes as `precision=[...]`. `--robustness-off`
-//!   compiles and creates every row in profile P's robustness-off leg, which the summary's `leg`
-//!   names. `--driver-caches-on` leaves the drivers' shader disk caches as the environment sets
+//! the attachments its outputs imply) with the engine's public compile API for profile P
+//! (`acceptance::row`). A render row's pipeline is created from the **binder layout the artifact
+//! carries** (set layouts, push ranges, specialization, subgroup size, vertex input, graphics
+//! state), its stages at their default specialization, not the graphics plan's (a limit). A
+//! fragment function's attachments have no more channels than its outputs write. A kernel row is
+//! made as a guest's kernel is, through the runtime (`candidate::RuntimeKernels`): its
+//! `ComputePipelineState` on the sweep's one runtime device, opened once for all its kernel rows,
+//! with the row's function-constant values, and one dispatch of one representative threadgroup
+//! (the state's thread execution width of threads, or its `maxTotalThreadsPerThreadgroup` where
+//! fewer) encoded into a command buffer that is never committed, so the runtime asks the driver
+//! for the pipeline that threadgroup runs on. The
+//! runtime's typed refusal (the translator's, a known gap, a device limit) is `RUNTIME_REFUSED`,
+//! counted; a kernel that writes no memory, whose dispatch the runtime runs as Metal's without
+//! effects and makes no pipeline for, is `NO_EFFECT`, counted. The make runs in this process,
+//! held to the per-attempt ceilings, after the row's compile worker compiled it within them. It
+//! times each `vkCreate*Pipelines` (`budgets::CreationClock`: its wall time less its thread's wait
+//! for a CPU; a kernel's, the runtime's own count of its pipeline creation), with the drivers'
+//! shader disk caches off (`budgets::turn_driver_shader_caches_off`); a creation above 5 s is a
+//! bug. A row's detail prints its own stage's module words, which are what the translation sweep
+//! (`corpus-triage --audit translation`) counts for it, a render row's other stages' apart as
+//! `companion_words`, then the pipeline's precision notes as `precision=[...]`. `--driver-caches-on` leaves the drivers' shader disk caches as the environment sets
 //!   them, so a creation may hit what an earlier process compiled: run twice, the second run times
 //!   the warm creation a program's later launches see, beside the cold one the ceiling times (the
 //!   summary's `driver_caches`). `--keep-modules DIR` writes each compiled row's stage modules,
-//!   their specialization layouts and lowering strategies' words, and the MoltenVK MSL helper's
-//!   configurations into DIR, a diagnostic (with `--compile-only` on any host): what a by-hand
-//!   conversion and Metal compile of a row's module starts from. `--pulled` compiles every vertex
-//!   attribute pulled in the shader instead of the projection the product derives: the repeatable
-//!   form of the pulled sweep, with `--compile-only` or on a device. `--fixtures` sweeps the owned
+//!   their specialization layouts and lowering strategies' words into DIR, a diagnostic (with
+//!   `--compile-only` on any host). `--fixtures` sweeps the owned
 //!   `validation/fixtures/public/engine` sources instead of the corpus, which is what the Linux
 //!   containers can run. A row that retains no bitcode (a public source) is assembled from its AIR
 //!   text.
@@ -77,20 +75,17 @@
 //! reports a message about the device, before the loader reads it again (in `vkDestroyDevice` at
 //! exit, where a run faulted after its summary before; `candidate::platform::loader_word`).
 
-use metal2vulkan::bind::ImageblockSize;
-use metal2vulkan::device::DeviceDescription;
 use metal2vulkan::library::FunctionConstantValues;
 use metal2vulkan::pipeline::PrecisionNote;
-use metal2vulkan_validation::acceptance::dispatch::BinderAnswer;
 use metal2vulkan_validation::acceptance::metal_report::MetalCompileFailure;
 use metal2vulkan_validation::acceptance::row::UnmodelledKind;
 use metal2vulkan_validation::acceptance::{
-    compile_draw_in_worker, compile_row_in_worker, Acceptance, AcceptanceError, Projection,
-    RowCompile, RowPipeline, RowStage,
+    compile_draw_in_worker, compile_row_in_worker, Acceptance, AcceptanceError, RowCompile,
+    RowPipeline, RowStage, RuntimeRow,
 };
 use metal2vulkan_validation::budgets::PIPELINE_CREATION_CEILING;
 use metal2vulkan_validation::candidate::engine::graphics::RenderTemplate;
-use metal2vulkan_validation::coverage::{robustness_off, Leg};
+use metal2vulkan_validation::candidate::RuntimeKernels;
 use metal2vulkan_validation::engine::{self, FailureKind, Outcome, RowInput, RowSource};
 use metal2vulkan_validation::gpu::wait::{parse_wait_timeout, set_wait_timeout};
 use metal2vulkan_validation::gpu::DeviceType;
@@ -132,20 +127,18 @@ fn main() {
 fn usage() -> String {
     "usage: corpus-pipeline --profile P [--corpus DIR] [--private-corpus DIR] [--limit N]\n\
      \x20      [--after HASH | --hash HASH | --fixtures] [--partition K/N] [--attempting PATH]\n\
-     \x20      [--pulled] [--robustness-off] [--driver-caches-on]\n\
+     \x20      [--driver-caches-on]\n\
      \x20      [--keep-modules DIR] [--specializations FILE | --draws FILE]\n\
      \x20      (--device-type cpu|gpu [--gpu-wait-timeout SECONDS] [--profiles-layer P]\n\
      \x20       | --compile-only)\n\
      It runs the engine. --profile P names a committed profile describing the device; it may take\n\
-     --fixtures, --pulled (every vertex attribute pulled in the shader), or --compile-only\n\
+     --fixtures or --compile-only\n\
      (compile every row, open no device).\n\
      --driver-caches-on leaves the drivers' shader disk caches as the environment sets them (warm\n\
      creations, when an earlier run compiled the same pipelines); every other run compiles cold.\n\
      --keep-modules DIR writes each compiled row's stage modules into DIR (a diagnostic): per stage\n\
-     <hash>.<stage>.spv, its entry point, specialization layout and strategy census (each lowering\n\
-     strategy's uses and words) in <hash>.<stage>.json, and the\n\
-     MoltenVK MSL helper's configuration of each set-0 variant in <hash>.<stage>.<variant>.cfg\n\
-     (scripts/moltenvk-msl-helper, for converting the module as MoltenVK 1.4.1 does).\n\
+     <hash>.<stage>.spv, and its entry point, specialization layout and strategy census (each\n\
+     lowering strategy's uses and words) in <hash>.<stage>.json.\n\
      --draws FILE compiles and creates the draws FILE lists (one JSON object per line, {\"id\",\n\
      \"vertex\": <source hash>, \"fragment\": <source hash>, \"template\": <render template>}),\n\
      each its vertex and fragment functions under the descriptor an application logged.\n\
@@ -154,14 +147,10 @@ fn usage() -> String {
      values.\n\
      --partition K/N sweeps only the corpus rows whose source shard is K modulo N (0 <= K < N <= 64),\n\
      so N processes sweep disjoint parts; --after then names a row of that part.\n\
-     --robustness-off compiles for P without its robustness features\n\
-     (robustBufferAccess, robustBufferAccess2, robustImageAccess, robustImageAccess2), so the\n\
-     product compiles the in-shader containment encodings, and opens the device enabling none\n\
-     of them: the robustness-off leg; P must state one.\n\
      --profiles-layer P (on a device, naming --profile's P) restricts the device to\n\
      P through VK_LAYER_KHRONOS_profiles, after checking that it has P and reports exactly P\n\
-     (validation spec 4.1.2's profile-restricted pipeline creation). A drm-shim gpu device requires scripts/drm-shim-exec inside the drm-shim\n\
-     container; cpu matches only a CPU Vulkan implementation."
+     (validation spec 4.1.2's profile-restricted pipeline creation). --device-type gpu opens a\n\
+     hardware or virtual GPU; cpu matches only a CPU Vulkan implementation."
         .to_string()
 }
 
@@ -203,8 +192,6 @@ fn run() -> Result<(), String> {
     let mut profile = None;
     let mut fixtures = false;
     let mut compile_only = false;
-    let mut leg = Leg::Stated;
-    let mut projection = Projection::Derived;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -228,8 +215,6 @@ fn run() -> Result<(), String> {
             "--fixtures" => fixtures = true,
             "--compile-only" => compile_only = true,
             "--profiles-layer" => options.profiles_layer = Some(value()?),
-            "--pulled" => projection = Projection::Pulled,
-            "--robustness-off" => leg = Leg::RobustnessOff,
             DRIVER_CACHES_ON => options.driver_caches = true,
             "--keep-modules" => options.keep_modules = Some(PathBuf::from(value()?)),
             "--draws" => {
@@ -303,8 +288,7 @@ fn run() -> Result<(), String> {
                 .into(),
         );
     }
-    // The process-wide leg is decided before any device opens.
-    let compiler = enter_leg(&profile, leg)?;
+    let compiler = compile_device(&profile)?;
     let worker = CompileWorker::current()?;
     sweep_new(
         device_type,
@@ -312,54 +296,24 @@ fn run() -> Result<(), String> {
         &compiler,
         &Sweep {
             profile: &profile,
-            leg,
             fixtures,
-            projection,
         },
         &options,
     )
 }
 
-/// The compile device of an engine sweep of profile `stem` in `leg`. The process's leg is
-/// decided here, before the sweep opens any device: in the robustness-off leg every Vulkan context
-/// of the process enables no robustness feature, and the rows compile for the profile without its
-/// robustness features ([`leg_description`]). The device is created under the process's policy
-/// (`candidate::requested_policy`).
-fn enter_leg(stem: &str, leg: Leg) -> Result<WorkerDevice, String> {
-    let description = leg_description(stem, leg)?;
-    if leg == Leg::RobustnessOff {
-        metal2vulkan_validation::candidate::run_robustness_off()?;
-    }
-    WorkerDevice::new(
-        description,
-        metal2vulkan_validation::candidate::requested_policy(),
-    )
-    .map_err(|error| format!("{stem}: {error}"))
+/// The compile device of an engine sweep of profile `stem` as the runtime's device describes it
+/// (`engine::runtime_description`), created under the default policy.
+fn compile_device(stem: &str) -> Result<WorkerDevice, String> {
+    let description = engine::runtime_description(stem)?;
+    WorkerDevice::new(description, metal2vulkan::device::DevicePolicy::default())
+        .map_err(|error| format!("{stem}: {error}"))
 }
 
-/// The description the sweep compiles profile `stem`'s rows for in `leg`: as committed, or without
-/// its robustness features, which the profile must state (otherwise its robustness-off leg is its
-/// stated one, and the sweep would only repeat it).
-fn leg_description(stem: &str, leg: Leg) -> Result<DeviceDescription, String> {
-    let description = engine::load_description(stem)?;
-    match leg {
-        Leg::Stated => Ok(description),
-        Leg::RobustnessOff => robustness_off(&description).ok_or_else(|| {
-            format!(
-                "--robustness-off: {stem} states no robustness feature, so its robustness-off \
-                 leg is its stated one"
-            )
-        }),
-    }
-}
-
-/// What one engine sweep compiles: profile P in a leg, the corpus or the owned fixtures, and
-/// the projection of its vertex attributes.
+/// What one engine sweep compiles: profile P, and the corpus or the owned fixtures.
 struct Sweep<'a> {
     profile: &'a str,
-    leg: Leg,
     fixtures: bool,
-    projection: Projection,
 }
 
 /// The part of the corpus one process of a split sweep visits (`--partition K/N`): every row
@@ -595,15 +549,12 @@ fn set_label(set: &Specialization) -> String {
 /// module `corpus-triage --audit translation` compiles for the row and counts; then
 /// `companion_words=M` when the pipeline has other stages (a fragment row's generated passthrough
 /// vertex companion, a post-tessellation vertex row's synthesized stages), which the translation
-/// sweep does not compile; then `imageblock=WxH` for a kernel with an explicit imageblock, the
-/// representative extent its pipeline was created with (`acceptance::dispatch`): another extent is
-/// another specialization, which can be refused where this one is created; then `precision=[...]`
-/// when any stage of the pipeline carries a precision note.
+/// sweep does not compile; then `precision=[...]` when any stage of the pipeline carries a
+/// precision note.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RowDetail {
     own: u64,
     companion: u64,
-    imageblock: Option<ImageblockSize>,
     precision: Vec<PrecisionNote>,
 }
 
@@ -612,10 +563,6 @@ impl RowDetail {
         RowDetail {
             own: pipeline.words(),
             companion: pipeline.companion_words(),
-            imageblock: match pipeline {
-                RowPipeline::Compute { creation, .. } => creation.imageblock,
-                RowPipeline::Render { .. } => None,
-            },
             precision: pipeline.precision_notes(),
         }
     }
@@ -626,9 +573,6 @@ impl std::fmt::Display for RowDetail {
         write!(f, "words={}", self.own)?;
         if self.companion > 0 {
             write!(f, " companion_words={}", self.companion)?;
-        }
-        if let Some(extent) = self.imageblock {
-            write!(f, " imageblock={}x{}", extent.width, extent.height)?;
         }
         if !self.precision.is_empty() {
             write!(f, " precision={:?}", self.precision)?;
@@ -651,11 +595,11 @@ struct Tally {
     unmodelled: usize,
     /// The `UNMODELLED` rows by kind (`acceptance::row::UnmodelledKind`).
     unmodelled_kinds: BTreeMap<UnmodelledKind, usize>,
-    /// Kernel rows the binder refused to bind for the representative dispatch with a typed
-    /// refusal the product documents (`BIND_REFUSED`).
-    bind_refused: usize,
-    /// Kernel rows the binder answered with any other error (`BIND_ERROR`), which fail the sweep.
-    bind_errors: usize,
+    /// Kernel rows the runtime refused with its typed error (`RUNTIME_REFUSED`).
+    runtime_refused: usize,
+    /// Kernel rows whose dispatch the runtime ran without effects, making no pipeline
+    /// (`NO_EFFECT`).
+    no_effect: usize,
     stage_not_covered: usize,
     no_bitcode: usize,
     tooling: usize,
@@ -715,6 +659,14 @@ impl Tally {
                 self.invalid_usage += 1;
                 Ok(("INVALID_USAGE", messages.join(" | "), 0))
             }
+            Ok(Acceptance::RuntimeRefused(why)) => {
+                self.runtime_refused += 1;
+                Ok(("RUNTIME_REFUSED", why, 0))
+            }
+            Ok(Acceptance::NoEffect) => {
+                self.no_effect += 1;
+                Ok(("NO_EFFECT", detail.to_string(), 0))
+            }
             Err(AcceptanceError::Unmodelled(why)) => {
                 self.tooling += 1;
                 Ok(("TOOLING", why, 0))
@@ -726,20 +678,6 @@ impl Tally {
             Err(error @ AcceptanceError::DeviceUnavailable(_)) => {
                 Err(format!("{key}: {error}; the sweep stops"))
             }
-        }
-    }
-
-    /// Count the binder's error for a kernel row's representative dispatch and return its
-    /// `(STATUS, detail, create_ms)`: a typed refusal the product documents is `BIND_REFUSED`,
-    /// which the sweep counts; any other binder error is `BIND_ERROR`, which fails it through
-    /// [`Tally::verdict`].
-    fn binder(&mut self, answer: BinderAnswer) -> (&'static str, String, u128) {
-        if answer.documented {
-            self.bind_refused += 1;
-            ("BIND_REFUSED", answer.detail, 0)
-        } else {
-            self.bind_errors += 1;
-            ("BIND_ERROR", answer.detail, 0)
         }
     }
 
@@ -785,28 +723,21 @@ impl Tally {
     }
 
     /// Whether the sweep passed: no refusal, no creation above the ceiling, no message from the
-    /// validation layer, no compile the worker boundary stopped, no binder error other than a
-    /// typed refusal the product documents, and no tooling error other than a modelled limit (of
-    /// the row's inputs or of the creation path).
+    /// validation layer, no compile the worker boundary stopped, and no tooling error other than
+    /// a modelled limit (of the row's inputs or of the creation path).
     fn verdict(&self) -> Result<(), String> {
-        if self.refused
-            + self.over_ceiling
-            + self.invalid_usage
-            + self.errors
-            + self.worker_stopped
-            + self.bind_errors
+        if self.refused + self.over_ceiling + self.invalid_usage + self.errors + self.worker_stopped
             > 0
         {
             return Err(format!(
                 "{} pipelines refused, {} created above the {} s ceiling, {} reported by the \
-                 validation layer, {} compiles stopped at the worker boundary, {} binder errors, \
-                 and {} tooling errors",
+                 validation layer, {} compiles stopped at the worker boundary, and {} tooling \
+                 errors",
                 self.refused,
                 self.over_ceiling,
                 PIPELINE_CREATION_CEILING.as_secs(),
                 self.invalid_usage,
                 self.worker_stopped,
-                self.bind_errors,
                 self.errors
             ));
         }
@@ -822,15 +753,13 @@ fn sweep_new(
     sweep: &Sweep<'_>,
     options: &Options,
 ) -> Result<(), String> {
-    let &Sweep {
-        profile,
-        leg,
-        fixtures,
-        projection,
-    } = sweep;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let &Sweep { profile, fixtures } = sweep;
+    let mut out = rows_output()?;
     let mut tally = Tally::default();
+    let mut target = device.map(|kind| SweepDevice {
+        kind,
+        kernels: None,
+    });
     let mut attempt = |row: NewRow| -> Result<(), String> {
         if tally.rows >= options.limit {
             return Ok(());
@@ -839,10 +768,9 @@ fn sweep_new(
         mark_attempting(options, &row.key)?;
         tally.row_compile = None;
         let (status, detail, create_ms) = attempt_row(
-            device,
+            target.as_mut(),
             worker,
             compiler,
-            projection,
             &row,
             options.keep_modules.as_deref(),
             &mut tally,
@@ -931,6 +859,16 @@ fn sweep_new(
             })
         })?;
     }
+    if let Some(SweepDevice {
+        kernels: Some(kernels),
+        ..
+    }) = target
+    {
+        if let Err(error) = kernels.finish() {
+            eprintln!("corpus-pipeline: the kernel rows' runtime device: {error}");
+            tally.errors += 1;
+        }
+    }
     let (slowest_key, slowest_ms) = tally
         .slowest
         .as_ref()
@@ -971,11 +909,7 @@ fn sweep_new(
         .as_ref()
         .map_or_else(|| "none".to_string(), |listed| listed.0.len().to_string());
     eprintln!(
-        "corpus-pipeline-summary\tengine=new\tprofile={profile}\tleg={}\tprofiles_layer={}\tprojection={projection:?}\tdevice_type={}\trows={}\tcompiled_only={}\tcreated={}\trefused={}\tnot_enabled={}\tnot_compiled={}\tunmodelled={}\tunmodelled_kinds={unmodelled_kinds}\tbind_refused={}\tbind_errors={}\tstage_not_covered={}\tno_bitcode={}\ttooling={}\terrors={}\tcreation_over_ceiling={}\tinvalid_usage={}\tworker_stopped={}\tmetal_failures={metal_failures}\tpartition={partition}\tslowest_creation={slowest_key}\tslowest_creation_ms={slowest_ms}\tslowest_compile={slowest_compile_key}\tslowest_compile_ms={slowest_compile_ms}\tpeak_compile_rss={peak_rss_key}\tpeak_compile_rss_bytes={peak_rss}\tpeak_compile_allocator={peak_allocator_key}\tpeak_compile_allocator_bytes={peak_allocator}\tdriver_caches={}\tspecializations={specializations}\tdraws={draws}",
-        match leg {
-            Leg::Stated => "stated",
-            Leg::RobustnessOff => "robustness-off",
-        },
+        "corpus-pipeline-summary\tengine=new\tprofile={profile}\tprofiles_layer={}\tdevice_type={}\trows={}\tcompiled_only={}\tcreated={}\trefused={}\tnot_enabled={}\tnot_compiled={}\tunmodelled={}\tunmodelled_kinds={unmodelled_kinds}\truntime_refused={}\tno_effect={}\tstage_not_covered={}\tno_bitcode={}\ttooling={}\terrors={}\tcreation_over_ceiling={}\tinvalid_usage={}\tworker_stopped={}\tmetal_failures={metal_failures}\tpartition={partition}\tslowest_creation={slowest_key}\tslowest_creation_ms={slowest_ms}\tslowest_compile={slowest_compile_key}\tslowest_compile_ms={slowest_compile_ms}\tpeak_compile_rss={peak_rss_key}\tpeak_compile_rss_bytes={peak_rss}\tpeak_compile_allocator={peak_allocator_key}\tpeak_compile_allocator_bytes={peak_allocator}\tdriver_caches={}\tspecializations={specializations}\tdraws={draws}",
         options.profiles_layer.as_deref().unwrap_or("none"),
         device.map_or("none", DeviceType::as_str),
         tally.rows,
@@ -985,8 +919,8 @@ fn sweep_new(
         tally.not_enabled,
         tally.not_compiled,
         tally.unmodelled,
-        tally.bind_refused,
-        tally.bind_errors,
+        tally.runtime_refused,
+        tally.no_effect,
         tally.stage_not_covered,
         tally.no_bitcode,
         tally.tooling,
@@ -1002,37 +936,89 @@ fn sweep_new(
     tally.verdict()
 }
 
-/// Compile one row in a compile worker and create its pipeline: `(STATUS, detail, create_ms)`.
-/// With `keep`, the compiled row's stage modules are written there first ([`keep_modules`]).
+/// Where the sweep writes its result rows: the process's standard output, which nothing else
+/// writes to. Whatever else this process writes to its standard output descriptor goes to its
+/// standard error instead: the validation layer names its log file there for each instance a kernel
+/// row's runtime makes, which would otherwise land between two rows.
+fn rows_output() -> Result<Box<dyn Write>, String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        // SAFETY: duplicates this process's own standard output descriptor, which stays open.
+        let rows = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if rows < 0 {
+            return Err(format!(
+                "duplicate the standard output: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: points the standard output descriptor at the standard error; both stay open for
+        // the process's life, and nothing was written to the standard output yet.
+        if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+            return Err(format!(
+                "point the standard output at the standard error: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `rows` is a descriptor this process just made and nothing else owns or closes.
+        let rows = unsafe { std::fs::File::from_raw_fd(rows) };
+        Ok(Box::new(std::io::LineWriter::new(rows)))
+    }
+    #[cfg(not(unix))]
+    Ok(Box::new(std::io::stdout()))
+}
+
+/// The device a sweep creates its rows' pipelines on: its kind, and the one runtime device its
+/// kernel rows are made on, opened at the first kernel row and finished after the last row.
+struct SweepDevice {
+    kind: DeviceType,
+    kernels: Option<RuntimeKernels>,
+}
+
+impl SweepDevice {
+    /// The sweep's runtime device for its kernel rows, opened here at the first.
+    fn kernels(&mut self) -> Result<&mut RuntimeKernels, AcceptanceError> {
+        let kernels = match self.kernels.take() {
+            Some(kernels) => kernels,
+            None => RuntimeKernels::open(self.kind)?,
+        };
+        Ok(self.kernels.insert(kernels))
+    }
+}
+
+/// Compile one row in a compile worker and create its pipeline on `device` (a kernel row's, made
+/// through the runtime from the row's AIR on the sweep's one runtime device,
+/// [`SweepDevice::kernels`]): `(STATUS, detail, create_ms)`. `device` is `None` for
+/// `--compile-only`. With `keep`, the compiled row's stage modules are written there first
+/// ([`keep_modules`]).
 fn attempt_row(
-    device: Option<DeviceType>,
+    device: Option<&mut SweepDevice>,
     worker: &CompileWorker,
     compiler: &WorkerDevice,
-    projection: Projection,
     row: &NewRow,
     keep: Option<&Path>,
     tally: &mut Tally,
 ) -> Result<(&'static str, String, u128), String> {
     let key = row.key.as_str();
-    let (compiled, measured) = match &row.what {
+    let constants = match &row.what {
         RowWork::Function {
-            input,
-            specialization,
-        } => {
+            specialization: Some(set),
+            ..
+        } => set.values(),
+        _ => FunctionConstantValues::defaults(),
+    };
+    let (compiled, measured) = match &row.what {
+        RowWork::Function { input, .. } => {
             let Ok(stage) = RowStage::parse(&row.stage) else {
                 tally.stage_not_covered += 1;
                 return Ok(("STAGE_NOT_COVERED", format!("stage {}", row.stage), 0));
             };
-            let constants = specialization
-                .as_ref()
-                .map_or_else(FunctionConstantValues::defaults, Specialization::values);
             compile_row_in_worker(
                 worker,
                 compiler,
                 &input.source,
                 &input.entry,
                 stage,
-                projection,
                 &constants,
             )
         }
@@ -1090,7 +1076,6 @@ fn attempt_row(
             *tally.unmodelled_kinds.entry(why.kind).or_default() += 1;
             return Ok(("UNMODELLED", why.to_string(), 0));
         }
-        RowCompile::Binder(answer) => return Ok(tally.binder(answer)),
     };
     if let Some(dir) = keep {
         keep_modules(dir, key, &pipeline)?;
@@ -1100,22 +1085,38 @@ fn attempt_row(
         tally.compiled += 1;
         return Ok(("COMPILED", detail.to_string(), 0));
     };
-    let result = metal2vulkan_validation::candidate::create_acceptance_pipeline(device, &pipeline);
+    let result = match (&*pipeline, &row.what) {
+        (RowPipeline::Render { pipeline, .. }, _) => {
+            metal2vulkan_validation::candidate::create_acceptance_pipeline(device.kind, pipeline)
+        }
+        (RowPipeline::Compute { .. }, RowWork::Function { input, .. }) => {
+            let bitcode = match input.source.bitcode() {
+                Ok(bitcode) => bitcode,
+                Err(error) => {
+                    tally.errors += 1;
+                    return Ok(("ERROR", format!("the row's bitcode: {error}"), 0));
+                }
+            };
+            let kernel = RuntimeRow {
+                bitcode: &bitcode,
+                entry: &input.entry,
+                constants: &constants,
+            };
+            device.kernels().and_then(|kernels| kernels.accept(&kernel))
+        }
+        (RowPipeline::Compute { .. }, RowWork::Draw { .. }) => {
+            return Err(format!(
+                "{key}: a logged draw compiled to a compute pipeline"
+            ));
+        }
+    };
     tally.record(key, detail, result)
 }
 
 /// Write row `key`'s stage modules into `dir` (`--keep-modules`): per stage, the SPIR-V as
-/// `<key>.<stage>.spv`, its entry point and specialization layout as `<key>.<stage>.json`, and
-/// the MoltenVK MSL helper's configuration of each set-0 variant as `<key>.<stage>.<variant>.cfg`
-/// (`msl_portability::moltenvk`, what the helper converts a module with), or the reason there is
-/// none in `<key>.<stage>.cfg.err`.
+/// `<key>.<stage>.spv`, and its entry point, specialization layout and strategy census as
+/// `<key>.<stage>.json`.
 fn keep_modules(dir: &Path, key: &str, pipeline: &RowPipeline) -> Result<(), String> {
-    use metal2vulkan_validation::msl_portability::moltenvk;
-    let layout = match pipeline {
-        RowPipeline::Compute { pipeline, .. } => &pipeline.layout,
-        RowPipeline::Render { pipeline, .. } => &pipeline.layout,
-    };
-    let layout = moltenvk::Layout::from(layout);
     let write = |name: String, bytes: &[u8]| {
         let path = dir.join(name);
         std::fs::write(&path, bytes).map_err(|error| format!("write {}: {error}", path.display()))
@@ -1137,19 +1138,6 @@ fn keep_modules(dir: &Path, key: &str, pipeline: &RowPipeline) -> Result<(), Str
         let meta = serde_json::to_vec_pretty(&meta)
             .map_err(|error| format!("encode {name}.json: {error}"))?;
         write(format!("{name}.json"), &meta)?;
-        match moltenvk::entry_point(&stage.spirv)
-            .and_then(|entry| moltenvk::conversions(&entry, &layout))
-        {
-            Ok(conversions) => {
-                for conversion in conversions {
-                    write(
-                        format!("{name}.{}.cfg", conversion.set0.as_str()),
-                        conversion.config_text().as_bytes(),
-                    )?;
-                }
-            }
-            Err(why) => write(format!("{name}.cfg.err"), why.as_bytes())?,
-        }
     }
     Ok(())
 }
@@ -1233,20 +1221,17 @@ mod tests {
     const DETAIL: RowDetail = RowDetail {
         own: 7,
         companion: 0,
-        imageblock: None,
         precision: Vec::new(),
     };
 
-    /// A row's detail prints its own stage's words, what the translation sweep counts for it, the
-    /// other stages' apart, and the representative imageblock extent a kernel with an explicit
-    /// imageblock was created with.
+    /// A row's detail prints its own stage's words, what the translation sweep counts for it, and
+    /// the other stages' apart.
     #[test]
-    fn a_rows_detail_is_its_own_stage_words_its_companions_and_its_imageblock_extent() {
+    fn a_rows_detail_is_its_own_stage_words_and_its_companions() {
         assert_eq!(DETAIL.to_string(), "words=7");
         let fragment = RowDetail {
             own: 1148,
             companion: 276,
-            imageblock: None,
             precision: Vec::new(),
         };
         assert_eq!(fragment.to_string(), "words=1148 companion_words=276");
@@ -1260,18 +1245,6 @@ mod tests {
             .record("fragment", fragment.clone(), created())
             .unwrap();
         assert_eq!(detail, "words=1148 companion_words=276");
-        let imageblock = RowDetail {
-            own: 412,
-            companion: 0,
-            imageblock: Some(ImageblockSize::new(32, 1)),
-            precision: Vec::new(),
-        };
-        assert_eq!(imageblock.to_string(), "words=412 imageblock=32x1");
-        let (status, detail, _) = tally.record("imageblock", imageblock, created()).unwrap();
-        assert_eq!(
-            (status, detail.as_str()),
-            ("OK", "words=412 imageblock=32x1")
-        );
         // A pipeline whose stages carry precision notes names them.
         let noted = RowDetail {
             precision: vec![PrecisionNote::DeviceArithmetic],
@@ -1352,64 +1325,30 @@ mod tests {
             .starts_with("line 1"));
     }
 
-    /// The binder's typed refusal for a kernel row's representative dispatch is counted and passes;
-    /// any other binder error fails the sweep.
+    /// The runtime's typed refusal of a kernel row and a kernel row it makes no pipeline for are
+    /// counted and pass; the driver's refusal of the pipeline it asks for fails the sweep.
     #[test]
-    fn a_documented_binder_refusal_is_counted_and_any_other_binder_error_fails_the_sweep() {
+    fn a_runtime_refusal_and_a_kernel_without_effects_are_counted_and_pass() {
         let mut tally = Tally::default();
-        let (status, detail, _) = tally.binder(BinderAnswer {
-            documented: true,
-            detail: "plan for a threadgroup of 32: Unsupported(..)".into(),
-        });
-        assert_eq!(status, "BIND_REFUSED");
-        assert!(
-            detail.starts_with("plan for a threadgroup of 32"),
-            "{detail}"
-        );
-        assert_eq!((tally.bind_refused, tally.bind_errors), (1, 0));
+        let refusal = "unsupported: the state's imageblock length is not measured against Metal's";
+        let (status, detail, _) = tally
+            .record(
+                "gap",
+                DETAIL,
+                Ok(Acceptance::RuntimeRefused(refusal.into())),
+            )
+            .unwrap();
+        assert_eq!((status, detail.as_str()), ("RUNTIME_REFUSED", refusal));
+        let (status, detail, _) = tally
+            .record("still", DETAIL, Ok(Acceptance::NoEffect))
+            .unwrap();
+        assert_eq!((status, detail.as_str()), ("NO_EFFECT", "words=7"));
+        assert_eq!((tally.runtime_refused, tally.no_effect), (1, 1));
         assert!(tally.verdict().is_ok());
-        let (status, _, _) = tally.binder(BinderAnswer {
-            documented: false,
-            detail: "instantiate a threadgroup of 32: Internal(..)".into(),
-        });
-        assert_eq!(status, "BIND_ERROR");
-        assert_eq!((tally.bind_refused, tally.bind_errors), (1, 1));
-        assert!(tally.verdict().unwrap_err().contains("1 binder errors"));
-    }
-
-    /// The robustness-off leg compiles for the profile without its robustness features and with
-    /// every other feature it states; the stated leg, for the profile as committed.
-    #[test]
-    fn the_robustness_off_leg_compiles_for_the_profile_without_its_robustness_features() {
-        use metal2vulkan_validation::coverage::ROBUSTNESS_FEATURES;
-        let stated = engine::load_description("moltenvk-m3").unwrap();
-        assert_eq!(leg_description("moltenvk-m3", Leg::Stated).unwrap(), stated);
-        let off = leg_description("moltenvk-m3", Leg::RobustnessOff).unwrap();
-        assert!(stated
-            .features
-            .iter()
-            .any(|feature| ROBUSTNESS_FEATURES.contains(feature)));
-        assert!(!off
-            .features
-            .iter()
-            .any(|feature| ROBUSTNESS_FEATURES.contains(feature)));
-        // Everything else the profile states is kept.
-        let mut kept = stated.clone();
-        kept.features
-            .retain(|feature| !ROBUSTNESS_FEATURES.contains(feature));
-        assert_eq!(off, kept);
-        assert!(leg_description("no-such-profile", Leg::RobustnessOff).is_err());
-    }
-
-    /// `--robustness-off` decides the process's leg before the sweep opens any device, so every
-    /// context it opens (`candidate::requested_leg`) is in the robustness-off leg, and the leg
-    /// cannot be decided again.
-    #[test]
-    fn the_robustness_off_leg_is_decided_before_any_device_opens() {
-        use metal2vulkan_validation::candidate::{requested_leg, run_robustness_off};
-        enter_leg("moltenvk-m3", Leg::RobustnessOff).unwrap();
-        assert_eq!(requested_leg(), Leg::RobustnessOff);
-        assert!(run_robustness_off().is_err());
+        tally
+            .record("refused", DETAIL, Ok(Acceptance::Refused("no".into())))
+            .unwrap();
+        assert!(tally.verdict().unwrap_err().contains("1 pipelines refused"));
     }
 
     #[test]

@@ -100,20 +100,6 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
                 Val::P(_) => return Err(malformed("pointer condition")),
             }
         }
-        // Correctly rounded (`float::fma`, one rounding).
-        Inst::Fma { a, b, c } => {
-            let w = p.t.num_of(*a)?.width;
-            let (va, vb, vc) = (l.get_ref(p, *a)?, l.get_ref(p, *b)?, l.get_ref(p, *c)?);
-            let (xs, ys, zs) = (va.comps()?, vb.comps()?, vc.comps()?);
-            if xs.len() != ys.len() || xs.len() != zs.len() {
-                return Err(malformed("component count mismatch"));
-            }
-            let mut out = Vec::with_capacity(xs.len());
-            for ((x, y), z) in xs.into_iter().zip(ys).zip(zs) {
-                out.push(float::fma(w, x, y, z)?);
-            }
-            Val::from_comps(out)
-        }
         Inst::BitFieldInsert {
             base,
             insert,
@@ -426,7 +412,6 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
                 "a collective instruction reached lane evaluation",
             ))
         }
-        Inst::ImageTexelPointer { .. } => return unmodelled(crate::spv::Op::ImageTexelPointer),
         Inst::SampledImage { .. } => return unmodelled(crate::spv::Op::SampledImage),
         // The image half of a loaded combined image sampler is its bound image (`sched`).
         Inst::Image(x) => match get(l, *x)? {
@@ -451,6 +436,7 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
         | Inst::ImageRead { .. }
         | Inst::ImageSparseTexelsResident(_)
         | Inst::ImageWrite { .. }
+        | Inst::ImageTexelPointer { .. }
         | Inst::ImageQuery { .. } => match super::image::exec(p, l, sh, &node.inst)? {
             Some(Some(v)) => v,
             Some(None) => return Ok(Flow::Next),
@@ -464,8 +450,6 @@ pub(super) fn exec(p: &Prog<'_>, l: &mut Lane, sh: &mut Shared, node: &InstNode)
         }
         Inst::IsHelperInvocation => return unmodelled(crate::spv::Op::IsHelperInvocationEXT),
         Inst::SetMeshOutputs { .. } => return unmodelled(crate::spv::Op::SetMeshOutputsEXT),
-        Inst::EmitVertex => return unmodelled(crate::spv::Op::EmitVertex),
-        Inst::EndPrimitive => return unmodelled(crate::spv::Op::EndPrimitive),
         // The interpreter has no acceleration structures: it cannot trace a ray.
         Inst::RayQuery(op) => return unmodelled(op.to_spirv()),
     };
@@ -523,7 +507,6 @@ fn atomic_op(op: AtomicOp, n: Num, old: u64, x: u64) -> IResult<u64> {
         AtomicOp::And => old & x,
         AtomicOp::Or => old | x,
         AtomicOp::Xor => old ^ x,
-        AtomicOp::FAdd => float::add(w, old, x)?,
     })
 }
 
@@ -714,20 +697,6 @@ pub(super) fn int_op(op: BinOp, w: u8, a: u64, b: u64) -> IResult<u64> {
             signed_ok()?;
             (sa / sb) as u64 & m
         }
-        BinOp::SRem => {
-            signed_ok()?;
-            (sa % sb) as u64 & m
-        }
-        BinOp::SMod => {
-            signed_ok()?;
-            let r = sa % sb;
-            let r = if r != 0 && (r < 0) != (sb < 0) {
-                r + sb
-            } else {
-                r
-            };
-            r as u64 & m
-        }
         BinOp::BitwiseOr => a | b,
         BinOp::BitwiseXor => a ^ b,
         BinOp::BitwiseAnd => a & b,
@@ -772,8 +741,6 @@ fn binary(p: &Prog<'_>, op: BinOp, a: Value, va: &Val, vb: &Val) -> IResult<Val>
         | B::UDiv
         | B::SDiv
         | B::UMod
-        | B::SRem
-        | B::SMod
         | B::BitwiseOr
         | B::BitwiseXor
         | B::BitwiseAnd => {
@@ -896,12 +863,7 @@ fn numeric(op: ConvOp, from: Num, to: Num, x: u64) -> IResult<u64> {
     match op {
         ConvOp::UConvert => Ok(x & mask(tw)),
         ConvOp::SConvert => Ok(sext(x, fw) as u64 & mask(tw)),
-        // An 8-bit float widens exactly: every value of either encoding is one of every wider
-        // float.
-        ConvOp::FConvert => match from.kind {
-            Kind::Float8 { e5m2 } => float::from_f64(float::fp8_to_f64(x as u8, e5m2), tw),
-            _ => float::from_f64(float::to_f64(x, fw)?, tw),
-        },
+        ConvOp::FConvert => float::from_f64(float::to_f64(x, fw)?, tw),
         ConvOp::ConvertSToF => int_to_float(i128::from(sext(x, fw)), tw),
         ConvOp::ConvertUToF => int_to_float(i128::from(x), tw),
         ConvOp::ConvertFToU | ConvOp::ConvertFToS => {
