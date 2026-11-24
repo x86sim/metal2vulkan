@@ -70,6 +70,7 @@ mod managed;
 mod memory;
 mod min_lod;
 mod mipmaps;
+mod moltenvk_semaphores;
 mod narrow;
 mod nil_slots;
 mod no_attachment;

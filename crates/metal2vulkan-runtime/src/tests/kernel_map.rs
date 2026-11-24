@@ -46,6 +46,33 @@ fn the_map_holds_its_cap_and_forgets_the_least_recently_used() {
     assert_eq!(map.len(), 0);
 }
 
+/// x86Sim: the idle trim forgets the entries last used before its time, a lookup counting as a
+/// use, and keeps the rest.
+#[test]
+fn the_map_forgets_entries_unused_since_a_time() {
+    let mut map: Lru<u32, &str> = Lru::new(8);
+    map.keep(1, "one");
+    map.keep(2, "two");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let between = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    map.keep(3, "three");
+    assert_eq!(map.get(&1), Some("one"), "a lookup is a use");
+    let mut gone = map.forget_unused_since(between);
+    gone.sort();
+    assert_eq!(gone, ["two"]);
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&2), None);
+    assert_eq!(
+        map.forget_unused_since(between).len(),
+        0,
+        "nothing older is left"
+    );
+    let later = std::time::Instant::now();
+    assert_eq!(map.forget_unused_since(later).len(), 2);
+    assert_eq!(map.len(), 0);
+}
+
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod on_device {
     use crate::kernel_map::KernelKey;
@@ -315,6 +342,49 @@ mod on_device {
             println!(
                 "{name}: the map held 2 of 3 contents, and freed a forgotten kernel with its state"
             );
+        });
+    }
+
+    /// x86Sim: `Device::forget_idle_contents` forgets the map's entries; a content no state holds
+    /// goes with its entry, one a state holds lives until the state goes, and a forgotten content
+    /// compiles again.
+    #[test]
+    fn every_device_forgets_idle_contents_and_frees_those_no_state_holds() {
+        let Some(constant) = products() else {
+            return;
+        };
+        each_device("kernel_map_idle", |name, _, device| {
+            let counters = device.counters();
+            let gauges = || {
+                let gauges = counters.gauges();
+                (gauges.kernels, gauges.kernel_entries)
+            };
+            let lowered = || counters.metrics().translations;
+            let start = lowered();
+            let one = state(name, &device, &vector(&constant, 1));
+            let each = lowered() - start;
+            drop(state(name, &device, &vector(&constant, 2)));
+            assert_eq!(gauges(), (2, 2), "{name}: the map holds both");
+            assert_eq!(
+                device.forget_idle_contents(std::time::Duration::from_secs(3600)),
+                0,
+                "{name}: none idle that long"
+            );
+            assert_eq!(
+                device.forget_idle_contents(std::time::Duration::ZERO),
+                2,
+                "{name}"
+            );
+            assert_eq!(gauges(), (1, 0), "{name}: 2 went, 1 lives in its state");
+            drop(one);
+            assert_eq!(gauges(), (0, 0), "{name}: 1 went with its state");
+            let _again = state(name, &device, &vector(&constant, 2));
+            assert_eq!(
+                lowered() - start,
+                3 * each,
+                "{name}: a forgotten content compiles again"
+            );
+            println!("{name}: idle contents forgotten, held ones kept until their states went");
         });
     }
 }

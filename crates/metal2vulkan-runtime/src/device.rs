@@ -1015,6 +1015,19 @@ impl Device {
         self.shared.core.counters.clone()
     }
 
+    /// No Metal counterpart (x86Sim): forgets the compiled contents, compute and render, that no
+    /// pipeline state's creation looked up for `idle`, from the device's map of the last 1,024
+    /// contents used. Each goes, with its `VkPipeline`s and shader modules, once no state holds
+    /// it; a later state of its content compiles it again, from the cache directory where it
+    /// holds the lowerings. For a long-lived consumer whose programs come and go (a simulator's
+    /// apps), whose map otherwise keeps every content its ended programs made, up to the cap, for
+    /// the device's life. Answers the entries forgotten (`Gauges::kernel_entries` falls by as
+    /// many).
+    pub fn forget_idle_contents(&self, idle: Duration) -> usize {
+        let core = &self.shared.core;
+        core.kernels.forget_idle(idle, &core.counters)
+    }
+
     /// What lost the device: the Vulkan call and result of its first loss, a call of the
     /// runtime's or one the consumer reported ([`Device::report_loss`]), None while it is not
     /// lost. Metal's counterpart is the code and description of `MTLCommandBuffer.error`

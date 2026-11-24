@@ -14,6 +14,7 @@ use metal2vulkan::cache::PipelineKey;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The entries the map holds at most.
 pub(crate) const KERNEL_ENTRIES: usize = 1024;
@@ -132,6 +133,25 @@ impl KernelMap {
         drop(held);
     }
 
+    /// x86Sim: forgets every entry no state creation looked up or kept for `idle`, for a
+    /// long-lived consumer's trim. Each goes once no state holds it, as one the cap forgot; a later
+    /// state of its content compiles it again from the cache directory. Answers the entries
+    /// forgotten. The map otherwise keeps its last [`KERNEL_ENTRIES`] contents, with their
+    /// `VkPipeline`s and shader modules, for as long as the device lives, though every state of
+    /// them is gone (a phone's apps that ended).
+    pub(crate) fn forget_idle(&self, idle: Duration, counters: &Counters) -> usize {
+        let Some(before) = Instant::now().checked_sub(idle) else {
+            return 0;
+        };
+        let gone = lock(&self.map).forget_unused_since(before);
+        for _ in &gone {
+            counters.fall(Gauge::KernelEntries);
+        }
+        let n = gone.len();
+        drop(gone);
+        n
+    }
+
     /// For the tests: a map of `cap` entries in place of [`KERNEL_ENTRIES`], set before any state.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn set_cap(&self, cap: usize) {
@@ -143,7 +163,8 @@ impl KernelMap {
 pub(crate) struct Lru<K, V> {
     cap: usize,
     clock: u64,
-    entries: HashMap<K, (V, u64)>,
+    /// Each entry with its last use: on the map's clock, and the host's (x86Sim: the idle trim).
+    entries: HashMap<K, (V, u64, Instant)>,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
@@ -160,8 +181,9 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
     pub(crate) fn get(&mut self, key: &K) -> Option<V> {
         self.clock += 1;
         let clock = self.clock;
-        let (value, used) = self.entries.get_mut(key)?;
+        let (value, used, at) = self.entries.get_mut(key)?;
         *used = clock;
+        *at = Instant::now();
         Some(value.clone())
     }
 
@@ -171,26 +193,43 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
     pub(crate) fn keep(&mut self, key: K, value: V) -> (V, Option<V>) {
         self.clock += 1;
         let clock = self.clock;
-        if let Some((held, used)) = self.entries.get_mut(&key) {
+        if let Some((held, used, at)) = self.entries.get_mut(&key) {
             *used = clock;
+            *at = Instant::now();
             return (held.clone(), Some(value));
         }
         let mut forgotten = None;
         if self.entries.len() >= self.cap.max(1) {
             let oldest = (self.entries.iter())
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(key, _)| key.clone());
-            if let Some((value, _)) = oldest.and_then(|oldest| self.entries.remove(&oldest)) {
+            if let Some((value, _, _)) = oldest.and_then(|oldest| self.entries.remove(&oldest)) {
                 forgotten = Some(value);
             }
         }
-        self.entries.insert(key, (value.clone(), clock));
+        self.entries
+            .insert(key, (value.clone(), clock, Instant::now()));
         (value, forgotten)
     }
 
     /// Every value, the map left empty.
     pub(crate) fn clear(&mut self) -> Vec<V> {
-        self.entries.drain().map(|(_, (value, _))| value).collect()
+        self.entries
+            .drain()
+            .map(|(_, (value, _, _))| value)
+            .collect()
+    }
+
+    /// x86Sim: every value last used before `before`, forgotten.
+    pub(crate) fn forget_unused_since(&mut self, before: Instant) -> Vec<V> {
+        let old: Vec<K> = (self.entries.iter())
+            .filter(|(_, (_, _, at))| *at < before)
+            .map(|(key, _)| key.clone())
+            .collect();
+        old.iter()
+            .filter_map(|key| self.entries.remove(key))
+            .map(|(value, _, _)| value)
+            .collect()
     }
 
     /// The entries held.

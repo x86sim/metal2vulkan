@@ -2808,6 +2808,12 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   kernel goes once its last state and the map have let it go. Each state numbers its own
   samplers. `Gauges::kernels` counts the compiled kernels alive and `Gauges::kernel_entries` the
   map's entries.
+- `Device::forget_idle_contents(idle)` (x86Sim's, no Metal counterpart) forgets the map's entries,
+  compute and render, that no state's creation looked up or kept for `idle`, and answers how many:
+  for a long-lived consumer whose programs come and go, whose map otherwise holds the contents of
+  programs that ended, with their `VkPipeline`s, up to the 1,024 for the device's life. Each goes
+  once no state holds it, as one the cap forgot; a later state of its content compiles it again,
+  from the cache directory's lowerings where it holds them.
 - A content the map does not hold is lowered from the device's stage entries (the translator's
   `StageEntries`), which every compute and render creation of the device reads: a module is
   decoded once for the device and a stage specialized once for its function, constants, links
