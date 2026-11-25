@@ -951,13 +951,14 @@ pub enum Refusal {
     },
     /// A render pass attachment or resolve texture of a level or slice past its texture's: its own
     /// slice, or the last of the slices a layered pass renders from it
-    /// (`renderTargetArrayLength`).
+    /// (`renderTargetArrayLength`); or a 3D texture's depth plane past its level's depth.
     ///
     /// Basis: ours (no texel of the texture is there to render into).
     AttachmentPlace {
         /// The level asked for.
         level: u32,
-        /// The slice asked for: the attachment's own, or the last its pass renders.
+        /// The slice asked for: the attachment's own, or the last its pass renders; a 3D texture's
+        /// depth plane.
         slice: u32,
     },
     /// A render pass color attachment of a depth or stencil pixel format, a depth attachment of a
@@ -1257,10 +1258,9 @@ pub enum Gap {
         pixel_format: PixelFormat,
     },
     /// [`BlitCommandEncoder::copy_from_texture`](crate::BlitCommandEncoder::copy_from_texture)
-    /// that the floor's `vkCmdCopyImage` does not make: a multisample texture; a format of depth
-    /// and stencil both; one pixel format held in two Vulkan formats, which the two textures'
-    /// usages chose; a 1D texture with one of another type; or a texture buffer, whose texels
-    /// are its buffer's bytes and no image.
+    /// that the floor's `vkCmdCopyImage` does not make: a multisample texture; one pixel format
+    /// held in two Vulkan formats, which the two textures' usages chose; a 1D texture with one of
+    /// another type; or a texture buffer, whose texels are its buffer's bytes and no image.
     ///
     /// Basis: ours (Vulkan 1.3 copies none of these with one command; each is built when a
     /// replay stream makes one).
@@ -1324,6 +1324,10 @@ pub enum Gap {
     /// device's linear image does not hold that usage, as the image format query of the tiling
     /// does not offer it or the tiling's format features lack what the optimal image has for it.
     /// A plane whose tiling lacks sampling, rendering or either copy takes the copy form instead.
+    /// A plane of a Direct3D 11 texture's import (`Device::import_d3d11_surface`, on Windows)
+    /// whose texture's uses ask an image usage the texture's bind flags do not give, or that the
+    /// import does not offer: storage, for one, of a texture made without
+    /// `D3D11_BIND_UNORDERED_ACCESS`.
     ///
     /// Basis: device (the image format query and the format features of the plane's tiling).
     SurfaceUsage {
@@ -1785,7 +1789,8 @@ pub enum DrawKind {
     /// attachment reads (`floor::Capabilities::attachment_reads`), from the vertex function at the
     /// rendered level and layer, written, of a depth or stencil attachment, of an image over a
     /// buffer in place or whose format the device takes neither the feedback usage nor a shadow
-    /// for, or of an image two attachments of the pass render.
+    /// for, or of an image two attachments of the pass render; and through a shadow, which holds
+    /// one layer, an attachment of a layered pass or a 3D texture's depth plane.
     /// Metal reads a render target through a texture.
     AttachmentRead,
     /// A draw through a pipeline state whose fragment function reads a colour attachment
@@ -1910,8 +1915,11 @@ pub enum RenderPassKind {
     /// `Unknown` with a resolve texture: the rendering began resolving into the texture, as Vulkan
     /// fixes the resolve as the rendering begins.
     LateStore,
-    /// An attachment of a texture type but a 2D texture, a 2D array, a cube or a cube array: a 1D
-    /// texture's, or a 3D texture's depth plane.
+    /// An attachment that is neither a level of a 2D texture, a 2D array, a cube, a cube array or a
+    /// 2D multisample texture or array, nor a depth plane of a 3D texture's level that a color
+    /// attachment renders in a pass of one layer: a 1D texture's; a 3D texture's in a layered pass
+    /// (`renderTargetArrayLength` 2 or more), as a depth or stencil attachment, or as a resolve
+    /// texture; and a resolve's depth plane but 0.
     TextureType,
     /// `MTLStoreActionCustomSampleDepthStore`, set on the pass or by the encoder's
     /// `setColorStoreAction:atIndex:` family.
@@ -1940,8 +1948,9 @@ pub enum TextureViewKind {
     /// Another pixel format Metal takes that a surface plane's image does not list: in place
     /// ([`Device::new_exported_surface`](crate::Device::new_exported_surface)), the device's
     /// linear image does not sample that format or its export does not take the list; over a
-    /// Direct3D 11 texture (`Device::import_d3d11_surface`, on Windows), the import does not take
-    /// the list of every format the plane's texture views as.
+    /// Direct3D 11 texture (`Device::import_d3d11_surface`, on Windows), the image lists only its
+    /// own format, the plane's texture's and that one's sRGB sibling, as Direct3D 11 made the
+    /// texture in one format.
     SurfacePixelFormat,
     /// Another texture type than the casts built
     /// ([`Texture::new_texture_view`](crate::Texture::new_texture_view)).

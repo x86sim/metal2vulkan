@@ -192,7 +192,13 @@ pub struct LoweringInputs {
     /// the record beside its dispatch's group counts. The identity domains refuse it
     /// (`Unsupported{IdentityDomains}`). It needs device addresses, and refuses a
     /// stage-input region, a tile function and `emulated_simdgroups`
-    /// (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`).
+    /// (`Unsupported{GpuEncodedIndirectCommands, NotImplemented}`). Its tangled instructions take
+    /// the profile's reconvergence mode even where the plain module's are reached together, as
+    /// a partial-threadgroups variant's do ([`partial_threadgroups`](Self::partial_threadgroups)):
+    /// its invocations past the grid return before the body, and SPIR-V reconverges only over
+    /// all invocations, those that returned included (SPIR-V 1.6 section 2.2.5, "Dynamic
+    /// Instance"); so on a device without maximal reconvergence it records
+    /// `Reconvergence::ImplementationDefined` and `PrecisionNote::DeviceReconvergence`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub flat_grid: bool,
     /// With [`flat_grid`](Self::flat_grid), the dispatch's threadgroups are the call's
@@ -399,7 +405,14 @@ pub struct LoweringInputs {
     /// `folded_groups` and `replay_bindings` are `Unsupported{PartialThreadgroups,
     /// NotImplemented}`, and a body whose uniform barriers' vote word its workgroup memory cannot
     /// hold is `Unsupported{PartialThreadgroups}` needing the `Limit` of
-    /// `maxComputeSharedMemorySize` the word passes. Any other function compiles as without it.
+    /// `maxComputeSharedMemorySize` the word passes. Any other function compiles as without it,
+    /// but for its reconvergence: its tangled instructions take the profile's mode even where
+    /// the plain module's are reached together, since its invocations past the grid return before
+    /// the body and SPIR-V reconverges only over all invocations, those that returned included
+    /// (SPIR-V 1.6 section 2.2.5, "Dynamic Instance"); so on a device without maximal
+    /// reconvergence it records `Reconvergence::ImplementationDefined` and
+    /// `PrecisionNote::DeviceReconvergence` where the plain module may record `Guaranteed` and
+    /// none.
     #[cfg_attr(feature = "serde", serde(default))]
     pub partial_threadgroups: bool,
     /// Texture slots bound in one of Apple's extended-range formats

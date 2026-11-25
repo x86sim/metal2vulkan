@@ -1263,6 +1263,7 @@ field	metal2vulkan-runtime::ComputePipelineDescriptor.stage_input	pub stage_inpu
 field	metal2vulkan-runtime::ComputePipelineDescriptor.support_adding_binary_functions	pub support_adding_binary_functions: bool
 field	metal2vulkan-runtime::ComputePipelineDescriptor.support_indirect_command_buffers	pub support_indirect_command_buffers: bool
 field	metal2vulkan-runtime::ComputePipelineDescriptor.threadgroup_size_is_multiple_of_execution_width	pub threadgroup_size_is_multiple_of_execution_width: bool
+field	metal2vulkan-runtime::D3d11Plane.bind_flags	pub bind_flags: u32
 field	metal2vulkan-runtime::D3d11Plane.descriptor	pub descriptor: TextureDescriptor
 field	metal2vulkan-runtime::D3d11Plane.handle	pub handle: BorrowedHandle<'a>
 field	metal2vulkan-runtime::D3d11Plane.image_format	pub image_format: PixelFormat
@@ -1596,6 +1597,7 @@ field	metal2vulkan-runtime::Metrics.texture_place_lock_waits	pub texture_place_l
 field	metal2vulkan-runtime::Metrics.translation_nanos	pub translation_nanos: u64
 field	metal2vulkan-runtime::Metrics.translations	pub translations: u64
 field	metal2vulkan-runtime::Metrics.translations_loaded	pub translations_loaded: u64
+field	metal2vulkan-runtime::Metrics.unslotted_attachment_reads	pub unslotted_attachment_reads: u64
 field	metal2vulkan-runtime::Metrics.untimed_command_buffers	pub untimed_command_buffers: u64
 field	metal2vulkan-runtime::Metrics.upload_waits	pub upload_waits: u64
 field	metal2vulkan-runtime::Metrics.visibility_interrupts_refused	pub visibility_interrupts_refused: u64
@@ -1626,6 +1628,7 @@ field	metal2vulkan-runtime::RawDevice.queue_family_index	pub queue_family_index:
 field	metal2vulkan-runtime::Region.origin	pub origin: [u32; 3]
 field	metal2vulkan-runtime::Region.size	pub size: [u32; 3]
 field	metal2vulkan-runtime::RenderPassColorAttachmentDescriptor.clear_color	pub clear_color: ClearColor
+field	metal2vulkan-runtime::RenderPassColorAttachmentDescriptor.depth_plane	pub depth_plane: u32
 field	metal2vulkan-runtime::RenderPassColorAttachmentDescriptor.level	pub level: u32
 field	metal2vulkan-runtime::RenderPassColorAttachmentDescriptor.load_action	pub load_action: LoadAction
 field	metal2vulkan-runtime::RenderPassColorAttachmentDescriptor.resolve_depth_plane	pub resolve_depth_plane: u32
@@ -2870,6 +2873,7 @@ fn	metal2vulkan::pipeline::heap_unused_while_pending	pub fn heap_unused_while_pe
 fn	metal2vulkan::pipeline::nonuniform_region_bytes	pub fn nonuniform_region_bytes(base: [u32; 3], threads: [u32; 3], l: [u32; 3]) -> Option<[u8; 32]>
 fn	metal2vulkan::pipeline::own_kernel	pub fn own_kernel(kernel: OwnKernel, profile: &DeviceProfile) -> Result<Vec<u32>, Error>
 fn	metal2vulkan::pipeline::region_bytes	pub fn region_bytes(base: [u32; 3], threads: [u32; 3], l: [u32; 3]) -> Option<[u8; 32]>
+fn	metal2vulkan::pipeline::specialize	pub fn specialize(words: &[u32], values: &[(u32, u64)]) -> Result<Vec<u32>, Error>
 fn	metal2vulkan::pipeline::threadgroup_constants	pub fn threadgroup_constants(size: [u32; 3]) -> [(SpecKey, u64); 8]
 macro-decl	metal2vulkan-air::ir::ArgIdx	ir_id! ArgIdx
 macro-decl	metal2vulkan-air::ir::BlockId	id_type! BlockId
@@ -7141,7 +7145,6 @@ trait-impl	metal2vulkan-runtime::ComputeCommandEncoder impl Drop	impl Drop for C
 trait-impl	metal2vulkan-runtime::ComputePipelineState impl crate::kept::Handle	impl crate::kept::Handle for ComputePipelineState
 trait-impl	metal2vulkan-runtime::ComputePipelineState impl crate::kept::Uncount	impl crate::kept::Uncount for ComputePipelineState
 trait-impl	metal2vulkan-runtime::DepthStencilDescriptor impl Default	impl Default for DepthStencilDescriptor
-trait-impl	metal2vulkan-runtime::Error impl From<Unmade>	impl From<Unmade> for Error
 trait-impl	metal2vulkan-runtime::Error impl fmt::Display	impl fmt::Display for Error
 trait-impl	metal2vulkan-runtime::Error impl std::error::Error	impl std::error::Error for Error
 trait-impl	metal2vulkan-runtime::FaultAddress impl fmt::Debug	impl fmt::Debug for FaultAddress

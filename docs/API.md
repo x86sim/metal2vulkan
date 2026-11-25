@@ -454,7 +454,15 @@ gives the specialization constants' keys, and with the stage's `stage_flags` and
 `DeepThreadgroup` and the `WorkgroupSize` parts on each axis. Write each of them the stage
 declares from it, never one alone: a kernel that declares `DeepThreadgroup` takes its Vulkan
 workgroup from the `WorkgroupSize` parts only, so one given its `LocalSize` without them runs
-workgroups of the parts' defaults. A required subgroup size needs `subgroupSizeControl` and the stage in
+workgroups of the parts' defaults. Hand the driver those values as fixed constants, not as a
+`VkSpecializationInfo`: `pipeline::specialize(words, values)`, with `values` the `(SpecId, bits)`
+of each constant, gives the stage's words with each specialization constant the plain constant of
+its value (its default where `values` names none), each `OpSpecConstantOp` the constant it
+computes, and a kernel's workgroup size its entry point's `LocalSize` literals in place of the
+`WorkgroupSize` composite, which is what Vulkan defines specialization as
+(VUID-VkPipelineShaderStageCreateInfo-pSpecializationInfo-06849). Make the shader module of those
+words and create the pipeline with no specialization, so no driver sizes a workgroup or an array
+from a constant's default. A required subgroup size needs `subgroupSizeControl` and the stage in
 `requiredSubgroupSizeStages`; full subgroups need `computeFullSubgroups`; a size that varies
 (`ALLOW_VARYING_SUBGROUP_SIZE`) needs `subgroupSizeControl`. A pipeline compiled for
 one device pins only what that device can take; `DeviceProfile::check` tells whether another
@@ -1300,7 +1308,13 @@ runtime lowers a kernel that does not observe its partition once, as that varian
 direct dispatch of it in its tiles; a kernel that observes its partition runs its whole grids,
 threadgroup dispatches and indirect dispatches on its plain module at their own threadgroup size,
 and a `dispatchThreads` grid that is not a whole number of threadgroups on its
-partial-threadgroups variant.
+partial-threadgroups variant. The variant answers what the plain module answers (Metal's limits,
+the imageblock answer, the precision notes, the samplers, the slots' accesses, the threadgroup
+arguments, the SIMD-group multiples and subgroup size, the buffer alignments), but for one
+exception: on a device without maximal reconvergence its precision notes may add
+`DeviceReconvergence` where the plain module's have none, since its invocations past the grid
+return before the body and SPIR-V reconverges only over all invocations (section 2.2.5; the
+note's entry in the precision-note catalogue).
 
 ### Levels a slot reads
 
@@ -1583,7 +1597,14 @@ bound.
     computed from them), and no thread skips the block by a `break`, `continue` or `return`.
     A loop whose exit differs between threads is not proven uniform, even where a barrier on
     every path makes every thread run it as often. A kernel compiled for partial threadgroups
-    has no such block.
+    or a flat grid (`LoweringInputs::flat_grid`) has no such block: its invocations past the
+    grid return before the body, and SPIR-V states
+    reconvergence over all invocations, those that returned included (SPIR-V 1.6 section 2.2.5,
+    "Dynamic Instance": "Invocations may only resume executing the same dynamic instances when
+    all invocations reach the same static instruction"). Only `MaximallyReconvergesKHR` lets an
+    invocation that returned escape reconvergence (`SPV_KHR_maximal_reconvergence`,
+    "Reconvergence"), so such a module takes the device's mode, and on a device without maximal
+    reconvergence records this note where its plain module records none.
 
   An entry whose every group operation stands in a block the pass proves uniform for the
   threadgroup, with no re-entered loop around it, states no mode and records

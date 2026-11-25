@@ -932,16 +932,27 @@ made as Direct3D 11 textures, each by its NT handle (`IDXGIResource1::CreateShar
 own format and the texture rt makes over it, and returns a `Surface` whose planes rt's shaders
 read and write in place. Each plane is an optimal image of the Direct3D 11 texture's format, of
 the descriptor's width and height, on a dedicated import of its handle, counted in
-`Gauges::surface_imports`. Its usage is each of sampled, rendered, copied and storage that the
-import offers and the descriptor's format holds. The image is mutable where it lists more than
-its own format. It lists its own format, the descriptor's (a chroma plane of `R16Uint` under an
-`RG8Unorm` texture, the same bytes per texel in Metal's same view class) and the formats the
-texture lists for views of another format (with `PixelFormatView` usage, those Metal views it as,
-such as an `R8Uint` view of an `R8Unorm` plane), where the import query
-(`vkGetPhysicalDeviceImageFormatProperties2`) takes that list with the image's usage. Where it
-does not, the image lists its own format and the descriptor's where they differ, and a view of a
-format it does not list is `Gap::TextureView` of `TextureViewKind::SurfacePixelFormat`. The
-consumer keeps and closes the handles.
+`Gauges::surface_imports`. The plane's VkImage takes the usage the texture's BindFlags give
+(`D3d11Plane::bind_flags`, as the consumer made the texture), and no other: copied from and into,
+as Direct3D 11 copies any texture of default usage; sampled for `D3D11_BIND_SHADER_RESOURCE`,
+rendered for `D3D11_BIND_RENDER_TARGET`, storage for `D3D11_BIND_UNORDERED_ACCESS`; each where
+the descriptor's format holds it and the import query
+(`vkGetPhysicalDeviceImageFormatProperties2`) offers it. Vulkan states no rule for an image over
+memory another API made with other parameters: its rule for an import of Vulkan's own export is
+the same image (`VUID-VkMemoryDedicatedAllocateInfo-image-01876`), and its memory aliasing
+promises a consistent reading to images of the same creation parameters. A texture whose uses
+ask more (`ShaderWrite` on a texture made without `D3D11_BIND_UNORDERED_ACCESS`) is
+`Gap::SurfaceUsage`. The one usage beside them is the attachment feedback loop's, which Direct3D
+11's description has no counterpart for: taken where the descriptor's texture is a render target
+a draw may read in its own pass. The image is mutable where it lists more than its own format, and
+it lists at most two more, the two places it asks beyond the texture Direct3D 11 made: the
+descriptor's format where it differs (a chroma plane of `R16Uint` under an `RG8Unorm` texture, the
+same bytes per texel in Metal's same view class), and the descriptor's sRGB sibling, which a guest
+may view the plane through (`R8Unorm_sRGB` of an 8-bit luma), where the device holds it and the
+import query takes the list. A 10-bit luma (`R16Unorm`) lists none and is not mutable. A view of
+any other format has no in-place form on the import: it is `Gap::TextureView` of
+`TextureViewKind::SurfacePixelFormat`, and the consumer answers it with a counted copy of the
+plane (Known gaps of memory blocks). The consumer keeps and closes the handles.
 
 The import submits nothing and waits for nothing. Vulkan 1.4's section 12.5.2 says "When images
 created with external memory handle types listed in the external image implied layouts table are
@@ -1050,6 +1061,13 @@ the Direct3D 11 texture's payload until it is freed.
     and the Radeon 780M (the runtime's surface test, jobs m3-max-70391, m3-max-70425 and
     m3-max-70426), so the conformance cases `surface-textures-*` are refused at `replace_region`
     there; RADV on the same cards answers all ten exactly (jobs m3-max-70513 and m3-max-70514).
+- A plane of a Direct3D 11 import (`Device::import_d3d11_surface`) is viewed in place only in the
+  image's own format, the descriptor's and the descriptor's sRGB sibling, as its image lists no
+  other format (Exported surfaces). A view in another format, which `PixelFormatView` usage lets
+  a Metal texture over an IOSurface's plane take, is `Gap::TextureView` of
+  `TextureViewKind::SurfacePixelFormat`: the import has no in-place form for it. The consumer
+  takes the copy form of the same call for such a texture, a copy of the plane in a texture of
+  its own, which it counts.
 - On the Iris Xe (ANV, Mesa 26.2.6) a 4K dma-buf surface takes 3.05 ms for P010 and 1.80 ms for
   NV12 from the start of its make to the return of `Surface::wait_until_ready()` (medians of ten),
   where the M3 Max takes 1.62 and 1.22 ms to create an IOSurface of the same planes, make its two
@@ -1143,7 +1161,15 @@ the Direct3D 11 texture's payload until it is freed.
   by address (20 steps, 5,969 presents in 481 s), these copies came to 4.67 GB, 97.2% of the
   walk's 4.81 GB of over-copies, every one over a no-copy buffer on a guest program's own pages.
   On average that is 9.7% of a 1080p frame's bytes a present, and from 0.44% to 45.7% a present in
-  the steps that present more than once.
+  the steps that present more than once. On a discrete card the copy's time follows the link's
+  state. On the RTX 5080 Laptop GPU idling at P8, where its driver keeps PCIe at Gen1 x8, the
+  runtime's own command buffers moved 553.5 MB in 362.4 ms (1.53 GB/s), so one copy-in of a
+  10,240,000-byte texture took about 6.7 ms. At P0, P2 and P4 the same card's link runs Gen5 x8.
+  In a 30 s scrolling step of a guest walk (job m3-max-72689) these copies came to 534.8 MB in
+  52 copies of 20 textures, and 26 of the step's 50 GPU starts that came 8 ms or more after
+  their scheduling fell in 50 ms intervals holding such a copy of 10.24 MB or more.
+  Documented Metal asks for no call before a CPU write to a Shared buffer reaches a texture
+  over it, so the runtime has no call to hold the copy for.
 - A texture over a buffer in a dma-buf's one import is the counted copy too on a device that
   offers no linear image for a dma-buf import without a dedicated allocation (Imported blocks).
   On the Radeon 780M (RADV) the external image query refuses the dma-buf handle with linear
@@ -1471,7 +1497,10 @@ made, with no lock, and never rewritten for layouts.
   `Refusal::TextureBufferNotOverBuffer` at every make but `Buffer::new_texture`, which makes texture
   buffers (below). A cube array texture's image
   is cube-compatible with six layers a cube, and its view is a cube array view (`imageCubeArray`,
-  in the floor).
+  in the floor). A 3D texture of `RenderTarget` usage and a colour format is made
+  2D-array-compatible (`VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT`, in its image format query too),
+  so that a pass renders into one depth plane of a level through a 2D view of it (Render
+  encoders).
 - `Texture::gpu_resource_id` is its index (0 without one) and the translator's `TextureWord` of
   its format and swizzle (`docs/RESOURCE-ID.md`), so the guest computes the ID itself. An ID of
   index 0 that a shader reads from bytes (an argument buffer's texture) reads the null descriptor,
@@ -2639,8 +2668,9 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   with nothing staged and no byte copied beyond the region. Both textures have one pixel format
   and one sample count, as Metal's validation requires; a compressed region is whole blocks or
   reaches the level's edge on both sides; a 3D texture's image copies into or out of a 2D
-  slice. A size of 0 on an axis a texture lacks copies one texel there; on
-  another axis the copy copies nothing.
+  slice. A format of depth and stencil both copies its pixels whole, as Metal's copy takes no
+  plane option: each region names both aspects. A size of 0 on an axis a texture lacks copies one
+  texel there; on another axis the copy copies nothing.
 - A copy records two barriers. The first moves each texture's level and slice from its home
   layout to the transfer layout after every earlier command, and makes every earlier write visible
   to every later command; it pays a barrier an encoder owed, and the hazard sets start again. The
@@ -2653,8 +2683,8 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
 - Refused: what Metal's validation refuses, textures of two pixel formats or two sample counts
   (`Refusal::TextureCopyMismatch`), and a region outside either texture or off its block grid
   (`Refusal::TextureRegion`). Not built (`Gap::TextureCopy`): what one `vkCmdCopyImage` in the
-  floor does not make (a multisample texture, a format of depth and stencil both, one pixel format
-  held in two Vulkan formats by the textures' usages, a 1D texture with another type).
+  floor does not make (a multisample texture, one pixel format held in two Vulkan formats by the
+  textures' usages, a 1D texture with another type).
 - Within one level and slice of one image (a texture into itself, or a texture and its view,
   which shares its image), regions apart copy with one `vkCmdCopyImage`, that subresource in the
   general layout: one barrier moves it there and one home, the same three barriers as any copy.
@@ -3322,7 +3352,8 @@ heaviest such stage's weight.
   (`Metrics::stage_fills`), and answers the helper's own times, from its host clock
   (`StageSpans`: its device's creation and its one `vkCreateComputePipelines` call); the make
   then succeeds when asked again. A request holds the module's
-  words, the pipeline's entry point, specialization and pinned subgroup size, and the device's
+  words specialized for the pipeline (its specialization constants fixed at their values, as
+  every compute pipeline's module is), the pipeline's entry point and pinned subgroup size, and the device's
   `deviceUUID`, `driverUUID`, pipeline cache header and enables, so the helper opens the same
   device with the same features; a helper whose device differs is answered `StageFill::NoDevice`
   or `StageFill::Enables`, and one of another build of the runtime `StageFill::Version`.
@@ -3539,6 +3570,15 @@ cache is answered compile-required on both.
   cold cache it compiles in that call, where Metal changes these with no compile: on a cold play,
   `Metrics::first_use_waits` against `Metrics::made_ahead_variants` reads what the consumer's
   pre-pass left to the encoding threads.
+- Each compute `VkPipeline` is created from a shader module of its own, made of the kernel's
+  words with every specialization constant the fixed constant of its value
+  (`metal2vulkan::pipeline::specialize`) and destroyed once the create returns: the driver is
+  handed no `VkSpecializationInfo`, every array length is a plain constant, and the workgroup's
+  size is the entry point's `LocalSize` literals, so no driver can size a workgroup or an array
+  from a constant's default. A render pipeline's stages are made the same way once, with the
+  content: each stage's module holds its sample count and amplification count fixed, and no
+  graphics `VkPipeline` takes a specialization either. Tests: `tests::deep_threadgroups`, and
+  every draw test for the render stages.
 - A kernel's module keeps 64 `VkPipeline`s of the threadgroup sizes, threadgroup memory lengths,
   imageblock sizes and tiles its dispatches give: the first 8 it made, and past them the 56
   dispatched last. A make past them evicts the least recently dispatched ones no command buffer
@@ -3742,6 +3782,18 @@ cache is answered compile-required on both.
   five took 4.40 s timed per dispatch with the same five modules (m3-max-72362), compute was 11.67 s
   against 9.03 s without the mode. Test: the translator's
   `tests::engine_reconvergence_together::a_shuffle_outside_uniform_control_flow_keeps_the_mode`.
+- AMD's open Linux driver (AMDVLK 2025.Q2.1, LLPC) on a Radeon 780M may compile a kernel whose
+  thread-local array of 256 or 512 bytes is indexed at run time with that array in scratch memory,
+  where Mesa's RADV (26.2.6) on the same chip keeps it in registers. In one recorded session on
+  that card, one kernel's module came to 148 VGPRs, 528 bytes of scratch and 512 scratch
+  instructions under AMDVLK, against 224 VGPRs and no scratch under RADV (m3-max-72775). Per
+  dispatch, the kernel's states that AMDVLK compiled with scratch ran 2 to 9 times as long as
+  under RADV, and those it compiled without scratch ran at 0.86 to 0.93 times. The array's
+  storage class does not change it: the same modules with every such array a `Function` variable
+  instead of a `Private` one compiled to the same registers and scratch (m3-max-72798). Neither
+  the array's size nor the module's register count separates the modules AMDVLK spills from
+  those it does not: a module holding the same 512-byte array, all eight of its access chains
+  indexed at run time, compiled to 174 VGPRs and no scratch.
 
 ## Render pipeline states
 
@@ -3956,6 +4008,9 @@ cache is answered compile-required on both.
   on the RTX 2080, RTX 3090 and RTX 5080 Laptop list none (`vulkaninfo`, jobs m3-max-48727, 48729
   and 48731); RADV on the RX 7900 XTX, the 780Ms and the RX 550, ANV on the Iris Xe, lavapipe,
   KosmicKrisp and the UHD 630's Windows driver list it (48727 to 48731, 48736, 48737 and 61508).
+  A WebGL 2 page reaches it: a browser's GL-on-Metal layer copies stencil for `blitFramebuffer`
+  with `STENCIL_BUFFER_BIT` by a draw whose fragment function writes `[[stencil]]`, on a Metal
+  device that it does not take for an Intel or NVIDIA GPU.
 - On a device without `shaderQuadControl` (Quad control, under Floor), a fragment function whose
   group operations read, combine or count other lanes (every SIMD-group and quad group function, and
   the SIMD-group matrix functions) is refused at creation, an `Error::Translation` naming
@@ -4054,6 +4109,11 @@ cache is answered compile-required on both.
   `renderTargetHeight`, `defaultRasterSampleCount` and `renderTargetArrayLength`. Each attachment is one level of its texture
   and, from its `slice`, the pass's layers (below): a 2D texture, a 2D
   array, a cube or a cube array, or a 2D multisample texture or array, of `RenderTarget` usage;
+  or a colour attachment's `depthPlane` of a level of a 3D texture of that usage, in a pass of one
+  layer, through a 2D view of that plane of its image (Vulkan's
+  `VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT`, whose barriers name the image's layers as
+  `VK_REMAINING_ARRAY_LAYERS` from 0 and move every plane of the level, and whose load, store and
+  clear act on the plane alone: the level's other planes keep their texels);
   every attachment of a pass has one sample count, and a draw's pipeline state that count as its
   `rasterSampleCount` (`DrawKind::AttachmentFormats` otherwise). The device's counts are
   `Device::supports_texture_sample_count`'s. A multisample attachment is stored as its samples:
@@ -4354,6 +4414,11 @@ cache is answered compile-required on both.
 
 ### Known gaps of render encoders
 
+- A draw that reads its own pass's attachment through an argument buffer or a resource ID reads a
+  descriptor whose layout differs from the image's, which Vulkan leaves undefined
+  (`VUID-vkCmdDraw-imageLayout-00344`); such draws count in
+  `Metrics::unslotted_attachment_reads`, and the image is back in its home layout once the pass
+  ends.
 - An indexed indirect draw's index count is the GPU's to read, so a count that runs past the index
   buffer is not refused, as a direct draw's is (`Refusal::IndexBufferOffset`, which Metal's
   validation stops). The index buffer is bound from the indices to the end of the block's
@@ -4573,8 +4638,9 @@ cache is answered compile-required on both.
   which no Vulkan resolve mode is, and two aspects paired where `independentResolve` or
   `independentResolveNone` does not allow it), a store action an encoder sets that does not
   resolve an attachment whose pass left it `Unknown` with a resolve texture (`LateStore`: the
-  rendering began resolving, as Vulkan fixes the resolve as it begins), a 1D or 3D texture's
-  attachment, a 3D resolve texture's plane (`TextureType`), the
+  rendering began resolving, as Vulkan fixes the resolve as it begins), a 1D texture's
+  attachment, a 3D texture's depth or stencil attachment, a 3D resolve texture, a resolve's depth
+  plane but 0 (`TextureType`), the
   `CustomSampleDepthStore` store action, a clear of a format only a shader clears (extended
   range, bfloat, YCbCr), a `renderTargetArrayLength` past the device's `maxFramebufferLayers`
   (`ArrayLength`: Vulkan renders at most that many layers,
@@ -4597,10 +4663,10 @@ cache is answered compile-required on both.
 - Layered rendering refuses: in a pass of `renderTargetArrayLength` 2 or more, an attachment or a
   resolve texture with fewer slices from its own `slice` than the pass's length
   (`Refusal::AttachmentPlace`, naming the last slice the pass would render), a 3D texture's
-  depth planes, which are no attachment's layers (`Gap::RenderPass`, `TextureType`, as for any 3D
-  attachment), and a draw that reads one of its pass's attachments through a texture on a device
-  without the attachment feedback loop (`Gap::Draw`, `AttachmentRead`: an attachment's shadow
-  holds one layer). A vertex function's `[[render_target_array_index]]` and
+  depth planes, which are no attachment's layers (`Gap::RenderPass`, `TextureType`), and a draw
+  that reads one of its pass's attachments through a texture on a device without the attachment
+  feedback loop (`Gap::Draw`, `AttachmentRead`: an attachment's shadow holds one layer, and no 3D
+  texture's depth plane, which a pass of one layer refuses the same way). A vertex function's `[[render_target_array_index]]` and
   `[[viewport_array_index]]` are stored as the function writes them. Metal requires the same value
   at every vertex of a primitive; where a program breaks that, the layer or viewport is the
   device's choice. An index the function declares and never writes, which Metal gives no value,
@@ -5002,14 +5068,18 @@ The test `tests::one_path` reads the crate's sources and fails on the first thre
 ## Encoder calls
 
 An encoder call executes no locked instruction on its success path: no atomic read-modify-write,
-no mutex and no reference count change. Each encoder holds the device once; a command borrows it,
+no mutex and no reference count change. The one exception is a fence: the first time a command
+buffer's encoders update or wait on a fence, the command buffer keeps it, which is one reference
+count change. Each encoder holds the device once; a command borrows it,
 the pipeline state and the bound resources, and counts into the encoder's own tally, which the
 device's counters take once, at the encoder's end. What a draw or a dispatch learns from its
 bindings (the vertex buffers it binds, the alignments it checks, whether it reads an attachment,
 reaches a Managed buffer's device copy or writes what the host reads) it works out again only
-after the pipeline state or a binding changes. On RADV a recorded command lies in write-combining
-memory, and a locked instruction between two of them flushes it: a draw took about 490 ns more on
-a Radeon RX 7900 XTX with one.
+after the pipeline state or a binding changes. Whether a declaration of the encoder covers an
+attachment its pass holds out of its home layout (`Metrics::unslotted_attachment_reads`) is
+settled as each declaration and each move of an attachment is made, and a draw tests that answer
+alone. On RADV a recorded command lies in write-combining memory, and a locked instruction between
+two of them flushes it: a draw took about 490 ns more on a Radeon RX 7900 XTX with one.
 
 ## Floor
 
@@ -5153,6 +5223,7 @@ extension offers each of them by Vulkan's definition and is not asked.
 | `imageViewFormatSwizzle` | `VkPhysicalDevicePortabilitySubsetFeaturesKHR` | a texture view's component mapping: its format's and Metal's swizzle |
 | `mutableComparisonSamplers` | `VkPhysicalDevicePortabilitySubsetFeaturesKHR` | the comparison sampler array, which takes each sampler state's sampler as it is made |
 | `multisampleArrayImage` | `VkPhysicalDevicePortabilitySubsetFeaturesKHR` | `MTLTextureType2DMultisampleArray` |
+| `imageView2DOn3DImage` | `VkPhysicalDevicePortabilitySubsetFeaturesKHR` | a 3D texture's depth plane as a colour attachment: a 2D view of a 2D-array-compatible 3D image |
 
 ### Step rates
 

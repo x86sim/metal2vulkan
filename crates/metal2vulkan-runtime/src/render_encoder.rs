@@ -55,7 +55,9 @@
 //! level and layer the pass cleared, inside Metal's render area, is a clear of the shadow's to the
 //! pass's clear colour instead, between the same barriers. A memory barrier after draws leaves
 //! every shadow holding nothing, so the next draw that reads an attachment copies what it reads
-//! again, after what the earlier draws rendered; it records nothing itself.
+//! again, after what the earlier draws rendered; it records nothing itself. A shadow's copies are
+//! of layers, so a draw that reads this way a 3D texture whose depth plane its pass renders is
+//! refused ([`DrawKind::AttachmentRead`]).
 //!
 //! A `Boolean` or `Counting` visibility result mode counts the draws after it in one precise
 //! occlusion query, begun before its first draw and ended in the rendering as the next mode set
@@ -593,6 +595,26 @@ struct Declarations {
     /// What the first texture a declaration writes lacks for it: no storage element, or one the
     /// device cannot write without a format ([`TextureObject::storage_gap`]).
     unstored_write: Option<StorageGap>,
+    /// The heaps' blocks `use_heap` declared, each once.
+    heaps: Vec<BlockId>,
+    /// A read declaration covers an attachment the pass holds out of its home layout
+    /// ([`Pass::held`]): a draw that may read beyond its slots then counts in
+    /// [`Metrics::unslotted_attachment_reads`](crate::Metrics::unslotted_attachment_reads).
+    /// Settled as a declaration is made and as an attachment moves to the feedback layout, so a
+    /// draw tests it alone; once set it holds for the pass, whose declarations and moves last
+    /// until its end.
+    held: bool,
+}
+
+impl Declarations {
+    /// Whether a read declaration covers `texture`: a `use_resource` read of it or of a view
+    /// that shares its image, or a `use_heap` of the heap its image lies in.
+    fn reads(&self, texture: &Texture) -> bool {
+        let hazard = texture.hazard_id();
+        (self.each.iter()).any(|&([id, _], access, ..)| id == hazard && access.reads())
+            || (TextureObject::object(texture).heap_block())
+                .is_some_and(|b| self.heaps.contains(&b))
+    }
 }
 
 /// `MTLRenderCommandEncoder`: one dynamic rendering into its pass's attachments, begun as the
@@ -1734,6 +1756,9 @@ impl RenderCommandEncoder {
                 t.layout = looped;
             }
         }
+        // A read declaration that covers an attachment now held out of its home layout.
+        let held = (self.pass.held()).any(|attachment| self.declared.reads(attachment));
+        self.declared.held |= held;
         self.moved.extend(moves.into_iter().map(|m| m.moved));
         self.push_filled = false;
         (self.drew, self.owed) = (false, false);
@@ -1914,7 +1939,11 @@ impl RenderCommandEncoder {
     /// every function, and the pass's barriers order its draws after every earlier command and
     /// before every later one. Every later draw of the encoder reaches the resource with the
     /// declared access, as it reaches its bound ones, for the copies a texture over a buffer in an
-    /// image of its own takes, and for what the host reads once the command buffer completes.
+    /// image of its own takes, and for what the host reads once the command buffer completes. A
+    /// later draw that may read beyond its slots while a texture declared read is an attachment of
+    /// the pass out of its home layout counts in
+    /// [`Metrics::unslotted_attachment_reads`](crate::Metrics::unslotted_attachment_reads), as Vulkan leaves such a read
+    /// undefined.
     ///
     /// A usage that writes a texture, or a view of one, made for shader writes with no storage
     /// element (not a multisampled one, which Metal's shaders only read) makes every later draw of
@@ -1979,7 +2008,12 @@ impl RenderCommandEncoder {
         let Some(access) = usage.access() else {
             return Ok(());
         };
+        // A read of an attachment the pass holds out of its home layout: of it, of a view of its
+        // image or of the buffer it lies over in place, all of which name its hazard id.
+        let held =
+            access.reads() && (self.pass.held()).any(|attachment| attachment.hazard_id() == id[0]);
         let declared = &mut self.declared;
+        declared.held |= held;
         declared.host_write |= access.writes() && host;
         if access.writes() && declared.unstored_write.is_none() {
             declared.unstored_write = unstored;
@@ -2001,13 +2035,22 @@ impl RenderCommandEncoder {
     /// The command buffer keeps the block until it retires, as
     /// [`ComputeCommandEncoder::use_heap`](crate::ComputeCommandEncoder::use_heap) does. It
     /// records nothing and declares no access, and the stages are not read: the pass's barriers
-    /// order its draws after every earlier command and before every later one.
+    /// order its draws after every earlier command and before every later one. A later draw that
+    /// may read beyond its slots while an attachment of the pass in the heap is out of its home
+    /// layout counts in [`Metrics::unslotted_attachment_reads`](crate::Metrics::unslotted_attachment_reads), as Vulkan leaves
+    /// such a read undefined.
     ///
     /// Err: [`Error::NoSuchBlock`] for a number no handle names.
     pub fn use_heap(&mut self, heap: BlockId) -> Result<(), Error> {
         let building = self.building();
         let block = building.device.block(heap)?;
         building.keep_block(&block);
+        if !self.declared.heaps.contains(&heap) {
+            self.declared.heaps.push(heap);
+            // An attachment in the heap that the pass holds out of its home layout.
+            self.declared.held |= (self.pass.held())
+                .any(|attachment| TextureObject::object(attachment).heap_block() == Some(heap));
+        }
         Ok(())
     }
 
@@ -2517,8 +2560,20 @@ impl RenderCommandEncoder {
                 self.overs_after(commands);
             }
         }
+        // A draw that may read beyond its slots while a read declaration covers an attachment the
+        // pass holds out of its home layout, the draw's own moves included: such a read names the
+        // texture's own element, whose layout is the home one
+        // (`Metrics::unslotted_attachment_reads`). The declarations settle the fact as they and
+        // the moves are made, so a draw tests it alone.
+        let unslotted = self.declared.held
+            && (commands
+                || (self.pipeline.as_ref())
+                    .is_some_and(|state| state.inner.compiled.draws.reads_unbound));
         let building = (self.building.as_mut())
             .expect("an encoder holds its command buffer's recording until it ends");
+        if unslotted {
+            building.count(Metric::UnslottedAttachmentReads);
+        }
         if self.facts.host {
             building.wrote_host();
         }
@@ -2974,8 +3029,11 @@ impl RenderCommandEncoder {
                 }));
             }
             if !texture.looped() {
-                // A shadow holds what one layer of its attachment rendered.
-                if a.layers > 1 {
+                // A shadow holds what one layer of its attachment rendered, and no depth plane of
+                // a 3D texture's: its copies are of layers at the plane 0 (`region`).
+                if a.layers > 1
+                    || target.texture.descriptor().texture_type == crate::TextureType::Type3D
+                {
                     return Err(Error::Unsupported(Gap::Draw {
                         kind: DrawKind::AttachmentRead,
                     }));
@@ -3580,6 +3638,13 @@ impl RenderCommandEncoder {
     /// words from.
     pub(crate) fn pushed(&self) -> &[u8] {
         &self.push
+    }
+
+    /// The dynamic states set since the encoder's last draw that its next draw records
+    /// (`record_state`'s bits): none where each setter since set the value it replaced, which
+    /// `tests::draw` reads.
+    pub(crate) fn unrecorded(&self) -> u32 {
+        self.dirty
     }
 }
 
