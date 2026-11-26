@@ -501,6 +501,9 @@ impl Device {
         )?;
         check_size(handle, len, &needs)?;
         let identity = identity(fd.as_raw_fd());
+        // x86Sim: the block keeps a duplicate, which a texture over it imports again where the
+        // device requires its image's memory dedicated (`memory::Block::dma_buf`).
+        let again = fd.try_clone().ok();
         let raw = fd.into_raw_fd();
         let mut import = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(handle.vk())
@@ -518,7 +521,12 @@ impl Device {
             memory_type: index,
         };
         match unsafe { memory::import(core, &info, handle.vk(), None, own) } {
-            Ok(memory) => Ok((claim(core, memory, release), index)),
+            Ok(memory) => {
+                let info = memory.info();
+                let mut block = memory::Block::imported(memory, Arc::clone(core), release);
+                block.dma_buf = again;
+                Ok((Block::claim(core, info, block), index))
+            }
             Err(ImportFailed::Before(error)) => {
                 // Nothing was imported, so the fd is still ours: closed, where it is still the
                 // dma-buf.

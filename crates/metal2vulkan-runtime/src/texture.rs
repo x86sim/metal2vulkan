@@ -1650,13 +1650,23 @@ impl Device {
                 // (`Image::homing`).
                 first = vk::ImageLayout::PREINITIALIZED;
                 home = vk::ImageLayout::GENERAL;
-                let (memory_type, handle) = match laid {
-                    Some(Laid::DmaBuf { memory_type }) => {
+                #[cfg(unix)]
+                let reimport = {
+                    use std::os::fd::AsRawFd;
+                    (buffer.held().0.dma_buf.as_ref()).map(|fd| fd.as_raw_fd())
+                };
+                #[cfg(not(unix))]
+                let reimport: Option<i32> = None;
+                let (memory_type, handle, modifier) = match laid {
+                    Some(Laid::DmaBuf {
+                        memory_type,
+                        modifier,
+                    }) => {
                         acquired = Some(memory.range(at + offset));
                         let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
-                        (memory_type, Some(handle))
+                        (memory_type, Some(handle), modifier)
                     }
-                    _ => (core.memory_type(class), None),
+                    _ => (core.memory_type(class), None, false),
                 };
                 let rows = u64::from(d.height) * bytes_per_row;
                 let reach = (usage.contains(TextureUsage::RENDER_TARGET))
@@ -1672,6 +1682,8 @@ impl Device {
                     at: at + offset,
                     bytes_per_row,
                     reach,
+                    modifier,
+                    reimport: reimport.filter(|_| modifier),
                 };
                 let under = Under::Buffer {
                     _buffer: buffer.clone(),
@@ -2216,7 +2228,10 @@ fn check_over(
                 handle: ImportHandle::DmaBuf,
                 memory_type,
             }),
-        ) if core.exports.foreign => Laid::DmaBuf { memory_type },
+        ) if core.exports.foreign => Laid::DmaBuf {
+            memory_type,
+            modifier: false,
+        },
         (None, Some(own)) => return Ok(Err(memory_cause(own))),
     };
     let spilled = copy.is_none() && block.memory.spilled();
@@ -2226,8 +2241,18 @@ fn check_over(
     let (linear, optimal) = core.format_features(plan.format);
     // Its linear image's query, and its linear tiling's features of each use its optimal tiling
     // holds: its format's, and an extended plan's other formats' storage (`Plan::extended`).
+    // Over a dma-buf, a device whose linear tiling takes no image for the handle may take one of
+    // DRM_FORMAT_MOD_LINEAR (`VK_EXT_image_drm_format_modifier`): Mesa's RADV makes dma-buf
+    // images of that tiling only. Its layout is stated (the texture's pitch), so the image is the
+    // buffer's bytes as a linear one is.
+    let modifier = std::cell::Cell::new(false);
     let held = |plan: &Plan| {
-        let extent = fits(linear_extent(core, shape, plan, laid.handle()));
+        let mut max = linear_extent(core, shape, plan, laid.handle());
+        if max.is_none() && matches!(laid, Laid::DmaBuf { .. }) && core.exports.modifiers {
+            max = modifier_extent(core, shape, plan);
+            modifier.set(max.is_some());
+        }
+        let extent = fits(max);
         let stored = !plan.extended
             || (plan.view_formats.iter()).all(|&format| {
                 let (linear, optimal) = core.format_features(format);
@@ -2254,6 +2279,13 @@ fn check_over(
         plan.linear_resolves = true;
         plan.linear_resolves = fits(linear_extent(core, shape, plan, None));
     }
+    let laid = match laid {
+        Laid::DmaBuf { memory_type, .. } => Laid::DmaBuf {
+            memory_type,
+            modifier: modifier.get(),
+        },
+        Laid::Own => Laid::Own,
+    };
     Ok(if spilled {
         Err(OverCause::Spilled)
     } else if !extent {
@@ -2297,7 +2329,7 @@ enum Laid {
     /// A dma-buf's one import (`Device::import_dma_buf`, on Unix), in its memory type: the image
     /// is made for the dma-buf, undefined, and its move home acquires the bytes from the foreign
     /// queue family, preinitialized ([`Image::homing`]).
-    DmaBuf { memory_type: u32 },
+    DmaBuf { memory_type: u32, modifier: bool },
 }
 
 impl Laid {
@@ -2401,6 +2433,128 @@ fn linear_extent(
         && memory.compatible_handle_types.contains(handle);
     binds.then_some(max)
 }
+
+/// As [`linear_extent`] for a dma-buf's import, of DRM_FORMAT_MOD_LINEAR
+/// (`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`), which a device may take where its linear tiling
+/// takes no image for the handle.
+fn modifier_extent(core: &Core, shape: &Shape, plan: &Plan) -> Option<vk::Extent3D> {
+    let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+    let mut list = plan.format_list();
+    let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(MOD_LINEAR)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(handle);
+    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(plan.format)
+        .ty(shape.image_type)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(plan.linear_usage())
+        .flags(plan.flags(shape))
+        .push_next(&mut external)
+        .push_next(&mut modifier);
+    if !plan.view_formats.is_empty() {
+        info = info.push_next(&mut list);
+    }
+    let mut answer = vk::ExternalImageFormatProperties::default();
+    let mut properties = vk::ImageFormatProperties2::default().push_next(&mut answer);
+    // SAFETY: the physical device is the instance's, of Vulkan 1.3; the handle's extensions and
+    // `VK_EXT_image_drm_format_modifier` are enabled.
+    unsafe {
+        (core.instance.vk()).get_physical_device_image_format_properties2(
+            core.physical,
+            &info,
+            &mut properties,
+        )
+    }
+    .ok()?;
+    let max = properties.image_format_properties.max_extent;
+    let memory = answer.external_memory_properties;
+    let features = memory.external_memory_features;
+    let binds = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        && !features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)
+        && memory.compatible_handle_types.contains(handle);
+    binds.then_some(max)
+}
+
+/// x86Sim: imports the dma-buf `fd` names again (a duplicate), dedicated to `image`, of a type
+/// both the image's requirements and the dma-buf take (`preferred`, the buffer's import's, where it
+/// is one): `None` where the device imports none.
+///
+/// # Safety
+///
+/// `image` is the device's, unbound, made for a dma-buf's memory; `fd` is open.
+#[cfg(unix)]
+unsafe fn reimport_dedicated(
+    core: &Core,
+    image: vk::Image,
+    fd: i32,
+    requirements: &vk::MemoryRequirements,
+    preferred: u32,
+) -> Option<vk::DeviceMemory> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+    let fds = core.imports.dma_buf.as_ref()?;
+    // SAFETY: `fd` is open; the duplicate is ours.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return None;
+    }
+    // SAFETY: `dup` is open and owned here.
+    let dup = unsafe { OwnedFd::from_raw_fd(dup) };
+    let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+    let mut properties = vk::MemoryFdPropertiesKHR::default();
+    // SAFETY: the extensions are enabled; the query takes no ownership.
+    unsafe {
+        fds.get_memory_fd_properties(
+            handle,
+            std::os::fd::AsRawFd::as_raw_fd(&dup),
+            &mut properties,
+        )
+    }
+    .ok()?;
+    let bits = properties.memory_type_bits & requirements.memory_type_bits;
+    let index = match bits & (1 << preferred) {
+        0 if bits == 0 => return None,
+        0 => bits.trailing_zeros(),
+        _ => preferred,
+    };
+    let mut import = vk::ImportMemoryFdInfoKHR::default()
+        .handle_type(handle)
+        .fd(std::os::fd::AsRawFd::as_raw_fd(&dup));
+    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(index)
+        .push_next(&mut import)
+        .push_next(&mut dedicated);
+    // SAFETY: an import of the dma-buf, dedicated to the image, of a type both take.
+    let memory = unsafe {
+        memory::allocate(
+            &core.device,
+            &core.counters,
+            core.max_allocations,
+            &info,
+            None,
+        )
+    }
+    .ok()?;
+    // A successful import owns the fd.
+    let _ = dup.into_raw_fd();
+    Some(memory)
+}
+
+#[cfg(not(unix))]
+unsafe fn reimport_dedicated(
+    _core: &Core,
+    _image: vk::Image,
+    _fd: i32,
+    _requirements: &vk::MemoryRequirements,
+    _preferred: u32,
+) -> Option<vk::DeviceMemory> {
+    None
+}
+
+/// `DRM_FORMAT_MOD_LINEAR`: rows one after another at a stated pitch.
+const MOD_LINEAR: u64 = 0;
 
 /// The smallest power of two from `texel` (a texel's bytes, rounded up to one) to 4,096 at which
 /// every `(row, pitch)`, a linear image's row bytes and the pitch the device lays it at, has its
@@ -3197,6 +3351,11 @@ enum Bind {
         at: u64,
         bytes_per_row: u64,
         reach: Option<u64>,
+        /// Made of DRM_FORMAT_MOD_LINEAR at `bytes_per_row` (a dma-buf's import, [`Laid::DmaBuf`])
+        modifier: bool,
+        /// With `modifier`: the import's dma-buf (`memory::Block::dma_buf`, which the texture's
+        /// buffer holds), imported again dedicated to the image, its plane at `base + at`.
+        reimport: Option<i32>,
     },
     /// `offset` in `heap`, whose block of `block_len` bytes lies at `base` in the allocation
     /// `memory`.
@@ -3289,11 +3448,38 @@ impl Made {
         let mut list = plan.format_list();
         let info = image_info(d, shape, plan, &mut list);
         let mut external = vk::ExternalMemoryImageCreateInfo::default();
+        // Of DRM_FORMAT_MOD_LINEAR over a dma-buf's import: the layout stated, rows at the
+        // texture's pitch from the image's place.
+        let (modifier, pitch, plane) = match bind {
+            Bind::InPlace {
+                modifier,
+                bytes_per_row,
+                reimport,
+                base,
+                at,
+                ..
+            } => (modifier, bytes_per_row, reimport.map_or(0, |_| base + at)),
+            _ => (false, 0, 0),
+        };
+        let layouts = [vk::SubresourceLayout {
+            offset: plane,
+            size: 0,
+            row_pitch: pitch,
+            array_pitch: 0,
+            depth_pitch: 0,
+        }];
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(MOD_LINEAR)
+            .plane_layouts(&layouts);
         let info = match bind {
             Bind::InPlace { handle, .. } => {
-                let info = info
-                    .tiling(vk::ImageTiling::LINEAR)
-                    .usage(plan.linear_usage());
+                let mut info = match modifier {
+                    true => info
+                        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                        .push_next(&mut explicit),
+                    false => info.tiling(vk::ImageTiling::LINEAR),
+                };
+                info = info.usage(plan.linear_usage());
                 match handle {
                     // Made for the import's handle (`VUID-vkBindImageMemory-memory-02989`), so
                     // undefined (`VUID-VkImageCreateInfo-pNext-01443`).
@@ -3309,8 +3495,15 @@ impl Made {
         };
         let started = crate::host_time();
         // SAFETY: the caller's contract: the device makes such an image.
-        let image =
-            unsafe { device.create_image(&info, None) }.map_err(Error::vulkan("vkCreateImage"))?;
+        let image = match unsafe { device.create_image(&info, None) } {
+            Ok(image) => image,
+            // A pitch the driver lays no DRM_FORMAT_MOD_LINEAR image at (RADV: a multiple of
+            // 256 bytes): the copy, as a linear image of another pitch is.
+            Err(vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT) if modifier => {
+                return Err(Unmade::Unfit(OverCause::Pitch));
+            }
+            Err(result) => return Err(Error::vulkan("vkCreateImage")(result).into()),
+        };
         let created = crate::host_time() - started;
         self.image = Some(image);
         let mut dedicated = vk::MemoryDedicatedRequirements::default();
@@ -3344,15 +3537,53 @@ impl Made {
             at,
             bytes_per_row,
             reach,
+            modifier,
+            reimport,
         } = bind
         {
+            // A DRM format modifier's image states its layout by memory plane.
             let color = vk::ImageSubresource {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask: match modifier {
+                    true => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+                    false => vk::ImageAspectFlags::COLOR,
+                },
                 mip_level: 0,
                 array_layer: 0,
             };
             // SAFETY: the image is the device's, linear, of one level and layer of a color format.
             let layout = unsafe { device.get_image_subresource_layout(image, color) };
+            // x86Sim: DRM_FORMAT_MOD_LINEAR over the dma-buf, on an import of its own dedicated to
+            // the image (RADV requires that of every such image), its plane at the texture's
+            // place: the same pages as the buffer's, so nothing is copied.
+            if let Some(fd) = reimport {
+                if layout.offset != base + at || layout.row_pitch != bytes_per_row {
+                    return Err(Unmade::Unfit(OverCause::Pitch));
+                }
+                if !in_reach(layout.size, reach) {
+                    return Err(Unmade::Unfit(OverCause::RenderReach));
+                }
+                // SAFETY: the image is the device's, of a DRM format modifier over the dma-buf
+                // `fd` names, which the texture's buffer holds open.
+                let memory =
+                    unsafe { reimport_dedicated(core, image, fd, &requirements, memory_type) }
+                        .ok_or(Unmade::Unfit(OverCause::ImageMemory))?;
+                core.counters.surface_imported(requirements.size);
+                self.backing = Some(Backing::Import(memory, requirements.size));
+                let bound = (core.counters).time(Part::ImageBind, requirements.size, || unsafe {
+                    device.bind_image_memory(image, memory, 0)
+                });
+                bound.map_err(Error::vulkan("vkBindImageMemory"))?;
+                // SAFETY: the image is bound, of the plan's format, and has `info`'s usage.
+                let usage = info.usage;
+                let (sampled, storage) = unsafe { self.views(core, image, shape, plan, usage) }?;
+                return Ok((
+                    image,
+                    Backing::Import(memory, requirements.size),
+                    requirements.size,
+                    sampled,
+                    storage,
+                ));
+            }
             let memory_fits = dedicated.requires_dedicated_allocation == vk::FALSE
                 && bits & (1 << memory_type) != 0
                 && at
@@ -3515,9 +3746,14 @@ impl Made {
                     core.counters.fall_by(Gauge::SpilledBytes, spilled);
                 }
                 Some(Backing::Placed(place)) => core.places.release(core, place),
-                // A surface's plane images are made by `crate::surface` and `crate::d3d11`,
-                // never here.
-                Some(Backing::Import(..)) => {}
+                // x86Sim: a texture over a dma-buf's import, imported again for its image
+                // (`reimport_dedicated`); a surface's plane images are made by `crate::surface`
+                // and `crate::d3d11`, never here.
+                Some(Backing::Import(memory, bytes)) => {
+                    device.free_memory(memory, None);
+                    core.counters.fall(Gauge::Blocks);
+                    core.counters.surface_import_freed(bytes);
+                }
                 Some(Backing::InBlock | Backing::Drawable) | None => {}
             }
         }

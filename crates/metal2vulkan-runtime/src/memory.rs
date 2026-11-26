@@ -502,6 +502,11 @@ pub(crate) struct Block {
     /// this one, so the block-maker thread destroys the sparse buffer before it frees any of
     /// their memory, the last of them holding the release.
     _chunks: Vec<Block>,
+    /// x86Sim: a dma-buf's one import ([`crate::Device::import_dma_buf`]): a duplicate of its fd,
+    /// which a texture over it imports again, dedicated to its image, where the device requires
+    /// that of a DRM_FORMAT_MOD_LINEAR image (RADV): else it is copied over.
+    #[cfg(unix)]
+    pub(crate) dma_buf: Option<std::os::fd::OwnedFd>,
     /// Of an exported block: set once a public call hands out a device address of its memory
     /// ([`address_out`](Self::address_out)), which the textures over it read at each submission
     /// (`crate::over::ExportedOvers`).
@@ -518,6 +523,8 @@ impl Block {
             release: Mutex::new(None),
             _under: None,
             _chunks: Vec::new(),
+            #[cfg(unix)]
+            dma_buf: None,
         }
     }
 
@@ -541,6 +548,8 @@ impl Block {
             release: Mutex::new(release),
             _under: None,
             _chunks: Vec::new(),
+            #[cfg(unix)]
+            dma_buf: None,
             addressed: None,
         }
     }
@@ -554,6 +563,8 @@ impl Block {
             release: Mutex::new(None),
             _under: Some(under),
             _chunks: Vec::new(),
+            #[cfg(unix)]
+            dma_buf: None,
             addressed: None,
         }
     }
@@ -2391,6 +2402,8 @@ pub(crate) fn sparse_block(
         release: Mutex::new(None),
         _under: None,
         _chunks: chunks,
+        #[cfg(unix)]
+        dma_buf: None,
         addressed: None,
     }
 }
