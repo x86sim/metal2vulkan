@@ -163,8 +163,11 @@ impl BlitCommandEncoder {
     /// `destinationSlice:destinationLevel:destinationOrigin:`: `size` texels from `from` in
     /// `source` to `to` in `destination`, one `vkCmdCopyImage`. Both textures have one pixel
     /// format and one sample count, as Metal's validation requires; a compressed format's region
-    /// is whole blocks or reaches the level's edge on both sides. A format of depth and stencil
-    /// both copies its pixels whole, as Metal's copy takes no plane option: each region of the
+    /// is whole blocks or reaches the level's edge on both sides, and whole blocks may end past
+    /// the edge inside the level's last block (the one 4 x 4 block of a level of 4 x 2 texels):
+    /// plain Metal copies that block whole, and the command's extent stops at the edge, both
+    /// sides' at the same one (where they stop at different ones, [`Gap::TextureCopy`]). A format
+    /// of depth and stencil both copies its pixels whole, as Metal's copy takes no plane option: each region of the
     /// command names both aspects. A 3D texture's region one image
     /// deep copies into or out of
     /// a 2D slice. A size of 0 on an axis one of the textures lacks (depth on any but a 3D
@@ -244,6 +247,9 @@ impl BlitCommandEncoder {
         if destination.host_reads() {
             building.wrote_host();
         }
+        if let Some(held) = building.coherence() {
+            held.wrote(destination.shared_range(held.atom));
+        }
         building.overs_after(overs, false);
         let (read, write) = match copy.shared {
             false => (
@@ -293,7 +299,7 @@ impl BlitCommandEncoder {
                 if n > 0 {
                     let dependency = vk::DependencyInfo::default().memory_barriers(&between);
                     device.cmd_pipeline_barrier2(command, &dependency);
-                    building.count(Metric::Barriers);
+                    building.count(Metric::BlitBarriers);
                 }
                 device.cmd_copy_image(
                     command,
@@ -306,8 +312,8 @@ impl BlitCommandEncoder {
             }
             close(core, command, back);
         }
-        building.count(Metric::Barriers);
-        building.count(Metric::Barriers);
+        building.count(Metric::BlitBarriers);
+        building.count(Metric::BlitBarriers);
         Ok(())
     }
 
@@ -315,7 +321,11 @@ impl BlitCommandEncoder {
     /// `toTexture:destinationSlice:destinationLevel:destinationOrigin:`: `size` texels from
     /// `source`, laid out as `layout` says, to `to` in `destination`, one
     /// `vkCmdCopyBufferToImage` a 3D region's image. The options form with no option is this
-    /// call. Sizes of 0 copy as [`copy_from_texture`](Self::copy_from_texture)'s do. The command
+    /// call. Sizes of 0 copy as [`copy_from_texture`](Self::copy_from_texture)'s do, and a
+    /// compressed region takes whole blocks ending inside the level's last block as its does.
+    /// Metal's validation layer stops this call's (`(destinationOrigin.y + sourceSize.height)(4)
+    /// must be <= height(2)` at a level of 4 x 2) and plain Metal copies the block; a guest's
+    /// Metal runs without the layer, so the runtime does what plain Metal does. The command
     /// buffer keeps the texture and the buffer until it retires. A Managed buffer's bytes here are
     /// those shaders reach: its device copy, where the device keeps one. A texture in place over
     /// those bytes ([`Buffer::new_texture`]) whose rows meet the region's, which Metal leaves
@@ -482,6 +492,9 @@ impl BlitCommandEncoder {
         if destination.is_shared() {
             building.wrote_host();
         }
+        if let Some(held) = building.coherence() {
+            held.wrote(destination.shared_range(held.atom));
+        }
         let earlier = [memory_barrier(Reach::Commands)];
         let written = [written()];
         let device = &core.device;
@@ -499,8 +512,8 @@ impl BlitCommandEncoder {
                 &vk::DependencyInfo::default().memory_barriers(&written),
             );
         }
-        building.count(Metric::Barriers);
-        building.count(Metric::Barriers);
+        building.count(Metric::BlitBarriers);
+        building.count(Metric::BlitBarriers);
         Ok(())
     }
 
@@ -607,6 +620,12 @@ impl BlitCommandEncoder {
         if host {
             building.wrote_host();
         }
+        if let Some(held) = building.coherence() {
+            held.wrote(match into_image {
+                true => texture.shared_range(held.atom),
+                false => buffer.shared_range(held.atom),
+            });
+        }
         let (layout, access) = match into_image {
             true => (
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -657,7 +676,7 @@ impl BlitCommandEncoder {
                     if n > 0 {
                         let dependency = vk::DependencyInfo::default().memory_barriers(&between);
                         device.cmd_pipeline_barrier2(command, &dependency);
-                        building.count(Metric::Barriers);
+                        building.count(Metric::BlitBarriers);
                     }
                     for region in slab {
                         match into_image {
@@ -681,8 +700,8 @@ impl BlitCommandEncoder {
             }
             close(core, command, back);
         }
-        building.count(Metric::Barriers);
-        building.count(Metric::Barriers);
+        building.count(Metric::BlitBarriers);
+        building.count(Metric::BlitBarriers);
         Ok(())
     }
 
@@ -723,6 +742,9 @@ impl BlitCommandEncoder {
         if buffer.is_shared() {
             building.wrote_host();
         }
+        if let Some(held) = building.coherence() {
+            held.wrote(buffer.shared_range(held.atom));
+        }
         let earlier = [memory_barrier(Reach::Commands)];
         let written = [written()];
         let device = &core.device;
@@ -746,8 +768,8 @@ impl BlitCommandEncoder {
                 &vk::DependencyInfo::default().memory_barriers(&written),
             );
         }
-        building.count(Metric::Barriers);
-        building.count(Metric::Barriers);
+        building.count(Metric::BlitBarriers);
+        building.count(Metric::BlitBarriers);
         Ok(())
     }
 
@@ -801,8 +823,8 @@ impl BlitCommandEncoder {
                 &vk::DependencyInfo::default().memory_barriers(&written),
             );
         }
-        building.count(Metric::Barriers);
-        building.count(Metric::Barriers);
+        building.count(Metric::BlitBarriers);
+        building.count(Metric::BlitBarriers);
         Ok(())
     }
 
@@ -876,6 +898,9 @@ impl BlitCommandEncoder {
         let command = building.ordered_command()?;
         if texture.host_reads() {
             building.wrote_host();
+        }
+        if let Some(held) = building.coherence() {
+            held.wrote(texture.shared_range(held.atom));
         }
         building.overs_after(overs, false);
         use vk::AccessFlags2 as A;
@@ -984,7 +1009,7 @@ impl BlitCommandEncoder {
         }
         // The chain's barriers: before it, between each level and the next, and after it.
         for _ in 0..levels {
-            building.count(Metric::Barriers);
+            building.count(Metric::BlitBarriers);
         }
         Ok(())
     }
@@ -1087,8 +1112,17 @@ impl BlitCommandEncoder {
             building.managed_reach(buffer, &mut backs);
             building.managed_backs(backs)?;
             let command = building.ordered_command()?;
-            // Marked after `ordered_command`, as a copy into a Shared buffer is.
+            // Marked after `ordered_command`, as a copy into a Shared buffer is. The copy writes
+            // the block of its bytes, which the host reads (`crate::coherence`).
             building.wrote_host();
+            if let Some(held) = building.coherence() {
+                held.wrote(crate::coherence::Range::of_block(
+                    &block.memory,
+                    buffer.offset(),
+                    buffer.length(),
+                    held.atom,
+                ));
+            }
             let earlier = [memory_barrier(Reach::Commands)];
             let written = [written()];
             let device = &core.device;
@@ -1106,8 +1140,8 @@ impl BlitCommandEncoder {
                     &vk::DependencyInfo::default().memory_barriers(&written),
                 );
             }
-            building.count(Metric::Barriers);
-            building.count(Metric::Barriers);
+            building.count(Metric::BlitBarriers);
+            building.count(Metric::BlitBarriers);
         }
         Ok(())
     }
@@ -1177,7 +1211,7 @@ impl BlitCommandEncoder {
         // block, until it retires; the barrier spans the block's own allocation, its buffer's,
         // and a dma-buf's foreign family is enabled (`Device::new_exported_block`).
         unsafe { core.device.cmd_pipeline_barrier2(command, &dependency) };
-        building.count(Metric::Barriers);
+        building.count(Metric::OtherBarriers);
         building.count(Metric::ExternalReleases);
         Ok(())
     }
@@ -1268,7 +1302,7 @@ impl BlitCommandEncoder {
         // buffer until it retires; each image is in its home layout, general, between commands,
         // the buffer spans the surface's memory, and a dma-buf's foreign family is enabled.
         unsafe { core.device.cmd_pipeline_barrier2(command, &dependency) };
-        building.count(Metric::Barriers);
+        building.count(Metric::OtherBarriers);
         building.count(Metric::ExternalReleases);
         Ok(())
     }
@@ -1848,6 +1882,15 @@ pub(crate) fn texture_copy(
     let (Some(from), Some(to)) = placed else {
         return Ok(None);
     };
+    // One command's one extent copies both regions, and stops at an image's edge only where
+    // that region does ("Copy regions for each image must be aligned to a multiple of the texel
+    // block extent in each dimension, except at the edges of the image, where region extents
+    // must match the edge of the image"): whole blocks that end inside one level's last block
+    // past its edge and not the other's copy with no one extent, though plain Metal copies the
+    // block whole.
+    if from.size != to.size {
+        return Err(gap());
+    }
     // One subresource of one image, the textures one or a texture and its view, copies in the
     // general layout (`VUID-vkCmdCopyImage-srcImage-09460`); two textures in place over one
     // buffer may share bytes too. No command's source and destination share a byte

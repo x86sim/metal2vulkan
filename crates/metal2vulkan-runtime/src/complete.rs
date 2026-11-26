@@ -9,6 +9,7 @@ use crate::device::{lock, Core};
 use crate::error::Error;
 use crate::event::{self, EventInner, Listener};
 use crate::fault;
+use crate::queue::QueueInner;
 use crate::submit::{Ended, Finished, Upload};
 use crate::times::{self, Calibration, OwnEnd, Spans};
 use ash::vk;
@@ -73,8 +74,13 @@ enum Waiting {
 
 struct Retiree {
     value: u64,
-    /// Of a held group's submission ([`Sent::held`]).
-    held: bool,
+    /// Of a held group's submission ([`Sent::held`]): its last progress value, which its members
+    /// share where it goes member by member, each with a value of its own.
+    held: Option<u64>,
+    /// Its submission's progress value. A member of a group sent member by member that retires
+    /// before it, at a value of its own, feeds its queue's expected run only as that value
+    /// retires, as it would with one signal for the group ([`Completion::expects`]).
+    last: u64,
     /// In flight at a loss ([`Retiree::lost`]): nothing of it is read.
     lost: bool,
     item: Item,
@@ -307,8 +313,9 @@ impl Done {
     }
 
     /// From the submit thread: a submission passed to `vkQueueSubmit2` (`sent`). Its command
-    /// buffers retire in order once it completes, each ended one with its error, and its uploads
-    /// and the copy-ins it took with them.
+    /// buffers retire in order, each once its own progress value is reached (the submission's,
+    /// or where it goes member by member its part's), each ended one with its error; its uploads
+    /// and the copy-ins it took once the submission completes.
     pub(crate) fn submitted(
         &self,
         core: &Core,
@@ -319,12 +326,14 @@ impl Done {
         watch: Vec<Arc<EventInner>>,
     ) {
         let Sent { value, held } = sent;
+        let (held, last) = (held.then_some(value), value);
         let mut state = self.lock();
         let flight_only = watch.is_empty();
         for upload in uploads {
             state.flight.push_back(Retiree {
                 value,
                 held,
+                last,
                 lost: false,
                 item: Item::Upload(upload),
             });
@@ -333,25 +342,36 @@ impl Done {
             state.flight.push_back(Retiree {
                 value,
                 held,
+                last,
                 lost: false,
                 item: Item::CopyIn(copy_in),
             });
         }
         for (cb, pending, error) in finished {
             let written = pending.stamps_written();
-            let Pending { gpu, handlers, .. } = pending;
-            state.flight.push_back(Retiree {
+            let Pending {
                 value,
-                held,
-                lost: false,
-                item: Item::Command {
-                    cb,
-                    gpu,
-                    handlers,
-                    error,
-                    written,
+                gpu,
+                handlers,
+                ..
+            } = pending;
+            let at = state.flight.partition_point(|other| other.value <= value);
+            state.flight.insert(
+                at,
+                Retiree {
+                    value,
+                    held,
+                    last,
+                    lost: false,
+                    item: Item::Command {
+                        cb,
+                        gpu,
+                        handlers,
+                        error,
+                        written,
+                    },
                 },
-            });
+            );
         }
         state.watched.extend(watch);
         self.wake(&mut state, &core.device, flight_only);
@@ -375,7 +395,8 @@ impl Done {
             } = pending;
             let retiree = Retiree {
                 value,
-                held: false,
+                held: None,
+                last: value,
                 lost: false,
                 item: Item::Command {
                     cb,
@@ -530,6 +551,11 @@ pub(crate) struct Completion<'a> {
     pub(crate) gpu_times: Option<(u64, u64)>,
     pub(crate) round: &'a Round,
     pub(crate) spans: &'a Spans,
+    /// Whether its GPU run feeds its queue's expected run as it retires (`QueueInner::ran`): not
+    /// for a member that completes before its submission's last, whose run the completion thread
+    /// feeds as the last retires. So the join, the unseen joins and the parting of the groups
+    /// the submit thread forms read the same runs, at the same points, as with one signal.
+    pub(crate) expects: bool,
 }
 
 /// What a round of the completion thread saw of the progress semaphore.
@@ -572,6 +598,11 @@ pub(crate) fn run(core: Arc<Core>) {
     // group's submission whose gap was counted (`Metrics::held_start_gap_nanos`).
     let mut last_end: Option<u64> = None;
     let mut gapped = 0;
+    // The GPU runs of the members of a group sent member by member that retired before its last,
+    // in their order, with their queues: each feeds its queue's expected run as the last retires
+    // (`Completion::expects`). No other submission's retirees come between, its values being
+    // consecutive.
+    let mut deferred: Vec<(Arc<QueueInner>, u64)> = Vec::new();
     // The latest GPU spans retired, on the host clock, under which a command buffer's span from
     // its scheduling to its GPU start may lie (`Metrics::scheduled_to_gpu_start_behind_nanos`).
     let mut spans = Spans::new();
@@ -679,6 +710,9 @@ pub(crate) fn run(core: Arc<Core>) {
         if newly_lost.is_some() || !retire.is_empty() || !fire.is_empty() {
             state.waiting = Waiting::Not;
             drop(state);
+            // A round that fired events or found the device lost wakes held work whatever it
+            // reached (`Work::completed`).
+            let reached = (newly_lost.is_none() && fire.is_empty()).then(|| done.completed());
             if let Some(loss) = newly_lost {
                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
                 done.enter(format!("the loss's fault report and work.lose ({loss:?})"));
@@ -689,7 +723,7 @@ pub(crate) fn run(core: Arc<Core>) {
             // it ends, so held work waits for its end.
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             done.enter("work.completed".to_owned());
-            core.work.completed();
+            core.work.completed(reached);
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             done.enter("pool.retired".to_owned());
             core.pool.retired();
@@ -727,8 +761,8 @@ pub(crate) fn run(core: Arc<Core>) {
                     // Retirees come in submission order: the first of a held group's command
                     // buffers with both timestamps starts the GPU's time behind it, from the
                     // latest end before it where the start is the later.
-                    if retiree.held && retiree.value != gapped {
-                        gapped = retiree.value;
+                    if let Some(group) = retiree.held.filter(|&group| group != gapped) {
+                        gapped = group;
                         if let Some(last) = last_end {
                             core.counters.held_start_gap(core.ticks.span(last, start));
                         }
@@ -740,10 +774,21 @@ pub(crate) fn run(core: Arc<Core>) {
                 let times = stamps
                     .zip(calibration.as_mut())
                     .map(|(stamps, calibration)| calibration.place(&core.ticks, stamps, seen));
+                let early = retiree.value < retiree.last;
+                if !early {
+                    for (queue, run) in deferred.drain(..) {
+                        queue.ran(run);
+                    }
+                } else if let (Item::Command { cb, .. }, Some((start, end))) =
+                    (&retiree.item, times)
+                {
+                    deferred.push((cb.queue.clone(), end.saturating_sub(start)));
+                }
                 let completion = Completion {
                     gpu_times: times,
                     round: &round,
                     spans: &spans,
+                    expects: !early,
                 };
                 // Its GPU span joins those the later ones' spans lie under: a command buffer's as
                 // placed, an upload's or a copy-in's by the calibration as it stands.
@@ -758,6 +803,14 @@ pub(crate) fn run(core: Arc<Core>) {
                     });
                 if let Some(span) = own.or(times) {
                     spans.push(span);
+                }
+            }
+            // The GPU's writes before the signals the listeners see are the host's first: the
+            // Shared memory the command buffers in flight may write is settled
+            // (`crate::coherence`).
+            if let Some(coherence) = &core.coherence {
+                if !fire.is_empty() {
+                    coherence.signal_seen(&core);
                 }
             }
             for (listener, value) in fire {

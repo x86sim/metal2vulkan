@@ -3,6 +3,7 @@
 
 use crate::alias::{Aliased, Marks, Placement};
 use crate::buffer::{Buffer, BufferInner, BufferObject};
+use crate::coherence::{self, Ranges};
 use crate::complete::Completion;
 use crate::counters::{Metric, Stage, Tally};
 use crate::device::{lock, Core, Device};
@@ -14,7 +15,7 @@ use crate::hazard::{Access, Hazards};
 use crate::kept::{Lent, Objects};
 use crate::memory::Block;
 use crate::over::{self, Overs, Reached};
-use crate::pipeline::{ComputePipelineState, Listed};
+use crate::pipeline::{Compiled, ComputePipelineState, Listed};
 use crate::queue::QueueInner;
 use crate::record::{self, Reach, Recorder};
 use crate::render::RenderPipelineState;
@@ -178,6 +179,9 @@ struct CbState {
     encoding: bool,
     /// From its commit until it retires: its pair of timestamp queries, where it took one.
     stamps: Option<Pair>,
+    /// The threads waiting on `changed` ([`CommandBuffer::wait`]): its enqueue and commit wake
+    /// them only where one waits, each wake a system call whether or not one does.
+    waiters: usize,
 }
 
 impl CbState {
@@ -192,6 +196,39 @@ impl CbState {
     }
 }
 
+/// Why a barrier is owed before the next command ([`Building::owe`]), in the order a dispatch's
+/// barrier that has several causes is counted by: an owed barrier a dispatch pays is counted in
+/// its source's bucket where the dispatch has no dependency of its own on the sets
+/// ([`Metrics::dispatch_hazard_barriers`](crate::Metrics::dispatch_hazard_barriers)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Owed {
+    /// An encoder that wrote ended.
+    EncoderEnd,
+    /// A render pass ended with no attachment to move home ([`Building::owe_pass`]).
+    PassEnd,
+    /// A dispatch wrote through an address outside its resources.
+    Unbound,
+    /// A dispatch over a Private arena records a piece after its first.
+    ArenaPiece,
+    /// A memory barrier was asked for, a block was released to another API, or a concurrent
+    /// encoder began after commands that touched anything.
+    Other,
+}
+
+impl Owed {
+    /// The bucket a dispatch's barrier that pays it is counted in, where the dispatch has no
+    /// dependency of its own.
+    pub(crate) fn metric(self) -> Metric {
+        match self {
+            Owed::EncoderEnd => Metric::DispatchEncoderEndBarriers,
+            Owed::PassEnd => Metric::DispatchPassEndBarriers,
+            Owed::Unbound => Metric::DispatchUnboundBarriers,
+            Owed::ArenaPiece => Metric::DispatchArenaPieceBarriers,
+            Owed::Other => Metric::DispatchOtherBarriers,
+        }
+    }
+}
+
 /// What a command buffer records until its commit; an open encoder holds it.
 pub(crate) struct Building {
     pub(crate) device: Device,
@@ -203,10 +240,11 @@ pub(crate) struct Building {
     /// Its pair of timestamp queries, from its first record; None before it and where it runs
     /// untimed.
     stamps: Option<Pair>,
-    /// A barrier owed before the next command: an encoder that wrote ended, a memory barrier was
-    /// asked for, a dispatch wrote through an address outside its resources, a render pass
-    /// ended, or a block was released to another API. The segment's own end barrier pays it too.
-    owed: bool,
+    /// A barrier owed before the next command, by the first of its causes in [`Owed`]'s order: an
+    /// encoder that wrote ended, a memory barrier was asked for, a dispatch wrote through an
+    /// address outside its resources, a render pass ended, or a block was released to another
+    /// API. The segment's own end barrier pays it too.
+    owed: Option<Owed>,
     /// The barrier owed orders a render pass ([`Building::owe_pass`]) or a release
     /// ([`Building::release_command`]) before what follows it: it reaches every later command
     /// ([`Reach::Commands`]), whatever the command that pays it names.
@@ -218,6 +256,9 @@ pub(crate) struct Building {
     /// The compute pipeline bound in the current segment's command buffer; set 1 is bound at the
     /// compute bind point with the first ([`bind_compute`](Self::bind_compute)).
     bound: Option<vk::Pipeline>,
+    /// The set of set 0 written last, and whether the current segment's command buffer has it
+    /// bound at the compute bind point (`crate::bound`).
+    views: crate::bound::Held,
     /// The graphics pipeline bound in the current segment's command buffer.
     drawn: Option<vk::Pipeline>,
     /// The push constant bytes the current segment's command buffer holds.
@@ -293,6 +334,24 @@ pub(crate) struct Gpu {
     /// The occlusion queries of its render encoders' visibility results, from pools of its own,
     /// each given back to the device as it retires (`crate::visibility`).
     pub(crate) queries: Queries,
+    /// The sets of set 0 its dispatches bound their kernels' storage buffers through, taken in
+    /// runs from the device's shared pools and given back as it retires (`crate::bound`).
+    pub(crate) sets: crate::bound::Sets,
+    /// What it holds of Shared memory, where the device's Shared type is not host-coherent:
+    /// what its commands may write and, from its commit, what they reach (`crate::coherence`),
+    /// boxed from its make. `None` where the type is host-coherent: one pointer, as each hand-off
+    /// moves the command buffer by value.
+    pub(crate) coherence: Option<Box<coherence::Recorded>>,
+}
+
+/// Whether `segments` hold nothing for the GPU: no commands, wait or signal ([`Gpu::is_empty`]).
+fn nothing_for_the_gpu(segments: &[Segment]) -> bool {
+    (segments.iter()).all(|segment| {
+        segment.command.is_none()
+            && segment.waits.is_empty()
+            && segment.signals.is_empty()
+            && segment.binary.is_empty()
+    })
 }
 
 impl Gpu {
@@ -300,12 +359,7 @@ impl Gpu {
     /// records no timestamps, and takes no submission unless a copy-in waits for it
     /// (`crate::capture`): the copy-in is then its submission.
     pub(crate) fn is_empty(&self) -> bool {
-        (self.segments.iter()).all(|segment| {
-            segment.command.is_none()
-                && segment.waits.is_empty()
-                && segment.signals.is_empty()
-                && segment.binary.is_empty()
-        })
+        nothing_for_the_gpu(&self.segments)
     }
 
     /// Its last segment signals the consumer's semaphores: the command buffer presents drawables
@@ -396,6 +450,7 @@ impl CommandBuffer {
     /// A new command buffer of `queue`, which counted it live, keeping its objects in `kept`,
     /// empty, the lists of a retired one where the queue had them.
     pub(crate) fn new(queue: Arc<QueueInner>, device: Device, kept: Objects) -> CommandBuffer {
+        let coherence = (device.core().coherence.as_ref()).map(coherence::Coherence::recording);
         CommandBuffer {
             inner: Arc::new(CbInner {
                 queue,
@@ -417,6 +472,8 @@ impl CommandBuffer {
                             fences: Fences::default(),
                             executed: Vec::new(),
                             queries: Queries::default(),
+                            sets: crate::bound::Sets::default(),
+                            coherence,
                         },
                         handlers: Handlers {
                             scheduled: Vec::new(),
@@ -424,10 +481,11 @@ impl CommandBuffer {
                         },
                         started: false,
                         stamps: None,
-                        owed: false,
+                        owed: None,
                         owed_all: false,
                         args_unordered: false,
                         bound: None,
+                        views: crate::bound::Held::default(),
                         drawn: None,
                         pushed: Pushed::default(),
                         host_written: false,
@@ -440,6 +498,7 @@ impl CommandBuffer {
                     times: Times::default(),
                     encoding: false,
                     stamps: None,
+                    waiters: 0,
                 }),
                 changed: Condvar::new(),
             }),
@@ -633,7 +692,9 @@ impl CommandBuffer {
         if state.status == CommandBufferStatus::NotEnqueued {
             work.enqueue(&self.inner);
             state.status = CommandBufferStatus::Enqueued;
-            self.inner.changed.notify_all();
+            if state.waiters > 0 {
+                self.inner.changed.notify_all();
+            }
         }
         Ok(())
     }
@@ -650,7 +711,20 @@ impl CommandBuffer {
         // The core, not a handle: the command buffer gives its handle up before another thread
         // can complete it, so a handler that drops the consumer's last handle ends the device on
         // the reaper, never in this call.
-        let core = self.building(|building| Ok(Arc::clone(building.device.core())))?;
+        // What it reaches of Shared memory, found here, off the work lock, where the Shared type
+        // is not host-coherent: no command is recorded after it (`crate::coherence`).
+        let core = self.building(|building| {
+            let core = Arc::clone(building.device.core());
+            let gpu = &mut building.gpu;
+            if let Some(held) = &mut gpu.coherence {
+                let reach = Ranges::of(&gpu.kept, &gpu.blocks, &held.writes, held.atom);
+                held.reach = reach.map(Arc::new);
+                if let (Some(reach), Some(coherence)) = (&held.reach, &core.coherence) {
+                    coherence.committed(reach);
+                }
+            }
+            Ok(core)
+        })?;
         let began = crate::host_time();
         #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
         (core.work.counting).store(true, std::sync::atomic::Ordering::SeqCst);
@@ -705,7 +779,9 @@ impl CommandBuffer {
             timed: stamps.is_some(),
         };
         state.status = CommandBufferStatus::Committed;
-        self.inner.changed.notify_all();
+        if state.waiters > 0 {
+            self.inner.changed.notify_all();
+        }
         let ended = state.ended;
         drop(state);
         // Where it is the last handle, the device ends below, once no lock is held.
@@ -817,11 +893,18 @@ impl CommandBuffer {
         self.inner.queue.is(queue)
     }
 
-    fn wait<'a>(&self, state: MutexGuard<'a, CbState>) -> MutexGuard<'a, CbState> {
-        self.inner
-            .changed
-            .wait(state)
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Waits for a change of `state`, counted among its waiters while it waits.
+    fn wait<'a>(&self, mut state: MutexGuard<'a, CbState>) -> MutexGuard<'a, CbState> {
+        state.waiters += 1;
+        let mut state = (self.inner.changed.wait(state)).unwrap_or_else(PoisonError::into_inner);
+        state.waiters -= 1;
+        state
+    }
+
+    /// For the device tests: the threads waiting on its status.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn waiters(&self) -> usize {
+        self.state().waiters
     }
 
     /// `status`.
@@ -893,9 +976,19 @@ impl CommandBuffer {
             f(&building.device.core().device, command);
             for buffer in buffers {
                 building.keep(buffer);
+                if let Some(held) = building.coherence() {
+                    held.wrote(buffer.shared_range(held.atom));
+                }
             }
             Ok(())
         })
+    }
+
+    /// For the device tests: whether it holds Shared memory's coherence state as it records
+    /// (`crate::coherence`), which only a device whose Shared type is not host-coherent builds.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn holds_coherence_for_test(&self) -> Result<bool, Error> {
+        self.building(|building| Ok(building.gpu.coherence.is_some()))
     }
 
     /// For the device tests: the checks of heap placements at the head of each of its segments
@@ -1000,6 +1093,7 @@ impl Building {
         }
         self.last().command = Some(command);
         self.bound = None;
+        self.views.unbound();
         self.drawn = None;
         self.pushed = Pushed::default();
         self.vertex.clear();
@@ -1023,12 +1117,19 @@ impl Building {
                     // texture, which holds its buffer, until it retires; each image is in its
                     // home layout between commands.
                     unsafe {
-                        over::record_side(&core.device, command, &back, false, &core.counters)
+                        over::record_side(
+                            &core.device,
+                            command,
+                            &back,
+                            false,
+                            Metric::OtherBarriers,
+                            &core.counters,
+                        )
                     };
                     self.host_written |= back.iter().any(|copy| copy.shared);
                 }
                 // Its end barrier pays what is owed and starts the hazard sets again.
-                self.owed = false;
+                self.owed = None;
                 self.owed_all = false;
                 self.args_unordered = false;
                 if let Some(recorder) = &mut self.gpu.recorder {
@@ -1079,13 +1180,30 @@ impl Building {
     }
 
     /// The current segment's command buffer, with the barrier owed recorded first, reaching what
-    /// the caller records next (`reach`). Commands after a signal go in a new segment.
+    /// the caller records next (`reach`): a dispatch's, counted as its barrier
+    /// ([`Metrics::dispatch_hazard_barriers`](crate::Metrics::dispatch_hazard_barriers)) in its
+    /// cause's bucket ([`Owed::metric`]), after which the hazard sets start again. Commands after a
+    /// signal go in a new segment.
     pub(crate) fn command(&mut self, reach: Reach) -> Result<vk::CommandBuffer, Error> {
         let command = self.current()?;
-        if self.owed {
-            self.barrier(command, reach);
+        if let Some(owed) = self.owed {
+            self.barrier(command, reach, owed.metric());
+            self.hazards().clear();
         }
         Ok(command)
+    }
+
+    /// The current segment's command buffer, with what is owed left for the caller to pay
+    /// ([`owed`](Self::owed)): a dispatch's, which counts its barrier by all of its causes.
+    /// Commands after a signal go in a new segment.
+    pub(crate) fn current_command(&mut self) -> Result<vk::CommandBuffer, Error> {
+        self.current()
+    }
+
+    /// The barrier owed before the next command, by the first of its causes; `None` where none
+    /// is.
+    pub(crate) fn owed(&self) -> Option<Owed> {
+        self.owed
     }
 
     /// The current segment's command buffer, for commands that record a barrier of their own
@@ -1093,7 +1211,7 @@ impl Building {
     /// visible to them (a blit's): it pays what is owed, and the hazard sets start again.
     pub(crate) fn ordered_command(&mut self) -> Result<vk::CommandBuffer, Error> {
         let command = self.current()?;
-        self.owed = false;
+        self.owed = None;
         self.owed_all = false;
         self.args_unordered = false;
         self.hazards().clear();
@@ -1113,18 +1231,18 @@ impl Building {
     }
 
     /// Records a barrier into `command`, the current segment's, reaching what the caller records
-    /// next (`reach`), and pays what is owed. The caller starts the hazard sets again where it
-    /// has not.
-    pub(crate) fn barrier(&mut self, command: vk::CommandBuffer, reach: Reach) {
+    /// next (`reach`), counted in `cause`, one of the barrier causes, and pays what is owed. The
+    /// caller starts the hazard sets again where it has not.
+    pub(crate) fn barrier(&mut self, command: vk::CommandBuffer, reach: Reach, cause: Metric) {
         // One owed after a render pass or a release reaches every later command, whatever the
         // caller names.
-        let reach = match self.owed && self.owed_all {
+        let reach = match self.owed.is_some() && self.owed_all {
             true => Reach::Commands,
             false => reach,
         };
         record::barrier(&self.device.core().device, command, reach);
-        self.tally.count(Metric::Barriers);
-        self.owed = false;
+        self.tally.count(cause);
+        self.owed = None;
         self.owed_all = false;
         if reach.reaches_indirect() {
             self.args_unordered = false;
@@ -1193,7 +1311,15 @@ impl Building {
         let tally = &mut self.tally;
         // SAFETY: the command buffer records outside any rendering and keeps each texture it uses
         // until it retires.
-        unsafe { crate::alias::record(device, command, moves, &mut |metric| tally.count(metric)) };
+        unsafe {
+            crate::alias::record(
+                device,
+                command,
+                moves,
+                Metric::OtherBarriers,
+                &mut |metric| tally.count(metric),
+            )
+        };
         Ok(())
     }
 
@@ -1205,6 +1331,14 @@ impl Building {
     /// A dispatch wrote memory the host may read: the segment's end barrier reaches the host.
     pub(crate) fn wrote_host(&mut self) {
         self.host_written = true;
+    }
+
+    /// What it holds of Shared memory, where the device's Shared type is not host-coherent: a
+    /// range its commands may write, named there, is settled before the host sees its progress,
+    /// widened to the atom it holds (`crate::coherence`). `None` where the type is host-coherent,
+    /// and no range is named.
+    pub(crate) fn coherence(&mut self) -> Option<&mut coherence::Recorded> {
+        self.gpu.coherence.as_deref_mut()
     }
 
     /// A dispatch wrote: an indirect dispatch after it needs a barrier that reaches its
@@ -1228,13 +1362,12 @@ impl Building {
             .hazards
     }
 
-    /// Owes a barrier before the next command, and starts the hazard sets again: it orders
-    /// everything before it.
-    pub(crate) fn owe(&mut self) {
-        self.owed = true;
-        if let Some(recorder) = &mut self.gpu.recorder {
-            recorder.hazards.clear();
-        }
+    /// Owes a barrier before the next command, for `cause`, kept with the first of the causes
+    /// owed in [`Owed`]'s order. The hazard sets start again where it is paid, which orders
+    /// everything before it: the command that pays it reads them first, to count it by what that
+    /// command depends on.
+    pub(crate) fn owe(&mut self, cause: Owed) {
+        self.owed = Some(self.owed.map_or(cause, |owed| owed.min(cause)));
     }
 
     /// A render pass ended with no attachment to move home: the barrier that orders it before
@@ -1242,7 +1375,7 @@ impl Building {
     /// command, or paid by the segment's end barrier where none follows. A command buffer that
     /// ends with a pass records one barrier after it, its end's.
     pub(crate) fn owe_pass(&mut self) {
-        self.owe();
+        self.owe(Owed::PassEnd);
         self.owed_all = true;
     }
 
@@ -1256,7 +1389,8 @@ impl Building {
     /// follows.
     pub(crate) fn release_command(&mut self) -> Result<vk::CommandBuffer, Error> {
         let command = self.current()?;
-        self.owe_pass();
+        self.owe(Owed::Other);
+        self.owed_all = true;
         Ok(command)
     }
 
@@ -1277,7 +1411,7 @@ impl Building {
             .as_ref()
             .is_some_and(|recorder| recorder.hazards.touched())
         {
-            self.owe();
+            self.owe(Owed::Other);
         }
     }
 
@@ -1316,6 +1450,34 @@ impl Building {
             }
         }
         self.bound = Some(pipeline);
+    }
+
+    /// Binds a set of set 0 whose first bindings hold `descriptors` into `command`, the current
+    /// segment's command buffer, at the compute bind point: the set written last where it begins
+    /// with them, else a new one of the command buffer's, written (`crate::bound`). Counted as
+    /// a bound dispatch, and as a set written or held.
+    ///
+    /// # Safety
+    ///
+    /// `command` is the current segment's, recording outside any render pass; every buffer a
+    /// descriptor names is kept by the command buffer until it retires.
+    pub(crate) unsafe fn bind_views(
+        &mut self,
+        core: &Core,
+        command: vk::CommandBuffer,
+        descriptors: &[crate::bound::Descriptor],
+    ) -> Result<(), Error> {
+        // SAFETY: by the caller; the sets are the command buffer's.
+        let written = unsafe {
+            self.views
+                .bind(core, (command, &mut self.gpu.sets), descriptors)
+        }?;
+        self.tally.count(Metric::BoundDispatches);
+        self.tally.count(match written {
+            true => Metric::BufferSetsWritten,
+            false => Metric::BufferSetsHeld,
+        });
+        Ok(())
     }
 
     /// Whether the graphics pipeline `pipeline` needs binding in the current command buffer, and
@@ -1419,6 +1581,12 @@ impl Building {
     /// buffer retires: one count at the recording's first dispatch of it, none at a later one.
     pub(crate) fn hold_variant(&mut self, variant: &Arc<Listed>) {
         self.gpu.kept.variants.hold(variant);
+    }
+
+    /// Keeps `content`, a kernel's variant that a dispatch runs, until the command buffer
+    /// retires: no state holds it (`PipelineInner::variant`).
+    pub(crate) fn hold_content(&mut self, content: &Arc<Compiled>) {
+        self.gpu.kept.contents.hold(content);
     }
 
     /// Keeps `state` until the command buffer retires, and lends it to the encoder that set it.
@@ -1552,7 +1720,16 @@ impl Building {
         // SAFETY: the command buffer records outside any render pass and keeps each image, and
         // each buffer through its texture or below, until it retires; each image is in its home
         // layout between commands.
-        unsafe { over::record_side(&core.device, command, &copies, false, &core.counters) };
+        unsafe {
+            over::record_side(
+                &core.device,
+                command,
+                &copies,
+                false,
+                Metric::OtherBarriers,
+                &core.counters,
+            )
+        };
         self.gpu
             .images
             .extend(backs.into_iter().map(|(_, _, image)| image));
@@ -1754,13 +1931,26 @@ pub(crate) fn retire(
         gpu_times,
         round,
         spans,
+        expects,
     } = completion;
     // Where its retirement begins, the step before its handlers (`Round::steps`): one clock read.
     let retiring = times::host_time();
     // Its own GPU run, by its timestamps, sets what its queue expects of the next
-    // (`QueueInner::expected_run`, which bounds the groups `submit.rs` joins).
-    if let Some((start, end)) = gpu_times {
+    // (`QueueInner::expected_run`, which bounds the groups `submit.rs` joins), now or as its
+    // submission's last retires (`Completion::expects`).
+    if let (true, Some((start, end))) = (expects, gpu_times) {
         inner.queue.ran(end.saturating_sub(start));
+    }
+    // The GPU's writes to Shared memory are the host's before anything tells it the command buffer
+    // completed: its status, a wait for it, its handlers (`crate::coherence`). Settled while it
+    // still keeps every block they lie in; what it held of Shared memory goes here, so a `None`
+    // is tested once.
+    let held = gpu.coherence;
+    if let Some(held) = held {
+        if let (Some(reach), Some(coherence)) = (&held.reach, &core.coherence) {
+            coherence.settle(core, &reach.written);
+            coherence.retired(reach);
+        }
     }
     // What was released while it was in flight may go (`crate::memory::Wait`).
     core.pool.ended();
@@ -1769,7 +1959,7 @@ pub(crate) fn retire(
         // One with nothing for the GPU, as Metal reports it: its start and end equal, at its
         // queue's previous command buffer's end or its own kernel end, whichever is later.
         let gpu_times = gpu_times.or_else(|| {
-            (error.is_none() && gpu.is_empty()).then(|| {
+            (error.is_none() && nothing_for_the_gpu(&gpu.segments)).then(|| {
                 let at = (inner.queue.last_end.load(Relaxed)).max(state.times.kernel_end);
                 (at, at)
             })
@@ -1800,6 +1990,8 @@ pub(crate) fn retire(
         fences,
         executed,
         queries,
+        sets,
+        coherence: _,
     } = gpu;
     if let Some(recorder) = recorder {
         core.recorders.give_back(core, recorder);
@@ -1807,6 +1999,7 @@ pub(crate) fn retire(
     ring.give_back(core);
     drop((segments, blocks, images, fences, executed));
     queries.give_back(core);
+    sets.give_back(core);
     kept.clear();
     if let Some(pair) = stamps {
         times::reset(&core.device, pair.pool, pair.first, written);
@@ -1872,6 +2065,7 @@ impl Drop for CbInner {
                 mut kept,
                 ring,
                 queries,
+                sets,
                 ..
             } = gpu;
             if let Some(recorder) = recorder {
@@ -1882,6 +2076,7 @@ impl Drop for CbInner {
                 core.stamps.give_back(pair);
             }
             queries.give_back(core);
+            sets.give_back(core);
             kept.clear();
             self.queue.release(kept);
         }

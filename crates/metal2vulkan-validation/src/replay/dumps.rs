@@ -5,24 +5,27 @@
 //! colour attachment its render passes stored and every texture its compute encoders bound
 //! ([`Stores`]), as these kinds of file in its directory:
 //! - `cb<C>-obj<O>.bin`: the buffer's bytes; a texture's, the parts of it the command buffer's
-//!   passes stored (a level, a slice and a depth plane each), in the order of [`Part`], and a
-//!   compute-bound texture's first level and slice, each laid out as a check reads a texture's
-//!   first level and slice;
+//!   passes stored (a level, a slice and a depth plane each; a layered pass's each slice it
+//!   renders), in the order of [`Part`], and a compute-bound texture's first level and slice,
+//!   each laid out as a check reads a texture's first level and slice;
 //! - `cb<C>-obj<O>.cover`: the ranges of it the player's cover rule (`covers.rs`) held covered
-//!   then, as `start..end` byte offsets joined by commas, or `-` for none (always `-` for a
-//!   texture);
+//!   then, as `start..end` byte offsets joined by commas, or `-` for none. A texture's is the
+//!   whole of its bytes, `0..N`, where the rule held any byte of it covered (`Covers::covered`),
+//!   and `-` otherwise: the rule's ranges are the texture's bytes in its heap, which its parts
+//!   here are not laid out as;
 //! - `cb<C>-obj<O>.unread`: where the backend could not read the buffer or texture, why, in place
 //!   of its bytes (a multisample texture a pass stores without resolving it, for one);
 //! - `cb<C>-obj<O>.copy`: for a buffer the play keeps two copies of, which one the bytes are
 //!   ([`ReadCopy::label`]): its CPU copy, or its device copy, read back.
 //!
 //! [`compare_dumps`] reads two plays' dumps and compares each buffer's bytes word by word (4 bytes).
-//! It leaves out a word that lies wholly inside a covered range of either play: the cover rule
-//! leaves those bytes undefined, and a backend that answers no texture writes covers less
-//! (`Backend::texture_writes`). Every other differing word is reported, and so is a dump that
-//! only one play has, a buffer that either play could not read, and a difference in length. So is
-//! a buffer the two plays read different copies of: the CPU's bytes of one and the device's of the
-//! other are no compare of either. The summary counts the buffers compared by the copy both read.
+//! It leaves out a word that lies wholly inside a covered range of either play, so all of a
+//! texture that either play's rule held covered: the cover rule leaves those bytes undefined, and
+//! a backend that answers no texture writes covers less (`Backend::texture_writes`). Every other
+//! differing word is reported, and so is a dump that only one play has, a buffer that either play
+//! could not read, and a difference in length. So is a buffer the two plays read different copies
+//! of: the CPU's bytes of one and the device's of the other are no compare of either. The summary
+//! counts the buffers compared by the copy both read.
 //! A whole-object checksum is no such compare: one word under a cover would make a buffer differ,
 //! and one word outside it would hide behind a cover elsewhere in the buffer.
 //!
@@ -137,15 +140,24 @@ struct Colour {
 }
 
 impl Colour {
-    /// The texture parts the attachment stores under store action `store`: its texture's under
-    /// `MTLStoreActionStore` and `MTLStoreActionStoreAndMultisampleResolve`, its resolve
-    /// texture's under `MTLStoreActionMultisampleResolve` and that one.
-    fn stored(&self, store: u64, out: &mut Vec<(u64, Part)>) {
+    /// The texture parts the attachment stores under store action `store` in a pass of `layers`
+    /// layers (its `renderTargetArrayLength`): its texture's under `MTLStoreActionStore` and
+    /// `MTLStoreActionStoreAndMultisampleResolve`, its resolve texture's under
+    /// `MTLStoreActionMultisampleResolve` and that one; each `layers` slices from the part's own
+    /// slice, its slice alone at 0 and 1, as Metal renders them.
+    fn stored(&self, store: u64, layers: u64, out: &mut Vec<(u64, Part)>) {
+        let mut each = |texture: u64, part: Part| {
+            let slices = (0..layers.max(1)).map(|layer| Part {
+                slice: part.slice.saturating_add(layer),
+                ..part
+            });
+            out.extend(slices.map(|part| (texture, part)));
+        };
         if matches!(store, 1 | 3) && self.texture != 0 {
-            out.push((self.texture, self.part));
+            each(self.texture, self.part);
         }
         if matches!(store, 2 | 3) && self.resolve != 0 {
-            out.push((self.resolve, self.resolve_part));
+            each(self.resolve, self.resolve_part);
         }
     }
 
@@ -171,23 +183,25 @@ impl Colour {
 }
 
 /// The colour attachments a play's render passes store: each render pass descriptor's, as its
-/// `m2v.setColorAttachment` records set them (`docs/REPLAY-STREAM.md`, section 9), and each
-/// render encoder's whose store action is `MTLStoreActionUnknown`, until the encoder's
+/// `m2v.setColorAttachment` records set them (`docs/REPLAY-STREAM.md`, section 9), with the
+/// layers its `m2v.setPass` records set (`renderTargetArrayLength`), and each render encoder's
+/// whose store action is `MTLStoreActionUnknown`, with its pass's layers, until the encoder's
 /// `setColorStoreAction:atIndex:` names the action; and the compute encoders, whose bound
 /// textures a dump reads too.
 #[derive(Default)]
 pub(super) struct Stores {
     passes: HashMap<u64, BTreeMap<u64, Colour>>,
-    unknown: HashMap<u64, BTreeMap<u64, Colour>>,
+    layers: HashMap<u64, u64>,
+    unknown: HashMap<u64, BTreeMap<u64, (Colour, u64)>>,
     /// The compute encoders made and not yet ended.
     computes: HashSet<u64>,
 }
 
 impl Stores {
-    /// `call`, played: a colour attachment's setter record on a render pass descriptor, kept. The
-    /// texture parts a render pass stores where `call` makes its encoder
-    /// (`renderCommandEncoderWithDescriptor:`) or names an attachment's store action left unknown
-    /// (`setColorStoreAction:atIndex:`), into `out`; and each texture a compute encoder binds
+    /// `call`, played: a colour attachment's setter record on a render pass descriptor, and the
+    /// layers a pass's own setter record sets, kept. The texture parts a render pass stores where
+    /// `call` makes its encoder (`renderCommandEncoderWithDescriptor:`) or names an attachment's
+    /// store action left unknown (`setColorStoreAction:atIndex:`), into `out`; and each texture a compute encoder binds
     /// (`setTexture:atIndex:` and `setTextures:withRange:`), as its first level and slice
     /// ([`Part::default`]), a nil one left out.
     pub(super) fn saw(&mut self, call: &Call, out: &mut Vec<(u64, Part)>) {
@@ -201,18 +215,32 @@ impl Stores {
                 let pass = self.passes.entry(call.receiver).or_default();
                 pass.entry(at).or_default().set(f);
             }
-            "renderCommandEncoderWithDescriptor:" if call.result != 0 => {
-                let pass = call.args.first().and_then(Value::as_object);
-                let Some(pass) = pass.and_then(|pass| self.passes.get(&pass)) else {
+            "m2v.setPass" => {
+                let Some(f) = call.args.first().and_then(Value::as_map) else {
                     return;
                 };
-                for (&at, colour) in pass {
+                let set = f
+                    .iter()
+                    .find(|(key, _)| &**key == "renderTargetArrayLength");
+                if let Some(layers) = set.and_then(|(_, value)| value.as_uint()) {
+                    self.layers.insert(call.receiver, layers);
+                }
+            }
+            "renderCommandEncoderWithDescriptor:" if call.result != 0 => {
+                let Some(pass) = call.args.first().and_then(Value::as_object) else {
+                    return;
+                };
+                let Some(colours) = self.passes.get(&pass) else {
+                    return;
+                };
+                let layers = self.layers.get(&pass).copied().unwrap_or(0);
+                for (&at, colour) in colours {
                     match colour.store {
                         4 => {
                             let unknown = self.unknown.entry(call.result).or_default();
-                            unknown.insert(at, *colour);
+                            unknown.insert(at, (*colour, layers));
                         }
-                        store => colour.stored(store, out),
+                        store => colour.stored(store, layers, out),
                     }
                 }
             }
@@ -221,8 +249,8 @@ impl Stores {
                     return;
                 };
                 let unknown = self.unknown.get_mut(&call.receiver);
-                if let Some(colour) = unknown.and_then(|unknown| unknown.remove(&at)) {
-                    colour.stored(store, out);
+                if let Some((colour, layers)) = unknown.and_then(|unknown| unknown.remove(&at)) {
+                    colour.stored(store, layers, out);
                 }
             }
             "computeCommandEncoder"
@@ -250,9 +278,10 @@ impl Stores {
         }
     }
 
-    /// Object `id` released: a render pass descriptor's attachments are dropped.
+    /// Object `id` released: a render pass descriptor's attachments and layers are dropped.
     pub(super) fn released(&mut self, id: u64) {
         self.passes.remove(&id);
+        self.layers.remove(&id);
     }
 }
 

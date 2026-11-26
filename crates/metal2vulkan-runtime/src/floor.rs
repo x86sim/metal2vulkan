@@ -8,7 +8,7 @@
 //! [`Device::new`](crate::Device::new) makes that last choice on the device.
 
 use ash::vk;
-use metal2vulkan::device::{EnableSet, VkExtension, VkFeature};
+use metal2vulkan::device::{EnableSet, VkExtension, VkFeature, KERNEL_BUFFER_BINDINGS};
 use std::ffi::{CStr, CString};
 use std::fmt;
 
@@ -58,8 +58,11 @@ pub const TIME_DOMAINS: [vk::TimeDomainKHR; 2] =
 /// reports it, through which an opaque handle's surface plane whose `LINEAR` tiling renders only
 /// as a linear colour attachment lies in place, `VK_EXT_device_fault`, with its `deviceFault`
 /// feature, which Vulkan requires of a device that lists it, through which a lost device's fault
-/// report is read once, at its first loss ([`DeviceLoss::fault`](crate::DeviceLoss::fault)), and
-/// `VK_KHR_maintenance8` ([`MAINTENANCE8`]), for the optional feature of its own.
+/// report is read once, at its first loss ([`DeviceLoss::fault`](crate::DeviceLoss::fault)),
+/// `VK_EXT_pipeline_robustness`, with its `pipelineRobustness` feature where the device reports it,
+/// through which a kernel's pipeline contains its buffer arguments' storage buffers by robust
+/// buffer access 2, and `VK_KHR_maintenance8` ([`MAINTENANCE8`]), for the
+/// optional feature of its own.
 pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[
     ash::khr::shader_maximal_reconvergence::NAME,
     ash::khr::shader_subgroup_uniform_control_flow::NAME,
@@ -77,6 +80,7 @@ pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[
     ash::ext::image_drm_format_modifier::NAME,
     ash::nv::linear_color_attachment::NAME,
     ash::ext::device_fault::NAME,
+    ash::ext::pipeline_robustness::NAME,
     MAINTENANCE8,
 ];
 
@@ -226,6 +230,8 @@ pub(crate) fn shader_extension(name: &CStr) -> Option<VkExtension> {
         Some(VkExtension::ExtCustomBorderColor)
     } else if name == ash::ext::external_memory_host::NAME {
         Some(VkExtension::ExtExternalMemoryHost)
+    } else if name == ash::ext::pipeline_robustness::NAME {
+        Some(VkExtension::ExtPipelineRobustness)
     } else {
         None
     }
@@ -295,11 +301,11 @@ pub const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 pub(crate) const PRIVATE_MEMORY: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
 
 /// The flags of the memory type Shared storage lives in: memory the host maps and reads at the
-/// speed of its own memory.
+/// speed of its own memory. Of the types with them, the first that is host-coherent too, else the
+/// first ([`choose`]); where the type chosen is not host-coherent, the runtime flushes and
+/// invalidates what commands reach of it (`crate::coherence`).
 pub(crate) const SHARED_MEMORY: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags::from_raw(
-    vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
-        | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw()
-        | vk::MemoryPropertyFlags::HOST_CACHED.as_raw(),
+    vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw() | vk::MemoryPropertyFlags::HOST_CACHED.as_raw(),
 );
 
 /// The flags of the memory type the parameter ring lives in: memory the GPU reads at its own speed
@@ -310,8 +316,9 @@ pub(crate) const RING_MEMORY: vk::MemoryPropertyFlags = vk::MemoryPropertyFlags:
         | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
 );
 
-/// The Vulkan names of the memory property flags the floor asks for.
-pub(crate) const MEMORY_FLAG_NAMES: [(vk::MemoryPropertyFlags, &str); 4] = [
+/// The Vulkan names of the memory property flags: those the floor asks for, then the rest Vulkan
+/// 1.3 and its extensions define, which a device's own types may carry.
+pub(crate) const MEMORY_FLAG_NAMES: [(vk::MemoryPropertyFlags, &str); 9] = [
     (
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
         "VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT",
@@ -327,6 +334,26 @@ pub(crate) const MEMORY_FLAG_NAMES: [(vk::MemoryPropertyFlags, &str); 4] = [
     (
         vk::MemoryPropertyFlags::HOST_CACHED,
         "VK_MEMORY_PROPERTY_HOST_CACHED_BIT",
+    ),
+    (
+        vk::MemoryPropertyFlags::LAZILY_ALLOCATED,
+        "VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT",
+    ),
+    (
+        vk::MemoryPropertyFlags::PROTECTED,
+        "VK_MEMORY_PROPERTY_PROTECTED_BIT",
+    ),
+    (
+        vk::MemoryPropertyFlags::DEVICE_COHERENT_AMD,
+        "VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD",
+    ),
+    (
+        vk::MemoryPropertyFlags::DEVICE_UNCACHED_AMD,
+        "VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD",
+    ),
+    (
+        vk::MemoryPropertyFlags::RDMA_CAPABLE_NV,
+        "VK_MEMORY_PROPERTY_RDMA_CAPABLE_BIT_NV",
     ),
 ];
 
@@ -399,6 +426,9 @@ pub struct Features {
     /// `VkPhysicalDeviceMaintenance8FeaturesKHR`, of `VK_KHR_maintenance8` ([`MAINTENANCE8`]):
     /// read and enabled only where the device lists it, and then only `maintenance8`.
     pub maintenance8: Maintenance8Features,
+    /// `VkPhysicalDevicePipelineRobustnessFeaturesEXT`, of `VK_EXT_pipeline_robustness`: read and
+    /// enabled only where the device lists it ([`OPTIONAL_EXTENSIONS`]).
+    pub pipeline_robustness: vk::PhysicalDevicePipelineRobustnessFeaturesEXT<'static>,
 }
 
 /// One feature: the Vulkan structure that reports it, its member as ash spells it, the member, and
@@ -470,6 +500,9 @@ macro_rules! feature {
     };
     (@structure maintenance5) => {
         "VkPhysicalDeviceMaintenance5FeaturesKHR"
+    };
+    (@structure pipeline_robustness) => {
+        "VkPhysicalDevicePipelineRobustnessFeaturesEXT"
     };
     (@translator) => {
         None
@@ -768,6 +801,17 @@ pub(crate) const LINEAR_ATTACHMENTS: &[Feature] =
 /// work ([`DeviceLoss::fault`](crate::DeviceLoss::fault)). The translator does not name it.
 pub(crate) const FAULT_REPORTS: &[Feature] = &[feature!(fault.device_fault)];
 
+/// The feature of `VK_EXT_pipeline_robustness` (one of [`OPTIONAL_EXTENSIONS`]): enabled where the
+/// device lists the extension and reports it, and its per-stage update-after-bind resources hold
+/// set 0's kernel storage buffers beside set 1 ([`kernel_buffers_fit`]). With it, where the translator's profile binds a
+/// kernel's buffer arguments (`DeviceProfile::binds_kernel_buffers`: robust buffer access 2
+/// supported, though never enabled for the device, and its other terms), a kernel reaches each
+/// buffer argument through a storage buffer of set 0 that its pipeline's robust buffer access 2
+/// contains (`VkPipelineRobustnessCreateInfo`), in place of its checked device address: the
+/// twelfth form a query chooses.
+pub(crate) const PIPELINE_ROBUSTNESS: &[Feature] =
+    &[feature!(pipeline_robustness.pipeline_robustness => PipelineRobustness)];
+
 /// The features of [`INDIRECT_COMMANDS`]: enabled together where the device offers indirect
 /// command buffers ([`IndirectCommandLimits`]), and neither otherwise. The translator is told of
 /// neither `maintenance5` nor `VK_KHR_maintenance5`: told, it would hold `A8Unorm` in `A8_UNORM`
@@ -797,6 +841,7 @@ pub(crate) const ENABLED: &[&[Feature]] = &[
     BORDER_SWIZZLE,
     LINEAR_ATTACHMENTS,
     FAULT_REPORTS,
+    PIPELINE_ROBUSTNESS,
     INDIRECT_COMMAND_FEATURES,
 ];
 
@@ -913,10 +958,16 @@ pub enum Missing {
     /// A queue family with both `VK_QUEUE_GRAPHICS_BIT` and `VK_QUEUE_COMPUTE_BIT`.
     QueueFamily,
     /// A memory type with these property flags, as Vulkan names them, for buffers of every usage
-    /// the runtime gives them. [`BUFFER_USAGE`] is that usage.
+    /// the runtime gives them. [`BUFFER_USAGE`] is that usage. It names the types the device
+    /// offers such buffers too.
     MemoryType {
         /// The flags, joined by ` | `.
         flags: String,
+        /// The memory types the device offers such a buffer, each as `type <index> with <flags>`
+        /// (a bit Vulkan does not name as its hexadecimal value, a type of none as `no flags`),
+        /// joined by `, `, or `no type`. From `PhysicalDevice::check`, every type the device
+        /// lists: Vulkan answers which types a buffer can use only for a created device.
+        offered: String,
     },
     /// A time domain of [`TIME_DOMAINS`] the device does not calibrate
     /// (`vkGetPhysicalDeviceCalibrateableTimeDomainsEXT`), as Vulkan names it.
@@ -949,7 +1000,10 @@ impl fmt::Display for Missing {
                 needed,
             } => write!(f, "{name} {device}, below {needed}"),
             Missing::QueueFamily => f.write_str("a queue family with graphics and compute"),
-            Missing::MemoryType { flags } => write!(f, "a memory type with {flags} for buffers"),
+            Missing::MemoryType { flags, offered } => write!(
+                f,
+                "a memory type with {flags} for buffers (the device offers buffers: {offered})"
+            ),
             Missing::TimeDomain(name) => write!(f, "the calibrateable time domain {name}"),
             Missing::SetLayout { set } => write!(
                 f,
@@ -1075,7 +1129,7 @@ impl std::fmt::Debug for Capabilities {
 }
 
 /// The memory types the runtime allocates its buffers from, each the first memory type with its
-/// flags that a buffer of [`BUFFER_USAGE`] can use.
+/// flags that a buffer of [`BUFFER_USAGE`] can use; Shared storage's a host-coherent one first.
 ///
 /// Metal's counterparts are storage modes: `MTLStorageModePrivate` and `MTLStorageModeShared`
 /// memory, and the memory `setBytes:length:atIndex:` copies into.
@@ -1083,7 +1137,8 @@ impl std::fmt::Debug for Capabilities {
 pub struct MemoryTypes {
     /// Device-local: Private storage.
     pub private: u32,
-    /// Host-visible, host-coherent and host-cached: Shared storage.
+    /// Host-visible and host-cached, the first that is host-coherent too where one is: Shared
+    /// storage.
     pub shared: u32,
     /// Device-local, host-visible and host-coherent: the parameter ring.
     pub ring: u32,
@@ -1184,6 +1239,7 @@ unsafe fn query(
         let line_rasterization_listed = listed(ash::ext::line_rasterization::NAME);
         let maintenance5_listed = listed(ash::khr::maintenance5::NAME);
         let maintenance8_listed = listed(MAINTENANCE8);
+        let pipeline_robustness_listed = listed(ash::ext::pipeline_robustness::NAME);
 
         let Features {
             core,
@@ -1206,6 +1262,7 @@ unsafe fn query(
             generated_commands,
             maintenance5,
             maintenance8,
+            pipeline_robustness,
         } = &mut queried.features;
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut *vulkan11)
@@ -1259,6 +1316,9 @@ unsafe fn query(
         if maintenance8_listed {
             features = features.push_next(&mut *maintenance8);
         }
+        if pipeline_robustness_listed {
+            features = features.push_next(&mut *pipeline_robustness);
+        }
         instance.get_physical_device_features2(physical, &mut features);
         *core = features.features;
         vulkan11.p_next = std::ptr::null_mut();
@@ -1280,6 +1340,7 @@ unsafe fn query(
         generated_commands.p_next = std::ptr::null_mut();
         maintenance5.p_next = std::ptr::null_mut();
         maintenance8.p_next = std::ptr::null_mut();
+        pipeline_robustness.p_next = std::ptr::null_mut();
 
         queried.families = instance.get_physical_device_queue_family_properties(physical);
         queried.memory = instance.get_physical_device_memory_properties(physical);
@@ -1408,6 +1469,11 @@ pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
             *(feature.field)(&mut features) = *(feature.field)(&mut reported);
         }
     }
+    if listed(ash::ext::pipeline_robustness::NAME) && kernel_buffers_fit(device, attachment_reads) {
+        for feature in PIPELINE_ROBUSTNESS {
+            *(feature.field)(&mut features) = *(feature.field)(&mut reported);
+        }
+    }
     let indirect_commands = indirect_commands(device, &mut features);
     Ok(Capabilities {
         float16: features.vulkan12.shader_float16 == vk::TRUE,
@@ -1498,6 +1564,17 @@ pub(crate) unsafe fn memory_types(
     device: &ash::Device,
     capabilities: &Capabilities,
 ) -> Result<MemoryTypes, BelowFloor> {
+    // SAFETY: the caller's contract.
+    let usable = unsafe { buffer_memory_bits(device) };
+    choose(&capabilities.memory, usable).map_err(|missing| BelowFloor { missing })
+}
+
+/// The memory types a buffer of [`BUFFER_USAGE`] can use on `device`, as its `memoryTypeBits`.
+///
+/// # Safety
+///
+/// `device` was created with the floor's features.
+pub(crate) unsafe fn buffer_memory_bits(device: &ash::Device) -> u32 {
     let buffer = vk::BufferCreateInfo::default()
         .size(65_536)
         .usage(BUFFER_USAGE)
@@ -1505,17 +1582,14 @@ pub(crate) unsafe fn memory_types(
     let question = vk::DeviceBufferMemoryRequirements::default().create_info(&buffer);
     let mut answer = vk::MemoryRequirements2::default();
     // SAFETY: the caller's contract; `BUFFER_USAGE`'s device addresses need
-    // `bufferDeviceAddress`, which the floor requires and `capabilities.features` enables.
+    // `bufferDeviceAddress`, which the floor requires.
     unsafe { device.get_device_buffer_memory_requirements(&question, &mut answer) };
-    choose(
-        &capabilities.memory,
-        answer.memory_requirements.memory_type_bits,
-    )
-    .map_err(|missing| BelowFloor { missing })
+    answer.memory_requirements.memory_type_bits
 }
 
 /// For each of [`MemoryTypes`], the first memory type with its flags whose bit is set in `usable`,
-/// or a [`Missing::MemoryType`] for each that has none.
+/// Shared storage's the first of them that is host-coherent too where one is, or a
+/// [`Missing::MemoryType`] for each that has none.
 pub(crate) fn choose(
     memory: &vk::PhysicalDeviceMemoryProperties,
     usable: u32,
@@ -1528,7 +1602,7 @@ pub(crate) fn choose(
     };
     match (
         first(PRIVATE_MEMORY),
-        first(SHARED_MEMORY),
+        first(SHARED_MEMORY | vk::MemoryPropertyFlags::HOST_COHERENT).or(first(SHARED_MEMORY)),
         first(RING_MEMORY),
     ) {
         (Some(private), Some(shared), Some(ring)) => Ok(MemoryTypes {
@@ -1547,17 +1621,39 @@ pub(crate) fn choose(
         .filter(|(index, _)| index.is_none())
         .map(|(_, flags)| Missing::MemoryType {
             flags: flag_names(flags),
+            offered: offered(memory, usable),
         })
         .collect()),
     }
 }
 
-/// The Vulkan names of `flags`, joined by ` | `.
+/// The memory types of `memory` whose bit is set in `usable`, as [`Missing::MemoryType`]'s
+/// `offered` gives them.
+fn offered(memory: &vk::PhysicalDeviceMemoryProperties, usable: u32) -> String {
+    let types: Vec<String> = (0u32..)
+        .zip(memory.memory_types_as_slice())
+        .filter(|(index, _)| usable & (1 << index) != 0)
+        .map(|(index, kind)| match kind.property_flags.is_empty() {
+            true => format!("type {index} with no flags"),
+            false => format!("type {index} with {}", flag_names(kind.property_flags)),
+        })
+        .collect();
+    match types.is_empty() {
+        true => "no type".to_owned(),
+        false => types.join(", "),
+    }
+}
+
+/// The Vulkan names of `flags`, joined by ` | `, and the bits Vulkan does not name after them as
+/// one hexadecimal value.
 pub(crate) fn flag_names(flags: vk::MemoryPropertyFlags) -> String {
+    let named = (MEMORY_FLAG_NAMES.iter()).fold(0, |named, (flag, _)| named | flag.as_raw());
+    let unnamed = flags.as_raw() & !named;
     MEMORY_FLAG_NAMES
         .iter()
         .filter(|(flag, _)| flags.contains(*flag))
-        .map(|(_, name)| *name)
+        .map(|(_, name)| (*name).to_owned())
+        .chain((unnamed != 0).then(|| format!("{unnamed:#x}")))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -1577,6 +1673,19 @@ fn second_elements_fit(device: &Queried) -> bool {
             >= sampled + storage + limits.max_color_attachments
         && descriptors.max_update_after_bind_descriptors_in_all_pools
             >= sampled + storage + SAMPLER_ARRAYS * SAMPLER_ELEMENTS
+}
+
+/// Whether `maxPerStageUpdateAfterBindResources` holds the compute stage's descriptors with set 0's
+/// kernel storage buffers (`crate::arrays::buffer_bindings`): set 1's arrays, `seconds` their
+/// second elements' (a uniform texel buffer counting as a sampled image, a storage one as a
+/// storage image), and [`KERNEL_BUFFER_BINDINGS`]. It is the one limit of that layout the
+/// translator's query (`DeviceProfile::binds_kernel_buffers`) cannot count, as set 1 is the
+/// runtime's: [`PIPELINE_ROBUSTNESS`] is enabled only where it holds.
+fn kernel_buffers_fit(device: &Queried, seconds: bool) -> bool {
+    let sampled = crate::arrays::sampled_images(seconds) + TEXTURES;
+    let storage = 2 * TEXTURES + LEVEL_ELEMENTS;
+    device.vulkan12.max_per_stage_update_after_bind_resources
+        >= sampled + storage + KERNEL_BUFFER_BINDINGS
 }
 
 /// Each limit the floor sets: its Vulkan name, the device's value, and the least value the runtime

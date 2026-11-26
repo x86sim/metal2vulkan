@@ -475,10 +475,15 @@ pub enum Refusal {
     },
     /// A dispatch whose kernel, or a draw whose vertex or fragment function, reaches a buffer
     /// bound where its address, the buffer's `gpuAddress` plus the bind offset, is not a multiple
-    /// of the argument's alignment (`air.arg_type_align_size`, at most 16). Plain Metal runs such a dispatch at addresses of
-    /// its own: an Apple M3 Max reaches each element at its address rounded down to the smaller of
-    /// the element's alignment and 4 (`probes/misaligned_buffer_binds.m` in the conformance
-    /// crate).
+    /// of the alignment the function holds it to: the argument's (`air.arg_type_align_size`, at
+    /// most 16), but 4 for an argument of 8 or 16 that a dispatch of a function's kernel binds at
+    /// a multiple of 4, or 8 where a 64-bit atomic may reach that buffer. Plain Metal runs such a
+    /// dispatch at addresses of its own: an Apple M3 Max reaches each element at its address
+    /// rounded down to the smaller of the element's alignment and 4
+    /// (`probes/misaligned_buffer_binds.m` in the conformance crate), which is not emulated. At a
+    /// multiple of 4 that is each element's own address, which the dispatch reaches through a
+    /// variant of its kernel that holds the buffer to 4 (`LoweringInputs::word_bound_buffers`); a
+    /// draw, and a kernel the consumer compiled, have no such variant.
     ///
     /// Basis: metal-documented (Metal's API validation refuses the bind offset: "must be a
     /// multiple of 4 but was set to 2" for a `uint *` argument bound at offset 2, an Apple M3 Max,
@@ -488,7 +493,7 @@ pub enum Refusal {
         index: u32,
         /// The bind offset.
         offset: u64,
-        /// The argument's alignment in bytes.
+        /// The alignment in bytes the function holds the address to.
         alignment: u64,
     },
     /// A grant of an index already granted ([`Device::grant_indices`](crate::Device::grant_indices)).
@@ -606,7 +611,8 @@ pub enum Refusal {
     /// [`Texture::replace_region`](crate::Texture::replace_region),
     /// [`Texture::get_bytes`](crate::Texture::get_bytes) or a blit copy
     /// ([`BlitCommandEncoder::copy_from_texture`](crate::BlitCommandEncoder::copy_from_texture))
-    /// of a level or slice past the texture's, or of a region that leaves the level or is off the
+    /// of a level or slice past the texture's, or of a region that leaves the level (but whole
+    /// blocks ending inside the level's last block, which plain Metal copies whole) or is off the
     /// format's block grid.
     ///
     /// Basis: ours (no texel of the texture is there to copy).
@@ -1260,7 +1266,11 @@ pub enum Gap {
     /// [`BlitCommandEncoder::copy_from_texture`](crate::BlitCommandEncoder::copy_from_texture)
     /// that the floor's `vkCmdCopyImage` does not make: a multisample texture; one pixel format
     /// held in two Vulkan formats, which the two textures' usages chose; a 1D texture with one of
-    /// another type; or a texture buffer, whose texels are its buffer's bytes and no image.
+    /// another type; a texture buffer, whose texels are its buffer's bytes and no image; or a
+    /// compressed region of whole blocks that ends inside one level's last block past its edge
+    /// and not inside the other's (the one 4 x 4 block of a level of 4 x 2 texels into a level of
+    /// 8 x 4), which plain Metal copies whole and one command's one extent cannot stop at one
+    /// image's edge alone.
     ///
     /// Basis: ours (Vulkan 1.3 copies none of these with one command; each is built when a
     /// replay stream makes one).
@@ -1829,6 +1839,15 @@ pub enum DrawKind {
     /// word is not built. Counted in
     /// [`Metrics::accumulated_visibility_refused`](crate::Metrics::accumulated_visibility_refused).
     AccumulatedVisibilityResults,
+    /// On a device without `VK_EXT_shader_stencil_export`, a draw through a pipeline state whose
+    /// fragment function writes `[[stencil]]`, which the runtime draws once and then once per
+    /// stencil bit the depth-stencil state can replace (`Metrics::stencil_bit_draws`), where
+    /// those draws do not give Metal's answer: under a stencil test whose compare function is
+    /// other than `Always` and `Never` on a face, as the fragment's output is that test's
+    /// reference; and, where the state replaces a bit, inside a `Counting` visibility result's
+    /// segment, whose count each draw would add to. Metal tests and writes the stencil against the
+    /// output in one draw.
+    StencilOutput,
 }
 
 /// What a render pass asks that the runtime does not build ([`Gap::RenderPass`]).
@@ -1919,7 +1938,8 @@ pub enum RenderPassKind {
     /// 2D multisample texture or array, nor a depth plane of a 3D texture's level that a color
     /// attachment renders in a pass of one layer: a 1D texture's; a 3D texture's in a layered pass
     /// (`renderTargetArrayLength` 2 or more), as a depth or stencil attachment, or as a resolve
-    /// texture; and a resolve's depth plane but 0.
+    /// texture, whatever its `resolveDepthPlane`, which Metal with its validation layer off reads
+    /// of a 3D resolve texture alone.
     TextureType,
     /// `MTLStoreActionCustomSampleDepthStore`, set on the pass or by the encoder's
     /// `setColorStoreAction:atIndex:` family.
@@ -2578,7 +2598,7 @@ impl fmt::Display for Refusal {
                 alignment,
             } => write!(
                 f,
-                "the buffer at index {index}, bound at offset {offset}, is not at a multiple of its argument's {alignment}-byte alignment"
+                "the buffer at index {index}, bound at offset {offset}, is not at a multiple of {alignment} bytes, the alignment its function holds it to"
             ),
             Refusal::IndicesGranted { class, index } => {
                 write!(f, "{class:?} index {index} is granted already")

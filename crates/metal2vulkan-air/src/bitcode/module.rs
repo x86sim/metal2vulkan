@@ -23,9 +23,9 @@ use super::constants::{self, ConstCx};
 use super::enum_attrs::EnumAttrTable;
 use super::function::{self, FnCx};
 use super::markers;
-use super::metadata::{self, MdCx, MdKinds, MdValue};
+use super::metadata::{self, KindTable, MdCx, MdIds, MdValue};
 use super::stream::{Item, Stream};
-use super::types::{self, grow, BitcodeTypes};
+use super::types::{self, grow, BitcodeTypes, TypeIds, NO_TYPE_ID};
 use super::{DecodeOptions, ModuleTables, ModuleValue};
 use crate::bitstream::Reader;
 use crate::budget::Meter;
@@ -170,9 +170,13 @@ pub(crate) fn decode(
         sections: Vec::new(),
         values: Vec::new(),
         pending_inits: Vec::new(),
-        md_kinds: MdKinds::default(),
+        kinds: KindTable::default(),
+        md_ids: MdIds::default(),
         sync_scopes: Vec::new(),
         defined: Vec::new(),
+        defined_types: Vec::new(),
+        type_ids: TypeIds::default(),
+        value_type_ids: Vec::new(),
         intrinsics: Vec::new(),
         legacy_mem: Vec::new(),
         marker_consts: Vec::new(),
@@ -347,9 +351,17 @@ struct ModuleDecoder<'a> {
     values: Vec<ModuleValue>,
     /// `(global, initializer value id)`, resolved once every module constant exists.
     pending_inits: Vec<(GlobalId, u64)>,
-    md_kinds: MdKinds,
+    kinds: KindTable,
+    /// LLVM's metadata ids to the arena's (`metadata::MdIds`).
+    md_ids: MdIds,
     sync_scopes: Vec<Option<SyncScope>>,
     defined: Vec<FuncId>,
+    /// The bitcode index of each defined function's function type, as `defined`.
+    defined_types: Vec<u32>,
+    /// LLVM's reader's type ids past the table (`types::TypeIds`), kept for the whole module.
+    type_ids: TypeIds,
+    /// The type id of each module value, by value id, made as function blocks need them.
+    value_type_ids: Vec<u32>,
     /// Every declaration named `air.*`/`llvm.*` with its class, in function id order.
     intrinsics: Vec<(FuncId, DeclClass)>,
     /// Every pre-LLVM 7 memory intrinsic declaration, declared in its modern form, with the type
@@ -423,7 +435,7 @@ impl<'a> ModuleDecoder<'a> {
             PARAMATTR_BLOCK => attrs::decode_lists(s, &mut self.groups, &mut self.attr_lists, m)?,
             CONSTANTS_BLOCK => self.constants(s, m)?,
             METADATA_BLOCK => self.metadata(s, m)?,
-            METADATA_KIND_BLOCK => metadata::decode_kinds(s, &mut self.md_kinds, m)?,
+            METADATA_KIND_BLOCK => metadata::decode_kinds(s, &mut self.kinds, m)?,
             VALUE_SYMTAB_BLOCK => {
                 if self.vst_bit.is_some() {
                     return Err(s.malformed(VALUE_SYMTAB_BLOCK, 0));
@@ -800,7 +812,9 @@ impl<'a> ModuleDecoder<'a> {
         }
         if !is_proto {
             grow(m, &mut self.defined)?;
+            grow(m, &mut self.defined_types)?;
             self.defined.push(f);
+            self.defined_types.push(fn_bc_type);
         } else if let Some(class) = self
             .parts
             .symbols
@@ -840,6 +854,27 @@ impl<'a> ModuleDecoder<'a> {
             .bc_types
             .as_ref()
             .ok_or_else(|| s.err(BitcodeError::BadType))?;
+        let fn_type_id = *self
+            .defined_types
+            .get(index)
+            .ok_or_else(|| s.malformed(FUNCTION_BLOCK, 0))?;
+        // Each module value's type id, as LLVM's reader numbers it: a constant's own type, and
+        // a global's or function's pointer to the object it addresses (`getVirtualTypeID`), which
+        // is the record's own typed pointer where the record names one.
+        let known = self.value_type_ids.len();
+        m.reserve(
+            &mut self.value_type_ids,
+            self.values.len().saturating_sub(known),
+        )?;
+        for v in self.values.iter().skip(known) {
+            let ptr = v.id.and_then(|c| self.parts.consts.ty(c));
+            let tid = match (v.bc_type, v.object_bc_type, ptr) {
+                (Some(own), _, _) => own,
+                (None, Some(object), Some(ptr)) => self.type_ids.id(bc_types, ptr, &[object], m)?,
+                _ => NO_TYPE_ID,
+            };
+            self.value_type_ids.push(tid);
+        }
         let ModuleParts {
             symbols,
             types,
@@ -851,6 +886,9 @@ impl<'a> ModuleDecoder<'a> {
         } = &mut self.parts;
         let mut cx = FnCx {
             bc_types,
+            type_ids: &mut self.type_ids,
+            value_type_ids: &self.value_type_ids,
+            fn_type_id,
             types,
             consts,
             symbols,
@@ -858,7 +896,8 @@ impl<'a> ModuleDecoder<'a> {
             funcs,
             values: &self.values,
             attr_lists: &self.attr_lists,
-            md_kinds: self.md_kinds,
+            md_kinds: self.kinds.kinds,
+            md_ids: self.md_ids,
             sync_scopes: &self.sync_scopes,
             intrinsics: &self.intrinsics,
             legacy_mem: &self.legacy_mem,
@@ -1054,6 +1093,7 @@ impl<'a> ModuleDecoder<'a> {
     fn metadata(&mut self, s: &mut Stream<'a>, m: &mut Meter) -> Result<(), Error> {
         let ModuleParts {
             symbols,
+            types,
             consts,
             metadata,
             named_md,
@@ -1078,13 +1118,19 @@ impl<'a> ModuleDecoder<'a> {
                 .and_then(|v| consts.get(v.id?))
                 .is_some_and(|c| matches!(c.value, Const::GlobalAddr(_) | Const::FuncAddr(_)))
         };
+        let types: &crate::ir::TypeTable = types;
+        let operand_type = |ty: u64| bc_types.and_then(|t| function::operand_type(t, types, ty));
         let mut cx = MdCx {
             symbols,
             metadata,
             base: 0,
             named: named_md,
+            ids: self.md_ids,
+            kinds: Some(&mut self.kinds),
         };
-        metadata::decode(s, &mut cx, &value, &global_object, m)
+        metadata::decode(s, &mut cx, &value, &operand_type, &global_object, m)?;
+        self.md_ids = cx.ids;
+        Ok(())
     }
 
     /// Version 2's module-level `VALUE_SYMTAB`: with a string table it holds only function
@@ -1173,7 +1219,7 @@ impl<'a> ModuleDecoder<'a> {
             types: self.bc_types.unwrap_or_default(),
             values: self.values,
             attr_lists: self.attr_lists,
-            md_kinds: self.md_kinds,
+            md_kinds: self.kinds.kinds,
             sync_scopes: self.sync_scopes,
             defined: self.defined,
             function_blocks: self.function_blocks,

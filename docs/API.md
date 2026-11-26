@@ -139,7 +139,13 @@ and so do the command line, the compile worker and every validation tool. It hol
   of its size is one `uvec2` or `uvec4`. The function states `RuntimeFact::AddressAlignment` with
   that alignment (at most 16), and the runtime refuses a dispatch whose bound address is not a
   multiple of it, as Metal's API validation refuses the bind offset (an accepted difference,
-  section 10). A slot whose argument states an alignment below 4, or none, is reached the same way where each of
+  section 10). Plain Metal reaches each element of an argument of 8- or 16-byte alignment bound at
+  a multiple of 4 exactly where the program put it (an Apple M3 Max, macOS 27.0.1,
+  `crates/metal2vulkan-conformance/probes/misaligned_buffer_binds.m`), so a function compiled with
+  such a slot in `LoweringInputs::word_bound_buffers` states the argument's alignment up to what
+  the slot's accesses need, 4, or 8 where a 64-bit atomic may reach it (any slot, where one goes
+  through a pointer loaded from memory), and its accesses through the address claim no more
+  `Aligned` than that; the runtime's dispatch of such a bind runs that variant. A slot whose argument states an alignment below 4, or none, is reached the same way where each of
   its accesses is one 1- or 2-byte unit no wider than that alignment (an `i8` access of a `uchar`
   buffer, an `i16` one of a `ushort` buffer) on a device with that width's storage access. Any
   other slot is reached from the word below each access, its offset sign-extended, so an access
@@ -294,6 +300,35 @@ and so do the command line, the compile worker and every validation tool. It hol
   into the parameter block `pipeline::ExecutionCounts` lays out, where each part's
   `sequenceCountAddress` reads it. Its interface is a compiled function's: the one push range,
   holding the block's device address at offset 0, and no descriptor.
+- **A kernel's bound buffers** (`DeviceProfile::binds_kernel_buffers`). Under the identity
+  domains, on a device that answers this query, a kernel reaches each buffer argument through a
+  storage buffer of set 0 bound over that buffer, not at its address. The descriptor covers the
+  buffer's own bytes in the `VkBuffer` that holds them, from its first byte rounded down to the
+  device's buffer base alignment (`DeviceProfile::buffer_base_alignment`,
+  `max(minStorageBufferOffsetAlignment, 16)`) to its last, and the slot's bytes from there to its
+  bind address are pushed (`PushField::SlotBindOffset`, section 5). The pipeline is made with
+  `VkPipelineRobustnessCreateInfo` naming robust buffer access 2 for its storage buffers
+  (`RuntimeFact::RobustStorageBuffers`): a load outside the descriptor's range reads zero and a
+  store there does nothing, so no access is checked in the shader (no `PushField::SlotBounds`, no
+  `PushField::ZeroAddress`) but an atomic, which keeps its check against the view's length and
+  answers 0 outside it (Vulkan states an atomic outside the checked range a write with an
+  undefined answer). The function requires `VkFeature::PipelineRobustness`, and states each
+  slot's `RuntimeFact::AddressAlignment` as an address slot does. The query is Vulkan's alone:
+  the features `pipelineRobustness` (enabled), `robustBufferAccess2` (supported, and not enabled)
+  and `robustBufferAccessUpdateAfterBind`; then the limits set 0's layout reaches:
+  `maxPerStageDescriptorStorageBuffers`, `maxPerStageDescriptorUpdateAfterBindStorageBuffers`,
+  `maxDescriptorSetStorageBuffers`, `maxDescriptorSetUpdateAfterBindStorageBuffers` and
+  `maxPerStageResources`, each at least its 31 bindings (`KERNEL_BUFFER_BINDINGS`), and
+  `maxStorageBufferRange` at least `IDENTITY_BUFFER_BYTES` (2^31) plus the base alignment less
+  1. The last limit that layout reaches, `maxPerStageUpdateAfterBindResources`, counts the set 1
+  a runtime makes beside it, which the runtime checks before it enables `pipelineRobustness`.
+  Four kinds of slot keep their device address by structure, on every device: a slot a wide
+  pointer may reach (a pointer the function stores, converts to an integer, or merges with one
+  loaded from memory or made from an integer), a slot a typed atomic reaches, a slot the
+  stage-in fetch reads, and a slot the dispatch binds at a multiple of 4 below its argument's
+  alignment (`LoweringInputs::word_bound_buffers`), as a view's `uvec4` and `uvec2` units take
+  the bind offset to be a multiple of that alignment. Every render stage keeps addresses. Of the
+  committed profiles, lavapipe's (a `maxStorageBufferRange` of 128 MiB) answers no.
 - **The resident-table domains** (`DevicePolicy::RESIDENT_TABLES`: `PointerDomain::ResidentTable`
   with `HandleDomain::Table`) exist for the validation executor alone, which builds the resident
   root and the handle table itself. Besides it, only the translator's own tests of that lowering
@@ -520,23 +555,13 @@ the widest mode is not weighed for it. The pin to 32 stays where 32 is the devic
 On the emulated tier, a simdgroup operation or barrier in a block whose control flow differs
 between threads is walked predicated: each thread carries a live flag, the threads that do not run
 the block take part in its exchanges as inactive lanes, and a loop that holds one votes on its
-exit. A kernel whose threads' positions alone make such a block differ, along some axes
-(`thread_position_in_threadgroup` or `thread_position_in_grid`, read by lane), states
-`RuntimeFact::UnitAxes { axes: 0, relief }`: `relief` holds, at bit `m - 1`, each mask `m` of axes
-(bit 0 `x`, bit 1 `y`, bit 2 `z`) under which fewer of those blocks differ once the positions along
-them are taken as uniform. In a threadgroup of one thread along an axis, Metal's
-`threads_per_threadgroup` is 1 there, so every thread's `thread_position_in_threadgroup` on that
-axis is 0 and its `thread_position_in_grid` is its threadgroup's position, partial threadgroups
-included. A dispatch of such threadgroups, where its axes are among the masks of `relief`, may
-run on the kernel's unit-axes variant (`VariantKey::unit_axes`, which `LoweringInputs::unit_axes`
-compiles): the same kernel with those positions uniform, walked without the predication they
-caused, giving the same answers. Its compile states `UnitAxes { axes, relief: 0 }`, and a
-dispatch with more than one thread along one of its axes takes the variant without them. A kernel has at most seven
-such variants per variant it runs on, one per mask. On the Iris Xe, an authored kernel of four shuffles each way and a
-simdgroup sum in a loop of 8 to 11 trips, in threadgroups of 8 x 1 x 16, ran 1.14 to 2.16 times
-the GPU time predicated (its trip count read from `thread_position_in_grid.y`) as with the same
-trip counts read from `threadgroup_position_in_grid.y`, over four sizes from 46 to 126 estimated
-words (one run each), with the same bits.
+exit. A block that the threads' positions alone make differ (`thread_position_in_threadgroup` or
+`thread_position_in_grid`, read by lane) is walked predicated at every threadgroup size. On the
+Iris Xe, an authored kernel of four shuffles each way and a simdgroup sum in a loop of 8 to 11
+trips, in threadgroups of 8 x 1 x 16, ran 1.14 to 2.16 times the GPU time predicated (its trip
+count read from `thread_position_in_grid.y`) as with the same trip counts read from
+`threadgroup_position_in_grid.y`, over four sizes from 46 to 126 estimated words (one run each),
+with the same bits.
 
 ### What the module contains
 
@@ -938,7 +963,13 @@ Where Metal's rules differ from Vulkan's, the pipeline gives Metal's answer:
   its channels rotated. A raster order group on a color input, or on a color output of an
   attachment the function reads, orders that read alone and takes no interlock; a group on
   anything else needs the pixel interlock (`Unsupported{RasterOrderGroups}`). A `[[stencil]]` output uses
-  `VK_EXT_shader_stencil_export`; a device without it refuses the function
+  `VK_EXT_shader_stencil_export`; on a device without it the function discards a fragment whose
+  output lacks the bit its push field names (`PushField::StencilBit`, every fragment kept at 8 or
+  more) and states `RuntimeFact::StencilBitDraws`: the runtime draws each draw once and then once
+  for each bit its depth-stencil state can replace (`metal2vulkan-degrade-stencil-output-overlap`).
+  There a function that also writes a color or memory, one whose returns cannot discard (an
+  interlocked body, a loop over its covered samples), a mesh pipeline and a pipeline made for
+  indirect command buffers refuse the output
   (`Unsupported{StencilExport}` naming the extension).
 - `[[barycentric_coord]]` reads `BaryCoordKHR` or `BaryCoordNoPerspKHR`, whose vertex order is
   Vulkan's first-vertex order and Metal's for every primitive type. A `float3` read takes the
@@ -1117,6 +1148,16 @@ for dependency in &pipeline.dependencies {
   device-replay variant (`VariantKey::replay_bindings`, section 6) reads each buffer slot's
   address from its replayed command's root entry, at `PushField::RootTableAddress`, which the
   identity domains do not read: it is refused, `Unsupported{IdentityDomains}` naming that field.
+- A kernel's bound buffer slot (section 1, `DeviceProfile::binds_kernel_buffers`) is one
+  storage buffer of set 0, its binding the slot's place among the kernel's bound slots in slot
+  order, and pushes `PushField::SlotBindOffset`, a `u32`: the bytes from the descriptor's first
+  byte to the slot's bind address (the buffer's first byte's distance past the descriptor's start,
+  below the base alignment, plus the bind offset), or 0 for a `setBytes` copy, whose descriptor
+  starts at its first byte, and for nothing bound, a null descriptor. An access through the slot
+  reads its view at that word plus its 32-bit byte offset, read as signed. Its descriptor's bytes
+  are congruent to their Metal addresses modulo 16, as the view's `uvec4` and `uvec2` units take
+  them. A consumer writes a descriptor only where a slot's buffer changes: a changed bind offset
+  alone is a new push word.
 - Under the identity domains, a buffer slot that an access may reach at a
   byte offset that is not a translation-time constant (an index the memory plan does not prove
   one value, a looping `memcpy` or `memset`, a pulled fetch) also reads
@@ -1340,12 +1381,7 @@ as its replay variant (`VariantKey::replay_bindings`), whose vertex and fragment
 each command's buffers from slot tables in memory, and as its merged variant
 (`VariantKey::merged_draws`), whose vertex function finds its command in one merged draw by a
 prefix of the commands' first vertices and runs the command's vertex,
-instance and buffers, in the commands' order. A buffer's records start at
-`bind::indirect_commands::records_address` of its ID, outside every Metal address; records may
-run past later IDs' starts, and a resident set keeps each records range whole. Storage may hold a written flag per command,
-a `u32` a command past the records (`bind::indirect_commands::written_flag_offset`): a consumer
-whose own writes of the records set the flags may reset only the flagged records of a run of
-commands, clearing each flag with its record.
+instance and buffers, in the commands' order.
 
 ## 7. Caching
 
@@ -1931,6 +1967,26 @@ bound.
   of these copies. Cost: a depth uploaded outside `[0, 1]` is the device's, and so is every read,
   sample, comparison and copy of it; one within it is copied exactly, except a denormal or
   `-0.0`, which a device may store as `+0.0` (`metal2vulkan-degrade-depth-denormals`).
+- `metal2vulkan-degrade-stencil-output-overlap` (precision).
+  `PrecisionNote::StencilOutputOverlap`: A fragment function that writes `[[stencil]]`, on a
+  device without `VK_EXT_shader_stencil_export`, recorded on its fragment stage on every such
+  device (`RuntimeFact::StencilBitDraws`). `metal2vulkan-runtime` draws each draw of its pipeline
+  once with a stencil reference of 0, which clears the stencil bits its depth-stencil state can
+  replace and runs its other stencil operations, then once for each of those bits (the low 8 of
+  the write masks of the faces that replace), keeping the fragments whose output holds that bit,
+  under the reference 255, that bit's write mask, `Replace` kept and every other operation
+  `Keep`, and no depth write; and, where the draw writes depth under a depth compare other than
+  always or never, once more for the depth, with stencil write masks of 0, the first draw then
+  writing none. Cost: fragments of one draw that overlap leave the OR of their values. Where two
+  fragments of one draw reach one sample under `Replace`, the sample stores the bitwise OR of
+  their outputs' low 8 bits within the write mask, where Metal stores the later fragment's value.
+  Measured on an RTX 3090 (NVIDIA 620.70.06) under the validation layer: two triangles of one
+  draw whose outputs are `0x35` and then `0x4a` store `0x7f` on the 32 texels both reach, where
+  Metal stores the later fragment's `0x4a`, and `0x35` on the 32 that one reaches. Under a depth
+  test that writes, each fragment's stencil operation is also chosen against the depth from
+  before the draw, where Metal tests a later fragment against the depth an earlier one wrote. A
+  draw whose fragments reach each sample at most once (a quad of two triangles, one fullscreen
+  triangle) stores Metal's values.
 - `metal2vulkan-degrade-cube-gradient-footprint` (precision).
   `PrecisionNote::CubeGradientFootprint`: An explicit-gradient sample of a cube texture takes
   Metal's footprint in the form Vulkan's rule reads, in every stage on every device. Cost: the
@@ -2748,6 +2804,35 @@ named states the rule in full.
   Without validation an Apple M3 Max (macOS 27.0.1) runs it, reaching each element at its address
   rounded down to the smaller of the element's alignment and 4, for loads, stores and pointers
   stored in a buffer alike (`crates/metal2vulkan-conformance/probes/misaligned_buffer_binds.m`).
+  A function kernel's argument of 8- or 16-byte alignment bound at a multiple of 4 below it is not
+  refused: that rule reaches each of its elements at its own address, and the dispatch runs a
+  variant of the kernel that reaches them there (section 1, `LoweringInputs::word_bound_buffers`),
+  though Metal's API validation refuses that bind offset too. Such a buffer that a 64-bit atomic
+  may reach off a multiple of 8, a draw's, and a consumer-compiled kernel's are still refused.
+- **A bound kernel buffer's out-of-bounds reach is its descriptor's, a few bytes wider than the
+  buffer** on a device that binds a kernel's buffers (section 1,
+  `DeviceProfile::binds_kernel_buffers`). Out-of-bounds accesses of a buffer are undefined in
+  Metal; the runtime's contract elsewhere is zero for a read and nothing for a write outside the
+  buffer. Under robust buffer access 2 that holds outside the descriptor's range, which is wider
+  than the buffer on two sides, from the queries:
+  - before the buffer: its first byte rounded down to the buffer base alignment, up to that
+    alignment less 1 bytes (15 at 16, the alignment on every lab device). Only a buffer whose
+    first byte is not a multiple of 16 has such bytes, which only a buffer over memory the
+    consumer brought can be (Metal's no-copy buffer, which Apple's page asks for at a page-aligned
+    pointer): a buffer the consumer places as `Device::heap_buffer_size_and_align` answers starts
+    at a multiple of 256 of its block, and every block at a multiple of 64 KiB of its allocation;
+  - past the buffer: its length rounded up to the device's `robustStorageBufferAccessSizeAlignment`,
+    up to 3 bytes past a length that is not a multiple of 4 where that alignment is 4 (RADV, ANV,
+    KosmicKrisp), and none where it is 1 (NVIDIA's driver). Apple's page asks a no-copy buffer
+    for a length that ends on a page.
+  A read of those bytes reads them and a write there lands in them. They are the same process's
+  memory, its own or shared with it by name: memory the consumer brought lies on the pages it
+  maps or was given; past a buffer the consumer placed in one of its blocks they are that block's,
+  the padding before the next buffer at a multiple of 256, which no zeroing of the buffer
+  reaches, so they read zero or the same device's earlier bytes there, never another device's (a
+  device's blocks are ranges of its own allocations). A kernel on a device that does not bind
+  its buffers, a render stage, and every slot that keeps its address (section 1) read zero and
+  write nothing outside the buffer exactly.
 - **A recursive call past the call stack yields zero**: the stack holds what Metal's byte model
   holds for the pipeline's `max_call_stack_depth`; a call that finds it full returns zero, where
   Metal's answer is corrupt.

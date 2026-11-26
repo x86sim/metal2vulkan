@@ -38,15 +38,6 @@ pub struct LoweringInputs {
     /// kernel has simdgroups this emulates; a vertex or fragment function compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub emulated_simdgroups: bool,
-    /// A kernel runs threadgroups whose simdgroups each lie within one row
-    /// (`VariantKey::one_row`): the lockstep barriers it takes are its threadgroup ones alone
-    /// where, so dispatched, no pair wants more than a threadgroup barrier, on every device (the
-    /// old binder asks for it where `air::Lockstep::rows` holds), and with no simdgroup barrier it
-    /// takes no simd class and pins no subgroup for them. A kernel
-    /// compiled under it depends on `RuntimeFact::OneRow`. Any other function compiles as without
-    /// it.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub one_row: bool,
     /// A kernel's stage-input descriptor (`MTLComputePipelineDescriptor.stageInputDescriptor`): how
     /// each `[[stage_in]]` attribute is fetched from its buffer. A kernel reading a stage-in
     /// attribute needs it (`NeedsInput(StageInputDescriptor)` without it);
@@ -106,8 +97,7 @@ pub struct LoweringInputs {
     /// and a vertex function that fetches an attribute in fixed function are
     /// `Unsupported{GpuEncodedIndirectCommands, NotImplemented}` under it (a replayed command is a
     /// compute dispatch with no stage-in region, or a draw whose buffers no fixed-function input
-    /// reads: a pulled attribute reads its slot table, and the replay pulls every fixed-function
-    /// binding's layout through the pulled-vertex-buffer variant).
+    /// reads: a pulled attribute reads its slot table).
     #[cfg_attr(feature = "serde", serde(default))]
     pub replay_bindings: bool,
     /// With `replay_bindings`, the vertex function of a draw replay merged into one draw
@@ -132,6 +122,15 @@ pub struct LoweringInputs {
     /// `PrecisionNote::SrgbTexelDecode`. A slot of no such access is ignored.
     #[cfg_attr(feature = "serde", serde(default))]
     pub srgb_textures: BTreeSet<SlotRef>,
+    /// Storage texture slots bound to an 8-bit sRGB texture whose storage element is a view of
+    /// the format's UNORM twin (`metal::format::srgb_raw_twin`), as Vulkan stores no sRGB format
+    /// through a storage image on the devices it is built for: each such slot a `half` or `float`
+    /// function writes or reads is declared without a format, of class `SrgbEncode`, so its
+    /// writes encode red, green and blue by the device's linear-to-sRGB conversion and keep alpha
+    /// linear (the MSL specification, 8.7.7), recording `PrecisionNote::DevicePackConversion`, and
+    /// its reads decode. A slot of no such access, or of another numeric type, is ignored.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub srgb_storage: BTreeSet<SlotRef>,
     /// Texture-buffer slots bound to a texture buffer of more texels than one view holds, each
     /// with its parts (`VariantKey::texel_buffer_parts`, `RuntimeFact::TexelBufferParts`): each is
     /// declared as an array of that many texel buffers, texel `i` of its reads, writes and atomics
@@ -760,17 +759,6 @@ pub struct LoweringInputs {
     /// function that writes none. Any other stage compiles as without it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub region_viewports: bool,
-    /// The axes along which every threadgroup the kernel runs has one thread
-    /// (`VariantKey::unit_axes`; bit 0 `x`, bit 1 `y`, bit 2 `z`): there every thread's
-    /// `thread_position_in_threadgroup` is 0 and its `thread_position_in_grid` is its
-    /// threadgroup's `threadgroup_position_in_grid`, partial threadgroups included, so the
-    /// workgroup-uniformity analysis takes those lanes of the two builtins as uniform
-    /// (`lower::simd::uniform`, "Unit axes") and a block they alone made divergent is walked as a
-    /// uniform one. A kernel compiled under it states `RuntimeFact::UnitAxes { axes, .. }`, and its
-    /// plans run only dispatches whose threadgroups have one thread along every such axis. Any
-    /// other stage compiles as without it.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub unit_axes: u8,
     /// Where a fragment function's push fields start on `Device::from_queries`' profile, whose
     /// render pipeline pushes one range `[0, W)` for both stages, `W` the device's push window
     /// ([`DeviceProfile::push_window`](crate::device::DeviceProfile::push_window), 256 or 128):
@@ -789,6 +777,16 @@ pub struct LoweringInputs {
     /// 0.
     #[cfg_attr(feature = "serde", serde(default))]
     pub push_base: u32,
+    /// Buffer slots bound where their address is a multiple of 4 and not of their argument's
+    /// alignment (`air.arg_type_align_size`, 8 or 16), which Metal's API validation refuses and
+    /// plain Metal runs, each element at its own address (`probes/misaligned_buffer_binds.m` in
+    /// the conformance crate). Under the identity domains each such device-address slot states
+    /// `RuntimeFact::AddressAlignment` as its argument's alignment up to what its accesses need,
+    /// 4, or 8 where a 64-bit atomic may reach it, and its accesses from its address claim no
+    /// more `Aligned` than that. A slot of alignment 4 or less, or that is no device-address slot
+    /// held to its alignment, is ignored.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub word_bound_buffers: BTreeSet<SlotRef>,
 }
 
 /// One channel of the second output a fragment function writes for an attachment held with its

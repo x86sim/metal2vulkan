@@ -251,6 +251,11 @@ pub(crate) struct Core {
     consumer_features: Vec<ConsumerFeature>,
     pub(crate) queues: Queues,
     pub(crate) memory_types: floor::MemoryTypes,
+    /// The flushes and invalidates of Shared memory where its type is not host-coherent: the
+    /// device's atom, and the command buffers in flight that may write Shared memory
+    /// (`crate::coherence`). `None` where the Shared type is host-coherent, decided at the make:
+    /// such a device keeps no ranges and makes no call.
+    pub(crate) coherence: Option<crate::coherence::Coherence>,
     /// The device-local memory types, one bit each: a texture's image takes the first its
     /// requirements allow.
     pub(crate) device_local: u32,
@@ -341,6 +346,8 @@ pub(crate) struct Core {
     pub(crate) stamps: StampPools,
     /// The occlusion query pools command buffers take their visibility results' queries from.
     pub(crate) occlusion: OcclusionPools,
+    /// The pools command buffers take their sets of set 0 from (`crate::bound`).
+    pub(crate) buffer_sets: crate::bound::SetPools,
     /// The one pipeline layout of every pipeline: the empty set 0, set 1, and the push window
     /// over every stage, the translator's `DeviceProfile::push_window` bytes.
     pub(crate) layout: vk::PipelineLayout,
@@ -477,6 +484,12 @@ pub struct DeviceOptions {
     /// same.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) described: Option<fn(DeviceDescription) -> DeviceDescription>,
+    /// For the device tests: the device's memory types and heaps as the runtime is to read them,
+    /// in place of the device's own answers, from the floor's memory types on; the floor's check
+    /// of the physical device reads the device's own. The Vulkan device is the same, so a view
+    /// only takes flags away from a type or leaves it.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) memory: Option<fn(&mut vk::PhysicalDeviceMemoryProperties)>,
 }
 
 /// Takes a lock. A panic while another thread held it leaves what it guards usable (a queue, the
@@ -521,6 +534,22 @@ impl Device {
         let vk_instance = instance.vk();
         let raw = physical.raw();
         let capabilities = physical.check().map_err(Error::BelowFloor)?;
+        // Under `m2v_shared_view`, a device the test gives no view of its own reads its memory
+        // types through the refused device's (docs/VALIDATION.md).
+        #[cfg(all(test, m2v_shared_view, any(m2v_gpu, m2v_cpu_icd)))]
+        let options = DeviceOptions {
+            memory: (options.memory).or(Some(crate::tests::command::on_device::suite_view)),
+            ..options
+        };
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        let capabilities = match options.memory {
+            Some(view) => {
+                let mut capabilities = capabilities;
+                view(&mut capabilities.memory);
+                capabilities
+            }
+            None => capabilities,
+        };
         // SAFETY: `raw` is the instance's, which was made at the floor's version.
         let description = unsafe { description(vk_instance, raw, &capabilities) }?;
         #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -567,6 +596,7 @@ impl Device {
             mut generated_commands,
             mut maintenance5,
             mut maintenance8,
+            mut pipeline_robustness,
         } = enabled_features;
         // `sparseBinding` for imports over several dma-bufs (`Device::import_dma_bufs`), only where
         // the device's queries offer that import: it changes no other path, as only that import
@@ -636,6 +666,9 @@ impl Device {
         if enabled(floor::MAINTENANCE8) {
             features = features.push_next(&mut maintenance8);
         }
+        if enabled(ash::ext::pipeline_robustness::NAME) {
+            features = features.push_next(&mut pipeline_robustness);
+        }
         // SAFETY: as for the floor check.
         let listed = unsafe { vk_instance.enumerate_device_extension_properties(raw) }
             .map_err(Error::vulkan("vkEnumerateDeviceExtensionProperties"))?;
@@ -679,6 +712,7 @@ impl Device {
         answer(&mut properties.properties.limits);
         let max_allocations = properties.properties.limits.max_memory_allocation_count;
         let granularity = properties.properties.limits.buffer_image_granularity;
+        let atom = properties.properties.limits.non_coherent_atom_size;
         let counters = Counters::new();
         let caches = Caches::new(
             options.pipeline_cache_dir.as_deref(),
@@ -687,9 +721,11 @@ impl Device {
         );
         // The translator's window: the device's `maxPushConstantsSize` up to 256 bytes.
         let window = translator.profile().push_window();
+        // Whether a kernel reaches its buffer arguments through set 0's storage buffers.
+        let buffers = translator.profile().binds_kernel_buffers();
         // SAFETY: the device was made from `raw` with `capabilities.features`, the family is its
         // queues' family, and its push limit holds the window.
-        let made = unsafe { objects(&device, &capabilities, &counters, window) };
+        let made = unsafe { objects(&device, &capabilities, &counters, (window, buffers)) };
         let (memory_types, done, arrays, layout) = match made {
             Ok(made) => made,
             Err(error) => {
@@ -804,6 +840,7 @@ impl Device {
             consumer_features,
             queues: Queues { runtime, present },
             memory_types,
+            coherence: crate::coherence::Coherence::of(&capabilities.memory, memory_types, atom),
             device_local,
             unified_memory,
             counters,
@@ -845,6 +882,7 @@ impl Device {
             reaper: Reaper::new(),
             stamps: StampPools::new(),
             occlusion: OcclusionPools::new(),
+            buffer_sets: crate::bound::SetPools::new(),
             layout,
             arrays,
             samplers: Mutex::new(SamplerTable::new(sampler_cap)),
@@ -853,7 +891,7 @@ impl Device {
             texels,
             copied_overs: AtomicUsize::new(0),
             limits,
-            ring: Ring::new(),
+            ring: Ring::new(translator.profile().buffer_base_alignment()),
             spans: crate::fault::Spans::default(),
             ids: Ids::new(),
             heap_ids: HeapIds::default(),
@@ -963,6 +1001,14 @@ impl Device {
     /// [`DeviceOptions::features`] the device reports, in the consumer's order.
     pub fn features(&self) -> &[ConsumerFeature] {
         &self.shared.core.consumer_features
+    }
+
+    /// No Metal counterpart: the alignment of the device's buffers of the runtime's usage, which
+    /// Vulkan's memory requirements give (`vkGetDeviceBufferMemoryRequirements`) and the device
+    /// read once at its making: Vulkan holds it the same for every such buffer, and every block's
+    /// first byte is a multiple of it.
+    pub fn buffer_alignment(&self) -> u64 {
+        self.shared.core.pool.alignment()
     }
 
     /// No Metal counterpart: the memory types the device's buffers are allocated from, as the
@@ -1478,7 +1524,8 @@ unsafe fn consumer_features(
 }
 
 /// The memory types the floor chooses on a new device, the completion thread's semaphores, set 1's
-/// arrays and the pipeline layout, whose one push range is `window` bytes.
+/// arrays and the pipeline layout, whose one push range is `window` bytes and whose set 0 holds a
+/// kernel's storage buffers where `buffers` (`crate::arrays::buffer_bindings`).
 ///
 /// # Safety
 ///
@@ -1488,7 +1535,7 @@ unsafe fn objects(
     device: &ash::Device,
     capabilities: &floor::Capabilities,
     counters: &Counters,
-    window: u32,
+    (window, buffers): (u32, bool),
 ) -> Result<(floor::MemoryTypes, Done, Arrays, vk::PipelineLayout), Error> {
     // SAFETY: the caller's contract.
     let memory_types =
@@ -1496,7 +1543,9 @@ unsafe fn objects(
     // SAFETY: the device is live.
     let made = unsafe { Done::new(device) }.and_then(|mut done| {
         // SAFETY: the device is live, with the floor's features.
-        let arrays = match unsafe { Arrays::new(device, counters, capabilities.attachment_reads) } {
+        let arrays = match unsafe {
+            Arrays::new(device, counters, (capabilities.attachment_reads, buffers))
+        } {
             Ok(arrays) => arrays,
             Err(error) => {
                 // SAFETY: the completion objects are unused.
@@ -1776,6 +1825,7 @@ impl Drop for Core {
         self.imports.destroy(&self.device);
         self.stamps.destroy(&self.device, &self.counters);
         self.occlusion.destroy(&self.device, &self.counters);
+        self.buffer_sets.destroy(&self.device, &self.counters);
         // SAFETY: the device is idle, and nothing records any more.
         unsafe { self.own.destroy(self) };
         // SAFETY: the device is idle; nothing reads the ring.

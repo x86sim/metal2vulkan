@@ -183,7 +183,11 @@ and a call that needs a runtime thread after `Device::quiesce` (`Error::Quiesced
 ### Counters
 
 `Device::counters` returns a handle that stays readable after the device is gone. `metrics()` are
-cumulative counts (submissions, passes, barriers, bytes copied, pipelines created, blocks made,
+cumulative counts (submissions, passes, barriers, each counted in one cause: a pass's start, a
+pass's move home, a blit, a dispatch's hazard, a segment's end, an upload or another, and a
+dispatch's in one source: its own dependency on a write or on a read, an encoder's end, a render
+pass's end, an indirect dispatch after a write, an access outside every resource, a Private-arena
+piece, a heap's one id or another; bytes copied, pipelines created, blocks made,
 first-use waits, kernels lowered, kernels read from the cache directory, upload waits, pushes,
 and the draws and dispatches whose push bytes the command buffer already held), and times in
 nanoseconds, in total and longest: among them each `vkQueueSubmit2` call's time inside the
@@ -227,7 +231,11 @@ states' main pipelines their `finish_pipeline` calls made, with their time, and 
 make failed (`finished_pipelines`, `finished_pipeline_nanos`, `failed_finishes`, Compute pipeline
 states below); the compiled contents a state's make dropped because an equal one landed in the
 device's map first (`kernel_makes_dropped`); the copies of resolve images into the buffers their
-textures lie over (`resolve_copies` and `resolve_copy_bytes`, Render encoders below);
+textures lie over (`resolve_copies` and `resolve_copy_bytes`, Render encoders below); the
+dispatches by the form their kernel reaches its buffers in, through storage buffers of set 0
+(`bound_dispatches`) or at their device addresses (`address_dispatches`), with the sets written
+for the bound ones and those that kept the set written last (`buffer_sets_written`,
+`buffer_sets_held`, Bound kernel buffers below);
 `gauges()` are live counts per kind of resource, every one zero after teardown, and
 `handles_out`, 1 while a handle of the device is out (Teardown). They are relaxed atomics, always
 on. What an encoder's commands count arrives when the encoder ends.
@@ -238,8 +246,9 @@ Memory comes in blocks the consumer takes and places buffers in, as a placement 
 in its memory.
 
 - `Device::take_block(class, len)` gives a block of `MemoryClass::Private` (device-local, no host
-  mapping) or `MemoryClass::Shared` (host-visible, host-coherent and host-cached, mapped for the
-  block's life) memory, as a `Block`: rt's own handle, with no Metal counterpart, which derefs to
+  mapping) or `MemoryClass::Shared` (host-visible and host-cached, host-coherent too where the
+  device has such a type, mapped for the block's life; Shared memory's coherence below) memory, as
+  a `Block`: rt's own handle, with no Metal counterpart, which derefs to
   the block's `BlockInfo` (its number, class, length, device address and, for Shared, its host
   address, and the allocation it is a range of with its offset there). One `VkBuffer` spans each
   of the pool's allocations, with every buffer usage and a device address; a block is a range of
@@ -523,6 +532,54 @@ staging blocks included; the consumer hands the guest blocks only. A block given
 with its allocation: from a block's give-back to the next take that lands on its bytes, they are
 the runtime's. A guest kernel that writes a free range damages only its own later buffers.
 
+### Shared memory's coherence
+
+Shared memory is the first host-visible, host-cached memory type a buffer can use, a
+host-coherent one first (`floor::MemoryTypes::shared`). Some devices have no type with all
+three: Mesa's Intel driver over the i915 kernel driver, on a GPU without a cache it shares with
+the CPU, lists a device-local, host-visible, host-coherent type and a device-local, host-visible,
+host-cached one. On a type without `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`, the host's writes
+reach the GPU only through `vkFlushMappedMemoryRanges`, and the GPU's writes reach the host only
+through `vkInvalidateMappedMemoryRanges`. `Device::new` reads that flag of the Shared type once.
+Where the type has it, as on every device of ours, the device keeps no ranges and makes neither
+call, which Vulkan calls "unnecessary" there. Where the type lacks it, the device makes both calls
+at these points:
+
+- Before each submission, it flushes the Shared memory the submission's command buffers reach, as
+  each commit found it: every buffer the command buffer keeps (bound, declared with
+  `use_resource`, a blit's or a pass's), the buffer under every texture over a Shared buffer it
+  keeps, every heap it uses, and the bytes each Managed copy-in it carries reads. A Managed buffer
+  with a device copy is not among them: its commands reach the copy, and only its copy-ins (which
+  flush the bytes they read) and its synchronize (a write, below) touch the block of its bytes.
+- Before the host can see the GPU's progress, it flushes the Shared memory a command buffer may
+  write, then invalidates it. That happens as the command buffer completes, before its status reads
+  completed, a wait for it returns or its completed handlers run. It also happens before a shared
+  event's value that a GPU signal raised reaches a listener, `SharedEvent::signaled_value` or
+  `SharedEvent::wait_until_signaled_value`, and then it covers every command buffer committed and
+  not yet completed. A command buffer may write: a blit's destination, a binding its function's
+  interface writes, a resource it declares with `use_resource` for writing, a render pass's
+  attachments and resolve targets, a visibility result buffer, a synchronize's buffer, the
+  whole Shared memory of every heap it uses, and every texture over a Shared buffer in an image
+  of its own. The flush comes first because Vulkan leaves a range undefined when the host wrote
+  it and it is invalidated without a flush.
+- Around its own host accesses: the bytes `Texture::replace_region` stages are flushed before
+  their copy, and so are the bytes `Texture::upload_region` copies from a Managed texture's
+  named buffer, at the call; the bytes a copy stages for `Texture::get_bytes` are flushed and
+  invalidated before it reads them; the zero source of fills is flushed once, when it is made.
+
+Each range is widened to whole multiples of the device's `nonCoherentAtomSize`, inside the
+pool's allocation, which the runtime maps whole. `Metrics::shared_flushes` and
+`shared_invalidates` count the calls, `shared_flushed_bytes` and `shared_invalidated_bytes` their
+bytes, and `shared_coherence_failures` the calls that did not return success; the work goes on
+after one. On a device whose Shared type is host-coherent all five stay 0.
+
+On a device whose Shared type is not host-coherent, a range that a command buffer reaches only
+through an address, with no binding or `use_resource` declaration naming its buffer, is neither
+flushed nor invalidated: the consumer declares what its commands reach. The consumer's own host
+reads and writes, through its own mappings (The consumer's mappings) or between those points, are
+its own. Imported blocks (below) are host-coherent memory and take no call. Exported blocks and
+surfaces are Private memory with no host mapping, and take none either.
+
 ### Imported blocks
 
 A no-copy buffer (`newBufferWithBytesNoCopy:length:options:deallocator:`) is the memory it was made
@@ -573,6 +630,12 @@ consumer's.
 
 Each call returns the block and the index of the memory type it imported into, and refuses before
 any allocation is attempted.
+
+On Linux 6.11 to 7.1 a udmabuf made over the pages of a large folio is malformed: one of its entries
+is a 4 KiB page at an offset past that page's size, and the AMD kernel driver's import of it then
+binds other pages than the buffer's. Linux 7.2 fixes it. So a consumer hands `import_dma_buf` or
+`import_dma_bufs` a udmabuf over such pages only on Linux 7.2 or later. The runtime does not check
+this, and cannot: it reads no kernel version.
 
 The granule is the alignment in which the device binds a sparse buffer's memory, rounded up to the
 host's page, offered where the device has `sparseBinding`, the runtime's queue family binds sparse
@@ -985,6 +1048,29 @@ the Direct3D 11 texture's payload until it is freed.
 
 ### Known gaps of memory blocks
 
+- On a device whose Shared type is not host-coherent (Shared memory's coherence), the flushes and
+  invalidates are that device's cost: before each submission over what its command buffers reach,
+  and at each completion and each shared event's GPU-raised value seen over what they may write, on
+  the submit and completion threads and in the calls that read an event's value. A submission's
+  flush names every Shared range its command buffers reach, written or not, merged, so its cost
+  grows with the Shared bytes a submission reaches, not with what its commands wrote. Every device
+  of ours has a host-visible, host-coherent, host-cached type, which Shared takes, so none makes
+  these calls, and none can show a flush the runtime missed: only a device whose Shared type is
+  cached and not coherent can. The device tests run the calls on our devices through a view that
+  reads their cached types as not coherent (`--cfg m2v_shared_view`, docs/VALIDATION.md), on memory
+  that is coherent in fact; neither the calls' time nor their effect has been measured on a device
+  whose memory is not.
+- On such a device, a host write to a range a command buffer may write, made while the command
+  buffer runs, may be lost, and so may the GPU's writes to the same atoms. The runtime flushes
+  each such range just before it invalidates it, and Vulkan states: "If a range of non-coherent
+  memory is written by the host and then invalidated without first being flushed, its contents
+  are undefined." A host write that lands between the flush and the invalidate is such a write.
+  Vulkan's `nonCoherentAtomSize` is "the size and alignment in bytes that bounds concurrent access
+  to host-mapped device memory", so the same holds where the host's write and the GPU's touch
+  different bytes of one atom.
+- On such a device, a Shared buffer that a command buffer reaches only through a residency set is
+  neither flushed nor invalidated: the runtime has no residency set, and such a buffer is one the
+  commands reach through an address with no declaration naming it.
 - On the Radeon 780M (RADV of Mesa 26.2.6) a texture over a buffer in a dma-buf's one import is
   the counted copy (`over_copies_dma_buf`). The external image query refuses the dma-buf handle
   with `LINEAR` tiling (`VK_ERROR_FORMAT_NOT_SUPPORTED`) for RGBA8Unorm and RGBA8Uint, for every
@@ -1471,12 +1557,13 @@ made, with no lock, and never rewritten for layouts.
   storage, else it stays in place plain. Its home is then the general layout, and its own
   format's views take the usage that format holds. So its view of the stored format has a storage
   element, and `Metrics::extended_view_dispatches` counts the dispatches that write such a view at
-  a slot; with no such image it has none (`StorageElementCase::Unextended`).
+  a slot; with no such image it has none (`StorageElementCase::Unextended`). An 8-bit sRGB
+  texture's own storage element is then its unorm sibling's view (Known gaps of textures).
 - The sampled element's view is the format's, through its component mapping with the
   descriptor's swizzle composed over it; a depth or stencil format's view takes its depth, else
   its stencil. The storage element is written where the usage has shader write and the device
-  stores the format through a storage image declared without a format; its view maps each
-  channel to itself. A cube's or a cube array's storage view is the 2D array of its faces,
+  stores the format through a storage image declared without a format, which no sRGB format is
+  on any device; its view maps each channel to itself. A cube's or a cube array's storage view is the 2D array of its faces,
   layer `6 · cube + face`, which a kernel's storage cube writes and reads by face. A multisampled
   texture has no storage element on any device, as Metal's shaders only read one (the Metal
   Shading Language: "Multisampled textures only support the read attribute"). Its image takes no
@@ -1507,8 +1594,10 @@ made, with no lock, and never rewritten for layouts.
   as Metal's nil texture; nothing refuses it there.
 - `Texture::replace_region` and `Texture::get_bytes` take a Shared or Managed texture
   (`Refusal::TextureBytesPrivate` otherwise), a region inside a level and slice on the format's
-  block grid (`Refusal::TextureRegion`), and rows and images apart as Metal's calls take them,
-  a compressed format's rows being rows of blocks (`Refusal::TextureBytesLayout` where they
+  block grid (`Refusal::TextureRegion`), whole blocks ending inside the level's last block past
+  its edge too (the one 4 x 4 block of a level of 4 x 2 texels, which Metal copies whole, where
+  Apple's pages ask for a size clamped to the edge), and rows and images apart as Metal's calls
+  take them, a compressed format's rows being rows of blocks (`Refusal::TextureBytesLayout` where they
   overlap or the bytes are too few). `replace_region` copies the bytes into the staging region
   before it returns, and the upload copies them into the image, leaving home for the transfer
   layout and coming back, ahead of every command buffer committed after the call. It takes the
@@ -1539,8 +1628,11 @@ made, with no lock, and never rewritten for layouts.
   `Device::new_heap_texture(descriptor, index, heap, offset)` binds the texture's image at that
   offset in the heap, where the consumer's own placement put it: no allocation and no texture
   block, the bytes those the memory holds, as Metal does not zero heap textures. Textures may
-  alias one another and the heap's buffers. A placement past the heap's end, an offset in the
-  block off the image's alignment, or a heap range past its block is refused
+  alias one another and the heap's buffers. A heap texture whose bytes another resource of its
+  heap wrote since its last write moves from undefined before its next write, a GPU command's or
+  `Texture::replace_region`'s copy (`Metrics::heap_moves`), as Vulkan's memory aliasing asks. A
+  placement past the heap's end, an offset in the block off the image's alignment, or a heap
+  range past its block is refused
   (`Refusal::HeapTexturePlace`); the image is never bound outside its heap. The texture holds
   the block, so a released block goes back to the pool only once its textures' images are gone.
   `Device::new_heap_buffer(heap, offset, length)` is `newBufferWithLength:options:offset:` of a
@@ -1610,7 +1702,9 @@ made, with no lock, and never rewritten for layouts.
   `bytes_per_row` apart, with no CPU copy. Each copy counts in `Metrics::over_copies` and its
   bytes in `Metrics::over_copy_bytes` and `Metrics::bytes_copied`; one over a buffer in an
   imported block counts in `Metrics::over_copies_imported` and `Metrics::over_copy_bytes_imported`
-  too. Each copy also counts in the pair of the cause the texture's making found, the first that
+  too, and its bytes count in `Metrics::over_copy_bytes_private` or
+  `Metrics::over_copy_bytes_shared` by the memory class the buffer's bytes are in (neither over a
+  Managed buffer's device copy). Each copy also counts in the pair of the cause the texture's making found, the first that
   holds: the buffer's memory (`over_copies_host_memory`, `_dma_buf`, `_dma_bufs`, `_dedicated`
   for an exported block's, `_surface` for an exported surface's buffer), a spilled block
   (`_spilled`), no linear image of the format, usage and size (`_linear`), a format feature the
@@ -1786,11 +1880,19 @@ made, with no lock, and never rewritten for layouts.
   `Gap::TextureFormat` (`BGRA8Unorm` on KosmicKrisp, whose storage texel buffers lack it).
 - `replace_region` and `get_bytes` of a texture without named bytes go through the staging region:
   a copy Metal does not make, counted in `Metrics::bytes_copied`.
+- A blit copy between textures of a compressed region of whole blocks that ends inside one
+  level's last block past its edge and not inside the other's (the one 4 x 4 block of a level of
+  4 x 2 texels into the second block of a level of 8 x 4, or the reverse) is `Gap::TextureCopy`.
+  Metal takes it, with its validation layer and without, and copies the block whole (probe
+  `compressed_copies_of_small_levels.m` in the conformance crate, an Apple M3 Max, job
+  m3-max-73696); one `vkCmdCopyImage` region has one extent, which stops at an image's edge only
+  where that image's region does ("Copy regions for each image must be aligned to a multiple of
+  the texel block extent in each dimension, except at the edges of the image").
 - A texture made for shader writes whose format the device does not store through a storage
-  image without a format (the 8-bit sRGB formats, `RGB9E5Float` or `BGR10A2Unorm` where the
-  device lacks their storage), or holds through a view of another (an `A8Unorm` held in red, the
-  extended-range formats), has no storage element; its view of a format the device stores has one
-  where its image is extended for it (above). A draw or dispatch whose function writes such
+  image without a format (`RGB9E5Float` or `BGR10A2Unorm` where the device lacks their storage,
+  an 8-bit sRGB format whose image is not extended for its unorm twin), or holds through a view
+  of another (an `A8Unorm` held in red, the extended-range formats), has no storage element; its
+  view of a format the device stores has one where its image is extended for it (above). A draw or dispatch whose function writes such
   a texture bound to a slot, or reads it there through its storage image (`access::read_write`),
   is `Gap::StorageElement`. So is, with no slot, a dispatch whose kernel, or a draw whose vertex
   or fragment function, may reach a texture through its storage image beyond its slots (an
@@ -1799,6 +1901,37 @@ made, with no lock, and never rewritten for layouts.
   A write through a resource ID with no such declaration is outside documented Metal
   (`useHeap:` declares its heap's resources read only) and is dropped, and a storage read there
   answers zeros.
+- An 8-bit sRGB texture (`RGBA8Unorm_sRGB`, `BGRA8Unorm_sRGB` and the other 8-bit sRGB formats)
+  made for shader writes, whose image is extended for its unorm twin (above), has the twin's
+  storage view for its storage element, on every device, as no device stores an sRGB format
+  through its own view here. A dispatch whose kernel writes it at a slot the kernel does not read
+  runs the kernel's sRGB variant, lowered at the first such dispatch from the state's function
+  with those slots and kept in the device's map of contents (1,024 entries, the least recently
+  used forgotten past them): the variant encodes each write there by the Metal Shading Language's
+  transfer (8.7.7, alpha linear) through the device's conversion, under the static note
+  `PrecisionNote::DevicePackConversion`, which a state whose kernel is a function writing a
+  texture slot it does not read announces from its creation. Its other uses:
+  - a draw whose vertex or fragment function writes it at a slot, and a draw or dispatch that
+    reads it at a slot through its storage image (`access::read_write`; Metal's read-write tiers
+    list no sRGB format), are `Gap::StorageElement`, and so is, with no slot, a draw or dispatch
+    after `use_resource` declared a write of it (above);
+  - a write that reaches it through an argument buffer or a resource ID with no such declaration
+    (after `use_heap` alone) is not encoded: the format of the texture such a write reaches is
+    unknown when its function is compiled, so the write stores each channel's linear code
+    (`round(255 · v)`) in the twin's bytes, where Metal stores its sRGB encode, and a storage read
+    there answers the stored codes as linear values. It is not refused: nothing the runtime is
+    told names the textures such an argument reaches, and a refusal by the declarations of reads
+    or by the bindings would refuse programs Metal runs.
+- Intel's Windows driver 101.2145 on the UHD Graphics 630 makes no such extended image for an
+  8-bit sRGB texture made for shader writes. Its image format query for `R8G8B8A8_SRGB`, optimal
+  tiling, `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT`, a format
+  list of that format and `R8G8B8A8_UNORM`, and the plain image's usage with the storage usage
+  answers no. So such a texture has no storage element there, and a dispatch whose kernel writes
+  it at a slot is `Gap::StorageElement` (`StorageElementCase::Absent`). This was read from the
+  runtime's test that asserts the image is extended exactly where that query takes it (it passed
+  there, job m3-max-74877) and from the conformance case `srgb-storage-writes` (job
+  m3-max-74873), not probed apart: whether that query takes the image without the plain image's
+  resolve attachment usage was not asked.
 - A texture whose storage element the device cannot read without a format (its format lacks
   `VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT`, which a device without
   `shaderStorageImageReadWithoutFormat` answers per format: on ANV before Gfx12.5, `BGRA8Unorm`,
@@ -1809,6 +1942,16 @@ made, with no lock, and never rewritten for layouts.
   as no declaration tells it from a sample: it reads the texture's storage element without a
   format, outside Vulkan's valid usage (`VUID-vkCmdDispatch-OpTypeImage-07028`), and Vulkan does
   not define what that read returns.
+- Intel's Windows driver 101.2145 on the UHD Graphics 630 lists
+  `VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT` for `B8G8R8A8_UNORM` while its
+  `shaderStorageImageReadWithoutFormat` is false, so a `BGRA8Unorm` texture's storage element is
+  read without a format there, at a slot through `access::read_write` and through an argument
+  buffer. Those reads differed from Metal's in 256 and 1,024 elements of the conformance cases
+  `read-write-tier-held` and `read-write-tier-round-trip-float` (the largest difference,
+  1055846127, is what a read of zero gives against a Metal answer of 0.46667; job m3-max-74873),
+  read from that run and not reproduced outside the runtime. `BGRA8Unorm` is outside Metal's
+  read-write tiers, so documented Metal defines no answer for that read; no Vulkan query tells
+  the driver's answer apart, and the runtime follows the per-format bit on every device.
 - A texture buffer's storage texel buffer is declared without a format too, but at a slot a
   texture atomic updates (`R32ui` or `R32i`), and its answers are its format's buffer features,
   of which Vulkan requires neither `VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT` nor the
@@ -2028,7 +2171,8 @@ made, with no lock, and never rewritten for layouts.
   wrote Shared memory (a Shared buffer bound or declared for writing, a write through an address
   outside the dispatch's resources, or a blit copy or fill into a Shared buffer) or signals an
   event, so the host reads those writes once the
-  command buffer completes or it sees the event; a segment that wrote only Private memory leaves
+  command buffer completes or it sees the event, after the flushes and invalidates of Shared
+  memory's coherence (Memory blocks and buffers); a segment that wrote only Private memory leaves
   the host out. No segment starts with a barrier of its own; a blit copy records its own two
   (see "Blit encoders").
   `enqueue` takes the command buffer's place in its queue; `commit` hands it to the submit
@@ -2085,8 +2229,9 @@ made, with no lock, and never rewritten for layouts.
   it), and a command buffer joins a group only while the group's expected runs, summed, stay within
   16 ms. One whose queue has no run yet, or that would take the sum past the bound, goes alone, the
   group held going first. The bound is tested again as the group goes, with the expected run as it
-  then stands: a group past it goes member by member, one `vkQueueSubmit2` each, only the last
-  signalling. At most four command buffers join a group while none of the queue's retires, since
+  then stands: a group past it goes member by member, one `vkQueueSubmit2` each, each signalling
+  its own progress value, so each completes at its own end, not the last's. At most four command
+  buffers join a group while none of the queue's retires, since
   they join on an expected run no completion has updated: in
   a replay stream on an RTX 3090, the most GPU time over four consecutive command buffers of a queue
   was 385.1 ms, within a quarter of amdgpu's default job timeout of 2,000 ms, and over sixteen
@@ -2520,7 +2665,14 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   where nothing maps there that is a fault, which loses the device on NVIDIA's driver and on RADV
   (above). An access through a pointer loaded from memory or made from an integer is not checked
   either: no binding bounds it. The check's measured cost, in GPU time and in cold pipeline
-  makes, is in docs/API.md, section 5 (`PushField::SlotBounds`).
+  makes, is in docs/API.md, section 5 (`PushField::SlotBounds`). A kernel on a device that binds
+  its buffers (Bound kernel buffers) carries no such check on its views, which its pipeline's
+  robust buffer access 2 contains; the check stays, by structure and not by device, on four kinds
+  of its slots, which keep their addresses: one a wide pointer may reach, one a typed atomic
+  reaches, one the stage-in fetch reads, and one the dispatch binds at a multiple of 4 below its
+  argument's alignment, and on its views' atomics. Every render stage pays it, and so does every
+  kernel on a device without the form: lavapipe, MoltenVK, the UHD 630's Windows driver and the
+  780M under AMDVLK 2025.Q2.1 among the lab's.
 - A dispatch's threadgroup memory, the kernel's own and the lengths set, each rounded up to 16
   bytes, is at most the device's `maxComputeSharedMemorySize` (`Limit::ThreadgroupMemory`), where
   Metal's is its `maxThreadgroupMemoryLength`, which `Device::max_threadgroup_memory_length`
@@ -2583,7 +2735,8 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   budget holds, its region carrying its first threadgroup, as a count past
   `maxComputeWorkGroupCount` does. Each piece is ordered after the commands before it by a
   barrier, but the first in a block the dispatch took new, which nothing reached before; a
-  dispatch of a kernel without an arena takes no such barrier.
+  dispatch of a kernel without an arena takes no such barrier. Those barriers leave the dispatch
+  in the hazard sets, so a later dispatch that depends on it takes its barrier as after any other.
   `Metrics::private_arena_dispatches`, `private_arena_pieces` and `private_arena_blocks` count
   them, and `private_arena_allocations` the takes that allocated. An indirect dispatch of such a kernel
   is `Gap::IndirectPrivateArena`: the GPU reads its counts, so the runtime can neither size its
@@ -2627,7 +2780,13 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   offset, is not a multiple of the kernel argument's alignment (`air.arg_type_align_size`, at
   most 16) is refused (`Refusal::BufferOffsetAlignment`) before anything is recorded, as Metal's
   API validation refuses the bind offset. Plain Metal runs such a dispatch at addresses of its
-  own; `docs/API.md` section 10 says which.
+  own; `docs/API.md` section 10 says which. A function kernel's argument of 8- or 16-byte
+  alignment bound at a multiple of 4 is not refused: plain Metal reaches each element at its own
+  address there, and the dispatch runs the state's variant that holds those buffers to 4
+  (`LoweringInputs::word_bound_buffers`), lowered at its first such dispatch and kept in the
+  device's map of contents under the state's key with the mask of those slots. The variant
+  holds a buffer a 64-bit atomic may reach to 8, and refuses it off a multiple of 8. A kernel the
+  consumer compiled has no variant and refuses such a bind; a draw refuses it too.
 - Parameters: fields in the push window, `[0, W)`, are pushed, `W` the device's
   `maxPushConstantsSize` up to 256 bytes (`DeviceProfile::push_window`: 256 on every lab device,
   128 on a device that reports Vulkan's least): the dispatch region and up to 24 buffer addresses
@@ -2667,9 +2826,13 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   side's slice, level and origin. It records one `vkCmdCopyImage` between the two images, at once,
   with nothing staged and no byte copied beyond the region. Both textures have one pixel format
   and one sample count, as Metal's validation requires; a compressed region is whole blocks or
-  reaches the level's edge on both sides; a 3D texture's image copies into or out of a 2D
-  slice. A format of depth and stencil both copies its pixels whole, as Metal's copy takes no
-  plane option: each region names both aspects. A size of 0 on an axis a texture lacks copies one
+  reaches the level's edge on both sides, and whole blocks may end inside the level's last block
+  past its edge, as Metal copies the one 4 x 4 block of a level of 4 x 2 texels whole where
+  Apple's page asks for the size clamped to the edge (probe `compressed_copies_of_small_levels.m`
+  in the conformance crate): the command's extent stops at the edge, both sides' at the same
+  one. A 3D texture's image copies into or out of a 2D slice. A format of depth and stencil both
+  copies its pixels whole, as Metal's copy takes no plane option: each region names both
+  aspects. A size of 0 on an axis a texture lacks copies one
   texel there; on another axis the copy copies nothing.
 - A copy records two barriers. The first moves each texture's level and slice from its home
   layout to the transfer layout after every earlier command, and makes every earlier write visible
@@ -2682,9 +2845,28 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   end among them. The encoder owes nothing at its end.
 - Refused: what Metal's validation refuses, textures of two pixel formats or two sample counts
   (`Refusal::TextureCopyMismatch`), and a region outside either texture or off its block grid
-  (`Refusal::TextureRegion`). Not built (`Gap::TextureCopy`): what one `vkCmdCopyImage` in the
-  floor does not make (a multisample texture, one pixel format held in two Vulkan formats by the
-  textures' usages, a 1D texture with another type).
+  (`Refusal::TextureRegion`), a size past the block the level's edge rounds up to among them
+  (8 x 4 at a level of 4 x 2, which the validation layer stops and plain Metal answers
+  differently by each call). A size of no whole blocks that stops at the source level's edge
+  and inside the destination's level is off the destination's grid too: 4 x 2 texels of a
+  compressed level of 4 x 2 into the second block of a level of 8 x 4, the size Apple's page
+  asks for. It stays refused for three facts:
+  - the validation layer stops it ("size.height(2) must be a multiple of MTLPixelFormatBC1_RGBA
+    blockHeight(4)"), though Apple's page asks for the clamped size;
+  - plain Metal lands the block by no one rule: from a level of 4 x 2 at the block the copy
+    names, from a level of 2 x 1 at the level's first block (probe
+    `compressed_copies_of_small_levels.m`, an Apple M3 Max, job m3-max-73696);
+  - Vulkan's prose asks a region of no whole blocks to match each image's edge ("Copy regions
+    for each image must be aligned to a multiple of the texel block extent in each dimension,
+    except at the edges of the image, where region extents must match the edge of the image"),
+    though in Vulkan 1.4.366 only the source's extent has a valid usage of that
+    (`VUID-vkCmdCopyImage-srcImage-01728`), and the destination's extent is bounded only by its
+    level (`VUID-vkCmdCopyImage-dstOffset-00150`).
+- Not built (`Gap::TextureCopy`): what one `vkCmdCopyImage` in the floor does not make (a
+  multisample texture, one pixel format held in two Vulkan formats by the textures' usages, a 1D
+  texture with another type, and whole blocks that end inside one level's last block past its
+  edge and not inside the other's, as the 4 x 4 block of a level of 4 x 2 texels into a level of
+  8 x 4, which plain Metal copies whole: one extent stops at one image's edge alone).
 - Within one level and slice of one image (a texture into itself, or a texture and its view,
   which shares its image), regions apart copy with one `vkCmdCopyImage`, that subresource in the
   general layout: one barrier moves it there and one home, the same three barriers as any copy.
@@ -2715,7 +2897,11 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   `copy_from_texture_to_buffer_with_options` are their options forms, a `BlitOption` naming the
   aspect a copy of a depth and stencil format moves (`MTLBlitOptionDepthFromDepthStencil` or
   `MTLBlitOptionStencilFromDepthStencil`, which Metal takes of a format of that aspect alone too),
-  one region of that aspect; the forms without an option are those of `None`.
+  one region of that aspect; the forms without an option are those of `None`. A compressed
+  region takes whole blocks ending inside the level's last block past its edge as
+  `copy_from_texture` does, each way: plain Metal copies the block of a level of 4 x 2 texels at
+  4 x 4 from a buffer too, where Metal's validation layer stops it (`(destinationOrigin.y +
+  sourceSize.height)(4) must be <= height(2)`), and the runtime does what plain Metal does.
   `MTLBlitOptionRowLinearPVRTC` is not offered, as no PVRTC texture is made. Each records
   `vkCmdCopyBufferToImage` or `vkCmdCopyImageToBuffer` against the bytes shaders reach (a Managed
   buffer's device copy, where the device keeps one), one region an image of the region, each at its
@@ -3055,7 +3241,11 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   answers may differ from Metal's on this device, fixed per operation: those of the modules made
   with the state, its variants among them. A kernel compiled
   with fast math carries `FastMathRewrites`: a driver may fold its arithmetic differently per
-  `VkPipeline`, so its answers in a tile and at another size may differ in the last place.
+  `VkPipeline`, so its answers in a tile and at another size may differ in the last place. A
+  kernel that is a function writing a texture slot it does not read carries
+  `DevicePackConversion`, for an 8-bit sRGB texture a dispatch may bind there, whose writes its
+  sRGB variant encodes (the known gaps of textures): the note is fixed at creation and never
+  decided at dispatch.
 - `ComputePipelineState::texture_accesses` answers each texture slot the kernel uses, by index,
   with the access a dispatch of the state marks in its hazards for the texture bound there, read
   from the same interface, as a `BindingAccess` (`MTLBindingAccess`): `ReadOnly` where the
@@ -3424,6 +3614,55 @@ cache is answered compile-required on both.
 
 ### Known gaps of pipeline states
 
+- A kernel bound below its argument's alignment (an argument of 8 or 16 bytes at a multiple of 4)
+  runs a relaxed form of the kernel, whose accesses of that buffer claim 4-byte alignment. A
+  build that took that form for every such argument, bound so or not, ran the harness's four
+  `constant_*` rows on an RTX 3090 in 234-252 us against 99-122 us (job 74651).
+- On a device that binds a kernel's buffers (Bound kernel buffers), a dispatch whose buffers
+  differ from those its command buffer bound last writes a descriptor set for them and binds it,
+  and a kernel whose accesses through a bound storage buffer cost the device more than through an
+  address runs slower than at its addresses. The harness's rows, GPU time of a build with the form
+  over a build that reaches every buffer argument at its address, on the same device (two
+  alternated pairs a job, so two ratios; release; Mesa 26.2.6, NVIDIA 620.70.06), and the CPU
+  instructions the form adds to a dispatch (user space, a run's over its dispatches):
+  - the sets, in rows of many small dispatches: 2,000 command buffers of one dispatch each, each
+    binding its two buffers (`burst_2000`), 1.07x-1.08x and +2,951 instructions on the Iris Xe
+    (m3-max-75203), 1.09x and +1,685 on the Radeon 780M (m3-max-75095), 1.13x-1.19x and +2,089 on
+    the RX 7900 XTX (m3-max-75094), and 1.00x and +3,772 on the RTX 3090 (m3-max-75237); 2,000
+    command buffers of five such dispatches, each in its own compute encoder (`burst_2000x5`), in
+    the same order, 0.94x and +1,161, 1.13x-1.14x and +821, 1.08x-1.09x and +780, and 1.00x and
+    +1,217; a chain of 512 dependent dispatches, each with its own `setBytes` (`dispatch_chain`),
+    1.02x and +1,842, 1.26x-1.27x and +490, 1.29x and +489, and 0.99x-1.00x and +2,422;
+  - the kernel's access, in a row of one large dispatch whose buffers are bound once: a 3x3 filter
+    over a 1920x1080 image (`image_filter`) takes 1.07x-1.08x on the Iris Xe (m3-max-75203), and
+    1.00x on the 780M, the RX 7900 XTX and the RTX 3090;
+  - a recorded stream with compute dispatches took 7.98% more GPU time a frame on the Iris Xe,
+    41.528 ms against 38.460 ms over its 1,050 frames, its four checked frames equal
+    (m3-max-75206). How much of that is the sets' and how much the kernels' slower access is not
+    measured.
+- On a device without the bound form (Bound kernel buffers: lavapipe, the M3 Max under MoltenVK,
+  the UHD 630's Windows driver and the 780M under AMDVLK 2025.Q2.1 among the lab's, each with the
+  query it fails), on a kernel's slots that keep their addresses by structure, and on every render
+  stage, a buffer argument is reached at its device address, with its accesses at an offset that
+  is not a constant checked in the shader (Compute encoders, above), where a native Vulkan program
+  binds the buffer as a storage buffer and the device's own range check applies. A build that
+  reached every kernel's buffer arguments at their addresses took, over a native Vulkan build of
+  the same kernel on the same device (device-local buffers, release, two runs each):
+  - a particle kernel whose inner loop makes one 8-byte load: 1.15x on an RTX 3090 (job
+    m3-max-74929), 1.35x on an RX 7900 XTX (m3-max-74927), 1.37x on an Iris Xe (m3-max-74928) and
+    1.48x-1.50x on a Radeon 780M (m3-max-74926);
+  - a vertical and a horizontal convolution: 1.86x-2.02x and 1.83x on the RTX 3090
+    (m3-max-74960), 1.23x-1.28x and 1.22x on the RX 7900 XTX (m3-max-74959), 1.05x and 1.11x on
+    the Radeon 780M (m3-max-74957).
+
+  A build that bound those arguments as storage buffers under the pipeline's robust buffer access
+  2 ran the particle kernel at 1.01x-1.02x of the native build on the 780M, 1.02x-1.03x on the RX
+  7900 XTX, 1.05x on the RTX 3090 and 1.09x on the Iris Xe (m3-max-75062, m3-max-75063,
+  m3-max-75064, m3-max-75061), so that much of the difference is the address form's. On the Iris
+  Xe the vertical and horizontal convolutions and a copy kernel take 1.38x, 1.38x and 1.61x of the
+  native build at the same threadgroup shape (m3-max-75079), and the build that bound their
+  buffers ran them in the same time (m3-max-75061): that difference is not the address form's,
+  and its cause is not found.
 - A driver's create of a state's main pipeline can fail after the state has answered, where Metal
   compiles the state before it answers and a program never meets a state it was given that cannot
   run. Vulkan lets `vkCreateComputePipelines` and `vkCreateGraphicsPipelines` fail with
@@ -4000,10 +4239,26 @@ cache is answered compile-required on both.
   states (jobs m3-max-63105 to 63108, and m3-max-63132 and m3-max-63156 for the two streams that
   ran past those jobs' 300-second limit).
 - On a device that does not list `VK_EXT_shader_stencil_export`, a fragment function's `[[stencil]]`
-  output is refused at creation, an `Error::Translation` naming `StencilExport`: the translator has
-  no other form. The runtime has refused it on such a device all along, worded otherwise before:
-  the translator's other form bound a storage image through a descriptor, which the identity
-  domains hold none of. Metal's feature set tables give stencil
+  output is drawn by bits (`RuntimeFact::StencilBitDraws`). Each draw through its state is drawn
+  once under the stencil reference 0, then once for each bit of the low 8 of the write masks of
+  the faces whose operations replace, each keeping only the fragments whose output holds that bit
+  (`PushField::StencilBit`), under the reference 255, that bit's write mask, `Replace` kept and
+  every other operation `Keep`, and no depth write; where the state writes the depth under a
+  compare other than `Always` and `Never`, the first draw writes none and a last draw writes it.
+  That is up to 10 draws where Metal draws once (`Metrics::stencil_bit_draws`), and a draw whose
+  state replaces no bit, or tests no stencil, is drawn once. Two fragments of one draw on one
+  sample store the OR of their outputs where Metal stores the later one, and under a depth test
+  that writes, each fragment's stencil operation is chosen against the depth from before the
+  draw: the static note `PrecisionNote::StencilOutputOverlap` on the fragment stage of every such
+  function. Refused at creation there, an `Error::Translation` naming `StencilExport`: a function
+  that also writes a colour or memory, one whose returns cannot discard, a mesh pipeline, and a
+  state made for indirect command buffers. Refused at a draw, `Gap::Draw` of
+  `DrawKind::StencilOutput`: a stencil compare other than `Always` and `Never` on a face, whose
+  answer the output decides, and, where the state replaces a bit, a draw inside a `Counting`
+  visibility result's segment, whose count every one of the draws would add to. A colour beside
+  the output can be built under this form when a guest needs it: every draw through the one
+  pipeline, the colour written the same each time, with blending off on every attachment, the
+  logic operation off and no colour input. Metal's feature set tables give stencil
   feedback to the Apple5 family and later and to Metal 3 and Metal 4. NVIDIA's 615 and 620 drivers
   on the RTX 2080, RTX 3090 and RTX 5080 Laptop list none (`vulkaninfo`, jobs m3-max-48727, 48729
   and 48731); RADV on the RX 7900 XTX, the 780Ms and the RX 550, ANV on the Iris Xe, lavapipe,
@@ -4403,7 +4658,8 @@ cache is answered compile-required on both.
   after what the earlier draws rendered. A draw that needs a copy first, of a texture over a
   buffer in an image of its own or over a
   Managed buffer's device copy, records it the same way, between the rendering's end and its new
-  beginning. Fences record nothing, as in a compute encoder.
+  beginning. Each such end and new beginning inside one encoder counts in
+  `Metrics::rendering_interrupts`. Fences record nothing, as in a compute encoder.
 - Refused, as Metal's validation stops them: a draw with no pipeline state
   (`Refusal::NoPipeline`), a vertex buffer the vertex descriptor reads that is not bound
   (`Refusal::NoBufferAtIndex`) or bound at an offset past its length
@@ -4461,10 +4717,7 @@ cache is answered compile-required on both.
   stepped draws (a WebGL stream's, at rates 2 and 3) are all at base instance 0. A draw that reads
   its own target over a buffer in place, a linear image on the buffer's memory that never leaves the
   general layout, is refused on every device (`AttachmentRead`): no play of the replay streams met
-  it. The forms ruled for it, should a stream meet it, are the read through the image's shadow, the
-  counted copy a device without the feedback loop takes, first, and then, where the device has the
-  feedback loop, unified image layouts and a `LINEAR` image with the feedback usage, the loop on the
-  attachment in the general layout.
+  it.
 - A fetch (`[[color(n)]]`) orders the fragments of earlier draws before it, not the fragments of its
   own draw that cover the same pixel, which Metal orders in primitive order: a fragment may read the
   texel from before an earlier fragment of its draw wrote it
@@ -4639,8 +4892,9 @@ cache is answered compile-required on both.
   `independentResolveNone` does not allow it), a store action an encoder sets that does not
   resolve an attachment whose pass left it `Unknown` with a resolve texture (`LateStore`: the
   rendering began resolving, as Vulkan fixes the resolve as it begins), a 1D texture's
-  attachment, a 3D texture's depth or stencil attachment, a 3D resolve texture, a resolve's depth
-  plane but 0 (`TextureType`), the
+  attachment, a 3D texture's depth or stencil attachment, a 3D resolve texture whatever its
+  `resolveDepthPlane` (`TextureType`; a resolve texture of another type is resolved into as at
+  plane 0, as Metal with its validation layer off does, probe `resolve_depth_planes.m`), the
   `CustomSampleDepthStore` store action, a clear of a format only a shader clears (extended
   range, bfloat, YCbCr), a `renderTargetArrayLength` past the device's `maxFramebufferLayers`
   (`ArrayLength`: Vulkan renders at most that many layers,
@@ -5119,7 +5373,7 @@ Presenting runs on the runtime's own device; nothing is exported or imported.
 | `VK_KHR_shader_subgroup_uniform_control_flow` | device, where listed | SIMD groups' reconvergence where maximal reconvergence is not offered |
 | `VK_KHR_shader_quad_control` | device, where listed | a fragment function's group operations over other lanes, through the quad-control feature below |
 | `VK_EXT_fragment_shader_interlock` | device, where listed | a fragment function's raster order groups on memory it reads and writes, through the pixel-interlock feature below |
-| `VK_EXT_shader_stencil_export` | device, where listed | a fragment function's `[[stencil]]` output as the fragment's stencil reference (`FragStencilRefEXT`); RADV, ANV, lavapipe, KosmicKrisp and the UHD 630's Windows driver list it, NVIDIA's 615 and 620 drivers do not |
+| `VK_EXT_shader_stencil_export` | device, where listed | a fragment function's `[[stencil]]` output as the fragment's stencil reference (`FragStencilRefEXT`); a device without it draws the output by bits (the known gaps); RADV, ANV, lavapipe, KosmicKrisp and the UHD 630's Windows driver list it, NVIDIA's 615 and 620 drivers do not |
 | `VK_KHR_portability_enumeration` | instance, where offered | listing portability devices, each checked against the floor as any other |
 | `VK_KHR_portability_subset` | device, where listed | Vulkan requires it enabled where a device lists it; the device is asked for the portability features below |
 | `VK_EXT_attachment_feedback_loop_layout` | device, with the feedback loop | a draw's read of an attachment of its own pass through a texture, in the feedback layout, with the colour flag every render pipeline takes (below) |
@@ -5133,6 +5387,7 @@ Presenting runs on the runtime's own device; nothing is exported or imported.
 | `VK_EXT_image_drm_format_modifier` | device, where listed | a dma-buf surface's planes in place, as `DRM_FORMAT_MOD_LINEAR` images (`Device::new_exported_surface`) |
 | `VK_NV_linear_color_attachment` | device, where listed | an opaque handle's surface planes in place whose `LINEAR` tiling renders as a linear colour attachment alone, through the linear-attachment feature below |
 | `VK_EXT_device_fault` | device, where listed | a lost device's fault report, read once at its first loss (`DeviceLoss::fault`), through the fault-report feature below |
+| `VK_EXT_pipeline_robustness` | device, where listed | a kernel's buffers bound as storage buffers of set 0, contained by its pipeline's robust buffer access 2, through the pipeline-robustness feature below (Bound kernel buffers) |
 | `VK_KHR_maintenance8` | device, where listed | a sample at a texel offset the shader computes, with the offset as the sample's own `Offset` operand, through the optional feature `maintenance8` below |
 | `VK_EXT_custom_border_color` | device, where reported from the image | Vulkan requires it of a device that enables the border swizzle below; none of its features is enabled |
 | `VK_EXT_border_color_swizzle` | device, where reported from the image | an opaque-black border sampled through a view whose component mapping is not the identity, defined and read through that mapping (Border swizzle, below) |
@@ -5365,15 +5620,20 @@ below 256 an indirect command reaches fewer vertex slots (Known gaps of indirect
 The runtime submits to the first queue family with `VK_QUEUE_GRAPHICS_BIT` and
 `VK_QUEUE_COMPUTE_BIT` (`floor::Capabilities::queue_family`). It allocates buffers from three memory
 types, each the first with its flags that a buffer of `floor::BUFFER_USAGE` can use: every buffer
-usage Vulkan 1.3 defines, and device addresses. Vulkan guarantees such a buffer a device-local
+usage Vulkan 1.3 defines, and device addresses. Of the types with Shared's flags, the first that is
+also host-coherent is taken where the device has one; where the type taken is not, the runtime
+flushes and invalidates Shared memory (Shared memory's coherence). Vulkan guarantees such a buffer a device-local
 type, so of the three only Shared and the ring can be missing on a conforming device. Vulkan answers which memory types a buffer can use
 only for a created device, so `PhysicalDevice::check` finds a type with each set of flags, and
-`Device::new` chooses on the device (`Device::memory_types` answers `floor::MemoryTypes`).
+`Device::new` chooses on the device (`Device::memory_types` answers `floor::MemoryTypes`). A device
+without one is refused with `floor::Missing::MemoryType`, which names the flags it lacks and every
+memory type the device offers buffers, by index and flags: from `PhysicalDevice::check`, every type
+the device lists.
 
 | Memory type | Flags | Used for |
 |---|---|---|
 | Private | `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` | Private storage, which only the GPU reads and writes |
-| Shared | `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`, `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`, `VK_MEMORY_PROPERTY_HOST_CACHED_BIT` | Shared storage, which the host maps and reads |
+| Shared | `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`, `VK_MEMORY_PROPERTY_HOST_CACHED_BIT` | Shared storage, which the host maps and reads |
 | ring | `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`, `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`, `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` | the parameter ring, which the host writes with no flush and the GPU reads |
 
 Vulkan's device type, not the Shared type's flags, decides a Managed buffer's form: on a device
@@ -5423,7 +5683,9 @@ Six features choose between two forms by the device's answer: 16-bit floats, sto
 without a format, 64-bit atomics, 64-bit floats, SIMD groups and run-time texel offsets. Beside
 them, a device without the
 attachment feedback loop reads attachments through a copy, the one form left there, which is a
-known gap (Known gaps of render encoders). `floor::Capabilities` holds each answer the floor
+known gap (Known gaps of render encoders), and a kernel reaches its buffers through storage
+buffers of set 0 where the device answers that form's query and at their addresses elsewhere
+(Bound kernel buffers below). `floor::Capabilities` holds each answer the floor
 reads, and the features and extensions to enable: the floor's, and each optional one the device
 has.
 
@@ -5468,6 +5730,71 @@ is expected to take the loop, not verified in the lab (public reports of it list
 | Attachment-read feature | Structure | Used for |
 |---|---|---|
 | `attachmentFeedbackLoopLayout` | `VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT` | the feedback layout and usage |
+
+### Bound kernel buffers
+
+Where the device lists `VK_EXT_pipeline_robustness`, reports the feature below, and its
+`maxPerStageUpdateAfterBindResources` holds set 1's arrays of the compute stage with set 0's 31
+storage buffers (`floor::kernel_buffers_fit`), device creation enables the feature, and none of
+it otherwise. The translator's profile then answers its query from the rest
+(`DeviceProfile::binds_kernel_buffers`, docs/API.md section 1): `robustBufferAccess2` and
+`robustBufferAccessUpdateAfterBind` supported (`robustBufferAccess2` is not enabled), the
+storage-buffer limits of set 0 at 31 or more, and `maxStorageBufferRange` at least
+`MAX_BUFFER_LENGTH` plus the buffer base alignment less 1. Where it answers yes:
+
+- every pipeline layout of the device has set 0 of 31 storage buffers, for the compute stage
+  (`arrays::buffer_bindings`), which render pipelines share and read none of;
+- a kernel reaches each buffer argument through its binding there, but the four kinds of slot that
+  keep their address by structure (docs/API.md section 1: a slot a wide pointer, a typed atomic
+  or the stage-in fetch reaches, and one bound at a multiple of 4 below its argument's
+  alignment). Its compute pipeline is made with `VkPipelineRobustnessCreateInfo` naming robust
+  buffer access 2 for storage buffers, under which a load outside a descriptor's range reads
+  zero and a store does nothing, so its accesses carry no check in the shader but an atomic's;
+- a dispatch describes each bound slot's buffer by its block's `VkBuffer`, from the buffer's
+  first byte rounded down to the buffer base alignment through its last (no `VkBuffer` of its
+  own, and no copy), and pushes the slot's bytes from there to its bind address
+  (`PushField::SlotBindOffset`). A dispatch whose slots' descriptors begin those of the set its
+  command buffer wrote last writes none and binds that set only where the Vulkan command buffer
+  does not hold it, so a changed bind offset alone is a push word; any other takes a set, writes
+  it and binds it. The device's sets are in pools of 256, allocated as the pool is
+  made, which command buffers share: a command buffer takes its sets from the pool the device
+  hands out from in runs, the first of one set and each next as long as all it took before, up to
+  32, so it holds no more sets unused than it wrote and at most 31; it gives them back as it
+  retires or drops uncommitted. A pool is free again once every set taken from it is back. The
+  device keeps at most 16 free pools besides the one it hands out from and destroys the rest, and
+  counts every pool alive (the `buffer_set_pools` gauge). So a device with no pending command
+  buffer holds at most 17 pools: 4,352 sets of 31 storage-buffer descriptors, 134,912
+  descriptors; on RADV (Mesa's source: 16 bytes of device memory a descriptor, 128 bytes of host
+  memory a set) 2.06 MiB of device memory and 0.53 MiB of host memory, and the runtime's own
+  2 KiB a pool for its sets' handles. Pending command buffers hold, besides, the pools their sets
+  are of. One lock orders a pool's making, its sets' allocation, the takes and give-backs, and a
+  pool's destruction; a set is written only while no pending work names it, by the one command
+  buffer that holds it.
+
+The dispatches by form, and the sets written and held, are counted (Counters). The containment
+differs from the address form's by bytes the queries state: before a buffer whose first byte is
+not a multiple of 16 (a no-copy buffer), up to 15; past a length that is not a multiple of 4, up
+to 3 where `robustStorageBufferAccessSizeAlignment` is 4 (RADV, ANV, AMDVLK, KosmicKrisp), none
+where it is 1 (NVIDIA). A read there reads those bytes and a write lands in them: the same
+process's memory, its own or shared with it by name; past a buffer the consumer placed in a block
+as `Device::heap_buffer_size_and_align` answers, the block's padding before the next buffer, zero
+or the same device's earlier bytes, never another device's (docs/API.md section 10). The test
+`pool_reach` reads and writes before and past a buffer between two neighbours of one block, past
+those bytes, and finds zero and no write on the Iris Xe (ANV), the Radeon 780M and RX 7900 XTX
+(RADV), the RTX 3090 (NVIDIA 620.70.06) and the M3 Max (KosmicKrisp 26.3.1) in this form (jobs
+m3-max-75037, 75038, 75039, 75040, 75048), and on the 780M under AMDVLK in the address form
+(m3-max-75041).
+
+The Radeon 780M under AMDVLK 2025.Q2.1 reports Vulkan 1.4, where the feature is core, and lists
+no `VK_EXT_pipeline_robustness`; the runtime's instance asks Vulkan 1.3, so the device keeps
+addresses there (m3-max-75042). lavapipe (`maxStorageBufferRange` 128 MiB; no dispatch bound in
+m3-max-75211), the M3 Max under MoltenVK (no `robustBufferAccess2`, by the validation crate's
+`moltenvk-m3` profile) and the UHD 630's Windows driver 101.2145 (no
+`VK_EXT_pipeline_robustness`) keep addresses too.
+
+| Pipeline-robustness feature | Structure | Used for |
+|---|---|---|
+| `pipelineRobustness` | `VkPhysicalDevicePipelineRobustnessFeaturesEXT` | a compute pipeline's robust buffer access 2 for its storage buffers, whatever the device enables |
 
 ### Border swizzle
 

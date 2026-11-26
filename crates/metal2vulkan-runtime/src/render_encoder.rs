@@ -85,9 +85,10 @@
 
 use crate::alias;
 use crate::buffer::{Buffer, BufferInner, BufferObject};
+use crate::coherence::Range;
 use crate::command::{Building, CommandBuffer};
 use crate::counters::Metric;
-use crate::depth_stencil::{DepthStencilState, Face, Tests};
+use crate::depth_stencil::{BitDraws, DepthStencilState, Face, Tests, EVERY_FRAGMENT};
 use crate::device::Core;
 use crate::encoder::{
     check_alignment, merge, Declared, Resource, ResourceUsage, BUFFER_SLOTS, SAMPLER_SLOTS,
@@ -405,6 +406,23 @@ impl Facts {
             });
         Ok(())
     }
+}
+
+/// The Shared memory a draw of `draws` writes through its bound slots, `tables`: each buffer slot
+/// a function writes bound to a Shared buffer, and each texture slot one writes bound to a
+/// texture over one (`crate::coherence`).
+fn shared_writes<'a>(
+    draws: &'a Draws,
+    tables: &'a [Tables; 2],
+    atom: u64,
+) -> impl Iterator<Item = Range> + 'a {
+    let buffers = (draws.buffers.iter())
+        .filter(|(_, _, access)| access.writes())
+        .filter_map(move |&(table, slot, _)| tables[table].buffer(slot)?.shared_range(atom));
+    let textures = (draws.textures.iter())
+        .filter(|(_, _, access)| access.writes())
+        .filter_map(move |&(table, slot, _)| tables[table].texture(slot)?.shared_range(atom));
+    buffers.chain(textures)
 }
 
 /// What a draw reads of its pass's attachments through textures
@@ -879,6 +897,12 @@ fn begin(
     if host_reads {
         building.wrote_host();
     }
+    // Every attachment over a Shared buffer is the pass's to write (`crate::coherence`).
+    if let Some(held) = building.coherence() {
+        for texture in (pass.targets().map(|t| &t.texture)).chain(resolves().map(|r| &r.texture)) {
+            held.wrote(texture.shared_range(held.atom));
+        }
+    }
     building.overs_after(overs(), false);
     building.count(Metric::Passes);
     let earlier = [memory_barrier(Reach::Commands)];
@@ -909,7 +933,7 @@ fn begin(
                     .image_memory_barriers(&away),
             );
         }
-        building.count(Metric::Barriers);
+        building.count(Metric::PassStartBarriers);
     }
     // SAFETY: the command buffer records outside any render pass and keeps each attachment's
     // texture until it retires; each attachment is in the layout the pass names.
@@ -1540,7 +1564,8 @@ impl RenderCommandEncoder {
         let query = self.building().take_query()?;
         // SAFETY: as above.
         unsafe { self.results.end(&self.core.device, self.command) };
-        self.results.start(offset, query);
+        self.results
+            .start(offset, query, mode == VisibilityResultMode::Counting);
         Ok(())
     }
 
@@ -1589,6 +1614,9 @@ impl RenderCommandEncoder {
         building.wrote_managed(&**buffer);
         if buffer.is_shared() {
             building.wrote_host();
+        }
+        if let Some(held) = building.coherence() {
+            held.wrote(buffer.shared_range(held.atom));
         }
     }
 
@@ -1731,7 +1759,7 @@ impl RenderCommandEncoder {
         (self.drew, self.owed) = (false, false);
         self.interrupt(|building, _| {
             let command = building.ordered_command()?;
-            building.barrier(command, Reach::Commands);
+            building.barrier(command, Reach::Commands, Metric::OtherBarriers);
             Ok(())
         })
     }
@@ -1776,7 +1804,7 @@ impl RenderCommandEncoder {
                         .image_memory_barriers(&images),
                 )
             };
-            building.count(Metric::Barriers);
+            building.count(Metric::OtherBarriers);
             Ok(())
         })
     }
@@ -1926,8 +1954,8 @@ impl RenderCommandEncoder {
                     &vk::DependencyInfo::default().image_memory_barriers(&back),
                 );
             }
-            building.count(Metric::Barriers);
-            building.count(Metric::Barriers);
+            building.count(Metric::OtherBarriers);
+            building.count(Metric::OtherBarriers);
             core.counters.attachment_read_copied(count, bytes);
             Ok(())
         })
@@ -2008,6 +2036,17 @@ impl RenderCommandEncoder {
         let Some(access) = usage.access() else {
             return Ok(());
         };
+        // What it writes of Shared memory is settled before the host sees its progress, where
+        // the Shared type is not host-coherent (`crate::coherence`).
+        if let Some(held) = self.building().coherence() {
+            if access.writes() {
+                held.wrote(match resource {
+                    Resource::Buffer(buffer) => buffer.shared_range(held.atom),
+                    Resource::Texture(texture) => texture.shared_range(held.atom),
+                    Resource::IndirectCommandBuffer(_) => None,
+                });
+            }
+        }
         // A read of an attachment the pass holds out of its home layout: of it, of a view of its
         // image or of the buffer it lies over in place, all of which name its hazard id.
         let held =
@@ -2424,6 +2463,15 @@ impl RenderCommandEncoder {
         if !self.facts.held {
             self.facts
                 .find(draws, &self.tables, &self.pass, &self.declared)?;
+            // The Shared memory its bound slots write, once for the facts: the bindings are the
+            // same until they change, which finds the facts again (`crate::coherence`).
+            if self.facts.host {
+                if let Some(held) = (self.building.as_mut()).and_then(Building::coherence) {
+                    for range in shared_writes(draws, &self.tables, held.atom) {
+                        held.wrote(Some(range));
+                    }
+                }
+            }
         }
         // Metal orders a colour attachment's read (`[[color(n)]]`) after every earlier fragment of
         // the pass, with no barrier from the program: after a draw of the pass, a draw that reads
@@ -2491,6 +2539,17 @@ impl RenderCommandEncoder {
         if lines && self.line_width != 1.0 {
             return gap(DrawKind::LineWidth);
         }
+        // A fragment function's stencil output drawn by bits: the draws this draw takes and the
+        // push offset of the bit each keeps, where it takes more than one.
+        let bits = match draws.stencil_bit {
+            None => None,
+            Some(at) => match BitDraws::of(self.tests, self.stencil_reference) {
+                None => return gap(DrawKind::StencilOutput),
+                Some(each) if each.draws().len() == 1 => None,
+                Some(_) if self.results.counts_samples() => return gap(DrawKind::StencilOutput),
+                Some(each) => Some((at as usize, each)),
+            },
+        };
         // Points Metal does not rasterize: the vertex function runs, behind an empty scissor.
         let hidden = topology == vk::PrimitiveTopology::POINT_LIST && !compiled.rasterizes_points();
         let pipeline = compiled.pipeline(topology, self.raster)?;
@@ -2627,6 +2686,10 @@ impl RenderCommandEncoder {
             self.push_filled = !commands;
         }
         let push = !self.push.is_empty() && building.push_needed(&self.push);
+        // A draw by bits records each of its draws' tests and reference before that draw.
+        if bits.is_some() {
+            self.dirty &= !(DEPTH | STENCIL | REFERENCE);
+        }
         let core = &*self.core;
         let command = self.command;
         // SAFETY: the command buffer is inside the pass's rendering, which the pipeline renders
@@ -2678,127 +2741,153 @@ impl RenderCommandEncoder {
             if push {
                 device.cmd_push_constants(command, core.layout, PUSH_STAGES, 0, &self.push);
             }
-            match (call, index) {
-                (
-                    Call::Indexed {
-                        index_count,
-                        base_vertex,
-                        ..
-                    },
-                    Some((_, buffer, offset, ty)),
-                ) => {
-                    device.cmd_bind_index_buffer(command, buffer, offset, ty);
-                    device.cmd_draw_indexed(
-                        command,
-                        index_count,
-                        instance_count,
-                        0,
-                        base_vertex,
-                        base_instance,
-                    );
-                }
-                (
-                    Call::Direct {
-                        vertex_start,
-                        vertex_count,
-                    },
-                    _,
-                ) => device.cmd_draw(
-                    command,
-                    vertex_count,
-                    instance_count,
-                    vertex_start,
-                    base_instance,
-                ),
-                (
-                    Call::Patches {
-                        patch_start,
-                        patch_count,
-                    },
-                    _,
-                ) => device.cmd_draw(
-                    command,
-                    patch_count,
-                    instance_count,
-                    patch_start,
-                    base_instance,
-                ),
-                (
-                    Call::Indirect {
-                        arguments, offset, ..
-                    },
-                    index,
-                ) => {
-                    let (reached, at) = arguments.device_range();
-                    let stride = indirect_bytes(index.is_some()) as u32;
-                    match index {
-                        Some((_, buffer, index_offset, ty)) => {
-                            device.cmd_bind_index_buffer(command, buffer, index_offset, ty);
-                            device.cmd_draw_indexed_indirect(
-                                command,
-                                reached,
-                                at + offset,
-                                1,
-                                stride,
-                            );
+            // A draw by bits: each of its draws after its tests, its reference and, past the
+            // first, whose bit is the one the push bytes hold, its bit.
+            let bit_draws = bits
+                .as_ref()
+                .map_or(&[][..], |(_, bit_draws)| bit_draws.draws());
+            for at in 0..bit_draws.len().max(1) {
+                if let (Some(draw), Some((offset, _))) = (bit_draws.get(at), &bits) {
+                    record_tests(device, command, draw.tests, self.recorded, (true, true));
+                    self.recorded = Some(draw.tests);
+                    if at == 0 || bit_draws[at - 1].reference != draw.reference {
+                        record_reference(device, command, draw.reference);
+                    }
+                    if at > 0 {
+                        let offset = *offset;
+                        let bit = draw.bit.to_le_bytes();
+                        self.push[offset..offset + 4].copy_from_slice(&bit);
+                        if building.push_needed(&self.push) {
+                            let pushed = &self.push;
+                            device.cmd_push_constants(command, core.layout, PUSH_STAGES, 0, pushed);
                         }
-                        None => device.cmd_draw_indirect(command, reached, at + offset, 1, stride),
                     }
                 }
-                (
-                    Call::Commands {
-                        buffer,
-                        first,
-                        sequences,
-                        counts,
-                        ..
-                    },
-                    _,
-                ) => {
-                    if let (Some(indirect), Some((shape, _, preprocess))) =
-                        (&core.indirect, &execution)
-                    {
-                        // One execution of each part, in order, each part's first command pushed
-                        // at the base field; the first part's push is the draw's own. Over a
-                        // range a buffer holds, each part runs as many as its count says.
-                        let layout = buffer.layout();
-                        let info = crate::dgc::PipelineInfo::new(pipeline);
-                        let base = shape.base as usize;
-                        for (part, from) in (0..sequences).step_by(shape.part as usize).enumerate()
-                        {
-                            let count = (sequences - from).min(shape.part);
-                            let counted = match counts {
-                                0 => 0,
-                                counts => counts + 4 * part as u64,
-                            };
-                            if part > 0 {
-                                let command_index = first + from;
-                                self.push[base..base + 4]
-                                    .copy_from_slice(&command_index.to_le_bytes());
-                                device.cmd_push_constants(
+                match (call, index) {
+                    (
+                        Call::Indexed {
+                            index_count,
+                            base_vertex,
+                            ..
+                        },
+                        Some((_, buffer, offset, ty)),
+                    ) => {
+                        device.cmd_bind_index_buffer(command, buffer, offset, ty);
+                        device.cmd_draw_indexed(
+                            command,
+                            index_count,
+                            instance_count,
+                            0,
+                            base_vertex,
+                            base_instance,
+                        );
+                    }
+                    (
+                        Call::Direct {
+                            vertex_start,
+                            vertex_count,
+                        },
+                        _,
+                    ) => device.cmd_draw(
+                        command,
+                        vertex_count,
+                        instance_count,
+                        vertex_start,
+                        base_instance,
+                    ),
+                    (
+                        Call::Patches {
+                            patch_start,
+                            patch_count,
+                        },
+                        _,
+                    ) => device.cmd_draw(
+                        command,
+                        patch_count,
+                        instance_count,
+                        patch_start,
+                        base_instance,
+                    ),
+                    (
+                        Call::Indirect {
+                            arguments, offset, ..
+                        },
+                        index,
+                    ) => {
+                        let (reached, at) = arguments.device_range();
+                        let stride = indirect_bytes(index.is_some()) as u32;
+                        match index {
+                            Some((_, buffer, index_offset, ty)) => {
+                                device.cmd_bind_index_buffer(command, buffer, index_offset, ty);
+                                device.cmd_draw_indexed_indirect(
                                     command,
-                                    core.layout,
-                                    PUSH_STAGES,
-                                    0,
-                                    &self.push,
+                                    reached,
+                                    at + offset,
+                                    1,
+                                    stride,
                                 );
                             }
-                            let stream =
-                                buffer.records().memory.address + layout.command(first + from);
-                            let size = u64::from(count) * u64::from(layout.stride());
-                            let at = *preprocess + shape.part_stride() * part as u64;
-                            let generated = crate::dgc::CommandsInfo::new(
-                                &info,
-                                shape.layout.handle(),
-                                (stream, size),
-                                (at, shape.preprocess_size()),
-                                (count, counted),
-                            );
-                            (indirect.dgc.execute)(command, vk::FALSE, &generated);
+                            None => {
+                                device.cmd_draw_indirect(command, reached, at + offset, 1, stride)
+                            }
                         }
                     }
+                    (
+                        Call::Commands {
+                            buffer,
+                            first,
+                            sequences,
+                            counts,
+                            ..
+                        },
+                        _,
+                    ) => {
+                        if let (Some(indirect), Some((shape, _, preprocess))) =
+                            (&core.indirect, &execution)
+                        {
+                            // One execution of each part, in order, each part's first command pushed
+                            // at the base field; the first part's push is the draw's own. Over a
+                            // range a buffer holds, each part runs as many as its count says.
+                            let layout = buffer.layout();
+                            let info = crate::dgc::PipelineInfo::new(pipeline);
+                            let base = shape.base as usize;
+                            for (part, from) in
+                                (0..sequences).step_by(shape.part as usize).enumerate()
+                            {
+                                let count = (sequences - from).min(shape.part);
+                                let counted = match counts {
+                                    0 => 0,
+                                    counts => counts + 4 * part as u64,
+                                };
+                                if part > 0 {
+                                    let command_index = first + from;
+                                    self.push[base..base + 4]
+                                        .copy_from_slice(&command_index.to_le_bytes());
+                                    device.cmd_push_constants(
+                                        command,
+                                        core.layout,
+                                        PUSH_STAGES,
+                                        0,
+                                        &self.push,
+                                    );
+                                }
+                                let stream =
+                                    buffer.records().memory.address + layout.command(first + from);
+                                let size = u64::from(count) * u64::from(layout.stride());
+                                let at = *preprocess + shape.part_stride() * part as u64;
+                                let generated = crate::dgc::CommandsInfo::new(
+                                    &info,
+                                    shape.layout.handle(),
+                                    (stream, size),
+                                    (at, shape.preprocess_size()),
+                                    (count, counted),
+                                );
+                                (indirect.dgc.execute)(command, vk::FALSE, &generated);
+                            }
+                        }
+                    }
+                    (Call::Indexed { .. }, None) => {}
                 }
-                (Call::Indexed { .. }, None) => {}
             }
         }
         // An execution holds its records, layout and region until the command buffer retires,
@@ -2808,6 +2897,16 @@ impl RenderCommandEncoder {
             building.keep_block(buffer.records());
             building.keep_executed(executed);
             building.pushes_lost();
+        }
+        // After a draw by bits, the push bytes keep every fragment again, and the next draw
+        // records the encoder's tests and reference where they differ from the last draw's.
+        if let Some((offset, bit_draws)) = &bits {
+            let every = EVERY_FRAGMENT.to_le_bytes();
+            self.push[*offset..*offset + 4].copy_from_slice(&every);
+            self.dirty |= DEPTH | STENCIL | REFERENCE;
+            for _ in 1..bit_draws.draws().len() {
+                building.count(Metric::StencilBitDraws);
+            }
         }
         if self.facts.levels {
             building.count(Metric::LevelFieldCommands);
@@ -2971,7 +3070,7 @@ impl RenderCommandEncoder {
                 }
                 core.device.cmd_dispatch(command, parts, 1, 1);
             }
-            building.barrier(command, Reach::Commands);
+            building.barrier(command, Reach::Commands, Metric::OtherBarriers);
             Ok(())
         })?;
         Ok(counts)
@@ -3275,7 +3374,15 @@ impl RenderCommandEncoder {
         self.interrupt(|building, core| {
             // SAFETY: the rendering ended, and the command buffer keeps each texture it uses
             // until it retires.
-            unsafe { alias::record(&core.device, command, &moves, &mut |m| building.count(m)) };
+            unsafe {
+                alias::record(
+                    &core.device,
+                    command,
+                    &moves,
+                    Metric::OtherBarriers,
+                    &mut |m| building.count(m),
+                )
+            };
             Ok(())
         })
     }
@@ -3358,7 +3465,6 @@ impl RenderCommandEncoder {
         let command = self.command;
         let dirty = self.dirty;
         self.dirty = 0;
-        let both = [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK];
         // SAFETY: the command buffer records; each state is dynamic in every render pipeline.
         unsafe {
             // As many scissors as viewports, as Vulkan's with-count states require.
@@ -3398,50 +3504,12 @@ impl RenderCommandEncoder {
             // Of the tests, the fields that differ from the ones last recorded; every field
             // before the first draw. A draw whose tests are not dirty copies none of them.
             if dirty & (DEPTH | STENCIL) != 0 {
-                let (t, was) = (self.tests, self.recorded);
-                if dirty & DEPTH != 0 {
-                    if was.is_none_or(|w| w.depth_test != t.depth_test) {
-                        device.cmd_set_depth_test_enable(command, t.depth_test);
-                    }
-                    if was.is_none_or(|w| w.depth_write != t.depth_write) {
-                        device.cmd_set_depth_write_enable(command, t.depth_write);
-                    }
-                    if was.is_none_or(|w| w.depth_compare != t.depth_compare) {
-                        device.cmd_set_depth_compare_op(command, t.depth_compare);
-                    }
-                }
-                if dirty & STENCIL != 0 {
-                    if was.is_none_or(|w| w.stencil != t.stencil) {
-                        device.cmd_set_stencil_test_enable(command, t.stencil);
-                    }
-                    for (at, face) in both.iter().enumerate() {
-                        let f = &t.faces[at];
-                        let old = was.map(|w| w.faces[at]);
-                        let ops = |f: &Face| (f.fail, f.pass, f.depth_fail, f.compare);
-                        if old.is_none_or(|o| ops(&o) != ops(f)) {
-                            device.cmd_set_stencil_op(
-                                command,
-                                *face,
-                                f.fail,
-                                f.pass,
-                                f.depth_fail,
-                                f.compare,
-                            );
-                        }
-                        if old.is_none_or(|o| o.compare_mask != f.compare_mask) {
-                            device.cmd_set_stencil_compare_mask(command, *face, f.compare_mask);
-                        }
-                        if old.is_none_or(|o| o.write_mask != f.write_mask) {
-                            device.cmd_set_stencil_write_mask(command, *face, f.write_mask);
-                        }
-                    }
-                }
-                self.recorded = Some(t);
+                let parts = (dirty & DEPTH != 0, dirty & STENCIL != 0);
+                record_tests(device, command, self.tests, self.recorded, parts);
+                self.recorded = Some(self.tests);
             }
             if dirty & REFERENCE != 0 {
-                for (face, reference) in both.iter().zip(self.stencil_reference) {
-                    device.cmd_set_stencil_reference(command, *face, reference);
-                }
+                record_reference(device, command, self.stencil_reference);
             }
             if dirty & BLEND != 0 {
                 device.cmd_set_blend_constants(command, &self.blend_color);
@@ -3509,7 +3577,8 @@ impl RenderCommandEncoder {
 
     /// Ends the pass's rendering, has `record` record into the command buffer, and begins the
     /// rendering again, loading what it stored; the rendering's draws since it began are
-    /// unwritten again.
+    /// unwritten again. Counted in
+    /// [`Metrics::rendering_interrupts`](crate::Metrics::rendering_interrupts).
     fn interrupt(
         &mut self,
         record: impl FnOnce(&mut Building, &Core) -> Result<(), Error>,
@@ -3524,6 +3593,7 @@ impl RenderCommandEncoder {
         // SAFETY: the command buffer is inside the pass's rendering, which nothing else records
         // into while the encoder holds it.
         unsafe { core.device.cmd_end_rendering(self.command) };
+        building.count(Metric::RenderingInterrupts);
         let recorded = record(building, core);
         // SAFETY: the command buffer records outside any rendering and keeps each attachment's
         // texture until it retires; each attachment stays in the layout the pass renders it in,
@@ -3592,7 +3662,7 @@ impl RenderCommandEncoder {
                         .image_memory_barriers(&back),
                 );
             }
-            building.count(Metric::Barriers);
+            building.count(Metric::PassHomeBarriers);
         }
         // A resolve into a resolve image copies its render area into the buffer's bytes, at the
         // texture's pitch, after the barrier that moved the image home; the barrier that orders
@@ -3645,6 +3715,75 @@ impl RenderCommandEncoder {
     /// `tests::draw` reads.
     pub(crate) fn unrecorded(&self) -> u32 {
         self.dirty
+    }
+}
+
+/// Records the fields of `tests` that differ from `was`, the tests last recorded (every field
+/// where none were), of its depth part and of its stencil part where `parts` says so.
+///
+/// # Safety
+///
+/// `command` records; each state is dynamic in every render pipeline.
+unsafe fn record_tests(
+    device: &ash::Device,
+    command: vk::CommandBuffer,
+    t: Tests,
+    was: Option<Tests>,
+    (depth, stencil): (bool, bool),
+) {
+    let both = [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK];
+    // SAFETY: by the caller.
+    unsafe {
+        if depth {
+            if was.is_none_or(|w| w.depth_test != t.depth_test) {
+                device.cmd_set_depth_test_enable(command, t.depth_test);
+            }
+            if was.is_none_or(|w| w.depth_write != t.depth_write) {
+                device.cmd_set_depth_write_enable(command, t.depth_write);
+            }
+            if was.is_none_or(|w| w.depth_compare != t.depth_compare) {
+                device.cmd_set_depth_compare_op(command, t.depth_compare);
+            }
+        }
+        if stencil {
+            if was.is_none_or(|w| w.stencil != t.stencil) {
+                device.cmd_set_stencil_test_enable(command, t.stencil);
+            }
+            for (at, face) in both.iter().enumerate() {
+                let f = &t.faces[at];
+                let old = was.map(|w| w.faces[at]);
+                let ops = |f: &Face| (f.fail, f.pass, f.depth_fail, f.compare);
+                if old.is_none_or(|o| ops(&o) != ops(f)) {
+                    device.cmd_set_stencil_op(
+                        command,
+                        *face,
+                        f.fail,
+                        f.pass,
+                        f.depth_fail,
+                        f.compare,
+                    );
+                }
+                if old.is_none_or(|o| o.compare_mask != f.compare_mask) {
+                    device.cmd_set_stencil_compare_mask(command, *face, f.compare_mask);
+                }
+                if old.is_none_or(|o| o.write_mask != f.write_mask) {
+                    device.cmd_set_stencil_write_mask(command, *face, f.write_mask);
+                }
+            }
+        }
+    }
+}
+
+/// Records `reference`, each face's stencil reference.
+///
+/// # Safety
+///
+/// As [`record_tests`].
+unsafe fn record_reference(device: &ash::Device, command: vk::CommandBuffer, reference: [u32; 2]) {
+    let both = [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK];
+    for (face, reference) in both.iter().zip(reference) {
+        // SAFETY: by the caller.
+        unsafe { device.cmd_set_stencil_reference(command, *face, reference) };
     }
 }
 
@@ -3761,7 +3900,12 @@ fn fill_push(
             FieldValue::IndirectRange => bytes[at..at + 8].copy_from_slice(&whole.to_le_bytes()),
             FieldValue::IndirectSequence | FieldValue::IndirectBase => bytes[at..at + 4].fill(0),
             // A render content has no dispatch or stage-in region (`render::draws`).
-            FieldValue::DispatchRegion | FieldValue::StageInRegion | FieldValue::PrivateArena => {}
+            // A render content has none of these (`crate::render`): its stages reach every buffer
+            // at its address.
+            FieldValue::DispatchRegion
+            | FieldValue::StageInRegion
+            | FieldValue::PrivateArena
+            | FieldValue::BindOffset { .. } => {}
         }
     }
 }

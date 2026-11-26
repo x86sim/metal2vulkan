@@ -3,10 +3,11 @@
 //! What the runtime does not build yet is skipped and counted: a render pipeline state it answers
 //! with a typed gap or the translator refuses (`render_states`, by the gap, with the first state
 //! and the runtime's answer of each); a render encoder whose pass the
-//! runtime's descriptor cannot hold (a depth plane, store action options, layered or tile
-//! rendering, a skipped texture, resolve texture or visibility result buffer) or that it answers
-//! with a typed gap (`encoders`); a draw whose pipeline state, or a buffer or texture bound to
-//! either stage, is a skipped object (`draws`); and a render command the runtime answers with a
+//! runtime's descriptor cannot hold (store action options, tile rendering, a skipped texture,
+//! resolve texture or visibility result buffer) or that it answers with a typed gap (`encoders`;
+//! a layered pass, `renderTargetArrayLength` 2 or more, plays as the runtime's descriptor holds
+//! it); a draw whose pipeline state, or a buffer or texture bound to either stage, is a skipped
+//! object (`draws`); and a render command the runtime answers with a
 //! typed gap, a draw it does not build and a visibility result mode in an `Accumulate` pass among
 //! them, or a visibility result mode it refuses as Metal's validation does (`render_commands`, by
 //! the gap, or `Refused(KIND)` by the refusal's kind, with the first frame and call of each),
@@ -16,6 +17,11 @@
 //! Visibility results play as the runtime's: the pass's `visibilityResultBuffer` and
 //! `visibilityResultType`, and each `setVisibilityResultMode:offset:`, whose counts the runtime
 //! writes into the buffer at the pass's end.
+//!
+//! `setSamplePositions:count:` plays as the runtime treats it: its descriptor has no field for
+//! the positions, and every multisample pass rasterizes at Vulkan's standard sample locations,
+//! with no refusal. A render encoder the runtime makes of a pass whose positions differ from
+//! Metal's default positions for the pass's sample count is counted (`OtherPositions`).
 
 use super::super::args::{arg, data, index, list, metal, refuse, uint, Fields};
 use super::super::translator::{self, attachment_keys, LINKED_KEYS, PASS_KEYS};
@@ -80,6 +86,63 @@ impl UnrecordedTessellation {
     }
 }
 
+/// Metal's default sample positions of 1, 2 and 4 samples, each `(x, y)` in the pixel, where a
+/// pass that sets none rasterizes: Vulkan's standard sample locations of those counts (the Vulkan
+/// specification, Multisampling, the "Standard Sample Locations" table), which the runtime's
+/// floor requires (`standardSampleLocations`, under Floor in the runtime's README, whose known
+/// gaps name them Metal's default positions at 1, 2 and 4 samples), and at which the conformance
+/// suite's `sample-positions-default-4x` and `sample-positions-default-2x` rows of
+/// `sample_positions` compare with Metal's. The tree holds Metal's defaults of no other count.
+const METAL_DEFAULT_POSITIONS: [&[[f32; 2]]; 3] = [
+    &[[0.5, 0.5]],
+    &[[0.75, 0.75], [0.25, 0.25]],
+    &[
+        [0.375, 0.125],
+        [0.875, 0.375],
+        [0.125, 0.625],
+        [0.625, 0.875],
+    ],
+];
+
+/// Whether a pass of `samples` samples whose `setSamplePositions:count:` set `positions`
+/// rasterizes at Metal's default positions, each coordinate equal as an `f32`: none set (a count
+/// of 0 is Metal's defaults), or exactly the defaults of `samples` ([`METAL_DEFAULT_POSITIONS`]).
+/// At a sample count whose defaults the tree does not hold, a set differs.
+pub(super) fn at_metal_defaults(samples: u32, positions: &[[f32; 2]]) -> bool {
+    let defaults = match samples {
+        1 => METAL_DEFAULT_POSITIONS[0],
+        2 => METAL_DEFAULT_POSITIONS[1],
+        4 => METAL_DEFAULT_POSITIONS[2],
+        _ => return positions.is_empty(),
+    };
+    positions.is_empty() || positions == defaults
+}
+
+/// The render encoders the runtime made of a pass whose sample positions differ from Metal's
+/// defaults for its sample count ([`at_metal_defaults`]): the runtime rasterizes them at the
+/// defaults, where Metal rasterizes them at the positions the program set.
+#[derive(Default)]
+pub(super) struct OtherPositions {
+    passes: u64,
+    /// The frame and call of the first.
+    first: Option<(u64, u64)>,
+}
+
+impl OtherPositions {
+    /// The report's line: the passes counted, and the first.
+    pub(super) fn line(&self) -> String {
+        let first = match self.first {
+            Some((frame, at)) => format!("the first at frame {frame}, call {at}"),
+            None => "the first: -".into(),
+        };
+        format!(
+            "passes at sample positions other than Metal's defaults {}: rasterized at the \
+             defaults, Vulkan's standard locations; {first}",
+            self.passes
+        )
+    }
+}
+
 /// The attachment index of the pass's own properties in [`Pass::unheld`].
 const OWN: usize = usize::MAX;
 
@@ -87,12 +150,14 @@ const OWN: usize = usize::MAX;
 /// each by its attachment (the colors' indices, then the depth and stencil attachments') or
 /// [`OWN`], and its key. The runtime makes an encoder of it only where there are none. Each
 /// attachment's texture as the stream names it, by attachment, for the surfaces' shapes a pass
-/// writes (`surfaces`).
+/// writes (`surfaces`). The sample positions its last `setSamplePositions:count:` set, which the
+/// runtime's descriptor does not hold and which change only what the report counts.
 #[derive(Default)]
 pub(super) struct Pass {
     descriptor: rt::RenderPassDescriptor,
     unheld: HashSet<(usize, &'static str)>,
     textures: HashMap<usize, u64>,
+    positions: Vec<[f32; 2]>,
 }
 
 impl Pass {
@@ -109,6 +174,35 @@ impl Pass {
             false => self.unheld.insert((at, key)),
         };
     }
+
+    /// Whether its sample positions differ from Metal's defaults for its sample count: its
+    /// attachments' (Metal's attachments share one), or `defaultRasterSampleCount` where it has
+    /// none.
+    fn other_positions(&self) -> bool {
+        let d = &self.descriptor;
+        let colors = d.color_attachments.iter().map(|a| a.texture.as_ref());
+        let attachments = colors.chain([
+            d.depth_attachment.texture.as_ref(),
+            d.stencil_attachment.texture.as_ref(),
+        ]);
+        let samples = (attachments.flatten().next()).map_or(d.default_raster_sample_count, |t| {
+            t.descriptor().sample_count
+        });
+        !at_metal_defaults(samples, &self.positions)
+    }
+}
+
+/// `setSamplePositions:count:`'s positions: its list of `MTLSamplePosition`s, `{x, y}` each.
+fn sample_positions(call: &Call) -> Result<Vec<[f32; 2]>, PlayError> {
+    let position = |value: &Value| -> Result<[f32; 2], PlayError> {
+        let f = Fields::of(call, value, &["x", "y"])?;
+        // The recorder writes each `float` as an f64 that holds it exactly.
+        Ok([
+            f.required("x", Fields::float)? as f32,
+            f.required("y", Fields::float)? as f32,
+        ])
+    };
+    list(call, 0)?.iter().map(position).collect()
 }
 
 /// `MTLLoadAction`.
@@ -228,6 +322,11 @@ struct AttachmentSet {
     texture: Option<Option<rt::Texture>>,
     level: Option<u32>,
     slice: Option<u32>,
+    /// `depthPlane`, which the runtime's color attachment holds. A depth or stencil attachment's
+    /// is not played: Metal reads it of a 3D texture alone (Apple's page for `depthPlane`: "If the
+    /// texture isn't a 3D texture, then Metal ignores this property."), and the runtime refuses a
+    /// 3D texture's depth or stencil attachment by its type, whatever its plane.
+    depth_plane: Option<u32>,
     load_action: Option<rt::LoadAction>,
     store_action: Option<rt::StoreAction>,
     resolve_texture: Option<Option<rt::Texture>>,
@@ -351,15 +450,21 @@ impl NewRuntime {
     }
 
     /// `renderCommandEncoderWithDescriptor:` of `command_buffer`: skipped and counted where the
-    /// pass holds what the runtime's descriptor does not, or the runtime answers a typed gap.
+    /// pass holds what the runtime's descriptor does not, or the runtime answers a typed gap;
+    /// counted where the runtime makes it of a pass at other sample positions than Metal's
+    /// defaults ([`OtherPositions`]).
     pub(super) fn render_encoder(
         &mut self,
         call: &Call,
         command_buffer: &rt::CommandBuffer,
     ) -> Result<Option<(Object, Made)>, PlayError> {
+        let mut other_positions = false;
         let descriptor = match self.get(call, Self::id(call, 0)?)? {
             Object::Pass(pass) => match pass.unheld.is_empty() {
-                true => Ok(pass.descriptor.clone()),
+                true => {
+                    other_positions = pass.other_positions();
+                    Ok(pass.descriptor.clone())
+                }
                 false => {
                     let mut keys: Vec<&str> = pass.unheld.iter().map(|&(_, key)| key).collect();
                     keys.sort_unstable();
@@ -374,12 +479,19 @@ impl NewRuntime {
             Err(unheld) => return self.skip_encoder(unheld),
         };
         match command_buffer.render_command_encoder(&descriptor) {
-            Ok(encoder) => unaddressed(Object::Render(Box::new(Render {
-                encoder,
-                skipped: HashSet::new(),
-                skipped_pipeline: false,
-                unrecorded_tessellation: false,
-            }))),
+            Ok(encoder) => {
+                if other_positions {
+                    let counted = &mut self.other_positions;
+                    counted.passes += 1;
+                    counted.first.get_or_insert(self.at);
+                }
+                unaddressed(Object::Render(Box::new(Render {
+                    encoder,
+                    skipped: HashSet::new(),
+                    skipped_pipeline: false,
+                    unrecorded_tessellation: false,
+                })))
+            }
             Err(rt::Error::Unsupported(gap)) => self.skip_encoder(format!("{gap:?}")),
             Err(error) => Err(failed(call)(error)),
         }
@@ -429,7 +541,6 @@ impl NewRuntime {
             Some(None) => (Some(None), Some(false)),
             None => (None, None),
         };
-        let depth_plane = f.uint("depthPlane")?;
         let options = f.uint("storeActionOptions")?;
         let narrow = |key: &str| -> Result<Option<u32>, PlayError> {
             (f.uint(key)?)
@@ -439,6 +550,7 @@ impl NewRuntime {
         let set = AttachmentSet {
             level: narrow("level")?,
             slice: narrow("slice")?,
+            depth_plane: narrow("depthPlane")?,
             load_action: (f.uint("loadAction")?)
                 .map(|raw| load_action(call, raw))
                 .transpose()?,
@@ -463,9 +575,6 @@ impl NewRuntime {
         if let Some(skipped) = resolve_skipped {
             pass.hold(at, "resolveTexture", !skipped);
         }
-        if let Some(plane) = depth_plane {
-            pass.hold(at, "depthPlane", plane == 0);
-        }
         if let Some(options) = options {
             pass.hold(at, "storeActionOptions", options == 0);
         }
@@ -475,9 +584,15 @@ impl NewRuntime {
     /// A setter record of the render pass descriptor `call` is sent to: each property its map
     /// sets. `defaultColorSampleCount` and `defaultRasterSampleCount`, which change nothing a pass
     /// with an attachment shows (the runtime refuses one without), are not played; a rate map is
-    /// refused.
+    /// refused. `setSamplePositions:count:` sets nothing in the runtime's descriptor, which has no
+    /// field for it: the pass keeps its positions for the count of passes at other positions than
+    /// Metal's defaults ([`OtherPositions`]).
     pub(super) fn pass_call(&mut self, call: &Call) -> Result<(), PlayError> {
         match &*call.selector {
+            "setSamplePositions:count:" => {
+                let positions = sample_positions(call)?;
+                self.pass(call.receiver).positions = positions;
+            }
             "m2v.setPass" => {
                 let f = Fields::arg(call, 0, &PASS_KEYS)?;
                 if let Some(Some(_)) = f.set_object("rasterizationRateMap")? {
@@ -494,7 +609,7 @@ impl NewRuntime {
                     Some(None) => (Some(None), false),
                     None => (None, false),
                 };
-                let layers = f.uint("renderTargetArrayLength")?;
+                let layers = f.count("renderTargetArrayLength")?;
                 let tile = [
                     "imageblockSampleLength",
                     "threadgroupMemoryLength",
@@ -513,7 +628,7 @@ impl NewRuntime {
                     pass.descriptor.visibility_result_type = kind;
                 }
                 if let Some(layers) = layers {
-                    pass.hold(OWN, "renderTargetArrayLength", layers <= 1);
+                    pass.descriptor.render_target_array_length = layers;
                 }
                 for set in tile {
                     if let (key, Some(value)) = set? {
@@ -544,6 +659,9 @@ impl NewRuntime {
                     None => None,
                 };
                 let a = &mut self.pass(call.receiver).descriptor.color_attachments[at];
+                if let Some(plane) = set.depth_plane {
+                    a.depth_plane = plane;
+                }
                 set_attachment!(set, &mut *a);
                 if let Some(clear) = clear {
                     a.clear_color = clear;

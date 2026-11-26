@@ -264,3 +264,99 @@ fn a_fault_s_access_is_placed_among_the_stream_s_buffers_and_heaps() {
     let placed = place(&at(0x5_0000, 0x4), &[], &freed);
     assert_eq!(placed, " outside every buffer and heap of the stream");
 }
+
+/// A pass's sample positions are Metal's defaults where none are set, or where they are the
+/// defaults of the pass's own sample count, each coordinate equal; any other set differs: one
+/// position off, the defaults in another order, another count's defaults (fewer positions than
+/// the pass's samples), and any set at a count whose defaults the tree does not hold (Vulkan's
+/// standard locations of 8 samples among them). The report's line reads none counted as such.
+#[test]
+fn sample_positions_differ_from_metal_s_defaults_of_the_pass_s_count() {
+    use super::render::{at_metal_defaults, OtherPositions};
+    let one = [[0.5, 0.5]];
+    let two = [[0.75, 0.75], [0.25, 0.25]];
+    let four = [
+        [0.375, 0.125],
+        [0.875, 0.375],
+        [0.125, 0.625],
+        [0.625, 0.875],
+    ];
+    let eight = [
+        [0.5625, 0.3125],
+        [0.4375, 0.6875],
+        [0.8125, 0.5625],
+        [0.3125, 0.1875],
+        [0.1875, 0.8125],
+        [0.0625, 0.4375],
+        [0.6875, 0.9375],
+        [0.9375, 0.0625],
+    ];
+    for samples in [0, 1, 2, 4, 8, 16] {
+        assert!(at_metal_defaults(samples, &[]), "{samples}");
+    }
+    assert!(at_metal_defaults(1, &one));
+    assert!(at_metal_defaults(2, &two));
+    assert!(at_metal_defaults(4, &four));
+    let mut off = four;
+    off[3][1] = 0.8125;
+    let reversed = [two[1], two[0]];
+    assert!(!at_metal_defaults(4, &off));
+    assert!(!at_metal_defaults(2, &reversed));
+    assert!(!at_metal_defaults(4, &two));
+    assert!(!at_metal_defaults(4, &[[0.25, 0.5]; 4]));
+    assert!(!at_metal_defaults(1, &[[0.25, 0.25]]));
+    assert!(!at_metal_defaults(8, &eight));
+    assert!(!at_metal_defaults(0, &one));
+    assert_eq!(
+        OtherPositions::default().line(),
+        "passes at sample positions other than Metal's defaults 0: rasterized at the defaults, \
+         Vulkan's standard locations; the first: -"
+    );
+}
+
+/// The `over copies by frame` line: each frame's over-copy bytes by the buffer's memory class and
+/// by cause, as the calls are located, their mean and the largest frame's, with the textures in
+/// an image of their own that frame's calls named, a view as its texture and a released one no
+/// more; the open frame counts once a call of it is located.
+#[test]
+fn over_copies_by_frame_give_the_mean_and_the_largest_frame() {
+    let mut frames = super::over_frames::OverFrames::default();
+    let mut m = rt::Metrics::default();
+    assert_eq!(frames.line(&m), "over copies by frame: no frame");
+    frames.made(5);
+    frames.made(6);
+    frames.viewed(5, 7);
+    // 9 is in no image of its own, nor its view 10.
+    frames.viewed(9, 10);
+    // Frame 0: a pitch copy of a Shared buffer's, of texture 5, named itself and through its view.
+    frames.located();
+    frames.named(&[5, 7, 9, 10]);
+    m.over_copy_bytes = 100;
+    m.over_copy_bytes_shared = 100;
+    m.over_copy_bytes_pitch = 100;
+    frames.ended(&m);
+    // Frame 1: a Private buffer's whose linear image the device does not make, and a dma-buf's,
+    // of textures 5 and 6; 6 is released.
+    frames.located();
+    frames.named(&[6, 5]);
+    m.over_copy_bytes = 400;
+    m.over_copy_bytes_private = 200;
+    m.over_copy_bytes_shared = 200;
+    m.over_copy_bytes_linear = 200;
+    m.over_copy_bytes_dma_buf = 100;
+    frames.released(6);
+    frames.ended(&m);
+    // Frame 2, open: host memory's, and 6 named once released.
+    frames.located();
+    frames.named(&[6]);
+    m.over_copy_bytes = 420;
+    m.over_copy_bytes_shared = 220;
+    m.over_copy_bytes_host_memory = 20;
+    assert_eq!(
+        frames.line(&m),
+        "over copies by frame, 3 frames as the calls played: mean bytes=140 private=66 shared=73 \
+         pitch=33 dma_buf=33 host_memory=6 own_image=66; largest, frame 1 bytes=300 private=200 \
+         shared=100 pitch=0 dma_buf=100 host_memory=0 own_image=200, 2 textures in an image of \
+         their own its calls named"
+    );
+}

@@ -20,14 +20,16 @@
 //! going first where the queue has room. The
 //! bound is tested again as the group goes, with the expected run as it then stands (a completion
 //! between a join and the send may have raised it): a group past it goes member by member, one
-//! `vkQueueSubmit2` each, only the last signalling. At most [`UNSEEN_JOINS`] command buffers join
+//! `vkQueueSubmit2` each, each signalling a progress value of its own, so each command buffer is
+//! seen complete at its own end, not the last's. At most [`UNSEEN_JOINS`] command buffers join
 //! a group while none of the queue's retires, so command buffers that turn long all at once join
 //! no more than that many on the estimate of the short ones before them. A segment that
 //! signals an event ends its group, which goes at once, so a command buffer that signals waits
 //! unstaged until its queue has room for it ([`WorkState::waits_for_room`]): a signal staged is
 //! one its waiters take as submitted. One that waits on a semaphore leads a new
 //! group, the one held going first. A group is one submission with one signal of the progress
-//! semaphore, which the completion thread follows in commit order. A command buffer that takes no
+//! semaphore, or member by member one a member, which the completion thread follows in commit
+//! order; its queue counts it one submission in flight. A command buffer that takes no
 //! submission of its own (one with nothing for the GPU that no copy-in waits for, or one ended
 //! with an error) and finds a
 //! group held joins it, and the group goes at once: what it retires behind is then submitted, so
@@ -61,6 +63,7 @@
 use crate::alias;
 use crate::buffer::{BufferInner, BufferObject, DeviceCopy};
 use crate::capture::{self, Changes, CopyIn, Modified};
+use crate::coherence::{self, Range, Ranges};
 use crate::command::{self, CbInner, CommandBufferError, DeviceLoss, Handler, Pending, Segment};
 use crate::complete;
 use crate::counters::{Counters, Gauge, Metric, Part, Site};
@@ -193,9 +196,12 @@ pub(crate) struct Work {
     /// lost: a staging call asleep for it looks again ([`Work::stage`]). Signalled only while one
     /// sleeps ([`WorkState::span_sleepers`]).
     spans: Condvar,
-    /// A queue holds a group, or a command buffer for room: the completion thread wakes the
-    /// thread as submissions complete.
-    keeping: AtomicBool,
+    /// The progress value whose completion can leave room for what a queue holds, a group or a
+    /// command buffer held for room: the first of that queue's submissions not seen complete
+    /// ([`room`]), the lowest over the queues that hold. The completion thread wakes the thread
+    /// for a completion that reaches it ([`Work::completed`]); 0 while the thread passes, so any
+    /// completion then wakes it again, and `u64::MAX` while no queue holds.
+    wake_at: AtomicU64,
     /// Bytes of textures and blocks released while an upload held them, since the last
     /// submission that left no upload unsent: they count against [`UPLOAD_BYTES`]. A texture's
     /// release adds without the work lock, which its drop may run under.
@@ -207,6 +213,9 @@ pub(crate) struct Work {
     /// lock.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) asking: AtomicBool,
+    /// For the device tests: the times the thread was poked to pass again ([`Work::poke`]).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) pokes: AtomicU64,
 }
 
 pub(crate) struct WorkState {
@@ -415,7 +424,7 @@ impl Upload {
             // is the device's and held by the upload, and holds the import whose buffer an
             // acquire names, a dma-buf's, whose foreign family is enabled (`check_over`).
             unsafe { device.cmd_pipeline_barrier2(self.command, &dependency) };
-            core.counters.count(Metric::Barriers);
+            core.counters.count(Metric::UploadBarriers);
         };
         let firsts: Vec<_> = homes.iter().map(|home| home.first).collect();
         let acquires: Vec<_> = homes.iter().filter_map(|home| home.buffer).collect();
@@ -462,7 +471,7 @@ impl Upload {
         let device = &core.device;
         if acquire {
             record::barrier(device, upload.command, Reach::Commands);
-            core.counters.count(Metric::Barriers);
+            core.counters.count(Metric::UploadBarriers);
         }
         let barriers: Vec<_> = (planes.iter())
             .map(|image| image.handed(core.family, acquire))
@@ -472,7 +481,7 @@ impl Upload {
         // each image is the device's, held by the submission until it retires, and general
         // between commands.
         unsafe { device.cmd_pipeline_barrier2(upload.command, &dependency) };
-        core.counters.count(Metric::Barriers);
+        core.counters.count(Metric::UploadBarriers);
         core.counters.count(match acquire {
             true => Metric::ExternalAcquires,
             false => Metric::ExternalReleases,
@@ -493,6 +502,10 @@ struct Batch {
     /// Command buffers whose last segment is in it, and those that ended behind them, in the
     /// queue's order.
     finished: Vec<Finished>,
+    /// For each of `finished`, how many command buffers led in it as that one joined: where it
+    /// goes member by member, the part whose progress value it retires at (0, the part ahead of
+    /// the first lead's).
+    parts_of: Vec<usize>,
     /// The command buffers whose last segment is in it.
     count: usize,
     /// It holds segments of its queue's head, whose last is not yet staged.
@@ -541,9 +554,23 @@ struct Batch {
     reached: Vec<Arc<BufferInner>>,
     /// The images of the Direct3D 11 planes its segments use (`Segment::planes`).
     planes: Vec<Arc<Image>>,
+    /// What it flushes before it is submitted, where the Shared type is not host-coherent and
+    /// a command buffer with a segment in it or a copy-in it carries reaches Shared memory
+    /// (`crate::coherence`); `None` where none does.
+    flushes: Option<Box<Flushes>>,
     /// The first failed call recording a command buffer of moves that leads a segment of it
     /// (`crate::alias::stage`), which loses the device.
     lost: Option<DeviceLoss>,
+}
+
+/// What a batch flushes before it is submitted, where the Shared type is not host-coherent
+/// (`crate::coherence`): what each command buffer with a segment in it reaches of Shared memory,
+/// once each, and the Shared ranges its copy-ins read. Boxed at the first of them, so a batch
+/// holds one `None` pointer in its place where it has none.
+#[derive(Default)]
+struct Flushes {
+    reached: Vec<Arc<Ranges>>,
+    copied: Vec<Range>,
 }
 
 /// One part of a submit info: a segment's or an upload's commands and its signals, and for a
@@ -633,12 +660,14 @@ impl Work {
             }),
             changed: Condvar::new(),
             spans: Condvar::new(),
-            keeping: AtomicBool::new(false),
+            wake_at: AtomicU64::new(u64::MAX),
             released: AtomicU64::new(0),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             counting: AtomicBool::new(false),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             asking: AtomicBool::new(false),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            pokes: AtomicU64::new(0),
         }
     }
 
@@ -729,14 +758,19 @@ impl Work {
 
     /// A host value rose: held segments may go.
     pub(crate) fn poke(&self) {
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        self.pokes.fetch_add(1, Ordering::SeqCst);
         self.lock().dirty = true;
         self.wake();
     }
 
-    /// Submissions completed: where a queue holds a group or a command buffer for room, it may
-    /// go.
-    pub(crate) fn completed(&self) {
-        if self.keeping.load(Ordering::SeqCst) {
+    /// Submissions completed through `reached`, or, with none, a round that fired events or found
+    /// the device lost: where a queue holds a group or a command buffer for room, it may go. A
+    /// completion short of the submission whose end leaves room, as a member of a group sent
+    /// member by member before its last, wakes nothing.
+    pub(crate) fn completed(&self, reached: Option<u64>) {
+        let at = self.wake_at.load(Ordering::SeqCst);
+        if at != u64::MAX && reached.is_none_or(|reached| reached >= at) {
             self.poke();
         }
     }
@@ -1004,6 +1038,8 @@ impl Work {
                     buffer: region.buffer,
                     offset,
                     host: region.host(offset),
+                    memory: region.memory,
+                    size: region.size,
                 });
             }
             let Some(oldest) = region.ring.oldest() else {
@@ -1255,7 +1291,7 @@ impl Work {
             let meets = |&(filled, from, to): &Filled| filled == buffer && from < end && start < to;
             if upload.filled.iter().any(meets) {
                 record::barrier(device, upload.command, Reach::Commands);
-                core.counters.count(Metric::Barriers);
+                core.counters.count(Metric::UploadBarriers);
                 if upload.leading.is_none() {
                     upload.leading = Some(upload.filled.clone());
                 }
@@ -1869,6 +1905,7 @@ impl WorkState {
             first: place,
             segments: Vec::new(),
             finished: Vec::new(),
+            parts_of: Vec::new(),
             count: 0,
             partial: false,
             run: 0,
@@ -1887,6 +1924,7 @@ impl WorkState {
             wrote: Vec::new(),
             reached: Vec::new(),
             planes: Vec::new(),
+            flushes: None,
             lost: None,
         });
         if leads {
@@ -1900,6 +1938,15 @@ impl WorkState {
             group.unseen += 1;
         }
         group.leans.join(&segment.overs);
+        if let Some(coherence::Recorded {
+            reach: Some(reach), ..
+        }) = pending.gpu.coherence.as_deref()
+        {
+            let flushes = group.flushes.get_or_insert_with(Box::default);
+            if !(flushes.reached.iter()).any(|held| Arc::ptr_eq(held, reach)) {
+                flushes.reached.push(Arc::clone(reach));
+            }
+        }
         for buffer in &segment.managed_written {
             if !group.written.iter().any(|kept| kept.id() == buffer.id()) {
                 group.written.push(buffer.clone());
@@ -1971,6 +2018,7 @@ impl WorkState {
             }
         }
         group.finished.push((cb, pending, None));
+        group.parts_of.push(group.starts.len());
         group.partial = false;
         group.count += 1;
         // A command buffer held for room behind it joins it or, not taken, sends it first: with
@@ -2037,6 +2085,10 @@ impl WorkState {
         let taken = self.changes.captured.take(&batch.leads);
         for (_, copy_in) in &taken {
             copy_in.backs(&mut batch.backs);
+            if let Some(coherence) = &core.coherence {
+                let flushes = batch.flushes.get_or_insert_with(Box::default);
+                flushes.copied.extend(copy_in.shared_ranges(coherence.atom));
+            }
         }
         // The copies back owed by writes submitted before it to the Managed buffers its segments
         // reach, which its upload makes first: as it goes, the order of each write and its
@@ -2045,8 +2097,17 @@ impl WorkState {
             buffer.over_entries().backs(None, &mut batch.backs);
         }
         batch.take(taken);
-        self.progress += 1;
+        // One progress value, or, where it goes member by member, one for each part, the last
+        // part's the highest (`submit`): each command buffer retires at its own part's, so one
+        // ahead of a long one is seen complete at its own end. The queue counts it one submission
+        // in flight, at its last value.
+        let parts = match batch.apart {
+            true => batch.starts.len() as u64 + 1,
+            false => 1,
+        };
+        self.progress += parts;
         let value = self.progress;
+        let first = value + 1 - parts;
         fifo.in_flight.push_back((value, batch.run));
         if batch.partial {
             if let Some(Entry {
@@ -2058,13 +2119,14 @@ impl WorkState {
                 pending.gpu.fences.submitted(value);
             }
         }
-        for (_, pending, error) in &mut batch.finished {
-            pending.value = value;
+        for ((_, pending, error), &part) in (batch.finished.iter_mut()).zip(&batch.parts_of) {
+            pending.value = (first + part as u64).min(value);
             if error.is_none() {
-                pending.gpu.fences.submitted(value);
+                pending.gpu.fences.submitted(pending.value);
             }
         }
-        (self.carried).extend((batch.finished.iter()).map(|(_, pending, _)| (pending.seq, value)));
+        (self.carried)
+            .extend((batch.finished.iter()).map(|(_, pending, _)| (pending.seq, pending.value)));
         let uploads = self.take_uploads(core, released, value, through);
         Some((value, uploads, batch))
     }
@@ -2182,6 +2244,7 @@ impl Fifo {
                 // waits only on submitted work.
                 self.send_through = self.send_through.max(group.first);
                 group.finished.push((cb, pending, error));
+                group.parts_of.push(group.starts.len());
             }
             None => {
                 // Behind its queue's work, and, where it waits on a fence, behind the last
@@ -2337,7 +2400,7 @@ fn pass<'a>(core: &'a Core, mut state: MutexGuard<'a, WorkState>) -> MutexGuard<
     let work = &core.work;
     // Marked before the completed value is read: a completion the read misses sees the mark and
     // wakes the thread.
-    work.keeping.store(true, Ordering::SeqCst);
+    work.wake_at.store(0, Ordering::SeqCst);
     state.settle(core.done.completed());
     let mut joined: Vec<Joined> = Vec::new();
     let mut ended: Vec<Ended> = Vec::new();
@@ -2400,9 +2463,15 @@ fn pass<'a>(core: &'a Core, mut state: MutexGuard<'a, WorkState>) -> MutexGuard<
             .front()
             .is_some_and(|entry| entry.held.is_some())
     };
-    if (state.fifos.iter()).all(|fifo| fifo.group.is_none() && !holds(fifo)) {
-        work.keeping.store(false, Ordering::SeqCst);
-    }
+    // What a queue holds goes once its first submission in flight completes, so completions
+    // short of that one, as a group's members before its last, wake nothing. One during the pass
+    // saw the mark of 0 and wakes the thread again.
+    let wake_at = (state.fifos.iter())
+        .filter(|fifo| fifo.group.is_some() || holds(fifo))
+        .map(|fifo| (fifo.in_flight.front()).map_or(0, |&(value, _)| value))
+        .min()
+        .unwrap_or(u64::MAX);
+    work.wake_at.store(wake_at, Ordering::SeqCst);
     if !joined.is_empty() || !ended.is_empty() {
         drop(state);
         scheduled(&mut joined);
@@ -2431,6 +2500,7 @@ impl Batch {
             first: 0,
             segments: Vec::new(),
             finished: Vec::new(),
+            parts_of: Vec::new(),
             count: 0,
             partial: false,
             run: 0,
@@ -2449,6 +2519,7 @@ impl Batch {
             wrote: Vec::new(),
             reached: Vec::new(),
             planes: Vec::new(),
+            flushes: None,
             lost: None,
         }
     }
@@ -2493,7 +2564,7 @@ fn order_fills(core: &Core, uploads: &[Upload]) {
         };
         if let (Some(before), true) = (index.checked_sub(1), first.iter().any(meets)) {
             record::barrier(&core.device, uploads[before].command, Reach::Commands);
-            core.counters.count(Metric::Barriers);
+            core.counters.count(Metric::UploadBarriers);
             open.clear();
         }
         if upload.leading.is_some() {
@@ -2512,8 +2583,9 @@ fn scheduled(joined: &mut Vec<Joined>) {
 }
 
 /// Submits a group: its uploads first, oldest first, then each segment in order, the last
-/// signalling the progress `value`. Whatever was passed to `vkQueueSubmit2` goes to the completion
-/// thread as in flight; a failed submission is taken as a loss.
+/// signalling the progress `value`, and where it goes member by member each part before it its
+/// own lower value. Whatever was passed to `vkQueueSubmit2` goes to the completion thread as in
+/// flight; a failed submission is taken as a loss.
 fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
     let Batch {
         mut segments,
@@ -2528,6 +2600,7 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         held,
         copy_ins,
         mut planes,
+        flushes,
         lost,
         ..
     } = batch;
@@ -2580,12 +2653,13 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         // retires, and each image is in its home layout, any move there recorded before.
         unsafe {
             let copies: Vec<OverCopy> = backs.iter().map(|(_, copy, _)| *copy).collect();
-            over::record_side(device, last.command, &copies, false, &core.counters);
-            over::record_side(device, last.command, &overs, true, &core.counters);
+            let (cause, counters) = (Metric::UploadBarriers, &core.counters);
+            over::record_side(device, last.command, &copies, false, cause, counters);
+            over::record_side(device, last.command, &overs, true, cause, counters);
         }
         (last.held).extend(backs.into_iter().map(|(_, _, image)| Held::Texture(image)));
         record::barrier(device, last.command, Reach::Host);
-        core.counters.count(Metric::Barriers);
+        core.counters.count(Metric::UploadBarriers);
         times::end_own(device, last.command, last.stamps);
         // SAFETY: as above.
         let ended = unsafe { device.end_command_buffer(last.command) };
@@ -2624,28 +2698,29 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         }),
     );
     // One part, or, where the group goes member by member, one for each command buffer that leads
-    // in it, the uploads with the first.
-    let mut parts: Vec<Vec<Staged>> = Vec::with_capacity(1);
-    let bounds: Vec<usize> = match apart {
-        true => (starts.iter())
-            .map(|start| start + ahead)
-            .filter(|&at| at > 0)
-            .collect(),
-        false => Vec::new(),
+    // in it, the uploads with the first; each with its progress value (`WorkState::close`): the
+    // part ahead of the first lead's `value` less the leads, each lead's one above the one before.
+    let leads = match apart {
+        true => starts.len(),
+        false => 0,
     };
-    for &at in bounds.iter().rev() {
-        parts.push(segments.split_off(at));
+    let mut parts: Vec<(u64, Vec<Staged>)> = Vec::with_capacity(1);
+    for (lead, &start) in starts[..leads].iter().enumerate().rev() {
+        let at = value - (leads - 1 - lead) as u64;
+        parts.push((at, segments.split_off(start + ahead)));
     }
-    parts.push(segments);
+    parts.push((value - leads as u64, segments));
     parts.reverse();
-    for part in &mut parts {
+    for (_, part) in &mut parts {
         part.retain(|staged| staged.command.is_some() || !staged.signals.is_empty());
     }
-    parts.retain(|part| !part.is_empty());
+    parts.retain(|(_, part)| !part.is_empty());
     // The release goes after every segment and takes its last signals, so it adds no submit info
     // (`infos`).
     if let Some(mut tail) = tail {
-        let last = parts.last_mut().and_then(Vec::pop).unwrap_or_default();
+        let last = (parts.last_mut())
+            .and_then(|(_, part)| part.pop())
+            .unwrap_or_default();
         let release = Staged {
             waits: Vec::new(),
             command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(tail.command)),
@@ -2656,24 +2731,46 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
             ..last
         };
         match parts.last_mut() {
-            Some(part) => part.extend([last, release]),
-            None => parts.push(vec![last, release]),
+            Some((_, part)) => part.extend([last, release]),
+            None => parts.push((value, vec![last, release])),
         }
         tail.held.extend(planes.into_iter().map(Held::Texture));
         uploads.push(tail);
     }
-    let progress = vk::SemaphoreSubmitInfo::default()
-        .semaphore(core.done.progress)
-        .value(value)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
-    match parts.last_mut().and_then(|part| part.last_mut()) {
-        Some(last) => last.signals.push(progress),
-        None => parts.push(vec![Staged {
-            signals: vec![progress],
-            ..Staged::default()
-        }]),
+    // Each part signals its value, the last `value`, which also covers the parts left empty.
+    match parts.last_mut() {
+        Some((last, _)) => *last = value,
+        None => parts.push((value, vec![Staged::default()])),
+    }
+    for (at, part) in &mut parts {
+        let progress = vk::SemaphoreSubmitInfo::default()
+            .semaphore(core.done.progress)
+            .value(*at)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+        if let Some(last) = part.last_mut() {
+            last.signals.push(progress);
+        }
     }
     if ok.is_ok() {
+        // The host's writes to the Shared memory its command buffers and copy-ins reach are the
+        // GPU's before it runs, where the Shared type is not host-coherent (`crate::coherence`).
+        // One command buffer and no copy-in flushes its own ranges, merged at its commit.
+        if let Some(flushes) = flushes {
+            let Flushes { reached, copied } = *flushes;
+            if let Some(coherence) = &core.coherence {
+                match (copied.is_empty(), &reached[..]) {
+                    (true, [one]) => coherence.flush(core, &one.reached),
+                    _ => {
+                        let mut flushed = copied;
+                        flushed.extend(
+                            (reached.iter()).flat_map(|ranges| ranges.reached.iter().copied()),
+                        );
+                        coherence::merge(&mut flushed);
+                        coherence.flush(core, &flushed);
+                    }
+                }
+            }
+        }
         let asked = times::host_time();
         #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
         (core.work.asking).store(true, Ordering::SeqCst);
@@ -2684,7 +2781,7 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         // wait (`crate::import::Sparse`).
         #[cfg(unix)]
         if let Some((timeline, value)) = (core.imports.sparse.as_ref()).and_then(|s| s.owed()) {
-            if let Some(first) = parts.first_mut().and_then(|part| part.first_mut()) {
+            if let Some(first) = parts.first_mut().and_then(|(_, part)| part.first_mut()) {
                 first.waits.push(
                     vk::SemaphoreSubmitInfo::default()
                         .semaphore(timeline)
@@ -2697,7 +2794,7 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         // buffers and each copy-in ahead of the one that takes it: counted before the calls, as
         // each call is.
         (core.counters).runtime_command_buffers((uploads.len() + copy_ins.len()) as u64);
-        for part in &parts {
+        for (_, part) in &parts {
             let merged = infos(part);
             let infos: Vec<vk::SubmitInfo2<'_>> = merged
                 .iter()

@@ -690,6 +690,10 @@ pub fn runs_render_through_runtime(case: &graphics::RenderCase) -> bool {
         color_targets: _,
         depth_stencil,
         depth_stencil_state: _,
+        // Drawn through the runtime on every device; on one without stencil export, a draw
+        // whose stencil test the output decides is the device's refusal
+        // (`platform::execute_runtime_render`).
+        stencil_output: _,
         render_target_array_length: _,
         assembly,
         draw,
@@ -902,6 +906,9 @@ pub(crate) fn draw_out_of_bounds_run(
             handle_table: pipeline.interface.needs_handle_translation,
             policy: *device.policy(),
             strategies: &graphics::vertex_module(pipeline)?.strategies,
+            // A render stage reaches its buffers at their addresses or through views checked in
+            // the shader.
+            robust_views: false,
         },
         &case.out_of_bounds,
     )

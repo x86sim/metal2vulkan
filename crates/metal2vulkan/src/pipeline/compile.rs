@@ -58,6 +58,7 @@ use crate::pipeline::descriptor::{
     LinkedFunctions, LinkedList, MeshPipelineDescriptor, RenderPipelineDescriptor,
     VertexDescriptor,
 };
+use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{SlotInterface, StageInterface};
 use crate::pipeline::sym::{SlotClass, SlotRef, Stage, VaryingKey};
 use crate::reflection;
@@ -83,9 +84,8 @@ pub enum InputsFrom<'a> {
     /// The caller's (`Device::compile_function`, validation, tests).
     Given(&'a LowerInputs),
     /// The vertex stage of a render pipeline under a variant key: the vertex-fetch projection of
-    /// this vertex descriptor over the attributes the specialized entry reads with the key's
-    /// pulled vertex buffers (`link::vertex::vertex_fetch_projection_for`), the key's other
-    /// vertex-stage inputs (`VariantKey::lowering_inputs`), the pipeline's
+    /// this vertex descriptor over the attributes the specialized entry reads
+    /// (`link::vertex::vertex_fetch_projection_for`), the key's vertex-stage inputs (`VariantKey::lowering_inputs`), the pipeline's
     /// `maxVertexCallStackDepth` (the `u32`), whether the pipeline's fragment function reads
     /// `[[primitive_id]]` where the device carries it through a varying
     /// ([`reads_primitive_id_varying`]). A vertex function writes the primitive ID's varying where
@@ -218,15 +218,6 @@ impl<'a> InputsFrom<'a> {
             InputsFrom::Given(i) => i.max_call_stack_depth.unwrap_or(1),
             InputsFrom::Vertex(_, _, depth, ..) => (*depth).max(1),
             InputsFrom::Fragment(pass, ..) => pass.max_call_stack_depth.max(1),
-        }
-    }
-
-    /// Whether the stage compiles as a kernel's one-row variant (`LoweringInputs::one_row`): the
-    /// given inputs' say; a render pipeline's stage never does.
-    fn one_row(&self) -> bool {
-        match self {
-            InputsFrom::Given(i) => i.one_row,
-            InputsFrom::Vertex(..) | InputsFrom::Fragment(..) => false,
         }
     }
 
@@ -1035,9 +1026,9 @@ struct KeptOrder {
     ordered: Arc<Specialized>,
 }
 
-/// The most ordered entries one [`StageEntry`] keeps. A device's profile fixes all of the key
-/// but whether the kernel is its one-row variant, so a creation asks for at most two.
-const KEPT_ORDERS: usize = 2;
+/// The most ordered entries one [`StageEntry`] keeps. A device's profile fixes the whole key, so a
+/// creation asks for one.
+const KEPT_ORDERS: usize = 1;
 
 impl std::fmt::Debug for StageEntries {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2652,7 +2643,6 @@ fn lower_inputs(
                 desc,
                 &attributes,
                 p,
-                &variant.pulled_vertex_buffers,
                 pull_every,
             )?;
             let mut out = variant.lowering_inputs(crate::pipeline::sym::Stage::Vertex);
@@ -2815,7 +2805,7 @@ fn decoded_module(r: &Request<'_>, m: &mut Meter) -> Result<air::Decoded, Error>
 /// ([`StageEntries::ordered`]): the check of the partition its kernel observes and its compile
 /// read one ordered entry.
 fn ordered_entry(r: &Request<'_>, p: &DeviceProfile, m: &mut Meter) -> Result<Specialized, Error> {
-    let key = OrderKey::of(p, r.inputs.one_row());
+    let key = OrderKey::of(p);
     if let Shared::Entry(entries, fd) = r.shared {
         let open_cl = (r.inputs.open_cl_mode(), r.inputs.open_cl_lines());
         let depth = r.inputs.call_stack_depth();
@@ -3091,6 +3081,11 @@ fn lower_bounded<K>(
     // The function's own side effects; the `ExecutionStatus` buffer's words (the resident-miss
     // count's) are the product's.
     let writes_memory = crate::spirv::requirements::writes_memory(&module)?;
+    // A stencil output drawn by bits runs the function once more for each bit, so its memory
+    // writes would be made again.
+    if writes_memory && plan.facts.contains(&RuntimeFact::StencilBitDraws) {
+        return Err(crate::lower::stage_io::stencil_export_refused());
+    }
     // A fragment function's texture slots read only at the fragment's own pixel.
     let own_pixel_textures = crate::spirv::requirements::own_pixel_textures(&module, m)?;
     // The levels of its bound view each texture slot's reads reach.
@@ -3207,6 +3202,14 @@ fn lower_bounded<K>(
         requirements
             .properties
             .insert(crate::device::requirements::VkProperty::DeviceSampling);
+    }
+    // A kernel that reaches its buffers through storage views of set 0 is contained by its
+    // pipeline's robust buffer access 2 (`RuntimeFact::RobustStorageBuffers`), which a pipeline
+    // states only where the device enables the pipeline-robustness feature.
+    if plan.families.access.robust_views {
+        requirements
+            .features
+            .insert(crate::device::requirements::VkFeature::PipelineRobustness);
     }
     // The set-1 heap's binding flags need their features beside the module's.
     requirements

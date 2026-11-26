@@ -125,11 +125,6 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         RuntimeFact::OpenClLineTexture { .. } => Mechanism::Variant,
         // The binder's local-size rules read it: a one-row region of the planned pipeline.
         RuntimeFact::RowLockstep => Mechanism::PlanTimeCheck,
-        // A pipeline compiled under the one-row variant; its plans state it.
-        RuntimeFact::OneRow => Mechanism::Variant,
-        // The relief a consumer reads to ask for the unit-axes variant, or the axes the variant
-        // was compiled under; its plans state them.
-        RuntimeFact::UnitAxes { .. } => Mechanism::Variant,
         // A pipeline compiled under the flat-grid variant; its plans state it.
         RuntimeFact::FlatGrid => Mechanism::Variant,
         RuntimeFact::CallThreadgroups => Mechanism::Variant,
@@ -166,6 +161,11 @@ pub fn mechanism(fact: &RuntimeFact, profile: &DeviceProfile) -> Mechanism {
         // The runtime pushes its arena's address, and sizes and orders the arena's slots by the
         // slot's bytes.
         RuntimeFact::PrivateArena { .. } => Mechanism::PushConstant,
+        // The consumer draws each draw once and then once per stencil bit its state can replace,
+        // pushing the bit for each.
+        RuntimeFact::StencilBitDraws => Mechanism::PushConstant,
+        // The pipeline's robustness, which the consumer states as it makes it.
+        RuntimeFact::RobustStorageBuffers => Mechanism::PipelineState,
         // Keyed by the slots bound to a texture buffer of more texels than one view holds.
         RuntimeFact::TexelBufferParts { .. } => Mechanism::Variant,
         // The runtime refuses a dispatch whose slot address is not a multiple of the alignment.

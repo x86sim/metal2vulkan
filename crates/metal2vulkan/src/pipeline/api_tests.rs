@@ -195,10 +195,7 @@ mod serde_round_trips {
         round_trip(&VariantKey {
             storage_images,
             psb_slots: BTreeSet::from([buffer(1)]),
-            pulled_vertex_buffers: BTreeSet::from([2, 5]),
             emulated_simdgroups: true,
-            one_row: true,
-            unit_axes: 6,
             srgb_textures: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 4)]),
             texel_buffer_parts: BTreeMap::from([(slot(Stage::Kernel, SlotClass::Texture, 11), 2)]),
             flat_grid: true,
@@ -269,7 +266,6 @@ mod serde_round_trips {
             storage_images: BTreeMap::new(),
             psb_slots: BTreeSet::from([buffer(0), buffer(30)]),
             emulated_simdgroups: true,
-            one_row: true,
             stage_input: Some({
                 let mut d = StageInputDescriptor::new();
                 d.attributes.insert(
@@ -292,6 +288,7 @@ mod serde_round_trips {
             replay_bindings: true,
             merged_draws: true,
             srgb_textures: BTreeSet::from([slot(Stage::Fragment, SlotClass::Texture, 7)]),
+            srgb_storage: BTreeSet::from([slot(Stage::Kernel, SlotClass::Texture, 3)]),
             texel_buffer_parts: BTreeMap::from([(
                 slot(Stage::Fragment, SlotClass::Texture, 11),
                 4,
@@ -404,8 +401,8 @@ mod serde_round_trips {
             instanced_attributes: BTreeSet::from([1]),
             object_payload: Some(64),
             region_viewports: true,
-            unit_axes: 2,
             push_base: 24,
+            word_bound_buffers: BTreeSet::from([slot(Stage::Kernel, SlotClass::Buffer, 2)]),
         });
     }
 
@@ -473,7 +470,6 @@ mod serde_round_trips {
                 step_rate: 2,
                 stride: VertexStride::Static(20),
             }],
-            variant_pulled: BTreeSet::from([3]),
         });
     }
 

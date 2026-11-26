@@ -14,6 +14,9 @@
 //! - `setLineWidth:` plays: at width 1 a draw of lines after it plays; at width 2 a draw of
 //!   triangles plays and one of lines is the runtime's gap, skipped and counted, and the report
 //!   says the play is no verdict past it: its gap, frame and call.
+//! - `setSamplePositions:count:` on a pass descriptor plays as the runtime treats it, nothing
+//!   refused or skipped: of two passes over a 4-sample target, the report counts the one whose
+//!   positions differ from Metal's defaults of 4 samples, and not the one at the defaults.
 //! - A pass's visibility results play as the runtime's: in a `Reset` pass, `Counting` and
 //!   `Boolean` modes before draws of the whole target write its 16 samples into their words, and
 //!   a word no mode took keeps its bytes, nothing skipped; the backend's gauges read the one
@@ -114,6 +117,8 @@
 //!   them, no modules line carries one.
 //! - A dump of a listed command buffer holds the colour attachment its pass stored: the draw's
 //!   Private target, read back through a blit, green at every texel, and covering nothing.
+//! - A layered pass plays as the runtime builds it, not skipped: a draw renders the layer its
+//!   vertex function selects, the clear covers the other, and a blit and a dump read both slices.
 //!
 //! The runtime's device is opened behind the hang tripwire, as every device open in this crate
 //! is (`gpu.rs`), its kernels kept in a cache the test owns ([`ScratchCache`]).
@@ -555,6 +560,161 @@ fn a_dump_holds_the_colour_attachment_a_pass_stored() {
     assert_eq!(read("cb12-obj7.cover"), b"-");
 }
 
+/// What the layered pass of [`layered_pass`] leaves in its target's two slices, one after the
+/// other: slice 0 the clear's 7, slice 1 `rt6_layered_fragment`'s word for instance 0, which
+/// selected layer 1, `(1 << 8) | 1`, at every texel.
+fn layered_slices() -> Vec<u8> {
+    let slice = |word: u32| word.to_le_bytes().repeat(16);
+    [slice(7), slice((1 << 8) | 1)].concat()
+}
+
+/// A stream of a layered pass: `renderTargetArrayLength` 2 over colour attachment 0, a 2D array
+/// texture (#7) of two slices, R32Uint, 4 by 4, from slice 0, cleared to 7; one instance of
+/// `rt6_layered`'s fullscreen triangle (engine `rt6_layered`), which renders into the layer its
+/// buffer 0 names, 1. A blit copies both slices to a buffer (#10), which the stream checks as
+/// [`layered_slices`].
+fn layered_pass(dir: &ScratchDir) -> PathBuf {
+    written(dir, |w| {
+        let ll = metal2vulkan_devtools::engine_dir().join("rt6_layered.ll");
+        let functions = [("rt6_layered_vertex", 0, 1), ("rt6_layered_fragment", 1, 2)];
+        let library = w.blob(&library_of(dir, &ll, &functions))?;
+        w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
+        w.call("newCommandQueue", 1, 2, &[], &[])?;
+        let made = [Value::Blob(library)];
+        w.call("newLibraryWithData:error:", 1, 3, &made, &[])?;
+        for (id, (name, _, _)) in [4, 5].into_iter().zip(functions) {
+            let name = [Value::Str(name.into())];
+            w.call("newFunctionWithName:", 3, id, &name, &[])?;
+        }
+        // Colour 0's format R32Uint.
+        let pipeline = Value::Map(vec![
+            ("vertex".into(), Value::Object(4)),
+            ("fragment".into(), Value::Object(5)),
+            ("color0PixelFormat".into(), Value::Uint(53)),
+        ]);
+        let made = "newRenderPipelineStateWithDescriptor:error:";
+        w.call(made, 1, 6, &[pipeline], &[])?;
+        // A 2D array of two slices, R32Uint, 4 by 4, shader-read and render-target, Private.
+        let target = uints(&[
+            ("textureType", 3),
+            ("pixelFormat", 53),
+            ("width", 4),
+            ("height", 4),
+            ("arrayLength", 2),
+            ("usage", 5),
+            ("storageMode", 2),
+        ]);
+        w.call("newTextureWithDescriptor:", 1, 7, &[target], &[])?;
+        // The layer instance 0 renders into.
+        let layers = [
+            Value::Bytes(1u32.to_le_bytes().to_vec()),
+            Value::Uint(4),
+            Value::Uint(0),
+        ];
+        w.call("newBufferWithBytes:length:options:", 1, 8, &layers, &[])?;
+        let shared = [Value::Uint(128), Value::Uint(0)];
+        w.call("newBufferWithLength:options:", 1, 10, &shared, &[])?;
+        w.call("MTLRenderPassDescriptor.new", 0, 11, &[], &[])?;
+        let pass = uints(&[
+            ("renderTargetArrayLength", 2),
+            ("renderTargetWidth", 4),
+            ("renderTargetHeight", 4),
+        ]);
+        w.call("m2v.setPass", 11, 0, &[pass], &[])?;
+        let Value::Map(mut color) = uints(&[
+            ("level", 0),
+            ("slice", 0),
+            ("loadAction", 2),
+            ("storeAction", 1),
+        ]) else {
+            unreachable!("a map");
+        };
+        color.push(("texture".into(), Value::Object(7)));
+        let clear = [("red", 7.0), ("green", 0.0), ("blue", 0.0), ("alpha", 0.0)]
+            .map(|(key, value)| (key.into(), Value::F64(value)));
+        color.push(("clearColor".into(), Value::Map(clear.to_vec())));
+        let args = [Value::Uint(0), Value::Map(color)];
+        w.call("m2v.setColorAttachment", 11, 0, &args, &[])?;
+        w.call("commandBuffer", 2, 12, &[], &[])?;
+        w.call(
+            "renderCommandEncoderWithDescriptor:",
+            12,
+            13,
+            &[Value::Object(11)],
+            &[],
+        )?;
+        w.call("setRenderPipelineState:", 13, 0, &[Value::Object(6)], &[])?;
+        let bound = [Value::Object(8), Value::Uint(0), Value::Uint(0)];
+        w.call("setVertexBuffer:offset:atIndex:", 13, 0, &bound, &[])?;
+        // MTLPrimitiveTypeTriangle, from vertex 0, three vertices, one instance.
+        let draw = [Value::Uint(3), Value::Uint(0), Value::Uint(3)];
+        w.call("drawPrimitives:vertexStart:vertexCount:", 13, 0, &draw, &[])?;
+        w.call("endEncoding", 13, 0, &[], &[])?;
+        w.call("blitCommandEncoder", 12, 14, &[], &[])?;
+        let selector = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:\
+                        destinationOffset:destinationBytesPerRow:destinationBytesPerImage:";
+        for slice in 0..2 {
+            let copy = [
+                Value::Object(7),
+                Value::Uint(slice),
+                Value::Uint(0),
+                uints(&[("x", 0), ("y", 0), ("z", 0)]),
+                uints(&[("width", 4), ("height", 4), ("depth", 1)]),
+                Value::Object(10),
+                Value::Uint(slice * 64),
+                Value::Uint(16),
+                Value::Uint(64),
+            ];
+            w.call(selector, 14, 0, &copy, &[])?;
+        }
+        w.call("endEncoding", 14, 0, &[], &[])?;
+        w.call("commit", 12, 0, &[], &[])?;
+        w.call(WAIT_COMPLETED, 12, 0, &[], &[])?;
+        let sum = Value::List(vec![Value::Bytes(
+            Sha256::digest(layered_slices()).to_vec(),
+        )]);
+        w.call("m2v.check", 0, 0, &[Value::Object(10)], &[("sha256", sum)])
+    })
+}
+
+/// A layered pass (`renderTargetArrayLength` 2) plays as the runtime builds it: its encoder is
+/// made, not skipped as a pass the runtime's descriptor does not hold, and nothing else is
+/// skipped. The draw renders the layer its vertex function selects, slice 1, the clear covers
+/// slice 0, and the stream's check of both slices, read back through a blit, matches. A dump of
+/// the command buffer (#12) holds both slices the pass stored (#7), one after the other.
+#[test]
+fn a_layered_pass_plays_and_its_draw_renders_the_layer_it_selects() {
+    let dir = ScratchDir::new("rt-replay-layered").unwrap();
+    let path = layered_pass(&dir);
+    let dumps = ScratchDir::new("rt-replay-layered-out").unwrap();
+    let cache = ScratchCache::new().unwrap();
+    let mut backend = NewRuntime::new(rt_device(cache.path()), gpu::TEST_DEVICE).unwrap();
+    let mut reader = StreamReader::open(&[path], None).unwrap();
+    let listed = CommandBufferList::parse("12").unwrap();
+    let player = Player::new(&mut backend).dumping(listed, dumps.path().to_path_buf());
+    let (report, ended) = player.play(&mut reader);
+    for line in report.lines().iter().chain(&backend.lines()) {
+        eprintln!("REPLAY layered {line}");
+    }
+    ended.unwrap();
+    let executed = &report.total.executed;
+    for skipped in [
+        "skipped_encoders",
+        "skipped_render_states",
+        "skipped_draws",
+        "skipped_calls",
+        "skipped_objects",
+    ] {
+        assert_eq!(executed[skipped], 0, "{skipped}: {executed:?}");
+    }
+    assert!(executed["passes"] >= 1, "{executed:?}");
+    assert_eq!(report.first_skip, None);
+    assert_eq!(Some(report.checks[0].sha256), report.checks[0].recorded);
+    let read = |name: &str| std::fs::read(dumps.path().join(name)).unwrap();
+    assert_eq!(read("cb12-obj7.bin"), layered_slices());
+    assert_eq!(read("cb12-obj7.cover"), b"-");
+}
+
 /// A play's report carries the runtime's stage sums among its executed counters, with the part
 /// from scheduling to GPU start under earlier spans and the completion thread's steps, which add
 /// up to the span from GPU end to handlers, and its stage histograms as each frame ended and at
@@ -662,6 +822,119 @@ fn a_draw_of_points_plays_on_the_new_runtime() {
     assert_eq!(report.first_skip, None);
 }
 
+/// A colour attachment's `depthPlane` plays as the runtime's: of an `RGBA8Unorm` 3D texture
+/// (#3, 4 x 4 x 4, Private), a pass with no plane set clears plane 0 green and one at
+/// `depthPlane` 2 clears plane 2 red; of a 2D texture (#4), a pass at `depthPlane` 2 clears it red,
+/// the plane ignored as Metal ignores it of a texture that is not 3D. Blits copy planes 0 and 2
+/// and the 2D texture into buffers, which the stream checks green, red and red; nothing is
+/// skipped.
+#[test]
+fn a_colour_attachment_s_depth_plane_plays_on_the_new_runtime() {
+    let dir = ScratchDir::new("rt-replay-depth-plane").unwrap();
+    let green: Vec<u8> = [0u8, 255, 0, 255].repeat(16);
+    let red: Vec<u8> = [255u8, 0, 0, 255].repeat(16);
+    let path = written(&dir, |w| {
+        w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
+        w.call("newCommandQueue", 1, 2, &[], &[])?;
+        // RGBA8Unorm, shader-read and render-target, Private: a 3D texture four planes deep and a
+        // 2D one.
+        for (id, kind, depth) in [(3, 7, 4), (4, 2, 1)] {
+            let texture = uints(&[
+                ("textureType", kind),
+                ("pixelFormat", 70),
+                ("width", 4),
+                ("height", 4),
+                ("depth", depth),
+                ("usage", 5),
+                ("storageMode", 2),
+            ]);
+            w.call("newTextureWithDescriptor:", 1, id, &[texture], &[])?;
+        }
+        for id in 5..=7 {
+            let shared = [Value::Uint(64), Value::Uint(0)];
+            w.call("newBufferWithLength:options:", 1, id, &shared, &[])?;
+        }
+        // Pass #10: #3 with no plane set, cleared green; #11: #3 at plane 2, cleared red; #12: #4
+        // at plane 2, cleared red.
+        let passes = [
+            (10, 3, None, [0.0, 1.0]),
+            (11, 3, Some(2), [1.0, 0.0]),
+            (12, 4, Some(2), [1.0, 0.0]),
+        ];
+        for (pass, texture, plane, [r, g]) in passes {
+            w.call("MTLRenderPassDescriptor.new", 0, pass, &[], &[])?;
+            let size = uints(&[("renderTargetWidth", 4), ("renderTargetHeight", 4)]);
+            w.call("m2v.setPass", pass, 0, &[size], &[])?;
+            let Value::Map(mut color) = uints(&[("loadAction", 2), ("storeAction", 1)]) else {
+                unreachable!("a map");
+            };
+            color.push(("texture".into(), Value::Object(texture)));
+            if let Some(plane) = plane {
+                color.push(("depthPlane".into(), Value::Uint(plane)));
+            }
+            let clear = [("red", r), ("green", g), ("blue", 0.0), ("alpha", 1.0)]
+                .map(|(key, value)| (key.into(), Value::F64(value)));
+            color.push(("clearColor".into(), Value::Map(clear.to_vec())));
+            let args = [Value::Uint(0), Value::Map(color)];
+            w.call("m2v.setColorAttachment", pass, 0, &args, &[])?;
+        }
+        w.call("commandBuffer", 2, 20, &[], &[])?;
+        for (encoder, pass) in [(21, 10), (22, 11), (23, 12)] {
+            let pass = [Value::Object(pass)];
+            w.call(
+                "renderCommandEncoderWithDescriptor:",
+                20,
+                encoder,
+                &pass,
+                &[],
+            )?;
+            w.call("endEncoding", encoder, 0, &[], &[])?;
+        }
+        w.call("blitCommandEncoder", 20, 24, &[], &[])?;
+        let selector = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:\
+                        destinationOffset:destinationBytesPerRow:destinationBytesPerImage:";
+        for (texture, z, buffer) in [(3, 0, 5), (3, 2, 6), (4, 0, 7)] {
+            let copy = [
+                Value::Object(texture),
+                Value::Uint(0),
+                Value::Uint(0),
+                uints(&[("x", 0), ("y", 0), ("z", z)]),
+                uints(&[("width", 4), ("height", 4), ("depth", 1)]),
+                Value::Object(buffer),
+                Value::Uint(0),
+                Value::Uint(16),
+                Value::Uint(64),
+            ];
+            w.call(selector, 24, 0, &copy, &[])?;
+        }
+        w.call("endEncoding", 24, 0, &[], &[])?;
+        w.call("commit", 20, 0, &[], &[])?;
+        w.call(WAIT_COMPLETED, 20, 0, &[], &[])?;
+        for (buffer, texels) in [(5, &green), (6, &red), (7, &red)] {
+            let sum = Value::List(vec![Value::Bytes(Sha256::digest(texels).to_vec())]);
+            w.call(
+                "m2v.check",
+                0,
+                0,
+                &[Value::Object(buffer)],
+                &[("sha256", sum)],
+            )?;
+        }
+        Ok(())
+    });
+    let (report, _) = play("depth-plane", &path);
+    assert_eq!(report.checks.len(), 3);
+    for (at, check) in report.checks.iter().enumerate() {
+        assert_eq!(Some(check.sha256), check.recorded, "check {at}");
+    }
+    let executed = &report.total.executed;
+    for skipped in ["skipped_encoders", "skipped_calls", "skipped_objects"] {
+        assert_eq!(executed[skipped], 0, "{skipped}: {executed:?}");
+    }
+    assert!(executed["passes"] >= 3, "{executed:?}");
+    assert_eq!(report.first_skip, None);
+}
+
 /// A render encoder's eight residency declarations (calls 21 to 28) play through the runtime, as
 /// the stream records them (each C array and its count one list, the usage after it, the stages
 /// last): `useResource:usage:` and `useResources:count:usage:`, with stages and without, each
@@ -711,6 +984,88 @@ fn a_line_width_plays_and_a_line_drawn_at_another_width_is_skipped() {
     let note = report.verdict_note();
     assert_eq!(note.as_deref(), Some("not a verdict past frame 0, call 21"));
     let line = "skipped render commands Draw { kind: LineWidth } 1, the first at frame 0, call 21";
+    assert!(lines.iter().any(|l| l == line), "{lines:?}");
+}
+
+/// `setSamplePositions:count:` plays as the runtime treats it: two passes over a 4-sample target
+/// (#3), one at Metal's default positions of 4 samples (#4) and one at four others (#5), each
+/// set on the pass descriptor, play through with nothing refused or skipped, and the report
+/// counts the second pass alone, at its encoder (call 12).
+#[test]
+fn sample_positions_play_and_a_pass_at_other_positions_is_counted() {
+    let dir = ScratchDir::new("rt-replay-sample-positions").unwrap();
+    let path = written(&dir, |w| {
+        w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
+        w.call("newCommandQueue", 1, 2, &[], &[])?;
+        // RGBA8Unorm, 4 by 4, 2D multisample of 4 samples, render-target, Private.
+        let target = uints(&[
+            ("textureType", 4),
+            ("pixelFormat", 70),
+            ("width", 4),
+            ("height", 4),
+            ("sampleCount", 4),
+            ("usage", 4),
+            ("storageMode", 2),
+        ]);
+        w.call("newTextureWithDescriptor:", 1, 3, &[target], &[])?;
+        // An `MTLSamplePosition` list, each `float` written as an f64, as the recorder writes it.
+        let positions = |at: &[[f32; 2]]| {
+            let position = |&[x, y]: &[f32; 2]| {
+                Value::Map(vec![
+                    ("x".into(), Value::F64(f64::from(x))),
+                    ("y".into(), Value::F64(f64::from(y))),
+                ])
+            };
+            Value::List(at.iter().map(position).collect())
+        };
+        // Metal's default positions of 4 samples, Vulkan's standard locations; then four others.
+        let defaults: [[f32; 2]; 4] = [
+            [0.375, 0.125],
+            [0.875, 0.375],
+            [0.125, 0.625],
+            [0.625, 0.875],
+        ];
+        let others: [[f32; 2]; 4] = [[0.25, 0.5]; 4];
+        for (pass, set) in [(4, &defaults), (5, &others)] {
+            w.call("MTLRenderPassDescriptor.new", 0, pass, &[], &[])?;
+            let Value::Map(mut color) = uints(&[("loadAction", 2), ("storeAction", 0)]) else {
+                unreachable!("a map");
+            };
+            color.push(("texture".into(), Value::Object(3)));
+            let args = [Value::Uint(0), Value::Map(color)];
+            w.call("m2v.setColorAttachment", pass, 0, &args, &[])?;
+            w.call(
+                "setSamplePositions:count:",
+                pass,
+                0,
+                &[positions(&set[..])],
+                &[],
+            )?;
+        }
+        w.call("commandBuffer", 2, 6, &[], &[])?;
+        for (pass, encoder) in [(4, 7), (5, 8)] {
+            let args = [Value::Object(pass)];
+            w.call(
+                "renderCommandEncoderWithDescriptor:",
+                6,
+                encoder,
+                &args,
+                &[],
+            )?;
+            w.call("endEncoding", encoder, 0, &[], &[])?;
+        }
+        w.call("commit", 6, 0, &[], &[])?;
+        w.call(WAIT_COMPLETED, 6, 0, &[], &[])
+    });
+    let (report, lines) = play("sample-positions", &path);
+    let executed = &report.total.executed;
+    for skipped in ["skipped_encoders", "skipped_calls", "skipped_objects"] {
+        assert_eq!(executed[skipped], 0, "{skipped}: {executed:?}");
+    }
+    assert!(executed["passes"] >= 2, "{executed:?}");
+    assert_eq!(report.first_skip, None);
+    let line = "passes at sample positions other than Metal's defaults 1: rasterized at the \
+                defaults, Vulkan's standard locations; the first at frame 0, call 12";
     assert!(lines.iter().any(|l| l == line), "{lines:?}");
 }
 

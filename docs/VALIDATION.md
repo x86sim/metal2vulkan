@@ -48,9 +48,20 @@ hang the host. So everything that opens a device is explicit, bounded and refusa
 | `--cfg m2v_cpu_icd` | Vulkan execution tests | a CPU ICD only (lavapipe) | Linux CI, with `LP_NUM_THREADS=1` |
 | `--cfg m2v_gpu` | Vulkan and Metal execution tests | a real GPU | explicitly, on a host with a GPU |
 | `--cfg m2v_gpu --cfg m2v_gpu_hazards` | the GPU hazards too | a real GPU | only to test that feature, by name |
+| `--cfg m2v_gpu --cfg m2v_shared_view` | `metal2vulkan-runtime`'s devices read their memory types as the refused device's | a real GPU | to test Shared memory's coherence, in its own target directory |
 
 `m2v_cpu_icd` and `m2v_gpu` are mutually exclusive; `m2v_gpu_hazards` adds to `m2v_gpu` and means
-nothing alone. Lint the gated code without running it, in its own target directory:
+nothing alone. So does `m2v_shared_view`: every device `metal2vulkan-runtime`'s tests make with no
+memory view of their own (`DeviceOptions`'s test-only `memory`) reads its memory types through
+`tests::command::on_device::cached_types_incoherent`, which takes `HOST_COHERENT` from every
+host-visible, host-coherent, host-cached type, as a Meteor Lake GPU under Mesa's Intel driver and
+i915 lists them. Shared storage then takes a cached type that is not coherent, so the unchanged
+device suite runs Shared memory's flushes and invalidates (the runtime README, "Shared memory's
+coherence") on a GPU whose memory is coherent in fact; Vulkan allows both calls on a coherent type.
+Lavapipe cannot run it: its one memory type also holds the parameter ring, which needs a coherent
+type. Under the view a card whose host-pointer and dma-buf queries offer only its cached types
+refuses every import; run it with the import families filtered. Lint the gated code without running
+it, in its own target directory:
 
 ```sh
 CARGO_TARGET_DIR=target/gpucfg RUSTFLAGS='-Dwarnings --cfg m2v_gpu' \
@@ -564,7 +575,15 @@ cargo run -p metal2vulkan-validation --release --bin corpus-vulkan -- \
   (`Refusal::IndexBufferOffset`), carries `index_buffer_past_end`, and a depth/stencil attachment
   of both aspects, the oracle's two textures, which the runtime renders into in no one pass yet
   (`Gap::RenderPass` of `DepthStencilViews`), carries `separate_depth_stencil`: each the runtime's
-  limit, run on Metal alone. Its device worker enables the
+  limit, run on Metal alone. A device without `VK_EXT_shader_stencil_export` draws a fragment
+  function's `[[stencil]]` output by bits and refuses a draw whose stencil test compares by a
+  function other than `Always` and `Never` on a face, which the output decides as its reference
+  (`Gap::Draw` of `StencilOutput`): such a case records `not_enabled` there, naming the extension
+  and the face, read from its function's live outputs and its depth-stencil state once the state is
+  made (`DrawDepthStencil::stencil_reference_face`). The case schema expresses no visibility
+  result mode, and neither executor sets one, so the runtime's other refusal of such a draw,
+  inside a `Counting` segment, meets none. Its device
+  worker enables the
   validation layer through the loader's and the layer's variables, and any message the layer logs
   fails the row. The pipeline state's make is held to 500 MiB of peak live allocations and 20 s.
   Its row records the state's precision notes, the runtime's fingerprint and an out-of-bounds

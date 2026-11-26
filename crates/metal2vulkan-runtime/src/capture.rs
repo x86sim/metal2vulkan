@@ -46,6 +46,7 @@
 //! command buffer that accesses the buffer, which then holds it.
 
 use crate::buffer::{BufferInner, DeviceCopy};
+use crate::coherence::Range;
 use crate::counters::Metric;
 use crate::device::Core;
 use crate::error::Error;
@@ -245,6 +246,22 @@ impl CopyIn {
         }
     }
 
+    /// The Shared memory its copies read: each range named, in the block of the consumer's bytes,
+    /// widened to whole atoms of `atom` bytes, which the submission that takes it flushes first
+    /// (`crate::coherence`).
+    pub(crate) fn shared_ranges(&self, atom: u64) -> impl Iterator<Item = Range> + '_ {
+        (self.modified.iter()).flat_map(move |modified| {
+            (modified.ranges.iter()).filter_map(move |&(start, end)| {
+                Range::of_block(
+                    &modified.cpu.memory,
+                    modified.offset + start,
+                    end - start,
+                    atom,
+                )
+            })
+        })
+    }
+
     /// Gives its recorder back and drops what it holds, and its pair of timestamp queries, read
     /// where its submission completed (`end`, [`times::retire_own`]): once what took it retired,
     /// or ended at a loss, or where it never went. Answers its two timestamps where it completed
@@ -307,9 +324,16 @@ pub(crate) fn copy_in(core: &Core, named: &[Modified], number: u64) -> Result<Co
         match into_copies.is_empty() {
             true => {
                 record::barrier(device, command, Reach::Commands);
-                core.counters.count(Metric::Barriers);
+                core.counters.count(Metric::UploadBarriers);
             }
-            false => over::record_side(device, command, &into_copies, true, &core.counters),
+            false => over::record_side(
+                device,
+                command,
+                &into_copies,
+                true,
+                Metric::UploadBarriers,
+                &core.counters,
+            ),
         }
     }
     times::end_own(device, command, stamps);

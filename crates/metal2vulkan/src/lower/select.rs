@@ -1852,7 +1852,9 @@ fn identity_unsourced(f: &RuntimeFact) -> bool {
 }
 
 /// Under the identity domains on profile `p`, the plans lowered so far: a kernel, a vertex or a
-/// fragment function that reaches memory only through its buffer slots' device addresses, the
+/// fragment function that reaches memory only through its buffer slots' device addresses (a
+/// kernel on a device that binds its buffer arguments, through its slots' storage views of set 0
+/// at their pushed bind offsets, `AccessPlan::robust_views`), the
 /// device addresses it loads or makes from integers (`access::dynamic`, no root table), its
 /// textures' and runtime samplers' resource IDs and its constexpr samplers' pushed indices, with no
 /// descriptor and no state of a bound texture or sampler but its resource ID's: a texture's
@@ -1863,12 +1865,14 @@ fn identity_unsourced(f: &RuntimeFact) -> bool {
 /// `PushField::TextureLevelBase`), the compute
 /// encoder's stage-in region (`PushField::StageInRegion`), the stride of a vertex layout whose
 /// attributes the function pulls (`PushField::VertexBufferStride`): a post-tessellation function's
-/// control points and patches, and a plain vertex function's layouts that a pulled-vertex-buffer
-/// variant or the de-indexed and private list forms pull; the render encoder's alpha test
+/// control points and patches, and a plain vertex function's layouts that the de-indexed and
+/// private list forms and a pipeline made for indirect command buffers pull; the render encoder's alpha test
 /// reference code a fragment function under the private alpha test compares with
 /// (`PushField::AlphaTestReference`); the index of the sampled-texture array's element a
 /// fragment function reads a colour attachment through (`PushField::FetchedColor`, framebuffer
-/// fetch on a device with neither ordered form); the render pass's length, at or past which a
+/// fetch on a device with neither ordered form); the stencil bit a fragment function whose
+/// stencil output is drawn by bits keeps (`PushField::StencilBit`); the render pass's length, at
+/// or past which a
 /// vertex function that writes `[[render_target_array_index]]` stores `Layer` 0
 /// (`PushField::RenderTargetArrayLength`); the address of the runtime's memory that holds a
 /// kernel's private arena past the floor (`PushField::PrivateArenaAddress`); the draw's viewport
@@ -1899,8 +1903,12 @@ fn identity_refusal(plan: &Plan) -> Option<String> {
             "a function of a stage other than a kernel, vertex or fragment function".to_owned(),
         );
     }
+    // A kernel on a device that binds its buffer arguments reaches each storage view at its
+    // pushed bind offset (`AccessPlan::robust_views`).
+    let views = plan.families.access.robust_views;
     let field = plan.push.fields.iter().find(|f| match (f.field, f.loc) {
         (PushField::ArgumentTableAddress, loc) => !matches!(loc, PushLoc::Push { .. }),
+        (PushField::SlotBindOffset(_), _) => !views,
         (field, _) => !matches!(
             field,
             PushField::SlotGuestBase(_)
@@ -1916,6 +1924,7 @@ fn identity_refusal(plan: &Plan) -> Option<String> {
                 | PushField::VertexBufferStride(_)
                 | PushField::AlphaTestReference
                 | PushField::FetchedColor { .. }
+                | PushField::StencilBit
                 | PushField::RenderTargetArrayLength
                 | PushField::PrivateArenaAddress
                 | PushField::ViewportCount
@@ -1930,7 +1939,9 @@ fn identity_refusal(plan: &Plan) -> Option<String> {
             f.field
         ));
     }
-    if (plan.slots.iter().flatten()).any(|c| c.form != BufferForm::Psb) {
+    if (plan.slots.iter().flatten())
+        .any(|c| !(c.form == BufferForm::Psb || views && c.form == BufferForm::Descriptor))
+    {
         return Some("a buffer argument not reached through its device address".to_owned());
     }
     let t = &plan.families.texture;
@@ -2029,7 +2040,16 @@ fn identity_refusal(plan: &Plan) -> Option<String> {
             ));
         }
     }
-    if plan.descriptors.descriptors() != 0 {
+    // A bound kernel's storage views are set 0's storage buffers, one a view slot.
+    let bound = match views {
+        true => (plan.slots.iter().flatten())
+            .filter(|c| c.form == BufferForm::Descriptor)
+            .count() as u64,
+        false => 0,
+    };
+    if plan.descriptors.descriptors() != bound
+        || u64::from(plan.descriptors.storage_buffers) != bound
+    {
         return Some("a resource bound through a descriptor".to_owned());
     }
     None

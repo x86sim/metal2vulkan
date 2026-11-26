@@ -97,7 +97,7 @@ const ENABLES: u32 = 3;
 /// version is a miss and removed, so a fix of ours to a helper that ended asks the helper again.
 /// Bump it with every change to that code that changes what the helper does; a driver's fix needs
 /// none, as the stage key holds the driver's header.
-pub(crate) const HELPER_VERSION: u32 = 2;
+pub(crate) const HELPER_VERSION: u32 = 3;
 
 /// No Metal counterpart: what ended a helper's compile of a kernel past the stage bound, kept as
 /// the pipeline's entry ([`Device::record_stage_breach`], [`Device::fill_stage`]) so its makes are
@@ -675,9 +675,14 @@ unsafe fn compile(core: &Core, request: &Request) -> Result<(Vec<u8>, u64), vk::
     if let Some(required) = &mut required {
         stage = stage.push_next(required);
     }
-    let info = vk::ComputePipelineCreateInfo::default()
+    let mut info = vk::ComputePipelineCreateInfo::default()
         .stage(stage)
         .layout(core.layout);
+    // As the device makes the pipeline (`crate::pipeline::kernel_robustness`).
+    let mut robustness = crate::pipeline::kernel_robustness(core);
+    if let Some(robustness) = &mut robustness {
+        info = info.push_next(robustness);
+    }
     let began = host_time();
     // SAFETY: the module, the layout and the cache are the device's.
     let made = unsafe { device.create_compute_pipelines(cache, &[info], None) };

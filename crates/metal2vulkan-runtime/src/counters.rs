@@ -4,7 +4,7 @@
 //! to its own; nothing turns them on or off.
 
 use crate::pipeline::DispatchVariant;
-use crate::{PixelFormat, TextureUsage};
+use crate::{MemoryClass, PixelFormat, TextureUsage};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -215,8 +215,36 @@ pub(crate) enum Metric {
     Submissions,
     /// [`Metrics::passes`].
     Passes,
-    /// [`Metrics::barriers`].
-    Barriers,
+    /// [`Metrics::pass_start_barriers`].
+    PassStartBarriers,
+    /// [`Metrics::pass_home_barriers`].
+    PassHomeBarriers,
+    /// [`Metrics::blit_barriers`].
+    BlitBarriers,
+    /// [`Metrics::dispatch_after_write_barriers`].
+    DispatchAfterWriteBarriers,
+    /// [`Metrics::dispatch_write_after_read_barriers`].
+    DispatchWriteAfterReadBarriers,
+    /// [`Metrics::dispatch_encoder_end_barriers`].
+    DispatchEncoderEndBarriers,
+    /// [`Metrics::dispatch_pass_end_barriers`].
+    DispatchPassEndBarriers,
+    /// [`Metrics::dispatch_indirect_barriers`].
+    DispatchIndirectBarriers,
+    /// [`Metrics::dispatch_unbound_barriers`].
+    DispatchUnboundBarriers,
+    /// [`Metrics::dispatch_arena_piece_barriers`].
+    DispatchArenaPieceBarriers,
+    /// [`Metrics::dispatch_heap_barriers`].
+    DispatchHeapBarriers,
+    /// [`Metrics::dispatch_other_barriers`].
+    DispatchOtherBarriers,
+    /// [`Metrics::segment_end_barriers`].
+    SegmentEndBarriers,
+    /// [`Metrics::upload_barriers`].
+    UploadBarriers,
+    /// [`Metrics::other_barriers`].
+    OtherBarriers,
     /// [`Metrics::pipelines_created`].
     PipelinesCreated,
     /// [`Metrics::blocks_made`].
@@ -263,6 +291,14 @@ pub(crate) enum Metric {
     Pushes,
     /// [`Metrics::pushes_held`].
     PushesHeld,
+    /// [`Metrics::bound_dispatches`].
+    BoundDispatches,
+    /// [`Metrics::address_dispatches`].
+    AddressDispatches,
+    /// [`Metrics::buffer_sets_written`].
+    BufferSetsWritten,
+    /// [`Metrics::buffer_sets_held`].
+    BufferSetsHeld,
     /// [`Metrics::upload_waits`].
     UploadWaits,
     /// [`Metrics::staging_sleeps`].
@@ -317,16 +353,34 @@ pub(crate) enum Metric {
     OverlappingCopiesRefused,
     /// [`Metrics::heap_moves`].
     HeapMoves,
+    /// [`Metrics::stencil_bit_draws`].
+    StencilBitDraws,
+    /// [`Metrics::rendering_interrupts`].
+    RenderingInterrupts,
 }
 
 /// The number of [`Metric`]s.
-const METRICS: usize = Metric::HeapMoves as usize + 1;
+const METRICS: usize = Metric::RenderingInterrupts as usize + 1;
 
 /// Every [`Metric`], in its order: each at its own index.
 const METRIC_ORDER: [Metric; METRICS] = [
     Metric::Submissions,
     Metric::Passes,
-    Metric::Barriers,
+    Metric::PassStartBarriers,
+    Metric::PassHomeBarriers,
+    Metric::BlitBarriers,
+    Metric::DispatchAfterWriteBarriers,
+    Metric::DispatchWriteAfterReadBarriers,
+    Metric::DispatchEncoderEndBarriers,
+    Metric::DispatchPassEndBarriers,
+    Metric::DispatchIndirectBarriers,
+    Metric::DispatchUnboundBarriers,
+    Metric::DispatchArenaPieceBarriers,
+    Metric::DispatchHeapBarriers,
+    Metric::DispatchOtherBarriers,
+    Metric::SegmentEndBarriers,
+    Metric::UploadBarriers,
+    Metric::OtherBarriers,
     Metric::PipelinesCreated,
     Metric::BlocksMade,
     Metric::DispatchesWithoutEffects,
@@ -350,6 +404,10 @@ const METRIC_ORDER: [Metric; METRICS] = [
     Metric::RingWrites,
     Metric::Pushes,
     Metric::PushesHeld,
+    Metric::BoundDispatches,
+    Metric::AddressDispatches,
+    Metric::BufferSetsWritten,
+    Metric::BufferSetsHeld,
     Metric::UploadWaits,
     Metric::StagingSleeps,
     Metric::Synchronizations,
@@ -377,6 +435,8 @@ const METRIC_ORDER: [Metric; METRICS] = [
     Metric::AccumulatedVisibilityRefused,
     Metric::OverlappingCopiesRefused,
     Metric::HeapMoves,
+    Metric::StencilBitDraws,
+    Metric::RenderingInterrupts,
 ];
 
 // Each metric of the order is at its own index.
@@ -394,11 +454,11 @@ const _: () = {
 pub(crate) struct Tally {
     counts: [u64; METRICS],
     /// The metrics counted since the tally was last added, a bit each at its index.
-    counted: u64,
+    counted: u128,
 }
 
 // Each metric has its bit in a tally's `counted`.
-const _: () = assert!(METRICS <= u64::BITS as usize);
+const _: () = assert!(METRICS <= u128::BITS as usize);
 
 impl Default for Tally {
     fn default() -> Self {
@@ -488,6 +548,8 @@ pub(crate) enum Gauge {
     TimestampPools,
     /// [`Gauges::occlusion_pools`].
     OcclusionPools,
+    /// [`Gauges::buffer_set_pools`].
+    BufferSetPools,
     /// [`Gauges::imports`].
     Imports,
     /// [`Gauges::exports`].
@@ -676,7 +738,21 @@ struct Atomics {
     held_start_gap_nanos: AtomicU64,
     held_for_room: AtomicU64,
     passes: AtomicU64,
-    barriers: AtomicU64,
+    pass_start_barriers: AtomicU64,
+    pass_home_barriers: AtomicU64,
+    blit_barriers: AtomicU64,
+    dispatch_after_write_barriers: AtomicU64,
+    dispatch_write_after_read_barriers: AtomicU64,
+    dispatch_encoder_end_barriers: AtomicU64,
+    dispatch_pass_end_barriers: AtomicU64,
+    dispatch_indirect_barriers: AtomicU64,
+    dispatch_unbound_barriers: AtomicU64,
+    dispatch_arena_piece_barriers: AtomicU64,
+    dispatch_heap_barriers: AtomicU64,
+    dispatch_other_barriers: AtomicU64,
+    segment_end_barriers: AtomicU64,
+    upload_barriers: AtomicU64,
+    other_barriers: AtomicU64,
     bytes_copied: AtomicU64,
     bytes_zeroed: AtomicU64,
     takes_from_free_ranges: AtomicU64,
@@ -746,6 +822,10 @@ struct Atomics {
     ring_writes: AtomicU64,
     pushes: AtomicU64,
     pushes_held: AtomicU64,
+    bound_dispatches: AtomicU64,
+    address_dispatches: AtomicU64,
+    buffer_sets_written: AtomicU64,
+    buffer_sets_held: AtomicU64,
     upload_waits: AtomicU64,
     staging_sleeps: AtomicU64,
     synchronizations: AtomicU64,
@@ -755,6 +835,8 @@ struct Atomics {
     over_copy_bytes: AtomicU64,
     over_copies_imported: AtomicU64,
     over_copy_bytes_imported: AtomicU64,
+    over_copy_bytes_private: AtomicU64,
+    over_copy_bytes_shared: AtomicU64,
     /// Each [`OverCause`]'s over-copies, at its index: their count and bytes.
     over_by_cause: [[AtomicU64; 2]; OVER_CAUSES],
     /// The first [`OVER_COPY_KINDS`] kinds copied, in that order ([`Counters::over_copy_kinds`]).
@@ -804,6 +886,8 @@ struct Atomics {
     accumulated_visibility_refused: AtomicU64,
     overlapping_copies_refused: AtomicU64,
     heap_moves: AtomicU64,
+    stencil_bit_draws: AtomicU64,
+    rendering_interrupts: AtomicU64,
     /// Each [`Part`]'s calls, at its index: their count, bytes, total and longest nanoseconds,
     /// and those over each of [`OVER_NANOS`].
     parts: [[AtomicU64; 7]; PARTS],
@@ -857,6 +941,7 @@ struct Atomics {
     textures_copied_over: AtomicU64,
     timestamp_pools: AtomicU64,
     occlusion_pools: AtomicU64,
+    buffer_set_pools: AtomicU64,
     imports: AtomicU64,
     exports: AtomicU64,
     surface_imports: AtomicU64,
@@ -883,6 +968,13 @@ struct Atomics {
     indirect_command_buffers: AtomicU64,
     preprocess_used_bytes: AtomicU64,
     preprocess_idle_bytes: AtomicU64,
+    /// Shared memory's flushes and invalidates (`crate::coherence`), after every other counter,
+    /// so a device that makes none keeps each of those at its place.
+    shared_flushes: AtomicU64,
+    shared_flushed_bytes: AtomicU64,
+    shared_invalidates: AtomicU64,
+    shared_invalidated_bytes: AtomicU64,
+    shared_coherence_failures: AtomicU64,
     /// Segment ends whose barrier reaches the host, for the tests.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     host_reaches: AtomicU64,
@@ -923,7 +1015,21 @@ impl Counters {
         match metric {
             Metric::Submissions => &a.submissions,
             Metric::Passes => &a.passes,
-            Metric::Barriers => &a.barriers,
+            Metric::PassStartBarriers => &a.pass_start_barriers,
+            Metric::PassHomeBarriers => &a.pass_home_barriers,
+            Metric::BlitBarriers => &a.blit_barriers,
+            Metric::DispatchAfterWriteBarriers => &a.dispatch_after_write_barriers,
+            Metric::DispatchWriteAfterReadBarriers => &a.dispatch_write_after_read_barriers,
+            Metric::DispatchEncoderEndBarriers => &a.dispatch_encoder_end_barriers,
+            Metric::DispatchPassEndBarriers => &a.dispatch_pass_end_barriers,
+            Metric::DispatchIndirectBarriers => &a.dispatch_indirect_barriers,
+            Metric::DispatchUnboundBarriers => &a.dispatch_unbound_barriers,
+            Metric::DispatchArenaPieceBarriers => &a.dispatch_arena_piece_barriers,
+            Metric::DispatchHeapBarriers => &a.dispatch_heap_barriers,
+            Metric::DispatchOtherBarriers => &a.dispatch_other_barriers,
+            Metric::SegmentEndBarriers => &a.segment_end_barriers,
+            Metric::UploadBarriers => &a.upload_barriers,
+            Metric::OtherBarriers => &a.other_barriers,
             Metric::PipelinesCreated => &a.pipelines_created,
             Metric::BlocksMade => &a.blocks_made,
             Metric::DispatchesWithoutEffects => &a.dispatches_without_effects,
@@ -947,6 +1053,10 @@ impl Counters {
             Metric::RingWrites => &a.ring_writes,
             Metric::Pushes => &a.pushes,
             Metric::PushesHeld => &a.pushes_held,
+            Metric::BoundDispatches => &a.bound_dispatches,
+            Metric::AddressDispatches => &a.address_dispatches,
+            Metric::BufferSetsWritten => &a.buffer_sets_written,
+            Metric::BufferSetsHeld => &a.buffer_sets_held,
             Metric::UploadWaits => &a.upload_waits,
             Metric::StagingSleeps => &a.staging_sleeps,
             Metric::Synchronizations => &a.synchronizations,
@@ -974,6 +1084,8 @@ impl Counters {
             Metric::AccumulatedVisibilityRefused => &a.accumulated_visibility_refused,
             Metric::OverlappingCopiesRefused => &a.overlapping_copies_refused,
             Metric::HeapMoves => &a.heap_moves,
+            Metric::StencilBitDraws => &a.stencil_bit_draws,
+            Metric::RenderingInterrupts => &a.rendering_interrupts,
         }
     }
 
@@ -1081,6 +1193,24 @@ impl Counters {
     /// A submission of `infos` submit infos ([`Metrics::submit_infos`]).
     pub(crate) fn submitted_infos(&self, infos: u64) {
         self.atomics.submit_infos.fetch_add(infos, Relaxed);
+    }
+
+    /// A `vkFlushMappedMemoryRanges` or `vkInvalidateMappedMemoryRanges` call over `bytes` bytes
+    /// of Shared memory ([`Metrics::shared_flushes`] and the three after it), `failed` where it
+    /// did not return success ([`Metrics::shared_coherence_failures`]).
+    pub(crate) fn coherence(&self, call: crate::coherence::Call, bytes: u64, failed: bool) {
+        let a = &self.atomics;
+        let (calls, total) = match call {
+            crate::coherence::Call::Flush => (&a.shared_flushes, &a.shared_flushed_bytes),
+            crate::coherence::Call::Invalidate => {
+                (&a.shared_invalidates, &a.shared_invalidated_bytes)
+            }
+        };
+        calls.fetch_add(1, Relaxed);
+        total.fetch_add(bytes, Relaxed);
+        if failed {
+            a.shared_coherence_failures.fetch_add(1, Relaxed);
+        }
     }
 
     /// A `vkQueueSubmit2` call that took `nanos` nanoseconds ([`Metrics::submit_call_nanos`]).
@@ -1385,10 +1515,18 @@ impl Counters {
     /// ([`Metrics::over_copies`], [`Metrics::over_copy_bytes`]), which count in
     /// [`Metrics::bytes_copied`] too, and where the bytes shaders reach of the buffer are in an
     /// imported block (`imported`), in [`Metrics::over_copies_imported`] and
-    /// [`Metrics::over_copy_bytes_imported`]; in the pair of the texture's cause; and its `kind`
-    /// kept where it is new and fewer than [`OVER_COPY_KINDS`] are kept, else, new,
-    /// [`Metrics::over_copies_unkept_kind`].
-    pub(crate) fn over_copied(&self, bytes: u64, imported: bool, kind: OverCopyKind) {
+    /// [`Metrics::over_copy_bytes_imported`]; by the class of the memory those bytes are in
+    /// (`class`, `None` for a Managed buffer's device copy), in
+    /// [`Metrics::over_copy_bytes_private`] or [`Metrics::over_copy_bytes_shared`]; in the pair of
+    /// the texture's cause; and its `kind` kept where it is new and fewer than
+    /// [`OVER_COPY_KINDS`] are kept, else, new, [`Metrics::over_copies_unkept_kind`].
+    pub(crate) fn over_copied(
+        &self,
+        bytes: u64,
+        imported: bool,
+        class: Option<MemoryClass>,
+        kind: OverCopyKind,
+    ) {
         let a = &self.atomics;
         a.over_copies.fetch_add(1, Relaxed);
         a.over_copy_bytes.fetch_add(bytes, Relaxed);
@@ -1396,6 +1534,13 @@ impl Counters {
         if imported {
             a.over_copies_imported.fetch_add(1, Relaxed);
             a.over_copy_bytes_imported.fetch_add(bytes, Relaxed);
+        }
+        if let Some(class) = class {
+            let class_bytes = match class {
+                MemoryClass::Private => &a.over_copy_bytes_private,
+                MemoryClass::Shared => &a.over_copy_bytes_shared,
+            };
+            class_bytes.fetch_add(bytes, Relaxed);
         }
         let [copies, copy_bytes] = &a.over_by_cause[kind.cause as usize];
         copies.fetch_add(1, Relaxed);
@@ -1642,6 +1787,7 @@ impl Counters {
             Gauge::TexturesCopiedOver => &a.textures_copied_over,
             Gauge::TimestampPools => &a.timestamp_pools,
             Gauge::OcclusionPools => &a.occlusion_pools,
+            Gauge::BufferSetPools => &a.buffer_set_pools,
             Gauge::Imports => &a.imports,
             Gauge::Exports => &a.exports,
             Gauge::SurfaceImports => &a.surface_imports,
@@ -1720,9 +1866,41 @@ impl Counters {
         };
         let stage = |stage: Stage| (a.stages[stage as usize].each_ref()).map(|n| n.load(Relaxed));
         let stage_nanos = |stage: Stage| a.stage_nanos[stage as usize].load(Relaxed);
+        // A dispatch's barrier counts in one source, and each barrier in one cause; their sums
+        // are every dispatch's barriers and every barrier.
+        let sources = [
+            &a.dispatch_after_write_barriers,
+            &a.dispatch_write_after_read_barriers,
+            &a.dispatch_encoder_end_barriers,
+            &a.dispatch_pass_end_barriers,
+            &a.dispatch_indirect_barriers,
+            &a.dispatch_unbound_barriers,
+            &a.dispatch_arena_piece_barriers,
+            &a.dispatch_heap_barriers,
+            &a.dispatch_other_barriers,
+        ]
+        .map(|n| n.load(Relaxed));
+        let dispatch_hazard = sources.iter().sum();
+        let causes = [
+            a.pass_start_barriers.load(Relaxed),
+            a.pass_home_barriers.load(Relaxed),
+            a.blit_barriers.load(Relaxed),
+            dispatch_hazard,
+            a.segment_end_barriers.load(Relaxed),
+            a.upload_barriers.load(Relaxed),
+            a.other_barriers.load(Relaxed),
+        ];
+        let [pass_start, pass_home, blit, _, segment_end, upload, other] = causes;
+        let [on_write, on_read, encoder_end, pass_end, indirect, unbound, arena, heap, rest] =
+            sources;
         Metrics {
             submissions: a.submissions.load(Relaxed),
             submit_infos: a.submit_infos.load(Relaxed),
+            shared_flushes: a.shared_flushes.load(Relaxed),
+            shared_flushed_bytes: a.shared_flushed_bytes.load(Relaxed),
+            shared_invalidates: a.shared_invalidates.load(Relaxed),
+            shared_invalidated_bytes: a.shared_invalidated_bytes.load(Relaxed),
+            shared_coherence_failures: a.shared_coherence_failures.load(Relaxed),
             submit_call_nanos: a.submit_call_nanos.load(Relaxed),
             submit_call_max_nanos: a.submit_call_max_nanos.load(Relaxed),
             pipeline_creation_nanos: a.pipeline_creation_nanos.load(Relaxed),
@@ -1751,7 +1929,23 @@ impl Counters {
             held_start_gap_nanos: a.held_start_gap_nanos.load(Relaxed),
             held_for_room: a.held_for_room.load(Relaxed),
             passes: a.passes.load(Relaxed),
-            barriers: a.barriers.load(Relaxed),
+            barriers: causes.iter().sum(),
+            pass_start_barriers: pass_start,
+            pass_home_barriers: pass_home,
+            blit_barriers: blit,
+            dispatch_hazard_barriers: dispatch_hazard,
+            dispatch_after_write_barriers: on_write,
+            dispatch_write_after_read_barriers: on_read,
+            dispatch_encoder_end_barriers: encoder_end,
+            dispatch_pass_end_barriers: pass_end,
+            dispatch_indirect_barriers: indirect,
+            dispatch_unbound_barriers: unbound,
+            dispatch_arena_piece_barriers: arena,
+            dispatch_heap_barriers: heap,
+            dispatch_other_barriers: rest,
+            segment_end_barriers: segment_end,
+            upload_barriers: upload,
+            other_barriers: other,
             bytes_copied: a.bytes_copied.load(Relaxed),
             bytes_zeroed: a.bytes_zeroed.load(Relaxed),
             takes_from_free_ranges: a.takes_from_free_ranges.load(Relaxed),
@@ -1835,6 +2029,10 @@ impl Counters {
             ring_writes: a.ring_writes.load(Relaxed),
             pushes: a.pushes.load(Relaxed),
             pushes_held: a.pushes_held.load(Relaxed),
+            bound_dispatches: a.bound_dispatches.load(Relaxed),
+            address_dispatches: a.address_dispatches.load(Relaxed),
+            buffer_sets_written: a.buffer_sets_written.load(Relaxed),
+            buffer_sets_held: a.buffer_sets_held.load(Relaxed),
             upload_waits: a.upload_waits.load(Relaxed),
             staging_sleeps: a.staging_sleeps.load(Relaxed),
             synchronizations: a.synchronizations.load(Relaxed),
@@ -1844,6 +2042,8 @@ impl Counters {
             over_copy_bytes: a.over_copy_bytes.load(Relaxed),
             over_copies_imported: a.over_copies_imported.load(Relaxed),
             over_copy_bytes_imported: a.over_copy_bytes_imported.load(Relaxed),
+            over_copy_bytes_private: a.over_copy_bytes_private.load(Relaxed),
+            over_copy_bytes_shared: a.over_copy_bytes_shared.load(Relaxed),
             over_copies_host_memory: over(OverCause::HostMemory)[0],
             over_copy_bytes_host_memory: over(OverCause::HostMemory)[1],
             over_copies_dma_buf: over(OverCause::DmaBuf)[0],
@@ -1915,6 +2115,8 @@ impl Counters {
             accumulated_visibility_refused: a.accumulated_visibility_refused.load(Relaxed),
             overlapping_copies_refused: a.overlapping_copies_refused.load(Relaxed),
             heap_moves: a.heap_moves.load(Relaxed),
+            stencil_bit_draws: a.stencil_bit_draws.load(Relaxed),
+            rendering_interrupts: a.rendering_interrupts.load(Relaxed),
             takes: part(Part::Take),
             take_lock_waits: part(Part::TakeLock),
             take_makes: part(Part::TakeMake),
@@ -1998,6 +2200,7 @@ impl Counters {
             textures_copied_over: a.textures_copied_over.load(Relaxed),
             timestamp_pools: a.timestamp_pools.load(Relaxed),
             occlusion_pools: a.occlusion_pools.load(Relaxed),
+            buffer_set_pools: a.buffer_set_pools.load(Relaxed),
             imports: a.imports.load(Relaxed),
             exports: a.exports.load(Relaxed),
             surface_imports: a.surface_imports.load(Relaxed),
@@ -2038,6 +2241,29 @@ pub struct Metrics {
     /// The `VkSubmitInfo2`s those calls passed: the command buffers of a submission that no event
     /// signal separates share one, and the upload shares the first.
     pub submit_infos: u64,
+    /// `vkFlushMappedMemoryRanges` calls over Shared memory: one before each submission whose
+    /// command buffers or copy-ins reach Shared memory, one before each invalidate
+    /// ([`shared_invalidates`](Self::shared_invalidates)), one after each `replace_region` through
+    /// a staging span, one at each `upload_region` of named bytes in Shared memory, and one at the
+    /// zero source's make. Only a device whose Shared type is not host-coherent makes them; on
+    /// one whose type is, this and the four after it stay 0 (the runtime README, "Shared memory's
+    /// coherence").
+    pub shared_flushes: u64,
+    /// The bytes those calls named, each range widened to whole multiples of the device's
+    /// `nonCoherentAtomSize`.
+    pub shared_flushed_bytes: u64,
+    /// `vkInvalidateMappedMemoryRanges` calls over Shared memory, each after a flush of the same
+    /// ranges: as a command buffer that may write Shared memory retires, before its status reads
+    /// completed or its handlers run; before a shared event's value a GPU signal raised reaches
+    /// the host, over every such command buffer in flight; and before `get_bytes` reads a staging
+    /// span.
+    pub shared_invalidates: u64,
+    /// The bytes those calls named, widened as the flushes' are.
+    pub shared_invalidated_bytes: u64,
+    /// Of those calls of both kinds, the ones that did not return success
+    /// (`VK_ERROR_OUT_OF_HOST_MEMORY` or `VK_ERROR_OUT_OF_DEVICE_MEMORY`): the work went on as
+    /// it would after a success.
+    pub shared_coherence_failures: u64,
     /// The nanoseconds of [`host_time`](crate::host_time) those calls took, from each call to
     /// its return, in total: the time inside the driver, which a driver may spend holding the call
     /// while another thread is inside a memory call
@@ -2177,8 +2403,77 @@ pub struct Metrics {
     /// around each copy between a texture's image and the staging region or a named buffer
     /// (`replaceRegion` and `getBytes`), and one before a zero fill of bytes an earlier fill of the
     /// upload wrote (a new buffer's zeroed bytes, or a range
-    /// [`Device::zero_block_range`](crate::Device::zero_block_range) zeroes).
+    /// [`Device::zero_block_range`](crate::Device::zero_block_range) zeroes). Each counts in one
+    /// of the seven causes below, whose sum this is.
     pub barriers: u64,
+    /// Of [`barriers`](Self::barriers), the first barrier of each render pass, before it: it pays
+    /// what is owed and moves the attachments from their home layouts to the pass's (none where
+    /// the pass opens its command buffer and moves nothing).
+    pub pass_start_barriers: u64,
+    /// Of [`barriers`](Self::barriers), the barrier at a render pass's end that moves its
+    /// attachments back to their home layouts. A pass that moves none home owes its barrier: the
+    /// next command's own barrier pays it, counted in that command's cause, or the segment's end.
+    pub pass_home_barriers: u64,
+    /// Of [`barriers`](Self::barriers), those of blit commands: the two around each copy, fill,
+    /// synchronize copy and indirect command buffer reset, one between two slabs of a copy
+    /// between textures, and a mipmap chain's, one a level.
+    pub blit_barriers: u64,
+    /// Of [`barriers`](Self::barriers), those a dispatch records before it: at a hazard with an
+    /// earlier dispatch of its encoder, or paying one an earlier command owed (an encoder that
+    /// wrote, a memory barrier call, a write through an address outside a dispatch's resources, a
+    /// render pass that moved nothing home, a release to another API). Each counts in one of the
+    /// nine sources below, whose sum this is: where it has several, in the dependency on a write
+    /// or on a read where the dispatch has one at its resources' level, and otherwise in the first
+    /// of the other seven, in their order.
+    pub dispatch_hazard_barriers: u64,
+    /// Of [`dispatch_hazard_barriers`](Self::dispatch_hazard_barriers), those where the dispatch
+    /// reads or writes a resource of its own (not through a heap's or a surface's one id) that a
+    /// command since the last barrier wrote.
+    pub dispatch_after_write_barriers: u64,
+    /// Of those, the ones where the dispatch writes such a resource that a command since the last
+    /// barrier read, and none wrote.
+    pub dispatch_write_after_read_barriers: u64,
+    /// Of those, the ones owed by an encoder that wrote anything, paid by the next encoder's first
+    /// dispatch, which has neither dependency.
+    pub dispatch_encoder_end_barriers: u64,
+    /// Of those, the ones owed by a render pass that moved nothing home, or that copied a resolve
+    /// into a buffer, paid by a dispatch with neither dependency.
+    pub dispatch_pass_end_barriers: u64,
+    /// Of those, the ones before an indirect dispatch after a write since the last barrier that
+    /// reached indirect argument reads, whatever buffer was written.
+    pub dispatch_indirect_barriers: u64,
+    /// Of those, the ones for an access through an address outside every resource: a read after
+    /// a write, a write after any access, or the barrier such a write owes the next dispatch.
+    pub dispatch_unbound_barriers: u64,
+    /// Of those, the ones before each piece of a dispatch split for its Private-arena slots but
+    /// the first in a block taken new: the piece reuses slots an earlier command may have used.
+    pub dispatch_arena_piece_barriers: u64,
+    /// Of those, the ones at a conflict through the one id of a heap's resources (or an exported
+    /// surface's buffer and planes), which Metal tracks as one resource.
+    pub dispatch_heap_barriers: u64,
+    /// Of those, the rest: owed by a memory barrier call, a release to another API, or a
+    /// concurrent encoder after commands that touched resources, and paid by a dispatch with
+    /// neither dependency.
+    pub dispatch_other_barriers: u64,
+    /// Of [`barriers`](Self::barriers), the one that ends each segment with commands of a command
+    /// buffer, paying what is owed.
+    pub segment_end_barriers: u64,
+    /// Of [`barriers`](Self::barriers), those in the device's uploads and in Managed buffers'
+    /// copy-ins: new textures' moves home and those after their zeroing
+    /// ([`texture_clear_barriers`](Self::texture_clear_barriers)), the two around each staging copy
+    /// (`replaceRegion` and `getBytes`), a heap texture's move before a host write, the acquires of
+    /// exported blocks and surfaces, Direct3D 11 planes' hand-overs, those between zero fills that
+    /// meet, a new indirect command buffer's, the two around each side of the copies of textures
+    /// over a buffer an upload or a copy-in carries, each upload's end, and a copy-in's where it
+    /// copies no texture.
+    pub upload_barriers: u64,
+    /// Of [`barriers`](Self::barriers), the rest: those inside a render pass (a memory barrier
+    /// after a draw that wrote memory, a move to the feedback layout, the two around an attachment
+    /// read's shadow copies or the clear of its shadow, an execution count's, heap textures'
+    /// moves), the two around each side of the copies between a texture over a buffer and its
+    /// image of its own in a command buffer, heap textures' moves before a command or ahead of a
+    /// segment, and each release of a block or a surface to another API.
+    pub other_barriers: u64,
     /// Bytes the runtime copied for a call: `replace_region` and `get_bytes` staging, the copies
     /// between a texture over a buffer and its image of its own
     /// ([`over_copy_bytes`](Self::over_copy_bytes)), the copies of attachments' images into their
@@ -2552,6 +2847,26 @@ pub struct Metrics {
     /// push: every pipeline shares the device's one layout and push range, so a push stays for the
     /// draws and dispatches after it.
     pub pushes_held: u64,
+    /// Dispatches recorded whose kernel reaches its buffer arguments through storage buffers of
+    /// set 0, each bound over its buffer and contained by its pipeline's robust buffer access 2:
+    /// the form a device whose translator profile binds a kernel's buffers
+    /// (`DeviceProfile::binds_kernel_buffers`) gives a kernel that reaches one through its
+    /// storage view. A dispatch split into pieces counts once a piece.
+    pub bound_dispatches: u64,
+    /// Dispatches recorded whose kernel reaches every buffer argument at its device address, each
+    /// access at a run-time offset checked in the shader: every kernel's on a device that does
+    /// not bind them, and on one that does, a kernel whose every argument a wide pointer, a typed
+    /// atomic or its stage-in fetch reaches. A dispatch split into pieces counts once a piece.
+    pub address_dispatches: u64,
+    /// Sets of set 0 written for [`bound_dispatches`](Self::bound_dispatches): a dispatch whose
+    /// buffer slots' descriptors differ from those of the set its command buffer wrote last takes
+    /// the next set of its command buffer's pools, writes it and binds it. A changed bind offset
+    /// alone writes none.
+    pub buffer_sets_written: u64,
+    /// [`bound_dispatches`](Self::bound_dispatches) whose descriptors begin the set their command
+    /// buffer wrote last: none is written, and that set is bound only where the Vulkan command
+    /// buffer does not hold it.
+    pub buffer_sets_held: u64,
     /// Calls that waited for an upload to complete before they recorded: the upload at its
     /// bound of calls or bytes, or the staging region with no room for a copy.
     pub upload_waits: u64,
@@ -2619,6 +2934,15 @@ pub struct Metrics {
     pub over_copies_imported: u64,
     /// The bytes of those copies, which count in [`over_copy_bytes`](Self::over_copy_bytes) too.
     pub over_copy_bytes_imported: u64,
+    /// Of [`over_copy_bytes`](Self::over_copy_bytes), those of a texture whose buffer's bytes
+    /// shaders reach are in Private memory ([`MemoryClass::Private`], `MTLStorageModePrivate`),
+    /// which no host write reaches: an exported block's
+    /// ([`Device::new_exported_block`](crate::Device::new_exported_block)) among them.
+    pub over_copy_bytes_private: u64,
+    /// Of [`over_copy_bytes`](Self::over_copy_bytes), those of a texture whose buffer's bytes
+    /// shaders reach are in Shared memory ([`MemoryClass::Shared`], `MTLStorageModeShared`), an
+    /// imported block's among them; the rest are over a Managed buffer's device copy.
+    pub over_copy_bytes_shared: u64,
     /// Of [`over_copies`](Self::over_copies), those of a texture over a buffer in host memory's import
     /// ([`Device::import_host_memory`](crate::Device::import_host_memory)): Vulkan shares that memory's
     /// ownership with the host, and an image made for it starts undefined, a layout whose move
@@ -2905,11 +3229,29 @@ pub struct Metrics {
     pub overlapping_copies_refused: u64,
     /// Heap textures' images moved from undefined to their home layout before a command that
     /// writes them (a dispatch's slot or declared write, a pass's attachment, a draw's write, a
-    /// blit's destination), because a write over their bytes through another resource of their
-    /// heap left them stale since their last write (Vulkan's memory aliasing): in place, or in a
-    /// command buffer of its own that leads the command's part of its command buffer. No Metal
-    /// counterpart.
+    /// blit's destination) or a host write's copy ([`Texture::replace_region`]), because a write
+    /// over their bytes through another resource of their heap left them stale since their last
+    /// write (Vulkan's memory aliasing): in place, in a command buffer of its own that leads the
+    /// command's part of its command buffer, or in the host write's upload ahead of its copy. No
+    /// Metal counterpart.
+    ///
+    /// [`Texture::replace_region`]: crate::Texture::replace_region
     pub heap_moves: u64,
+    /// On a device without `VK_EXT_shader_stencil_export`, the draws recorded beyond a draw's
+    /// own for a pipeline state whose fragment function writes `[[stencil]]`: one for each
+    /// stencil bit the draw's depth-stencil state can replace, and one that writes the depth last
+    /// where the state writes it under a compare other than `Always` and `Never`
+    /// ([`DrawKind::StencilOutput`](crate::DrawKind::StencilOutput) says where they are refused).
+    /// 0 on a device with the extension. Metal draws once.
+    pub stencil_bit_draws: u64,
+    /// Renderings a render encoder ended and began again inside itself, loading what it stored,
+    /// to record work between its draws (`crate::render_encoder`): a barrier (a memory barrier
+    /// after a draw that wrote memory, or the one owed before a draw that reads an attachment),
+    /// copies a draw or a visibility result mode needs first (of textures over a buffer in images
+    /// of their own or over a Managed buffer's device copy, and into attachments' shadows),
+    /// moves of attachments to the feedback layout or of heap textures, and an execution's count
+    /// kernel. No Metal counterpart: a Metal render encoder is one pass.
+    pub rendering_interrupts: u64,
     /// Takes from the pool on the consumer's threads, each whole: a block of
     /// [`Device::take_block`](crate::Device::take_block) and a texture block, carved from a free
     /// range or from an allocation the take made ([`take_makes`](Self::take_makes)); their bytes
@@ -3122,9 +3464,11 @@ pub struct Gauges {
     /// `VkPipeline`s.
     pub pipelines: u64,
     /// Compiled kernels: each the translation of one compute pipeline content (its descriptor's
-    /// kernel, constant values, linked functions and compile fields), with its shader modules and
-    /// their `VkPipeline`s, shared by every state of that content. One lives while a state or
-    /// the device's map of kernels holds it.
+    /// kernel, constant values, linked functions and compile fields), or of a content with the
+    /// texture slots a dispatch bound to an 8-bit sRGB texture's UNORM twin, whose writes it
+    /// encodes, with its shader modules and their `VkPipeline`s, shared by every state of that
+    /// content. One lives while a state, the device's map of kernels, or a command buffer not yet
+    /// retired that dispatched it holds it.
     pub kernels: u64,
     /// `VkPipeline`s of compiled kernels' modules, each of one workgroup size, threadgroup memory
     /// lengths, imageblock size and tiles: the 8 each module made first, the 56 dispatched last
@@ -3238,6 +3582,12 @@ pub struct Gauges {
     /// results: a command buffer takes them as its encoders set `Boolean` and `Counting` modes,
     /// and gives them back as it retires; at most 16 are kept free, and the rest destroyed.
     pub occlusion_pools: u64,
+    /// The device's pools of sets of set 0, each of 256 sets, on a device whose kernels bind
+    /// their buffers as storage buffers there (`Metrics::bound_dispatches`): command buffers
+    /// share them, each taking sets in runs as its dispatches write sets and giving them back as
+    /// it retires. A pool is free once every set taken from it is back; at most 16 are kept free
+    /// besides the one sets are handed out from, and the rest destroyed.
+    pub buffer_set_pools: u64,
     /// Imports whose memory is not yet freed: one for each imported block
     /// (`Device::import_dma_buf` on Unix,
     /// [`Device::import_host_memory`](crate::Device::import_host_memory)), and one for each

@@ -250,25 +250,7 @@ pub enum RuntimeFact {
     /// where a simdgroup spans two rows of its threadgroup (`Lockstep::rows`). A dispatch region
     /// of one row runs on the planned pipeline whatever its width, without whole subgroups, where
     /// no pair meets; any other region keeps the tier's whole subgroups or emulated simdgroups.
-    /// A dispatch whose every region is one row asks for the kernel's one-row variant
-    /// (`VariantKey::one_row`), which has none of those barriers.
     RowLockstep,
-    /// The kernel was compiled under `VariantKey::one_row` (`LoweringInputs::one_row`): it runs
-    /// threadgroups whose simdgroups each lie within one row, without the lockstep barriers that
-    /// order only pairs meeting where a simdgroup spans two rows (its threadgroup ones kept),
-    /// whatever its device. Its plans state the variant, and a dispatch with a region of more than
-    /// one row asks for the variant without it.
-    OneRow,
-    /// Unit axes (`lower::simd::uniform`, "Unit axes"; bit 0 `x`, bit 1 `y`, bit 2 `z`). Where
-    /// `axes` is 0, the kernel's walk is predicated and `relief` holds, at bit `m − 1`, each mask
-    /// `m` of axes under which fewer of its synchronizations' blocks are divergent once its
-    /// threads' positions along them are taken as uniform: a dispatch whose threadgroups have one
-    /// thread along exactly the axes `m` may run the kernel's unit-axes variant
-    /// (`VariantKey::unit_axes`). Where `axes` is not 0, the
-    /// kernel was compiled under that variant (`LoweringInputs::unit_axes`), `relief` is 0, its
-    /// plans state the variant, and a dispatch with more than one thread along one of `axes` asks
-    /// for the variant without it.
-    UnitAxes { axes: u8, relief: u8 },
     /// The kernel was compiled under `VariantKey::flat_grid` (`LoweringInputs::flat_grid`): it
     /// runs any grid in threadgroups of its own size, reading the grid from the 32-byte region
     /// record at its `PushField::ReplayRegionAddress`, which a preprocess writes beside the
@@ -607,6 +589,30 @@ pub enum RuntimeFact {
     /// them in its own slots' memory or ordered after the last one that used it. The kernel's own
     /// bytes decide it, never a device fact.
     PrivateArena { slot_bytes: u32 },
+    /// The fragment function writes `[[stencil]]` on a profile without
+    /// `VK_EXT_shader_stencil_export` (`FragmentCaps::stencil_export`): it stores no stencil
+    /// reference, and keeps a fragment only where its output's low 8 bits hold the bit
+    /// `PushField::StencilBit` names, every fragment at 8 or more. The consumer draws each draw of
+    /// its pipeline first at 8, under the draw's own depth-stencil state but a reference of 0 on
+    /// both faces; then at each bit `k` of the stencil write masks of the faces whose operations
+    /// include `Replace`, under a reference of 255, each face's write mask cut to bit `k`, its
+    /// `Replace` operations kept and its others `Keep`, and no depth write; and, where the state
+    /// writes depth under a compare other than `Always` and `Never`, the first draw writes none
+    /// and a last one at 8 writes it under stencil write masks of 0. Under a stencil compare of
+    /// `Always` or `Never` on both faces that stores Metal's values, but where fragments of one
+    /// draw meet at a sample (`PrecisionNote::StencilOutputOverlap`). The function writes no color
+    /// and no memory, and its pipeline is no mesh pipeline and is not made for indirect command
+    /// buffers, so each draw takes the repeats; anything else refuses the output
+    /// (`Feature::StencilExport`).
+    StencilBitDraws,
+    /// The kernel reaches its buffer arguments through set 0's storage buffers
+    /// (`DeviceProfile::binds_kernel_buffers`), whose accesses the module does not check: the
+    /// consumer makes its pipeline with `VkPipelineRobustnessCreateInfo` naming robust buffer
+    /// access 2 for storage buffers (its other members the device default), and binds each slot's
+    /// buffer over that buffer alone, from its first byte rounded down to
+    /// `max(minStorageBufferOffsetAlignment, 16)` through its last (`docs/API.md` section 5). A
+    /// read outside the range then reads zero and a write there changes nothing.
+    RobustStorageBuffers,
 }
 
 impl RuntimeFact {
@@ -661,8 +667,6 @@ impl RuntimeFact {
             RuntimeFact::OpenClMode => "OpenClMode",
             RuntimeFact::OpenClLineTexture { .. } => "OpenClLineTexture",
             RuntimeFact::RowLockstep => "RowLockstep",
-            RuntimeFact::OneRow => "OneRow",
-            RuntimeFact::UnitAxes { .. } => "UnitAxes",
             RuntimeFact::FlatGrid => "FlatGrid",
             RuntimeFact::CallThreadgroups => "CallThreadgroups",
             RuntimeFact::SparseTextureWrites { .. } => "SparseTextureWrites",
@@ -703,6 +707,8 @@ impl RuntimeFact {
             RuntimeFact::AddressAlignment { .. } => "AddressAlignment",
             RuntimeFact::GridTiles => "GridTiles",
             RuntimeFact::PrivateArena { .. } => "PrivateArena",
+            RuntimeFact::StencilBitDraws => "StencilBitDraws",
+            RuntimeFact::RobustStorageBuffers => "RobustStorageBuffers",
         }
     }
 }
@@ -741,4 +747,7 @@ pub enum Mechanism {
     /// Static pipeline state for fixed-function layouts (no dynamic stride on the profile), a
     /// push field for pulled ones.
     PipelineStateOrPushConstant,
+    /// Static pipeline state the consumer states as it makes the pipeline
+    /// (`VkPipelineRobustnessCreateInfo`).
+    PipelineState,
 }

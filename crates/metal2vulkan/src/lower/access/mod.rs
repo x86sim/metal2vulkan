@@ -132,7 +132,7 @@ use crate::memory::provenance::{Repr, Root};
 use crate::memory::views::{self, View};
 use crate::pipeline::facts::RuntimeFact;
 use crate::pipeline::interface::{AccessSet, BufferForm, PushLoc, PushPlacement, Window};
-use crate::pipeline::sym::{PushField, SlotRef};
+use crate::pipeline::sym::{PushField, SlotRef, Stage};
 use crate::spirv::builder::{FunctionBuilder, ModuleBuilder};
 use crate::spirv::error::BResult;
 use crate::spirv::ids::{DemoteTy, TypeId, Value as SValue};
@@ -698,6 +698,12 @@ pub struct AccessPlan {
     /// ([`note_variable`]): each reads its `PushField::SlotBounds`, and each of those accesses
     /// whose emitted offset is not a constant is checked against its buffer (`emit::prepare`).
     pub variable: BTreeSet<SlotRef>,
+    /// Under the identity domains, a kernel on a device that binds its buffer arguments
+    /// (`DeviceProfile::binds_kernel_buffers`): its storage views are its slots' buffers, each
+    /// bound over its buffer, and its pipeline's robust buffer access 2 contains them
+    /// (`RuntimeFact::RobustStorageBuffers`), so a view's load or store is not checked in the
+    /// shader (`emit::prepare`); an atomic is (`emit::prepare_atomic`).
+    pub robust_views: bool,
     /// The arenas the function uses.
     pub local: local::LocalPlan,
     /// The function's index extensions ([`index`]): planned before any instruction is selected
@@ -753,20 +759,25 @@ pub struct AccessPlan {
     /// (`psb::PsbMem::read_only`), so the device may read them as read-only memory (on RADV a
     /// uniform read is a scalar load).
     pub unwritten: BTreeSet<usize>,
-    /// Memory-plan slots reached under the identity domains from their address as it is, which
-    /// the binder holds to a multiple of their argument's alignment ([`address_alignment`],
-    /// `RuntimeFact::AddressAlignment`), at least the granularity their accesses reach
-    /// ([`AccessPlan::reach`]): no access rounds the address (`psb::prepare_direct`), and a leaf
-    /// at an offset proven a multiple of 8 or 16 is accessed at that alignment (`memory::leaf`'s
-    /// whole words). Every other device-address slot is reached from the word below each access
+    /// Memory-plan slots reached under the identity domains from their address as it is, each
+    /// with the alignment the binder holds that address to ([`address_alignment`],
+    /// `RuntimeFact::AddressAlignment`): their argument's, or 4 (8 where a 64-bit atomic may reach
+    /// it) for a slot of `LoweringInputs::word_bound_buffers`, at least the granularity their
+    /// accesses reach ([`AccessPlan::reach`]). No access rounds the address
+    /// (`psb::prepare_direct`), and a leaf at an offset proven a multiple of 8 or 16 is accessed
+    /// at that alignment where the address is held to it (`memory::leaf`'s whole words), else at
+    /// the address's. Every other device-address slot is reached from the word below each access
     /// (`psb::prepare_at`).
-    pub aligned: BTreeSet<usize>,
+    pub aligned: BTreeMap<usize, u32>,
     /// The granularity in bytes at which the static-root accesses of each memory-plan slot reach
     /// its memory, the widest over them ([`note_reach`]): an access whose leaf is one narrow unit
-    /// ([`leaf_reach`]) that unit's size, and any other 4, as it reaches words or wider units
-    /// from a 4-aligned base. A slot whose alignment is below 4 is reached from its address as
-    /// it is only where its alignment is at least this.
+    /// ([`leaf_reach`]) that unit's size, a 64-bit atomic 8, and any other 4, as it reaches words
+    /// or wider units from a 4-aligned base. A slot whose alignment is below 4 is reached from its
+    /// address as it is only where its alignment is at least this.
     pub reach: BTreeMap<usize, u32>,
+    /// Some 64-bit atomic goes through a wide pointer ([`atomic`]), which may reach any slot's
+    /// memory: a slot of `LoweringInputs::word_bound_buffers` is held to 8 ([`AccessPlan::aligned`]).
+    pub wide_atomics64: bool,
     /// The units ([`Units`]) the static-root accesses of each slot read or write whole, by
     /// memory-plan slot index: narrow units whose storage access the profile has, and `uvec2`
     /// and `uvec4` units. The slot gets a view of each that its final view kind holds
@@ -1180,6 +1191,11 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
         plan_replay(cx, &sources)?;
     }
     let own_addresses = identity(p) && !replay;
+    // Under the identity domains a kernel on a device that binds its buffer arguments reaches
+    // each through its storage view, bound over its buffer and contained by the pipeline's
+    // robustness (`DeviceProfile::binds_kernel_buffers`); a slot a wide pointer, a typed atomic or
+    // the stage-in fetch reaches keeps its device address, as every slot of another stage does.
+    let bound = own_addresses && stage == Stage::Kernel && p.binds_kernel_buffers();
     let shared_slot = |s: SlotRef| {
         memory
             .slots
@@ -1213,9 +1229,13 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
         // reaches needs a typed pointer, which only its device address gives; a replay variant
         // reads every slot through its root entry, which the replay's preprocess writes from the
         // replayed command's record.
-        // Under the identity domains every slot is its device address.
+        // Under the identity domains every slot is its device address, but a kernel's that its
+        // device binds (`bound`), other than one the dispatch binds at a multiple of 4 below its
+        // argument's alignment (`LoweringInputs::word_bound_buffers`): a view's `uvec4` and
+        // `uvec2` units take the bind offset to be a multiple of that alignment (`memory::leaf`).
+        let binds = bound && !shared && !cx.inputs.word_bound_buffers.contains(&plan.slot);
         if replay
-            || identity(p)
+            || (identity(p) && !binds)
             || cx.families.access.dynamic.slots.contains(&i)
             || cx.families.access.typed_slots.contains(&i)
         {
@@ -1223,7 +1243,9 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
             continue;
         }
         let mut l = SlotLowering::View;
-        if !storage_range_fits(window, limits) {
+        // A bound slot's descriptor range holds its buffer: the device's range holds the longest
+        // (`DeviceProfile::binds_kernel_buffers`).
+        if !bound && !storage_range_fits(window, limits) {
             cx.facts
                 .insert(RuntimeFact::BufferRangeLimit { slot: plan.slot });
         }
@@ -1356,21 +1378,44 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
             continue;
         };
         let form = match l {
-            SlotLowering::View => BufferForm::Descriptor,
+            SlotLowering::View => {
+                // A bound slot's accesses are not checked in the shader: the pipeline's
+                // robustness contains them (`AccessPlan::robust_views`).
+                if bound {
+                    cx.families.access.variable.remove(&plan.slot);
+                    cx.push.remove(&PushField::SlotBounds(plan.slot));
+                    // Its view's words and units take its address to be a multiple of its
+                    // argument's alignment: the dispatch checks it, as a device-address slot's.
+                    if let Some(align) = address_alignment(cx, plan).filter(|a| *a >= 2) {
+                        cx.facts.insert(RuntimeFact::AddressAlignment {
+                            slot: plan.slot,
+                            align,
+                        });
+                    }
+                }
+                BufferForm::Descriptor
+            }
             SlotLowering::Psb { .. } => {
                 addressed_slot(cx, plan.slot);
                 if let Some(align) = address_alignment(cx, plan) {
+                    // A word memory's base is a multiple of 4; a slot each of whose accesses is
+                    // one narrow unit needs only that unit's alignment.
+                    let reach = cx.families.access.reach.get(&i).copied().unwrap_or(4);
+                    // A slot bound at a multiple of 4 below its argument's alignment is held to
+                    // what its accesses need: 4 for words, 8 where a 64-bit atomic may reach it.
+                    let align = match cx.inputs.word_bound_buffers.contains(&plan.slot) {
+                        true if cx.families.access.wide_atomics64 => align.min(8),
+                        true => align.min(reach.max(4)),
+                        false => align,
+                    };
                     if align >= 2 {
                         cx.facts.insert(RuntimeFact::AddressAlignment {
                             slot: plan.slot,
                             align,
                         });
                     }
-                    // A word memory's base is a multiple of 4; a slot each of whose accesses is
-                    // one narrow unit needs only that unit's alignment.
-                    let reach = cx.families.access.reach.get(&i).copied().unwrap_or(4);
                     if align >= reach.min(4) {
-                        cx.families.access.aligned.insert(i);
+                        cx.families.access.aligned.insert(i, align);
                     }
                 }
                 BufferForm::Psb
@@ -1397,6 +1442,19 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
     for (slot, l) in &own {
         if let SlotLowering::Psb { .. } = l {
             addressed_slot(cx, *slot);
+        }
+    }
+    let views = slots
+        .iter()
+        .flatten()
+        .any(|c| c.form == BufferForm::Descriptor);
+    if bound && views {
+        cx.families.access.robust_views = true;
+        cx.facts.insert(RuntimeFact::RobustStorageBuffers);
+        // A checked load outside its buffer reads the zero range only where a checked slot is
+        // left.
+        if cx.families.access.variable.is_empty() {
+            cx.push.remove(&PushField::ZeroAddress);
         }
     }
     let counts = census.counts(stage);
@@ -1441,10 +1499,13 @@ fn place_slots(cx: &mut SelectCx<'_>, m: &mut Meter) -> Result<Vec<Option<SlotCh
 /// refuses a buffer bound at an offset that is not a multiple of its argument type's alignment
 /// ("must be a multiple of 4 but was set to 2" for a `uint *` argument, "of 16 ... 8" for a
 /// `float4 *`, "of 2 ... 1" for a `ushort *`; `probes/vector_access_placement.m` in the conformance
-/// crate). A slot whose alignment is at least 4 is then reached from its address as it is
-/// ([`AccessPlan::aligned`]), and one held to less where each of its accesses is one narrow unit
-/// no wider than its alignment ([`AccessPlan::reach`]). 1 for an argument with no alignment or
-/// one of 1, which states none; `None` for a buffer-table element and an argument buffer.
+/// crate), though plain Metal runs one of 8 or 16 bound at a multiple of 4, each element at its
+/// own address (`probes/misaligned_buffer_binds.m`): a slot the dispatch binds so
+/// (`LoweringInputs::word_bound_buffers`) is held to less, what its accesses need. A slot whose
+/// alignment is at least 4 is then reached from its address as it is ([`AccessPlan::aligned`]),
+/// and one held to less where each of its accesses is one narrow unit no wider than its alignment
+/// ([`AccessPlan::reach`]). 1 for an argument with no alignment or one of 1, which states none;
+/// `None` for a buffer-table element and an argument buffer.
 fn address_alignment(cx: &SelectCx<'_>, plan: &SlotPlan) -> Option<u32> {
     if !identity(cx.profile) || plan.element.is_some() || plan.argument_buffer {
         return None;

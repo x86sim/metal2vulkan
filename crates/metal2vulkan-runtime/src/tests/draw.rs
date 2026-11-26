@@ -2885,7 +2885,8 @@ define internal void @_GLOBAL__sub_I_() section "air.static_init" {
     /// the feedback layout, a barrier of its own. Through a copy, on a device without the loop,
     /// the pass's first such draw, the pass's first draw, clears the image's shadow to the pass's
     /// clear colour, and the one after the memory barrier copies what it reads into the shadow,
-    /// each between two barriers of their own, and the memory barrier records nothing; the
+    /// each between two barriers of their own, and the memory barrier records nothing. Either way
+    /// the rendering ends and begins again twice (`Metrics::rendering_interrupts`); the
     /// copies, their bytes and the live shadows are printed. A device without the
     /// attachment reads refuses the draw, `Gap::Draw { AttachmentRead }`, and records nothing for
     /// it.
@@ -2980,6 +2981,36 @@ define internal void @_GLOBAL__sub_I_() section "air.static_init" {
                     ),
                     (barriers, 1),
                     "{name} {case}: barriers, passes"
+                );
+                // By cause: the pass's start and its move home, and the segment's end; the rest
+                // inside the pass, but the upload's two.
+                let causes = |m: &crate::Metrics| {
+                    [
+                        m.pass_start_barriers,
+                        m.pass_home_barriers,
+                        m.blit_barriers,
+                        m.dispatch_hazard_barriers,
+                        m.segment_end_barriers,
+                        m.upload_barriers,
+                        m.other_barriers,
+                    ]
+                };
+                let grown: Vec<u64> = (causes(&after).into_iter())
+                    .zip(causes(&before))
+                    .map(|(after, before)| after - before)
+                    .collect();
+                let expected = match looped {
+                    true => [1, 1, 0, 0, 1, 0, 2],
+                    false => [1, 1, 0, 0, 1, 2, 4],
+                };
+                assert_eq!(grown, expected, "{name} {case}: barriers by cause");
+                // The rendering ended and began again twice inside the one pass: through the
+                // loop, around the move and around the memory barrier's barrier; through a copy,
+                // around the shadow's clear and around its copy.
+                assert_eq!(
+                    after.rendering_interrupts - before.rendering_interrupts,
+                    2,
+                    "{name} {case}: renderings ended and begun again in the encoder"
                 );
                 // The whole target, after the memory barrier: its own pixels under a scissor over
                 // it, or the texture's one level and layer. The first read is the clear's.

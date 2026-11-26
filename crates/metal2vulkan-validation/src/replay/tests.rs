@@ -586,6 +586,9 @@ struct Kept {
     per_commit: Counters,
     /// The buffers it keeps two copies of, and which one its read takes.
     read_copies: HashMap<u64, ReadCopy>,
+    /// The word it reads first in each part of a texture here, in place of the texture's id; it
+    /// reads a part as that word, then the part's level, slice and plane.
+    texels: HashMap<u64, u64>,
 }
 
 impl Backend for Kept {
@@ -667,7 +670,8 @@ impl Backend for Kept {
     }
 
     fn read_texture_part(&mut self, object: u64, part: Part) -> Result<Vec<u8>, PlayError> {
-        let words = [object, part.level, part.slice, part.plane];
+        let first = self.texels.get(&object).copied().unwrap_or(object);
+        let words = [first, part.level, part.slice, part.plane];
         Ok(words.iter().flat_map(|word| word.to_le_bytes()).collect())
     }
 
@@ -1353,6 +1357,13 @@ fn frames_releases_and_splits() {
         ("commits", 2),
         ("dispatches", 0),
         ("draws", 0),
+        ("blits", 0),
+        ("render_buffer_binds", 0),
+        ("render_buffer_changes", 0),
+        ("render_offset_changes", 0),
+        ("compute_buffer_binds", 0),
+        ("compute_buffer_changes", 0),
+        ("compute_offset_changes", 0),
         ("encoders", 0),
         ("misaligned_address_words", 0),
         ("address_looking_words", 0),
@@ -1452,16 +1463,34 @@ fn a_skipped_draw_ends_the_verdict_at_its_frame_and_call() {
 }
 
 /// What a stream fixes, apart from what the runtime executed: its calls played, its commits, the
-/// encoders its command buffers made and the draws and dispatches their calls issued, per group of
-/// command buffers waited for and in total. The call that waited for a group counts in the next.
+/// encoders its command buffers made, the draws, dispatches and blit commands their calls issued,
+/// and the buffer slots their set-buffer calls set, render and compute apart, with the buffer
+/// changes (another buffer than the slot held, or a slot's first) and the offset-only changes
+/// among them (a set of the buffer and offset the slot holds is neither), per group of command
+/// buffers waited for and in total. The call that waited for a group counts in the next.
 #[test]
-fn the_stream_fixes_its_calls_commits_encoders_draws_and_dispatches() {
+fn the_stream_fixes_its_calls_commits_encoders_draws_dispatches_blits_and_binds() {
     let draw = "drawPrimitives:vertexStart:vertexCount:";
+    let bind = |buffer, offset, at| [Value::Object(buffer), Value::Uint(offset), Value::Uint(at)];
     let (report, ended) = played(&mut Kept::default(), |w| {
         w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
         w.call("newCommandQueue", 1, 2, &[], &[])?;
+        let plain = [Value::Uint(64), Value::Uint(0)];
+        w.call("newBufferWithLength:options:", 1, 8, &plain, &[])?;
+        w.call("newBufferWithLength:options:", 1, 9, &plain, &[])?;
         w.call("commandBuffer", 2, 3, &[], &[])?;
         w.call("computeCommandEncoder", 3, 4, &[], &[])?;
+        // A change, an offset-only change, neither, then an offset-only change and a change.
+        w.call("setBuffer:offset:atIndex:", 4, 0, &bind(8, 0, 0), &[])?;
+        let offset = [Value::Uint(16), Value::Uint(0)];
+        w.call("setBufferOffset:atIndex:", 4, 0, &offset, &[])?;
+        w.call("setBuffer:offset:atIndex:", 4, 0, &bind(8, 16, 0), &[])?;
+        let both = [
+            Value::List(vec![Value::Object(8), Value::Object(9)]),
+            Value::List(vec![Value::Uint(32), Value::Uint(0)]),
+            map(&[("location", Value::Uint(0)), ("length", Value::Uint(2))]),
+        ];
+        w.call("setBuffers:offsets:withRange:", 4, 0, &both, &[])?;
         w.call(
             "dispatchThreadgroups:threadsPerThreadgroup:",
             4,
@@ -1477,9 +1506,35 @@ fn the_stream_fixes_its_calls_commits_encoders_draws_and_dispatches() {
             &[Value::Nil],
             &[],
         )?;
+        // A change in each stage's slot 0, an offset-only change, then a change of buffer alone.
+        w.call("setVertexBuffer:offset:atIndex:", 5, 0, &bind(9, 0, 0), &[])?;
+        w.call(
+            "setFragmentBuffer:offset:atIndex:",
+            5,
+            0,
+            &bind(9, 0, 0),
+            &[],
+        )?;
+        let offset = [Value::Uint(64), Value::Uint(0)];
+        w.call("setVertexBufferOffset:atIndex:", 5, 0, &offset, &[])?;
         w.call(draw, 5, 0, &[], &[])?;
+        w.call(
+            "setVertexBuffer:offset:atIndex:",
+            5,
+            0,
+            &bind(8, 64, 0),
+            &[],
+        )?;
         w.call(draw, 5, 0, &[], &[])?;
         w.call("endEncoding", 5, 0, &[], &[])?;
+        w.call("blitCommandEncoder", 3, 6, &[], &[])?;
+        let fill = [
+            Value::Object(9),
+            map(&[("location", Value::Uint(0)), ("length", Value::Uint(16))]),
+            Value::Uint(0),
+        ];
+        w.call("fillBuffer:range:value:", 6, 0, &fill, &[])?;
+        w.call("endEncoding", 6, 0, &[], &[])?;
         w.call("commit", 3, 0, &[], &[])?;
         w.call("m2v.present", 1, 0, &[Value::Nil], &[])
     });
@@ -1490,7 +1545,14 @@ fn the_stream_fixes_its_calls_commits_encoders_draws_and_dispatches() {
             ("commits", 1),
             ("dispatches", 1),
             ("draws", 2),
-            ("encoders", 2),
+            ("blits", 1),
+            ("render_buffer_binds", 4),
+            ("render_buffer_changes", 3),
+            ("render_offset_changes", 1),
+            ("compute_buffer_binds", 5),
+            ("compute_buffer_changes", 2),
+            ("compute_offset_changes", 2),
+            ("encoders", 3),
             ("misaligned_address_words", 0),
             ("address_looking_words", 0),
             ("noted_words", 0),
@@ -1501,21 +1563,23 @@ fn the_stream_fixes_its_calls_commits_encoders_draws_and_dispatches() {
     };
     let executed = Counters::from([("submissions", 1)]);
     let group = Counts {
-        stream: fixed(10),
+        stream: fixed(23),
         executed: executed.clone(),
     };
     assert_eq!(report.completed, [(vec![3], group.clone())]);
     assert_eq!(report.frames, [group]);
     let total = Counts {
-        stream: fixed(12),
+        stream: fixed(25),
         executed,
     };
     assert_eq!(report.total, total);
     assert_eq!(
         report.lines()[0],
-        "completed #3 stream address_arguments=0 address_looking_words=0 calls=10 commits=1 \
-         dispatches=1 draws=2 encoders=2 misaligned_address_words=0 noted_words=0 \
-         relocated_words=0 written_bytes=0 executed submissions=1"
+        "completed #3 stream address_arguments=0 address_looking_words=0 blits=1 calls=23 \
+         commits=1 compute_buffer_binds=5 compute_buffer_changes=2 compute_offset_changes=2 \
+         dispatches=1 draws=2 encoders=3 misaligned_address_words=0 noted_words=0 \
+         relocated_words=0 render_buffer_binds=4 render_buffer_changes=3 render_offset_changes=1 \
+         written_bytes=0 executed submissions=1"
     );
 }
 
@@ -3439,6 +3503,84 @@ fn the_dump_compare_reports_a_word_whose_cover_the_buffer_s_last_write_voided() 
     assert!(!comparison.agrees());
 }
 
+/// The dump tests' play of three textures of 0x1000 bytes placed in a heap, into `dir`, their
+/// parts read with `texels` ([`Kept::texels`]): #5 and #6 at offset 0, one over the other, and #7
+/// at 0x1000, apart. Command buffer #20 dispatches a state that writes texture slot 0 twice: the
+/// first time with #5 there, which covers #6, the second with #6, which covers #5 and is written
+/// again itself; #7, at slot 1, which the state does not write, is neither.
+fn play_covered_textures(dir: &std::path::Path, texels: &[(u64, u64)]) {
+    let mut kept = Kept::default();
+    kept.heap_answers.insert(4, (0x1000, 0x1000));
+    kept.kernel_writes.insert(9, vec![0]);
+    kept.texels.extend(texels.iter().copied());
+    let (_, ended) = dumped(&mut kept, dir, |w| {
+        w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
+        w.call("newHeapWithDescriptor:", 1, 2, &heap_of(0x1_0000, 1), &[])?;
+        w.call("m2v.textureDescriptor", 0, 4, &[map(&[])], &[])?;
+        for (texture, offset) in [(5, 0), (6, 0), (7, 0x1000)] {
+            let placed = [Value::Object(4), Value::Uint(offset)];
+            w.call("newTextureWithDescriptor:offset:", 2, texture, &placed, &[])?;
+        }
+        w.call("newCommandQueue", 1, 8, &[], &[])?;
+        w.call("newComputePipelineStateWithFunction:error:", 1, 9, &[], &[])?;
+        w.call("commandBuffer", 8, 20, &[], &[])?;
+        w.call("computeCommandEncoder", 20, 21, &[], &[])?;
+        w.call("setComputePipelineState:", 21, 0, &[Value::Object(9)], &[])?;
+        let size = map(&[("width", Value::Uint(1)), ("height", Value::Uint(1))]);
+        let groups = [size.clone(), size];
+        let dispatch = "dispatchThreadgroups:threadsPerThreadgroup:";
+        let apart = [Value::Object(7), Value::Uint(1)];
+        w.call("setTexture:atIndex:", 21, 0, &apart, &[])?;
+        for written in [5, 6] {
+            let slot = [Value::Object(written), Value::Uint(0)];
+            w.call("setTexture:atIndex:", 21, 0, &slot, &[])?;
+            w.call(dispatch, 21, 0, &groups, &[])?;
+        }
+        w.call("endEncoding", 21, 0, &[], &[])?;
+        w.call("commit", 20, 0, &[], &[])
+    });
+    ended.unwrap();
+}
+
+/// A texture the cover rule holds covered when its command buffer's dump reads it is covered
+/// whole, and the compare leaves it out; one it does not hold covered is compared: in the second
+/// play #5 (covered by #6's write after its own) and #7 (apart) read otherwise, each one part of
+/// 32 bytes whose first word differs, and only #7 is reported. #6, written last, is alike.
+#[test]
+fn the_dump_compare_leaves_out_a_covered_texture_and_reports_one_outside_every_cover() {
+    let (a, b) = (
+        ScratchDir::new("dumps-a").unwrap(),
+        ScratchDir::new("dumps-b").unwrap(),
+    );
+    play_covered_textures(a.path(), &[]);
+    play_covered_textures(b.path(), &[(5, 50), (7, 70)]);
+    let cover = |texture: u64| {
+        let name = format!("cb20-obj{texture}.cover");
+        std::fs::read_to_string(a.path().join(name)).unwrap()
+    };
+    assert_eq!([cover(5), cover(6), cover(7)], ["0..32", "-", "-"]);
+    let comparison = compare_dumps(a.path(), b.path()).unwrap();
+    assert_eq!(comparison.compared, 3);
+    let differs = |object, covered, first_uncovered| Difference {
+        command_buffer: 20,
+        object,
+        differing: 1,
+        covered,
+        first_uncovered,
+        lengths: (32, 32),
+    };
+    assert_eq!(
+        comparison.differences,
+        [differs(5, 1, None), differs(7, 0, Some(0))]
+    );
+    assert!(!comparison.agrees());
+    assert_eq!(
+        comparison.lines()[0],
+        "differs cb #20 obj #7: 1 words outside every cover, the first word 0; 0 covered; \
+         lengths 32 and 32"
+    );
+}
+
 /// A listed command buffer's dump holds every buffer its encoders named, whatever made it: a
 /// plain buffer, a buffer in a block and a host's padded buffer; and the texture its compute
 /// encoder binds, as such a texture
@@ -3502,7 +3644,8 @@ fn a_listed_command_buffer_dumps_every_buffer_it_names_whatever_made_it() {
 /// `MTLStoreActionDontCare`), the resolve texture #11's level 1 and slice 2 of multisample #10,
 /// not #10 itself (2, `MTLStoreActionMultisampleResolve`), #12's level 1 by the encoder's
 /// `setColorStoreAction:atIndex:` (3, `MTLStoreActionUnknown`), and no depth attachment (#13);
-/// the second stores #8's level 2 and depth plane 3. A texture's dump covers nothing.
+/// the second stores #8's level 2 and depth plane 3. No texture is placed in a heap, so no
+/// texture's dump has a cover.
 #[test]
 fn a_listed_command_buffer_dumps_the_colour_attachments_its_render_passes_store() {
     let dir = ScratchDir::new("dumps-stores").unwrap();
@@ -3605,6 +3748,67 @@ fn a_listed_command_buffer_dumps_the_colour_attachments_its_render_passes_store(
     for dump in dumps {
         assert_eq!(read(&format!("{dump}.cover")), b"-");
     }
+}
+
+/// A layered pass's dump holds each slice it renders: pass #30, of `renderTargetArrayLength` 3,
+/// stores texture #8 from slice 1 (`MTLStoreActionStore`) as slices 1 to 3, and #9 from slice 0
+/// (`MTLStoreActionUnknown`, named by the encoder's `setColorStoreAction:atIndex:`) as slices 0 to
+/// 2; pass #31, of length 1, stores #10's slice 2 alone.
+#[test]
+fn a_layered_pass_s_dump_holds_each_slice_it_renders() {
+    let dir = ScratchDir::new("dumps-layered").unwrap();
+    let (_, ended) = dumped(&mut Kept::default(), dir.path(), |w| {
+        w.call("MTLCreateSystemDefaultDevice", 0, 1, &[], &[])?;
+        w.call("newCommandQueue", 1, 6, &[], &[])?;
+        w.call("m2v.textureDescriptor", 0, 7, &[map(&[])], &[])?;
+        for texture in 8..=10 {
+            let made = [Value::Object(7)];
+            w.call("newTextureWithDescriptor:", 1, texture, &made, &[])?;
+        }
+        let pass = |w: &mut StreamWriter<File>, id, layers| -> std::io::Result<()> {
+            w.call("MTLRenderPassDescriptor.new", 0, id, &[], &[])?;
+            let set = [map(&[("renderTargetArrayLength", Value::Uint(layers))])];
+            w.call("m2v.setPass", id, 0, &set, &[])
+        };
+        let colour = |w: &mut StreamWriter<File>, pass, at, texture, slice, store| {
+            let set = map(&[
+                ("texture", Value::Object(texture)),
+                ("slice", Value::Uint(slice)),
+                ("storeAction", Value::Uint(store)),
+            ]);
+            w.call(
+                "m2v.setColorAttachment",
+                pass,
+                0,
+                &[Value::Uint(at), set],
+                &[],
+            )
+        };
+        pass(w, 30, 3)?;
+        colour(w, 30, 0, 8, 1, 1)?;
+        colour(w, 30, 1, 9, 0, 4)?;
+        pass(w, 31, 1)?;
+        colour(w, 31, 0, 10, 2, 1)?;
+        w.call("commandBuffer", 6, 20, &[], &[])?;
+        let encoder = "renderCommandEncoderWithDescriptor:";
+        w.call(encoder, 20, 21, &[Value::Object(30)], &[])?;
+        let store = [Value::Uint(1), Value::Uint(1)];
+        w.call("setColorStoreAction:atIndex:", 21, 0, &store, &[])?;
+        w.call("endEncoding", 21, 0, &[], &[])?;
+        w.call(encoder, 20, 22, &[Value::Object(31)], &[])?;
+        w.call("endEncoding", 22, 0, &[], &[])?;
+        w.call("commit", 20, 0, &[], &[])
+    });
+    ended.unwrap();
+    let read = |name: &str| std::fs::read(dir.path().join(name)).unwrap();
+    let slices = |texture: u64, slices: std::ops::Range<u64>| -> Vec<u8> {
+        (slices.flat_map(|slice| [texture, 0, slice, 0]))
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    };
+    assert_eq!(read("cb20-obj8.bin"), slices(8, 1..4));
+    assert_eq!(read("cb20-obj9.bin"), slices(9, 0..3));
+    assert_eq!(read("cb20-obj10.bin"), slices(10, 2..3));
 }
 
 /// A listed command buffer's dump holds each texture its compute encoders bound, its first level

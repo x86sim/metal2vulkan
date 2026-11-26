@@ -21,7 +21,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::bind::YCbCrPlanesSampler;
 use crate::device::profile::Independence;
 use crate::device::requirements::{
     ApiVersion, FloatControl, FloatWidth, FormatUsage, Requirements, ResolveMode, SpirvCapability,
@@ -813,10 +812,9 @@ codec_struct! {
     SamplerDesc {
         mag_filter, min_filter, mipmap_mode, address_mode_u, address_mode_v, address_mode_w,
         mip_lod_bias, max_anisotropy, compare, min_lod, max_lod, border_color, reduction,
-        border_components, ycbcr, unnormalized,
+        border_components, unnormalized,
     }
     ComponentMapping { r, g, b, a }
-    YCbCrPlanesSampler { conversion }
 }
 
 // ---- Link symbols (`pipeline::sym`) ----
@@ -852,7 +850,6 @@ codec_enum! {
         Buffer, Texture, Sampler, Heap(f0), Synthetic(f0), InputAttachment(f0),
         CombinedTextureSampler(f0), HeapSampler(f0), AccelerationStructure(f0), TileAttachment(f0),
         TileMap, SeparateTexture(f0), SeparateSampler(f0),
-        YCbCrPlanes(f0),
         SamplerArray { compare, integer },
     }
     AccelerationStructureLevel { Primitive, Instance }
@@ -899,6 +896,7 @@ codec_enum! {
         IndirectSequence,
         IndirectBase,
         TextureLevelBase(f0),
+        StencilBit,
     }
     Symbol { Binding(f0), DescriptorSet(f0), Location(f0), Component(f0), SpecId(f0) }
 }
@@ -987,6 +985,7 @@ codec_enum! {
         MultiDraw,
         ShaderFloat8,
         PointPolygons,
+        PipelineRobustness,
     }
     VkExtension {
         ExtRobustness2, ExtImageRobustness, ExtShaderAtomicFloat, ExtShaderAtomicFloat2,
@@ -1016,6 +1015,7 @@ codec_enum! {
         Ext4444Formats,
         ExtMultiDraw,
         ExtShaderFloat8,
+        ExtPipelineRobustness,
     }
     SubgroupOp { Basic, Vote, Arithmetic, Ballot, Shuffle, ShuffleRelative, Clustered, Quad }
     FloatWidth { F16, F32, F64 }
@@ -1224,7 +1224,6 @@ codec_enum! {
         OpenClMode,
         OpenClLineTexture { slot },
         RowLockstep,
-        OneRow,
         FlatGrid,
         CallThreadgroups,
         SparseTextureWrites { slot, atomic },
@@ -1261,16 +1260,18 @@ codec_enum! {
         BorderTexels { slot },
         RegionViewports,
         PartialThreadgroups,
-        UnitAxes { axes, relief },
         TexelBufferParts { slot },
         AddressAlignment { slot, align },
         GridTiles,
         PrivateArena { slot_bytes },
+        StencilBitDraws,
+        RobustStorageBuffers,
     }
     Mechanism {
         Specialization, Variant, PushConstant, DynamicState, DynamicStateOrPushConstant,
         Builtin, PlanTimeCheck, BinderView, KeyProjection, RegionSelected,
         SyntheticBinding, RenderPassContract, None, PipelineStateOrPushConstant,
+        PipelineState,
     }
 }
 
@@ -1345,7 +1346,7 @@ codec_struct! {
         immutable_samplers,
     }
     PushConstantRange { stages, offset, size }
-    VertexInputState { bindings, attributes, pulled, variant_pulled }
+    VertexInputState { bindings, attributes, pulled }
     VertexBinding { binding, buffer_index, input_rate, divisor, stride }
     VertexAttribute { location, binding, format, offset }
     PulledAttribute { attribute, buffer_index, format, offset, step_function, step_rate, stride }
@@ -1446,13 +1447,13 @@ codec_enum! {
         DeviceOcclusionCount,
         VertexSimdgroupGrouping,
         RestrictedDepthUpload,
+        StencilOutputOverlap,
     }
     BindingSource {
         Buffer(f0), Texture(f0), Sampler(f0), CombinedTextureSampler { texture, sampler },
         Synthetic { stage, binding }, Heap(f0), InputAttachment(f0), HeapSampler { stage, sampler },
         AccelerationStructure { slot, level }, TileAttachment(f0), TileMap(f0),
         SeparateTexture { texture, sampler }, SeparateSampler { stage, sampler },
-        YCbCrPlanes(f0),
         SamplerArray { stage, compare, integer },
         IdentityArray,
     }

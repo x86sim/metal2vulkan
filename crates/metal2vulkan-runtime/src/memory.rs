@@ -133,9 +133,14 @@ pub(crate) fn idle_due(since: u64, now: u64) -> Option<u64> {
 pub enum MemoryClass {
     /// `MTLStorageModePrivate`: device-local memory with no host mapping.
     Private,
-    /// `MTLStorageModeShared`: host-visible, host-coherent and host-cached memory, mapped for the
-    /// block's life. On a discrete GPU it is system memory the GPU reads across its bus, as on a
-    /// Mac with a discrete GPU.
+    /// `MTLStorageModeShared`: host-visible and host-cached memory, host-coherent too where the
+    /// device has such a type ([`floor::MemoryTypes::shared`]), mapped for the block's life. On a
+    /// discrete GPU it is system memory the GPU reads across its bus, as on a Mac with a discrete
+    /// GPU. Where that type is not host-coherent, the runtime flushes what commands reach of it
+    /// before each submission, and flushes and invalidates what they may write before the host
+    /// sees their progress (the crate's README, "Shared memory's coherence"): a range the commands
+    /// reach only through an address, with no binding or declaration naming it, is neither, nor
+    /// are the consumer's own host reads and writes outside those points.
     Shared,
 }
 
@@ -925,6 +930,12 @@ impl Carve {
 }
 
 impl Pool {
+    /// The alignment of a buffer of the pool's usage, which Vulkan's memory requirements gave at
+    /// the device's making ([`buffer_alignment`]).
+    pub(crate) fn alignment(&self) -> u64 {
+        self.alignment
+    }
+
     /// The pool of a device whose `bufferImageGranularity` is `granularity`, and whose buffers of
     /// the pool's usage have the alignment `alignment`.
     pub(crate) fn new(

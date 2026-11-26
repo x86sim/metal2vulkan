@@ -5,7 +5,9 @@
 //! command buffer retires; a block whose last handle drops freed once its last command buffer
 //! retires; a block's clones, one dropped giving nothing back, and a handle outliving its
 //! device; the thread gauge holding the device's four threads as it is made; a command buffer
-//! joining a held group only within the group's expected GPU run; and each command buffer
+//! joining a held group only within the group's expected GPU run; each member of a group sent
+//! member by member signalling its own progress value, and its writes to Shared memory settled
+//! as it retires there; and each command buffer
 //! counted once in every stage histogram. Without a device: a push whose bytes the command buffer
 //! holds is not recorded again; a queue's expected run rises to a longer run at once and halves
 //! toward a shorter one; the join and send decisions of the group bound; the stage histograms'
@@ -141,12 +143,13 @@ fn a_push_of_the_bytes_a_command_buffer_holds_records_nothing() {
 pub(crate) mod on_device {
     use crate::buffer::BufferObject;
     use crate::device::lock;
+    use crate::floor::{buffer_memory_bits, choose, BelowFloor};
     use crate::submit::{GROUP_RUN, IN_FLIGHT, UNSEEN_JOINS};
     use crate::tests::devices_of_the_cfgs_kind;
     use crate::{
         host_time, AllocationId, AllocationInfo, Block, BlockMappings, Buffer, CommandBuffer,
         CommandBufferError, CommandBufferStatus, CommandQueue, Device, DeviceLoss, DeviceOptions,
-        DispatchType, Error, Fence, Gauges, Instance, MemoryClass, Refusal, SharedEvent,
+        DispatchType, Error, Fence, Gauges, Instance, MemoryClass, Metrics, Refusal, SharedEvent,
     };
     use ash::vk;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -261,24 +264,127 @@ pub(crate) mod on_device {
         for (name, physical) in &devices {
             let device =
                 Device::new(physical, options()).unwrap_or_else(|error| panic!("{name}: {error}"));
-            // The block-maker thread's first work done, so a body's counts start from a device
-            // that holds its fixed-size internals.
-            device.core().pool.await_internals();
-            // And the reaper's first work: the seed makes the pipeline cache and sets
-            // `pipeline_cache_bytes` (`Caches::seed`), after `Device::new` returns, so a body that
-            // compares the gauges across its work starts from settled ones.
-            within("the seed", || device.core().caches.is_seeded());
-            let counters = device.counters();
-            body(name, instance, device);
-            within("the teardown", || counters.gauges() == Gauges::default());
-            print_gauges_at_drop(test, counters.gauges());
-            // The matrix holds these at 0 (`readback::timestamps`, the completion thread's wait).
-            let metrics = counters.metrics();
-            let unavailable = metrics.stamps_not_available;
-            println!("M2V-MATRIX metric {test}/stamps_not_available {unavailable}");
-            let behind = metrics.waits_behind_counter;
-            println!("M2V-MATRIX metric {test}/waits_behind_counter {behind}");
+            run_settled(test, instance, name, device, &mut body);
         }
+    }
+
+    /// Each device of the cfg's kind, read through the memory view of the refused device's shape
+    /// ([`cached_types_incoherent`]), decided by the floor's choice over the view
+    /// (`floor::choose`), with the buffer bits a device made with no view answers. Where the
+    /// choice refuses, as it does a device whose one host-visible, host-cached buffer type also
+    /// holds the parameter ring, the device's make through the view is refused with exactly that
+    /// choice's refusal, which is printed. Where it chooses, the device opens through the view
+    /// with the chosen types and `body` runs on it as in [`each_device_with`], given the viewed
+    /// memory properties.
+    pub(crate) fn each_device_under_the_view(
+        test: &str,
+        mut body: impl FnMut(&str, &Instance, Device, &vk::PhysicalDeviceMemoryProperties),
+    ) {
+        let instance = crate::tests::validation::instance(&[]);
+        let (_, vk_instance) = instance.raw();
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device = Device::new(physical, DeviceOptions::default())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            // SAFETY: the device is live, made with the floor's features.
+            let usable = unsafe { buffer_memory_bits(device.raw().device) };
+            drop(device);
+            // SAFETY: `physical` is one of the instance's.
+            let mut memory =
+                unsafe { vk_instance.get_physical_device_memory_properties(physical.raw()) };
+            cached_types_incoherent(&mut memory);
+            let view = DeviceOptions {
+                memory: Some(cached_types_incoherent),
+                ..DeviceOptions::default()
+            };
+            match (choose(&memory, usable), Device::new(physical, view)) {
+                (Ok(types), Ok(device)) => {
+                    assert_eq!(device.memory_types(), types, "{name}");
+                    run_settled(test, &instance, name, device, |name, instance, device| {
+                        body(name, instance, device, &memory)
+                    });
+                }
+                (Err(missing), Err(Error::BelowFloor(below))) => {
+                    assert_eq!(below, BelowFloor { missing }, "{name}");
+                    println!(
+                        "{test}: {name} under the view: {}",
+                        Error::BelowFloor(below)
+                    );
+                }
+                (chosen, Err(error)) => panic!("{name}: {error}, where the floor chose {chosen:?}"),
+                (chosen, Ok(_)) => panic!("{name}: made, where the floor chose {chosen:?}"),
+            }
+        }
+    }
+
+    /// A memory view (`DeviceOptions::memory`) of the shape of a device the floor refused, a Meteor
+    /// Lake GPU under Mesa's Intel driver and the i915 kernel driver: `HOST_COHERENT` is taken from
+    /// every type that is host-visible, host-coherent and host-cached, so no type is both cached
+    /// and coherent; every other type keeps its flags.
+    ///
+    /// The tests reach it through three doors alone: a device opens through it only in
+    /// [`each_device_under_the_view`], as the floor's choice over the view decides; [`viewed`]
+    /// reads a device's types through it; and [`suite_view`] is the `m2v_shared_view` suite's
+    /// hook in `Device::new`.
+    fn cached_types_incoherent(memory: &mut vk::PhysicalDeviceMemoryProperties) {
+        use ash::vk::MemoryPropertyFlags as F;
+        let all = F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED;
+        let count = memory.memory_type_count as usize;
+        for kind in &mut memory.memory_types[..count] {
+            if kind.property_flags.contains(all) {
+                kind.property_flags &= !F::HOST_COHERENT;
+            }
+        }
+    }
+
+    /// `memory` read through the refused device's view ([`cached_types_incoherent`]): the types a
+    /// device made under `m2v_shared_view` reads.
+    pub(crate) fn viewed(
+        mut memory: vk::PhysicalDeviceMemoryProperties,
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        cached_types_incoherent(&mut memory);
+        memory
+    }
+
+    /// The view every device the tests make reads its types through under `m2v_shared_view`, where
+    /// the test gives none of its own (`Device::new`; docs/VALIDATION.md).
+    #[cfg(m2v_shared_view)]
+    pub(crate) fn suite_view(memory: &mut vk::PhysicalDeviceMemoryProperties) {
+        cached_types_incoherent(memory);
+    }
+
+    /// Runs `body` on `device` of `instance`, just made, once the block-maker thread's first work
+    /// and the reaper's are done, then checks that every gauge reaches zero once `body` has
+    /// dropped it, and prints the matrix's records.
+    fn run_settled(
+        test: &str,
+        instance: &Instance,
+        name: &str,
+        device: Device,
+        body: impl FnOnce(&str, &Instance, Device),
+    ) {
+        // The block-maker thread's first work done, so a body's counts start from a device that
+        // holds its fixed-size internals.
+        device.core().pool.await_internals();
+        // And the reaper's first work: the seed makes the pipeline cache and sets
+        // `pipeline_cache_bytes` (`Caches::seed`), after `Device::new` returns, so a body that
+        // compares the gauges across its work starts from settled ones.
+        within("the seed", || device.core().caches.is_seeded());
+        let counters = device.counters();
+        body(name, instance, device);
+        within("the teardown", || counters.gauges() == Gauges::default());
+        print_gauges_at_drop(test, counters.gauges());
+        // The matrix holds these at 0 (`readback::timestamps`, the completion thread's wait).
+        let metrics = counters.metrics();
+        let unavailable = metrics.stamps_not_available;
+        println!("M2V-MATRIX metric {test}/stamps_not_available {unavailable}");
+        let behind = metrics.waits_behind_counter;
+        println!("M2V-MATRIX metric {test}/waits_behind_counter {behind}");
+        // The form the test's kernels reached their buffers in, for a leg that names which tests
+        // ran the bound form on its card.
+        let (bound, address) = (metrics.bound_dispatches, metrics.address_dispatches);
+        println!("M2V-FORM {test} {name}: {bound} dispatches bound, {address} at their addresses");
     }
 
     /// Buffers of 256 bytes in one Shared block, each zeroed.
@@ -4751,6 +4857,551 @@ pub(crate) mod on_device {
                 in_groups.1
             );
             drop((kept, alone, a, b, arena, event, queue, device));
+        });
+    }
+
+    /// A group that goes member by member signals each member's own progress value: while its long
+    /// last member L runs, the progress semaphore already holds the value of the short member A
+    /// ahead of it, above the busy work's and below the group's last, so A's completion can be
+    /// seen at its own end and not at L's. Each repeat prints when A's handler began against L's
+    /// GPU end. L's copies are sized on the device to about 10 ms, and doubled for another attempt
+    /// where L ends less than 4 ms after A.
+    #[test]
+    fn every_device_signals_each_member_of_a_group_sent_apart() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        const REPEATS: usize = 3;
+        // L's GPU run aimed at: a span in `Metrics::gpu_end_to_handler`'s bucket 13.
+        const TARGET: u64 = 10_000_000;
+        const FLOOR: u64 = TARGET * 2 / 5;
+        each_device("command_group_apart_signals", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let small = arena.buffer();
+            let big = private(&device);
+            let long = |queue: &CommandQueue, copies: u64| halves(queue, &big, copies);
+            // L's copies, from eight copies' run on this device.
+            let queue = queue(&device);
+            let mut copies = halves_for(name, &queue, &big, TARGET);
+            let core = device.core();
+            // SAFETY: the progress semaphore is the device's timeline semaphore.
+            let counter = || unsafe { core.device.get_semaphore_counter_value(core.done.progress) };
+            for repeat in 0..REPEATS {
+                for attempt in 1.. {
+                    let queue = self::queue(&device);
+                    let a = queue.command_buffer().expect("a command buffer");
+                    fill(&a, &small, 1);
+                    let handled = Arc::new(AtomicU64::new(0));
+                    let stamp = Arc::clone(&handled);
+                    (a.add_completed_handler(move |_| stamp.store(host_time(), Ordering::SeqCst)))
+                        .expect("a handler");
+                    let l = long(&queue, copies);
+                    let (mut held_at, mut sent, mut read) = (0, 0, Vec::new());
+                    behind_busy(name, &device, &queue, |busy, submitted, _| {
+                        for command_buffer in [&a, &l] {
+                            command_buffer.commit().expect("a commit");
+                        }
+                        for command_buffer in [&a, &l] {
+                            within(name, || {
+                                command_buffer.status() != CommandBufferStatus::Committed
+                            });
+                        }
+                        let count = || device.counters().metrics().submissions - submitted;
+                        assert_eq!(count(), AHEAD, "{name}: A and L held in one group");
+                        held_at = core.work.progress();
+                        // A long run seen before the group goes: it goes member by member.
+                        l.queue().ran(1_000_000_000);
+                        let stop = AtomicBool::new(false);
+                        read = thread::scope(|scope| {
+                            // Each value the progress semaphore takes, with the host time first read.
+                            let poller = scope.spawn(|| {
+                                let mut read: Vec<(u64, u64)> = Vec::new();
+                                while !stop.load(Ordering::SeqCst) {
+                                    let value = counter().expect("the counter");
+                                    if read.last().is_none_or(|&(_, last)| last != value) {
+                                        read.push((host_time(), value));
+                                    }
+                                }
+                                read
+                            });
+                            busy.open();
+                            finished(name, &a);
+                            finished(name, &l);
+                            stop.store(true, Ordering::SeqCst);
+                            poller.join().expect("the poller")
+                        });
+                        sent = count() - AHEAD;
+                    });
+                    let last = core.work.progress();
+                    let (a_end, l_end) = (a.gpu_end_time(), l.gpu_end_time());
+                    if l_end.saturating_sub(a_end) < FLOOR && attempt < 4 {
+                        println!(
+                            "{name} {repeat}: L ended {} ns after A, under {FLOOR}: again with {} \
+                             copies",
+                            l_end.saturating_sub(a_end),
+                            copies * 2
+                        );
+                        copies = (copies * 2).min(4096);
+                        drop((a, l, queue));
+                        continue;
+                    }
+                    let early = (read.iter())
+                        .find(|&&(at, value)| held_at < value && value < last && at < l_end);
+                    let handler = handled.load(Ordering::SeqCst);
+                    let after = |at: u64| at as i64 - a_end as i64;
+                    println!(
+                        "{name} {repeat}: from A's GPU end, L's GPU end at {} ns, A's handler at {} \
+                         ns; the busy work's last value {held_at}, the group's {last}; read, ns \
+                         from A's end and value: {:?}",
+                        after(l_end),
+                        after(handler),
+                        read.iter()
+                            .map(|&(at, value)| (after(at), value))
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(sent, 2, "{name}: A and L, a submission each");
+                    assert!(
+                        l_end.saturating_sub(a_end) >= FLOOR,
+                        "{name}: L ended {} ns after A, short of {FLOOR} ns",
+                        l_end.saturating_sub(a_end)
+                    );
+                    assert!(
+                        early.is_some(),
+                        "{name}: no value between the busy work's {held_at} and the group's \
+                         {last} before L's end"
+                    );
+                    drop((a, l, queue));
+                    break;
+                }
+            }
+            drop((small, big, arena, device));
+        });
+    }
+
+    /// A command buffer of `copies` copies of `big`'s first half to its second, each after a
+    /// barrier on the copy before it, so its GPU run grows with `copies`.
+    fn halves(queue: &CommandQueue, big: &Buffer, copies: u64) -> CommandBuffer {
+        let half = big.length() / 2;
+        let command_buffer = queue.command_buffer().expect("a command buffer");
+        let (target, offset) = big.device_range();
+        command_buffer
+            .record_for_test(&[big], |device, command| {
+                let region = [vk::BufferCopy::default()
+                    .src_offset(offset)
+                    .dst_offset(offset + half)
+                    .size(half)];
+                let barrier = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                let dependency = vk::DependencyInfo::default().memory_barriers(&barrier);
+                for copy in 0..copies {
+                    if copy > 0 {
+                        // SAFETY: recording, outside any render pass.
+                        unsafe { device.cmd_pipeline_barrier2(command, &dependency) };
+                    }
+                    // SAFETY: recording; the two halves are the buffer's and apart.
+                    unsafe { device.cmd_copy_buffer(command, target, target, &region) };
+                }
+            })
+            .expect("the copies");
+        command_buffer
+    }
+
+    /// The copies of [`halves`] of `big` that run about `target` ns on `queue`'s device, from
+    /// eight copies' run there, the second of two.
+    fn halves_for(name: &str, queue: &CommandQueue, big: &Buffer, target: u64) -> u64 {
+        const SIZING: u64 = 8;
+        let mut run = 1;
+        for _ in 0..2 {
+            let eight = halves(queue, big, SIZING);
+            eight.commit().expect("a commit");
+            finished(name, &eight);
+            run = (eight.gpu_end_time() - eight.gpu_start_time()).max(1);
+        }
+        let copies = (target * SIZING).div_ceil(run).clamp(1, 4096);
+        println!(
+            "{name}: {SIZING} copies of {} bytes ran {run} ns: {copies} copies",
+            big.length() / 2
+        );
+        copies
+    }
+
+    /// A member of a group sent member by member that completes before the group's last leaves
+    /// its queue's expected run and retirement count as they stood (`QueueInner::ran`): its run
+    /// feeds them as the last retires, where one signal for the group fed them, so what the
+    /// submit thread joins and parts meanwhile reads what it read then. A's handler, after A's
+    /// retirement, sees them as they stood; L's, after the last's, sees the count two higher and
+    /// the run fed twice, each run halving the way down from the long run the test set.
+    #[test]
+    fn every_device_feeds_an_early_members_run_to_its_queue_as_the_last_retires() {
+        each_device("command_group_apart_feeds_late", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (first, second) = (arena.buffer(), arena.buffer());
+            let queue = queue(&device);
+            let a = queue.command_buffer().expect("a command buffer");
+            fill(&a, &first, 1);
+            let l = queue.command_buffer().expect("a command buffer");
+            fill(&l, &second, 2);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for command_buffer in [&a, &l] {
+                let (seen, inner) = (Arc::clone(&seen), Arc::clone(command_buffer.queue()));
+                (command_buffer.add_completed_handler(move |_| {
+                    lock(&seen).push((inner.retired(), inner.expected_run()));
+                }))
+                .expect("a handler");
+            }
+            behind_busy(name, &device, &queue, |busy, submitted, _| {
+                for command_buffer in [&a, &l] {
+                    command_buffer.commit().expect("a commit");
+                }
+                for command_buffer in [&a, &l] {
+                    within(name, || {
+                        command_buffer.status() != CommandBufferStatus::Committed
+                    });
+                }
+                let count = || device.counters().metrics().submissions - submitted;
+                assert_eq!(count(), AHEAD, "{name}: A and L held in one group");
+                // A long run seen before the group goes: it goes member by member.
+                l.queue().ran(1_000_000_000);
+                busy.open();
+                finished(name, &a);
+                finished(name, &l);
+                assert_eq!(count() - AHEAD, 2, "{name}: A and L, a submission each");
+            });
+            let seen = lock(&seen).clone();
+            let &[(a_retired, Some(a_run)), (l_retired, Some(l_run))] = seen.as_slice() else {
+                panic!("{name}: A's and L's handlers, each with an expected run: {seen:?}");
+            };
+            println!(
+                "{name}: at A's handler {a_retired} retired and a run of {a_run} ns expected, at \
+                 L's {l_retired} and {l_run} ns"
+            );
+            assert_eq!(
+                l_retired,
+                a_retired + 2,
+                "{name}: A's run fed its queue as L retired"
+            );
+            // Each run halves the way down to a short command buffer's: fed twice after A's
+            // handler, the run comes to about a quarter of what A's handler saw; once, a half.
+            assert!(
+                l_run * 3 < a_run,
+                "{name}: the run fed twice after A's handler"
+            );
+            drop((a, l, queue));
+            drop((first, second, arena, device));
+        });
+    }
+
+    /// A member of a group sent member by member that completes before the group's last has its
+    /// writes to Shared memory settled as it retires at its own progress value, before its status
+    /// reads completed and its handlers run (`crate::coherence`): A fills one Shared buffer, then
+    /// L, long, fills another. Where the device holds a coherence state, the invalidates since the
+    /// group was held are A's one, over A's buffer's atoms, at A's handler and at A's status, each
+    /// seen before L's GPU end, and A's and L's two, over both buffers' atoms, at L's handler; each
+    /// handler reads its own fill. Where the device holds none, it makes no flush or invalidate,
+    /// and A's sight before L's end is not asked for (lavapipe retires A with L). Each device runs
+    /// it as it reads its types and, under `m2v_gpu`, through the refused device's view
+    /// ([`cached_types_incoherent`]), which builds the state, as the floor's choice
+    /// over the view decides ([`each_device_under_the_view`]): a device whose one host-visible,
+    /// host-cached buffer type also holds the parameter ring is refused under the view, and that
+    /// refusal is printed. L's copies are sized to about 10 ms and, where the device holds the
+    /// state, doubled for another attempt where A was seen complete only after L's GPU end, up to
+    /// four.
+    #[test]
+    fn every_device_settles_an_early_members_shared_writes_at_its_own_completion() {
+        let test = "command_group_apart_settles";
+        each_device(test, early_member_settles);
+        if cfg!(m2v_gpu) && !cfg!(m2v_shared_view) {
+            each_device_under_the_view(test, |name, instance, device, _| {
+                early_member_settles(name, instance, device)
+            });
+        }
+    }
+
+    /// [`every_device_settles_an_early_members_shared_writes_at_its_own_completion`] on `device`.
+    fn early_member_settles(name: &str, _: &Instance, device: Device) {
+        // L's GPU run aimed at.
+        const TARGET: u64 = 10_000_000;
+        let atom = (device.core().coherence.as_ref()).map(|coherence| coherence.atom);
+        let counters = device.counters();
+        let mut arena = Arena::new(&device);
+        let (first, second) = (arena.buffer(), arena.buffer());
+        let big = private(&device);
+        // The first fill of each, so the group's meet no first use.
+        let warm = queue(&device);
+        let once = warm.command_buffer().expect("a command buffer");
+        fill(&once, &first, 0);
+        fill(&once, &second, 0);
+        once.commit().expect("a commit");
+        finished(name, &once);
+        let mut copies = halves_for(name, &warm, &big, TARGET);
+        // From `before` to `after`: the flushes, their bytes, the invalidates, their bytes, and
+        // the calls that failed.
+        let calls = |before: &Metrics, after: &Metrics| {
+            [
+                after.shared_flushes - before.shared_flushes,
+                after.shared_flushed_bytes - before.shared_flushed_bytes,
+                after.shared_invalidates - before.shared_invalidates,
+                after.shared_invalidated_bytes - before.shared_invalidated_bytes,
+                after.shared_coherence_failures - before.shared_coherence_failures,
+            ]
+        };
+        for attempt in 1.. {
+            let queue = queue(&device);
+            let a = queue.command_buffer().expect("a command buffer");
+            fill(&a, &first, 0x5a5a_5a5a);
+            let l = halves(&queue, &big, copies);
+            fill(&l, &second, 0xa5a5_a5a5);
+            // At each handler, on the completion thread: the metrics, its buffer's first word and
+            // the host time.
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for (command_buffer, buffer) in [(&a, &first), (&l, &second)] {
+                let (seen, buffer, counters) =
+                    (Arc::clone(&seen), buffer.clone(), counters.clone());
+                (command_buffer.add_completed_handler(move |_| {
+                    let metrics = counters.metrics();
+                    lock(&seen).push((metrics, word(&buffer), host_time()));
+                }))
+                .expect("a handler");
+            }
+            let (mut held, mut at_status) = (Metrics::default(), (Metrics::default(), 0));
+            behind_busy(name, &device, &queue, |busy, submitted, _| {
+                for command_buffer in [&a, &l] {
+                    command_buffer.commit().expect("a commit");
+                }
+                for command_buffer in [&a, &l] {
+                    within(name, || {
+                        command_buffer.status() != CommandBufferStatus::Committed
+                    });
+                }
+                let count = || counters.metrics().submissions - submitted;
+                assert_eq!(count(), AHEAD, "{name}: A and L held in one group");
+                // A long run seen before the group goes: it goes member by member.
+                l.queue().ran(1_000_000_000);
+                held = counters.metrics();
+                busy.open();
+                finished(name, &a);
+                // The metrics first: read before L's GPU end, as the host time after them shows,
+                // they hold nothing of L's retirement.
+                at_status = (counters.metrics(), host_time());
+                finished(name, &l);
+                assert_eq!(count() - AHEAD, 2, "{name}: A and L, a submission each");
+            });
+            let l_end = l.gpu_end_time();
+            let seen = lock(&seen).clone();
+            let &[(at_a, a_word, a_handled), (at_l, l_word, _)] = seen.as_slice() else {
+                panic!("{name}: A's and L's handlers: {seen:?}");
+            };
+            let (status_metrics, status_seen) = at_status;
+            let early = a_handled < l_end && status_seen < l_end;
+            // Only a coherence state's calls follow A's own retirement; with none there is no call
+            // to place, and lavapipe, whose one memory type is coherent, retires A with L.
+            if atom.is_some() && !early && attempt < 4 {
+                println!(
+                    "{name}: A seen complete {} ns after L's GPU end: again with {} copies",
+                    a_handled.max(status_seen) - l_end,
+                    copies * 2
+                );
+                copies = (copies * 2).min(4096);
+                drop((a, l, queue));
+                continue;
+            }
+            let (a_calls, status_calls, l_calls) = (
+                calls(&held, &at_a),
+                calls(&held, &status_metrics),
+                calls(&held, &at_l),
+            );
+            println!(
+                "{name}: attempt {attempt}, atom {atom:?}, A seen complete before L's GPU end: \
+                 {early}; flushes, flushed bytes, invalidates, invalidated bytes and failures \
+                 since the group was held: at A's handler {a_calls:?}, {} ns before L's GPU end; \
+                 at A's status {status_calls:?}, {} ns before it; at L's handler {l_calls:?}",
+                l_end as i64 - a_handled as i64,
+                l_end as i64 - status_seen as i64
+            );
+            assert_eq!(
+                (a_word, l_word),
+                (0x5a5a_5a5a, 0xa5a5_a5a5),
+                "{name}: each handler reads its own fill"
+            );
+            if atom.is_none() {
+                for (at, calls) in [("A's handler", a_calls), ("A's status", status_calls)] {
+                    assert_eq!(calls, [0; 5], "{name}: no coherence state, no call at {at}");
+                }
+                assert_eq!(l_calls, [0; 5], "{name}: no coherence state, no call");
+            } else {
+                assert!(
+                    early,
+                    "{name}: A seen complete before L's GPU end in none of {attempt} attempts"
+                );
+                // A block starts at a multiple of 64 KiB and the atom is a power of two of at most
+                // 256, so each 256-byte buffer of the arena is whole atoms of its own.
+                let one = first.length();
+                assert_eq!(
+                    a_calls[2..],
+                    [1, one, 0],
+                    "{name}: at A's handler, A's writes invalidated as A retired, ahead of L's"
+                );
+                assert_eq!(
+                    status_calls[2..],
+                    [1, one, 0],
+                    "{name}: at A's status, A's writes invalidated"
+                );
+                assert_eq!(
+                    l_calls[2..],
+                    [2, 2 * one, 0],
+                    "{name}: at L's handler, A's writes and L's invalidated"
+                );
+            }
+            drop((a, l, queue));
+            break;
+        }
+        drop((first, second, big, once, warm, arena, device));
+    }
+
+    /// A completion that cannot leave room pokes no submit pass (`Work::completed`): while a
+    /// queue holds X behind a group sent member by member, S, A and L, and one more submission,
+    /// Y, the members ahead of the group's last complete without poking the submit thread, and
+    /// the last's completion, which leaves room, pokes it once. A second gate ([`Busy::new`]),
+    /// submitted on the device's one `VkQueue` after the busy work and ahead of the group, which
+    /// goes only once the busy work is seen complete, keeps the group and Y from running until
+    /// X's hold has been asserted, so no completion past the busy work's comes before it, however
+    /// fast the device or however loaded the host. The hold is staged where the completion thread
+    /// sees the whole busy work complete behind the gate. Where it does not within `SEEN`, the
+    /// gate opens at once, the test prints so with the completion side's state, and neither the
+    /// hold nor the poke is asserted: lavapipe's timestamp read of a busy command buffer, in the
+    /// round that retires it, does not return while its queue waits on the gate's semaphore, so
+    /// a busy command buffer seen in a round of its own holds the next round off. S's and L's
+    /// copies are sized to about 10 ms each, A is a fill.
+    #[test]
+    fn every_device_pokes_the_submit_thread_for_a_completion_that_leaves_room() {
+        use std::sync::atomic::AtomicU64;
+        // S's and L's GPU run aimed at.
+        const RUN: u64 = 10_000_000;
+        // How long the completion thread is given to see the busy work complete behind the gate.
+        const SEEN: Duration = Duration::from_secs(5);
+        each_device("command_group_apart_pokes", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let (first, second, third) = (arena.buffer(), arena.buffer(), arena.buffer());
+            let (one, two) = (private(&device), private(&device));
+            let sizing = queue(&device);
+            let copies = halves_for(name, &sizing, &one, RUN);
+            let core = device.core();
+            let queue = queue(&device);
+            let s = halves(&queue, &one, copies);
+            let a = queue.command_buffer().expect("a command buffer");
+            fill(&a, &first, 1);
+            let l = halves(&queue, &two, copies);
+            let at_last = Arc::new(AtomicU64::new(0));
+            let (stamp, inner) = (Arc::clone(&at_last), Arc::clone(core));
+            (l.add_completed_handler(move |_| {
+                stamp.store(inner.work.pokes.load(Ordering::SeqCst), Ordering::SeqCst);
+            }))
+            .expect("a handler");
+            let y = queue.command_buffer().expect("a command buffer");
+            fill(&y, &second, 2);
+            let x = queue.command_buffer().expect("a command buffer");
+            fill(&x, &third, 3);
+            let (mut before, mut seen, mut staged) = (0, (0, 0), false);
+            behind_busy(name, &device, &queue, |busy, submitted, _| {
+                for command_buffer in [&s, &a, &l] {
+                    command_buffer.commit().expect("a commit");
+                }
+                for command_buffer in [&s, &a, &l] {
+                    within(name, || {
+                        command_buffer.status() != CommandBufferStatus::Committed
+                    });
+                }
+                let count = || device.counters().metrics().submissions - submitted;
+                assert_eq!(count(), AHEAD, "{name}: S, A and L held in one group");
+                let busy_last = core.work.progress();
+                // A long run seen before the group goes: it goes member by member.
+                l.queue().ran(1_000_000_000);
+                // Submitted while the group is held, so ahead of it. Its batch's fence follows the
+                // busy work, so it is made just before the busy work opens: dropped by a failed
+                // check, it never waits for a fence the busy work's closed gate holds.
+                let gate = Busy::new(&device);
+                busy.open();
+                let deadline = Instant::now() + SEEN;
+                while core.done.completed() < busy_last && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                staged = core.done.completed() >= busy_last;
+                if !staged {
+                    println!(
+                        "{name}: the hold not staged: the busy work's last value {busy_last} not \
+                         seen complete behind the gate in {SEEN:?}; {}",
+                        core.done.stall(&core.device)
+                    );
+                    gate.open();
+                }
+                within(name, || count() == AHEAD + 3);
+                y.commit().expect("a commit");
+                within(name, || count() == AHEAD + 4);
+                x.commit().expect("a commit");
+                within(name, || x.status() != CommandBufferStatus::Committed);
+                before = core.work.pokes.load(Ordering::SeqCst);
+                // A round raises what the completion thread has seen before it pokes: behind the
+                // gate it sees no further than the busy work, so S's round, and every round after
+                // it, pokes after `before` was read.
+                seen = (core.done.completed(), busy_last);
+                if staged {
+                    assert!(
+                        seen.0 <= busy_last,
+                        "{name}: seen complete at {} past the busy work's {busy_last} behind the \
+                         gate",
+                        seen.0
+                    );
+                    assert_eq!(count(), AHEAD + 4, "{name}: X held behind the group and Y");
+                    gate.open();
+                }
+                for command_buffer in [&s, &a, &l, &y, &x] {
+                    finished(name, command_buffer);
+                }
+            });
+            if staged {
+                let poked = at_last.load(Ordering::SeqCst) - before;
+                println!(
+                    "{name}: X held with {} seen complete behind the gate, the busy work's last \
+                     {}; {poked} pokes of the submit thread from X's hold to L's handler",
+                    seen.0, seen.1
+                );
+                assert_eq!(
+                    poked, 1,
+                    "{name}: the group's last completion alone poked it"
+                );
+            }
+            drop((s, a, l, y, x, queue));
+            drop((first, second, third, one, two, sizing, arena, device));
+        });
+    }
+
+    /// A thread that waits for a command buffer not yet enqueued or committed wakes as its status
+    /// changes: its enqueue and commit find the waiter and wake it, and the wait returns once the
+    /// command buffer completed, its write done.
+    #[test]
+    fn every_device_wakes_a_wait_begun_before_the_commit() {
+        each_device("command_wait_before_commit", |name, _, device| {
+            let mut arena = Arena::new(&device);
+            let written = arena.buffer();
+            let queue = queue(&device);
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            fill(&command_buffer, &written, 7);
+            thread::scope(|scope| {
+                let waiter = scope.spawn(|| command_buffer.wait_until_completed());
+                within(name, || command_buffer.waiters() == 1);
+                command_buffer.commit().expect("a commit");
+                (waiter.join().expect("the waiter")).expect("the wait");
+            });
+            assert_eq!(
+                command_buffer.status(),
+                CommandBufferStatus::Completed,
+                "{name}"
+            );
+            assert_eq!(command_buffer.waiters(), 0, "{name}: the wait left");
+            assert_eq!(word(&written), 7, "{name}: the write done");
+            drop((command_buffer, queue));
+            drop((written, arena, device));
         });
     }
 }

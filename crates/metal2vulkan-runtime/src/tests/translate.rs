@@ -144,41 +144,6 @@ mod on_device {
             })
     }
 
-    /// The facts the runtime reads of `descriptor`'s kernel, one that observes its threadgroup
-    /// partition, on `device`, lowered as the state lowers it: of its plain module, under the
-    /// inputs the kernel reads, and of its emulated-SIMD-group variant, the same inputs with
-    /// emulated SIMD groups.
-    fn facts_read(
-        name: &str,
-        device: &Device,
-        descriptor: &ComputePipelineDescriptor,
-    ) -> [Vec<RuntimeFact>; 2] {
-        let StageSource::Function(function) = &descriptor.kernel else {
-            unreachable!("a fixture's kernel is a function");
-        };
-        let translator = device.translator();
-        let budget = Budget::standard();
-        let entries = StageEntries::new();
-        let plain = translator
-            .kernel_inputs_read(function, &descriptor.lowering_inputs(), &budget, &entries)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        let emulated = plain.kernel_variant(KernelVariant::EmulatedSimdgroups);
-        [plain, emulated].map(|inputs| {
-            let compiled = translator
-                .compile_function_from_entries(function, &inputs, &budget, &entries)
-                .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let mut lowered = descriptor.clone();
-            lowered.kernel = StageSource::Compiled(compiled);
-            translator
-                .compile_compute_pipeline(&lowered, &budget)
-                .unwrap_or_else(|error| panic!("{name}: {error}"))
-                .dependencies
-                .iter()
-                .map(|dependency| dependency.fact)
-                .collect()
-        })
-    }
-
     /// Whether `state`'s make made its emulated-SIMD-group module.
     fn emulated_made(state: &ComputePipelineState) -> bool {
         use crate::pipeline::Lowered;
@@ -2220,15 +2185,14 @@ attributes #1 = { convergent nounwind willreturn }
 
     /// `unit_axes_walk`: a loop of `(y & 3) + 1` iterations at row `y`, each a SIMD-group sum over
     /// the threads still in it, in one threadgroup of 8 x 8 threads and one of 8 x 10 (a partial
-    /// SIMD group of 16 last). Where its SIMD groups are emulated its walk is predicated, and the
-    /// translator states the unit axes that would make it less divergent (`RuntimeFact::UnitAxes`
-    /// with no axes): the module is the general one, and every device creates the state and runs
-    /// both sizes, on the module whose walk states it where its tier emulates SIMD groups, and on
-    /// the emulated module at 8 x 10 where it runs only whole ones. Every answer is Metal's (M3 Max,
-    /// macOS 27.0.1): thread `t` adds, at each iteration `i` of its own, `i + 1` times the threads
-    /// of its SIMD group whose own trip count exceeds `i`.
+    /// SIMD group of 16 last). Where its SIMD groups are emulated its walk is predicated: every
+    /// device creates the state and runs both sizes, on the module whose walk is predicated where
+    /// its tier emulates SIMD groups, and on the emulated module at 8 x 10 where it runs only
+    /// whole ones. Every answer is Metal's (M3 Max, macOS 27.0.1): thread `t` adds, at each
+    /// iteration `i` of its own, `i + 1` times the threads of its SIMD group whose own trip count
+    /// exceeds `i`.
     #[test]
-    fn every_device_runs_a_kernel_whose_walk_unit_axes_could_relieve() {
+    fn every_device_runs_a_kernel_whose_walk_diverges_by_row() {
         let Some(descriptor) = descriptor("unit_axes_walk") else {
             return;
         };
@@ -2271,26 +2235,10 @@ attributes #1 = { convergent nounwind willreturn }
                     "{name}: the sums in a threadgroup of 8 x {rows}"
                 );
             }
-            // Which modules the runtime read the relief of: the plain one, and the emulated
-            // variant.
-            let relieved = |facts: &[RuntimeFact]| {
-                facts.iter().any(|fact| match *fact {
-                    RuntimeFact::UnitAxes { axes, relief } => axes == 0 && relief != 0,
-                    _ => false,
-                })
-            };
-            let [plain, emulated] = facts_read(name, &device, &descriptor);
-            let (plain, emulated) = (relieved(&plain), relieved(&emulated));
-            let made = emulated_made(&state);
-            assert!(
-                plain || (emulated && made),
-                "{name}: a module that states unit axes with no axes ran (plain {plain}, emulated \
-                 {emulated}, emulated made {made})"
-            );
             println!(
-                "{name}: unit axes with no axes stated by the {} module, which ran; sums checked \
-                 in threadgroups of 8 x 8 and 8 x 10",
-                if plain { "plain" } else { "emulated" }
+                "{name}: sums checked in threadgroups of 8 x 8 and 8 x 10 (emulated module made: \
+                 {})",
+                emulated_made(&state)
             );
         });
     }
@@ -2744,7 +2692,9 @@ attributes #1 = { convergent nounwind willreturn }
     /// the device's translator (`Device::translator`), under `LoweringInputs::kernel_variant` of
     /// the inputs `kernel_inputs_read` gives: for the observing kernel, whose plain module checks
     /// its one store at a computed index against its buffer (`PushField::SlotBounds` of buffer 1)
-    /// and leaves its two loads at constant offsets unchecked (none of buffer 0), and for a kernel
+    /// and leaves its two loads at constant offsets unchecked (none of buffer 0), and checks
+    /// neither on a device that binds kernel buffers, whose pipeline's robust buffer access 2
+    /// contains them (`DeviceProfile::binds_kernel_buffers`), and for a kernel
     /// of SIMD-group products. Each lowering a first device kept in its cache directory is found
     /// under the key of one variant's inputs, its artifact the public compile's byte for byte, and
     /// as many are found as the states made modules.
@@ -2830,9 +2780,12 @@ attributes #1 = { convergent nounwind willreturn }
                     _ => None,
                 })
                 .collect();
+            let want: &[u32] = match translator.profile().binds_kernel_buffers() {
+                true => &[],
+                false => &[1],
+            };
             assert_eq!(
-                checked,
-                [1],
+                checked, want,
                 "{name}: the buffers whose accesses are checked"
             );
             drop(second);
@@ -3434,14 +3387,18 @@ attributes #1 = { convergent nounwind willreturn }
     /// `vector_word_phases`'s kernels (`metal2vulkan_devtools::vector_word_phases`): with
     /// `vwp_words`'s two `uint` buffers bound at each word phase, 0, 4, 8 and 12, so its `uint4`
     /// and `float4` accesses through cast pointers land that far past a multiple of 16 whatever
-    /// the AIR's `align 16`, and `vwp_vec16`'s two `float4` buffers at multiples of 16, all four
-    /// buffers hold Metal's words afterwards, byte for byte from their first byte: the
+    /// the AIR's `align 16`, and `vwp_vec16`'s two `float4` buffers at multiples of 16, then with
+    /// `vwp_words`'s at 0 and `vwp_vec16`'s 4 and 8 bytes past a multiple of 16
+    /// (`VEC16_AT_WORDS`: arguments of alignment 16 at multiples of 4 only, which plain Metal
+    /// runs, and which run on the state's variant that holds them to 4, lowered at that dispatch),
+    /// all four buffers hold Metal's words afterwards, byte for byte from their first byte: the
     /// conformance crate's `vector-word-phases-*` cases hold the answer an Apple M3 Max recorded
     /// equal to the same words.
     #[test]
     fn every_device_places_each_vector_access_at_its_own_address() {
         use metal2vulkan_devtools::vector_word_phases::{
-            answer, inputs, vec16_offsets, FIXTURE, OFFSETS, THREADS, VEC16, WORDS,
+            answer_at, inputs, vec16_offsets, FIXTURE, OFFSETS, THREADS, VEC16, VEC16_AT_WORDS,
+            WORDS,
         };
         let (Some(phased), Some(aligned)) =
             (descriptor_of(FIXTURE, WORDS), descriptor_of(FIXTURE, VEC16))
@@ -3460,11 +3417,16 @@ attributes #1 = { convergent nounwind willreturn }
                 .map(|bytes| (buffers.buffer(bytes.len() as u64), bytes))
                 .collect();
             let queue = device.new_command_queue(4).expect("a queue");
-            for offset in OFFSETS {
+            let lowered = || device.counters().metrics().translations;
+            let runs: Vec<(u64, (u64, u64))> = (OFFSETS.into_iter())
+                .map(|offset| (offset, vec16_offsets(offset)))
+                .chain([(0, VEC16_AT_WORDS)])
+                .collect();
+            for &(offset, (a_at, b_at)) in &runs {
                 for (buffer, bytes) in &held {
                     write(buffer, 0, bytes);
                 }
-                let (a_at, b_at) = vec16_offsets(offset);
+                let start = lowered();
                 let command_buffer = queue.command_buffer().expect("a command buffer");
                 let mut encoder = command_buffer
                     .compute_command_encoder(DispatchType::Serial)
@@ -3487,7 +3449,13 @@ attributes #1 = { convergent nounwind willreturn }
                 command_buffer.commit().expect("a commit");
                 finished(name, &command_buffer);
                 assert_eq!(command_buffer.error(), None, "{name}");
-                let want = answer(offset);
+                // Only the binds off a multiple of 16 run a variant, lowered at their dispatch.
+                assert_eq!(
+                    lowered() > start,
+                    a_at % 16 != 0,
+                    "{name}: vec16 at {a_at} and {b_at}: a variant lowered"
+                );
+                let want = answer_at(offset, (a_at, b_at));
                 for ((buffer, bytes), (which, want)) in held.iter().zip([
                     ("src", &want.src),
                     ("dst", &want.dst),
@@ -3504,11 +3472,101 @@ attributes #1 = { convergent nounwind willreturn }
                     let first = got.iter().zip(&want).position(|(x, y)| x != y);
                     assert_eq!(
                         first, None,
-                        "{name}: offset {offset}: {which} differs from Metal's words"
+                        "{name}: offset {offset}, vec16 at {a_at} and {b_at}: {which} differs \
+                         from Metal's words"
                     );
                 }
             }
-            println!("{name}: Metal's words at bind offsets {OFFSETS:?}");
+            println!("{name}: Metal's words at bind offsets {runs:?}");
+        });
+    }
+
+    /// A state's variants of buffers bound at a multiple of 4 below their argument's alignment
+    /// (`LoweringInputs::word_bound_buffers`) live in the device's bounded map of contents under
+    /// the state's key with their slots' mask (`KernelKey::words`): `vwp_vec16` with both its
+    /// `float4` buffers 4 and 8 bytes past a multiple of 16 lowers one variant at its first
+    /// dispatch and none at its second; with only `a` so bound, another. Filled past a cap of 2,
+    /// the map holds 2, and a variant it forgot lowers again at its next dispatch.
+    #[test]
+    fn every_device_keeps_a_word_bound_variant_in_the_bounded_map_of_contents() {
+        use metal2vulkan_devtools::vector_word_phases::{inputs, FIXTURE, THREADS, VEC16, WORDS};
+        let (Some(aligned), Some(phased)) =
+            (descriptor_of(FIXTURE, VEC16), descriptor_of(FIXTURE, WORDS))
+        else {
+            return;
+        };
+        each_device("word-bound variants", |name, _, device| {
+            device.core().kernels.set_cap(2);
+            let counters = device.counters();
+            let entries = || counters.gauges().kernel_entries;
+            let lowered = || counters.metrics().translations;
+            let before = inputs();
+            let mut buffers = Buffers::new(&device, 64 * 1024);
+            let (a, b) = (
+                buffers.buffer(before.a.len() as u64),
+                buffers.buffer(before.b.len() as u64),
+            );
+            let queue = device.new_command_queue(4).expect("a queue");
+            let vec16 = state(name, &device, &aligned);
+            let run = |binds: [u64; 2]| {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut encoder = command_buffer
+                    .compute_command_encoder(DispatchType::Serial)
+                    .expect("an encoder");
+                encoder.set_compute_pipeline_state(&vec16).expect("a state");
+                for (index, (buffer, at)) in [&a, &b].into_iter().zip(binds).enumerate() {
+                    encoder
+                        .set_buffer(Some(buffer), at, index as u32)
+                        .expect("a buffer");
+                }
+                (encoder.dispatch_threadgroups([1, 1, 1], [THREADS, 1, 1]))
+                    .unwrap_or_else(|error| panic!("{name}: binds {binds:?}: {error}"));
+                encoder.end_encoding();
+                command_buffer.commit().expect("a commit");
+                finished(name, &command_buffer);
+                assert_eq!(command_buffer.error(), None, "{name}: binds {binds:?}");
+            };
+            let start = lowered();
+            run([16, 64]);
+            assert_eq!(
+                lowered(),
+                start,
+                "{name}: binds at multiples of 16 run the state's own"
+            );
+            assert_eq!(entries(), 1, "{name}: the state's content");
+            run([4, 8]);
+            let each = lowered() - start;
+            assert!(
+                each > 0,
+                "{name}: the variant lowered at its first dispatch"
+            );
+            run([4, 8]);
+            assert_eq!(lowered() - start, each, "{name}: one variant, kept");
+            assert_eq!(entries(), 2, "{name}: the state's content and its variant");
+            // Another mask is another variant: the map holds its cap, the state's content gone.
+            run([4, 64]);
+            assert_eq!(
+                lowered() - start,
+                2 * each,
+                "{name}: a second variant lowered"
+            );
+            assert_eq!(entries(), 2, "{name}: the map holds its cap");
+            // Another kernel's content forgets the least recently used, the first variant.
+            let words = state(name, &device, &phased);
+            assert_eq!(entries(), 2, "{name}: the map holds its cap");
+            let forgotten = lowered();
+            run([4, 8]);
+            assert_eq!(
+                lowered() - forgotten,
+                each,
+                "{name}: a forgotten variant lowered again"
+            );
+            assert_eq!(entries(), 2, "{name}: the map holds its cap");
+            drop((vec16, words));
+            println!(
+                "{name}: one variant a mask, kept in a map of 2 filled past its cap, a forgotten \
+                 one lowered again"
+            );
         });
     }
 
@@ -4428,11 +4486,12 @@ define void @nil_read_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %t
 
     /// `vwp_vec16` takes its `float4 *` arguments' addresses to be multiples of 16 and `vwp_words`
     /// its `uint *` arguments' multiples of 4 (`RuntimeFact::AddressAlignment`). A dispatch with
-    /// either argument bound off that alignment (`vwp_words`'s 1 and 3 bytes past each word phase,
-    /// `vwp_vec16`'s 4 and 12 bytes past its multiples of 16) is refused, as Metal's API
+    /// either argument bound off a multiple of 4 (`vwp_words`'s 1 and 3 bytes past each word
+    /// phase, `vwp_vec16`'s 2 and 3 bytes past its multiples of 16) is refused, as Metal's API
     /// validation refuses the bind (`Refusal::BufferOffsetAlignment`, naming the index, the offset
-    /// and the alignment), and records nothing: the command buffer completes without error and
-    /// every buffer holds its bytes as they were.
+    /// and the argument's alignment), and records nothing: the command buffer completes without
+    /// error and every buffer holds its bytes as they were. Plain Metal reaches those elements at
+    /// addresses rounded down to a multiple of 4, which is not emulated.
     #[test]
     fn an_argument_bound_off_its_alignment_is_refused() {
         use metal2vulkan_devtools::vector_word_phases::{
@@ -4474,8 +4533,8 @@ define void @nil_read_kernel(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %t
                 for (state, binds, off, alignment) in [
                     (&phased, [(0, offset + 1), (1, offset)], 0, 4),
                     (&phased, [(0, offset), (1, offset + 3)], 1, 4),
-                    (&aligned, [(2, a_at + 4), (3, b_at)], 0, 16),
-                    (&aligned, [(2, a_at), (3, b_at + 12)], 1, 16),
+                    (&aligned, [(2, a_at + 2), (3, b_at)], 0, 16),
+                    (&aligned, [(2, a_at), (3, b_at + 3)], 1, 16),
                 ] {
                     encoder.set_compute_pipeline_state(state).expect("a state");
                     for (index, (buffer, at)) in binds.into_iter().enumerate() {

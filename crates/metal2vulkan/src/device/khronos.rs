@@ -21,10 +21,9 @@
 //! and flag sets (`independentResolve`, the sample-location properties) state nothing.
 //!
 //! Where a profile's device departs from the specifications, which no Vulkan query reports,
-//! is not the document's to state: its `driverID`, `vendorID` and `driverVersion` name the
-//! driver and release whose measured deviations translation takes (`device::driver_facts`). A
-//! document that still holds the former top-level `m2v_deviations` object is refused, so a
-//! statement it makes is never silently dropped.
+//! is not the document's to state, and translation takes no deviation: it reads no driver
+//! identity (`Device::from_queries`). A document that still holds the former top-level
+//! `m2v_deviations` object is refused, so a statement it makes is never silently dropped.
 //!
 //! A venue profile's document also states each color attachment format's sample counts, which no
 //! profiles-schema structure holds, in a top-level `m2v_color_attachment_sample_counts` object
@@ -341,6 +340,13 @@ impl Merged {
         desc.device_name = p.string("deviceName");
         desc.device_type = p.enum_value("deviceType", vk::PhysicalDeviceType::from_name)?;
         desc.limits = limits(&p, api_version, &self.extensions)?;
+        // `robustBufferAccess2` as the document states it supported, from an exposed structure:
+        // a limit of the description, which no enable set removes (`Limits::robust_buffer_access2`).
+        desc.limits.robust_buffer_access2 = self.features.iter().any(|(structure, members)| {
+            feature_route(structure)
+                .is_some_and(|route| route.exposed(api_version, &self.extensions))
+                && members.get("robustBufferAccess2") == Some(&true)
+        });
         desc.allocation = AllocationLimits::new(
             p.u64_or("maxMemoryAllocationSize", 0)?,
             p.u64_or("maxBufferSize", 0)?,
@@ -714,6 +720,8 @@ fn limits(p: &Props<'_>, api: ApiVersion, extensions: &BTreeSet<String>) -> Resu
     // an omitted one there is the required minimum, 16.
     // The parallelogram property exists where `VK_KHR_maintenance5` is exposed.
     let maintenance5 = Route::Ext(&["VK_KHR_maintenance5"], Some(4)).exposed(api, extensions);
+    let robustness2 =
+        Route::Ext(&["VK_EXT_robustness2", "VK_KHR_robustness2"], None).exposed(api, extensions);
     let accel = Route::Ext(&["VK_KHR_acceleration_structure"], None).exposed(api, extensions);
     let accel_limit = |name: &str| -> Result<u32, Error> {
         if accel {
@@ -860,6 +868,18 @@ fn limits(p: &Props<'_>, api: ApiVersion, extensions: &BTreeSet<String>) -> Resu
         early_fragment_multisample_coverage_after_sample_counting: maintenance5
             && p.bool("earlyFragmentMultisampleCoverageAfterSampleCounting")?,
         sub_pixel_precision_bits: p.u32("subPixelPrecisionBits")?,
+        // A feature member, read where the document's features are (`Merged::describe`).
+        robust_buffer_access2: false,
+        robust_buffer_access_update_after_bind: p.bool("robustBufferAccessUpdateAfterBind")?,
+        // Its property structure exists where `VK_EXT_robustness2` is exposed.
+        robust_storage_buffer_access_size_alignment: match robustness2 {
+            true => p.u64_or("robustStorageBufferAccessSizeAlignment", 0)?,
+            false => 0,
+        },
+        max_per_stage_descriptor_update_after_bind_storage_buffers: p
+            .u32("maxPerStageDescriptorUpdateAfterBindStorageBuffers")?,
+        max_descriptor_set_update_after_bind_storage_buffers: p
+            .u32("maxDescriptorSetUpdateAfterBindStorageBuffers")?,
     })
 }
 
@@ -1065,6 +1085,8 @@ const PROPERTY_STRUCTS: &[&str] = &[
     "VkPhysicalDeviceMaintenance4PropertiesKHR",
     "VkPhysicalDeviceMaintenance5Properties",
     "VkPhysicalDeviceMaintenance5PropertiesKHR",
+    "VkPhysicalDeviceRobustness2PropertiesEXT",
+    "VkPhysicalDeviceRobustness2PropertiesKHR",
     "VkPhysicalDevicePushDescriptorProperties",
     "VkPhysicalDevicePushDescriptorPropertiesKHR",
     "VkPhysicalDeviceVertexAttributeDivisorProperties",
@@ -1195,6 +1217,10 @@ fn feature_route(structure: &str) -> Option<Route> {
         }
         "VkPhysicalDeviceMaintenance5Features" | "VkPhysicalDeviceMaintenance5FeaturesKHR" => {
             Ext(&["VK_KHR_maintenance5"], Some(4))
+        }
+        "VkPhysicalDevicePipelineRobustnessFeatures"
+        | "VkPhysicalDevicePipelineRobustnessFeaturesEXT" => {
+            Ext(&["VK_EXT_pipeline_robustness"], Some(4))
         }
         "VkPhysicalDeviceVertexAttributeDivisorFeatures"
         | "VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR"
@@ -1667,6 +1693,7 @@ pub(super) const FEATURE_MEMBERS: &[(&str, VkFeature)] = {
         ("separateStencilMaskRef", F::SeparateStencilMaskRef),
         ("imageViewFormatSwizzle", F::ImageViewFormatSwizzle),
         ("pointPolygons", F::PointPolygons),
+        ("pipelineRobustness", F::PipelineRobustness),
         ("fullDrawIndexUint32", F::FullDrawIndexUint32),
         ("depthClipEnable", F::DepthClipEnable),
         ("depthClampControl", F::DepthClampControl),
@@ -1760,6 +1787,7 @@ pub(crate) fn extension_from_name(name: &str) -> Option<VkExtension> {
         "VK_EXT_4444_formats" => E::Ext4444Formats,
         "VK_EXT_multi_draw" => E::ExtMultiDraw,
         "VK_EXT_shader_float8" => E::ExtShaderFloat8,
+        "VK_EXT_pipeline_robustness" => E::ExtPipelineRobustness,
         "VK_IMG_format_pvrtc" => E::ImgFormatPvrtc,
         "VK_EXT_border_color_swizzle" => E::ExtBorderColorSwizzle,
         "VK_EXT_custom_border_color" => E::ExtCustomBorderColor,

@@ -17,6 +17,7 @@ mod imports;
 pub(super) mod indices;
 mod judged;
 mod makes;
+mod over_frames;
 pub(super) mod places;
 mod prepass;
 mod render;
@@ -566,6 +567,7 @@ pub struct NewRuntime {
     freed: faulted::Freed,
     substitutes: Substitutes,
     unrecorded_tessellation: render::UnrecordedTessellation,
+    other_positions: render::OtherPositions,
     /// Each open encoder's command buffer.
     owners: HashMap<u64, u64>,
     /// How the recording's device kept Managed buffers; `None` where the player was not told,
@@ -639,6 +641,9 @@ pub struct NewRuntime {
     textures_over: [u64; 2],
     /// Of those in an image of their own, how many of each pixel format and usage.
     copied_over_kinds: BTreeMap<String, u64>,
+    /// The over copies by frame, and the textures in an image of their own each frame's calls
+    /// named: the report's `over copies by frame` line.
+    over_frames: over_frames::OverFrames,
     /// The textures over a surface's plane, and the entries under them.
     surfaces: surfaces::Surfaces,
     /// The video surfaces, made through the surface call.
@@ -992,6 +997,7 @@ impl NewRuntime {
             no_copies: imports::NoCopies::default(),
             textures_over: [0; 2],
             copied_over_kinds: BTreeMap::new(),
+            over_frames: over_frames::OverFrames::default(),
             surfaces: surfaces::Surfaces::default(),
             videos: videos::Videos::new(VideoHandle::DmaBuf),
             device,
@@ -1013,6 +1019,7 @@ impl NewRuntime {
             freed: faulted::Freed::default(),
             substitutes: Substitutes::default(),
             unrecorded_tessellation: render::UnrecordedTessellation::default(),
+            other_positions: render::OtherPositions::default(),
             owners: HashMap::new(),
             managed: None,
             display: None,
@@ -2447,6 +2454,7 @@ impl NewRuntime {
                     if in_image {
                         let kind = format!("{:?} {:?}", descriptor.pixel_format, descriptor.usage);
                         *self.copied_over_kinds.entry(kind).or_default() += 1;
+                        self.over_frames.made(call.result);
                     }
                 }
                 Ok(made)
@@ -2639,6 +2647,7 @@ impl Backend for NewRuntime {
             self.videos.released(call.receiver);
             self.substitutes.live.remove(&call.receiver);
             self.tiled.released(call.receiver);
+            self.over_frames.released(call.receiver);
             self.unrecorded_tessellation.released(call.receiver);
             self.skips.roots.remove(&call.receiver);
             match self.objects.remove(&call.receiver) {
@@ -2695,6 +2704,7 @@ impl Backend for NewRuntime {
                 self.substitutes.live.insert(call.result, false);
             }
         }
+        self.over_named(call);
         if !self.tiled.is_empty() {
             // Skipped encoders too: the copy is taken at their use.
             self.tiled_named(call)?;
@@ -3093,12 +3103,56 @@ impl Backend for NewRuntime {
             ("pushes_held", metrics.pushes_held),
             ("passes", metrics.passes),
             ("barriers", metrics.barriers),
+            ("pass_start_barriers", metrics.pass_start_barriers),
+            ("pass_home_barriers", metrics.pass_home_barriers),
+            ("blit_barriers", metrics.blit_barriers),
+            ("dispatch_hazard_barriers", metrics.dispatch_hazard_barriers),
+            (
+                "dispatch_after_write_barriers",
+                metrics.dispatch_after_write_barriers,
+            ),
+            (
+                "dispatch_write_after_read_barriers",
+                metrics.dispatch_write_after_read_barriers,
+            ),
+            (
+                "dispatch_encoder_end_barriers",
+                metrics.dispatch_encoder_end_barriers,
+            ),
+            (
+                "dispatch_pass_end_barriers",
+                metrics.dispatch_pass_end_barriers,
+            ),
+            (
+                "dispatch_indirect_barriers",
+                metrics.dispatch_indirect_barriers,
+            ),
+            (
+                "dispatch_unbound_barriers",
+                metrics.dispatch_unbound_barriers,
+            ),
+            (
+                "dispatch_arena_piece_barriers",
+                metrics.dispatch_arena_piece_barriers,
+            ),
+            ("dispatch_heap_barriers", metrics.dispatch_heap_barriers),
+            ("dispatch_other_barriers", metrics.dispatch_other_barriers),
+            ("bound_dispatches", metrics.bound_dispatches),
+            ("address_dispatches", metrics.address_dispatches),
+            ("buffer_sets_written", metrics.buffer_sets_written),
+            ("buffer_sets_held", metrics.buffer_sets_held),
+            ("segment_end_barriers", metrics.segment_end_barriers),
+            ("upload_barriers", metrics.upload_barriers),
+            ("other_barriers", metrics.other_barriers),
             ("bytes_copied", metrics.bytes_copied),
             ("heap_moves", metrics.heap_moves),
             ("over_copies", metrics.over_copies),
             ("over_copy_bytes", metrics.over_copy_bytes),
             ("over_copies_imported", metrics.over_copies_imported),
             ("over_copy_bytes_imported", metrics.over_copy_bytes_imported),
+            ("over_copy_bytes_private", metrics.over_copy_bytes_private),
+            ("over_copy_bytes_shared", metrics.over_copy_bytes_shared),
+            ("rendering_interrupts", metrics.rendering_interrupts),
             ("over_copies_host_memory", metrics.over_copies_host_memory),
             (
                 "over_copy_bytes_host_memory",
@@ -3452,6 +3506,7 @@ impl Backend for NewRuntime {
                 kinds.join(", ")
             ));
         }
+        lines.push(self.over_frames.line(&metrics));
         lines.push(self.surfaces.line());
         lines.push(self.videos.line());
         lines.extend(self.substitutes.lines());
@@ -3465,6 +3520,7 @@ impl Backend for NewRuntime {
             if first.is_empty() { " -" } else { &first },
         ));
         lines.push(self.unrecorded_tessellation.line());
+        lines.push(self.other_positions.line());
         lines.push(self.asides.line());
         lines.push(self.places.line());
         lines.push(self.unwritten.line());
@@ -3483,7 +3539,9 @@ impl Backend for NewRuntime {
         while (self.frame_stages.len() as u64) < frame {
             let metrics = self.device.counters().metrics();
             self.frame_stages.push(stages(&metrics));
+            self.over_frames.ended(&metrics);
         }
+        self.over_frames.located();
     }
 
     fn announced_bytes_recorded(&mut self) {

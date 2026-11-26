@@ -224,6 +224,8 @@ surface! {
         struct StageSimd N;
         struct DevicePolicy N;
         struct DeviceProfile O;
+        const KERNEL_BUFFER_BINDINGS;
+        const IDENTITY_BUFFER_BYTES;
         struct SpirvValidation N;
         struct EnabledCaps N;
         struct FragmentCaps N;
@@ -456,15 +458,12 @@ surface! {
         struct PvrtcDecode N;
         enum EtcDecode N;
         enum EtcTexels N;
-        struct YCbCrPlanesSampler N;
         fn function_table_entry_offset;
         fn function_table_header;
         mod indirect_commands;
     }
     "bind::indirect_commands" => metal2vulkan::bind::indirect_commands {
         enum Action E;
-        enum AddressError N;
-        enum BindingError E;
         struct Bindings O;
         struct BufferBinding E;
         enum BufferStage E;
@@ -475,22 +474,13 @@ surface! {
         enum ComputeDispatch E;
         struct Inheritance E;
         enum RecordError E;
-        enum RecordField E;
         struct RecordView<'static> O;
-        struct RegisteredBuffer<'static, u8> O;
         struct RenderDraws E;
-        struct ResolvedBindings O;
-        struct ResolvedBuffer<'static, u8> N;
         enum StateSource E;
         const BINDING_COUNT;
         const COMMAND_BUFFER_HEADER_BYTES;
         const COMMAND_BYTES;
-        const RECORDS_ADDRESS_BASE;
-        const RECORDS_ID_LIMIT;
         const THREADGROUP_BUFFER_ARGUMENT_COUNT;
-        const WRITTEN_FLAG_BYTES;
-        fn records_address;
-        fn written_flag_offset;
     }
     "cache" => metal2vulkan::cache {
         type Hash256;

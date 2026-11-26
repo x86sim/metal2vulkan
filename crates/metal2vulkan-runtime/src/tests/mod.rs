@@ -15,6 +15,7 @@ mod border;
 mod buffer_accesses;
 mod cache;
 mod choice;
+mod coherence;
 pub(crate) mod command;
 mod compute;
 mod copy_out;
@@ -91,6 +92,7 @@ mod patch;
 mod pixel_format_info;
 mod pixel_interlock;
 mod places;
+mod pool_reach;
 mod present;
 mod private_arena;
 mod private_sinks;
@@ -108,10 +110,13 @@ mod resolve;
 mod ring;
 mod sampler;
 mod sampling;
+mod set_pools;
 mod shadow;
 mod signed_zeros;
 mod sites;
+mod small_levels;
 mod spill;
+mod srgb_twin;
 mod stage;
 mod staging;
 #[cfg(m2v_gpu)]
@@ -136,6 +141,7 @@ mod validation;
 mod view;
 mod viewports;
 mod visibility;
+mod wg_lattice;
 
 /// This crate's directory: the test process's `CARGO_MANIFEST_DIR` where it holds the crate's
 /// sources (cargo and nextest set it for each test, and an archive run elsewhere remaps it to the

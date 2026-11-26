@@ -2,15 +2,17 @@
 
 use crate::alias::Placement;
 use crate::arena;
+use crate::bound::{Descriptor, NULL};
 use crate::buffer::{Buffer, BufferInner, BufferObject};
-use crate::command::{Building, CommandBuffer};
+use crate::coherence::Range;
+use crate::command::{Building, CommandBuffer, Owed};
 use crate::counters::Metric;
 use crate::device::Core;
 use crate::error::{Error, Gap, Limit, PartialThreadgroupsSite, Refusal, StageInKind};
 use crate::fence::Fence;
 use crate::floor;
 use crate::function_table::VisibleFunctionTable;
-use crate::hazard::Access;
+use crate::hazard::{Access, Dependency};
 use crate::indirect::IndirectCommandBuffer;
 use crate::kept::{Handle, Lent, Uncounted};
 use crate::memory::BlockId;
@@ -20,7 +22,7 @@ use crate::pipeline::{
     VariantRefusal, Which, PUSH_STAGES, SQUARE,
 };
 use crate::record::Reach;
-use crate::ring::CHUNK;
+use crate::ring::{Placed, CHUNK};
 use crate::sampler::SamplerState;
 use crate::texture::{Region, StorageGap, Texture, TextureObject};
 use ash::vk;
@@ -105,8 +107,8 @@ enum Slot {
         buffer: Lent<Buffer>,
         offset: u64,
     },
-    /// The address of a `set_bytes` copy in the parameter ring, and its length.
-    Bytes(u64, u32),
+    /// Where a `set_bytes` copy lies in the parameter ring, and its length.
+    Bytes(Placed, u32),
 }
 
 /// [`Refusal::BufferOffsetAlignment`] where `buffer`, bound at `offset` to buffer argument
@@ -302,6 +304,11 @@ struct DispatchFacts {
     /// ([`FieldValue::TextureLevels`], [`FieldValue::TextureLevelBase`]), found with the
     /// alignments.
     levels: bool,
+    /// The state's variant the dispatch runs, where a texture slot its kernel writes and does not
+    /// read is bound to an 8-bit sRGB texture's UNORM twin ([`TextureObject::encodes`]), or a
+    /// buffer slot at a multiple of 4 below its argument's alignment ([`check_alignments`]),
+    /// found with the alignments.
+    variant: Option<Arc<Compiled>>,
 }
 
 /// Which of its state's modules a dispatch runs.
@@ -320,6 +327,8 @@ pub(crate) enum Module {
 /// The last dispatch's module and workgroup size, and its `VkPipeline`.
 #[derive(Clone, Copy)]
 struct Last {
+    /// The content whose module it is: the state's, or its sRGB variant's.
+    content: u64,
     module: Module,
     local: [u32; 3],
     pipeline: vk::Pipeline,
@@ -757,14 +766,16 @@ impl ComputeCommandEncoder {
                 max: CHUNK,
             }));
         }
-        let address = self.building().write_ring(bytes)?;
+        // At the ring's alignment, which a storage buffer of set 0 over the copy starts at
+        // (`crate::bound`).
+        let placed = self.building().write_ring_placed(bytes)?;
         // Bytes are aligned, of no Managed or Shared buffer: a dispatch's facts change only where
         // the slot held a buffer.
         if !matches!(self.slots[slot], Slot::Bytes(..)) {
             self.changed();
         }
         // At most one chunk, 64 KiB.
-        self.slots[slot] = Slot::Bytes(address, bytes.len() as u32);
+        self.slots[slot] = Slot::Bytes(placed, bytes.len() as u32);
         Ok(())
     }
 
@@ -874,6 +885,17 @@ impl ComputeCommandEncoder {
         let Some(access) = usage.access() else {
             return Ok(());
         };
+        // What it writes of Shared memory is settled before the host sees its progress, where
+        // the Shared type is not host-coherent (`crate::coherence`).
+        if let Some(held) = self.building().coherence() {
+            if access.writes() {
+                held.wrote(match resource {
+                    Resource::Buffer(buffer) => buffer.shared_range(held.atom),
+                    Resource::Texture(texture) => texture.shared_range(held.atom),
+                    Resource::IndirectCommandBuffer(_) => None,
+                });
+            }
+        }
         self.declared_shared_write |= access.writes() && shared;
         if access.writes() && self.declared_unstored_write.is_none() {
             self.declared_unstored_write = unstored;
@@ -913,7 +935,7 @@ impl ComputeCommandEncoder {
     /// `memoryBarrierWithScope:` and `memoryBarrierWithResources:count:`: one global memory
     /// barrier either way, before the next dispatch.
     pub fn memory_barrier(&mut self) {
-        self.building().owe();
+        self.building().owe(Owed::Other);
     }
 
     /// `updateFence:`: encoders that wait on `fence` after this one, of any queue, see what this
@@ -954,8 +976,10 @@ impl ComputeCommandEncoder {
     ///
     /// Err: [`Refusal::NoPipeline`]; [`Refusal::ThreadgroupSize`] past Metal's limit for the
     /// kernel; [`Limit::ThreadgroupThreads`] within it and past this device's;
-    /// [`Refusal::BufferOffsetAlignment`] for a buffer the kernel reaches bound off its argument's
-    /// alignment, which nothing records; [`Gap::SwizzledReadWrite`]; [`Gap::BicubicTexels`];
+    /// [`Refusal::BufferOffsetAlignment`] for a buffer the kernel reaches bound off the alignment
+    /// its function holds it to, which nothing records (a function kernel's argument of 8 or 16
+    /// bound at a multiple of 4 runs on its kernel's variant that holds it to 4);
+    /// [`Gap::SwizzledReadWrite`]; [`Gap::BicubicTexels`];
     /// [`Limit::LevelElements`] where no run of level elements holds a texture of several levels
     /// the kernel writes or reads at a level other than the constant 0;
     /// [`Limit::ThreadgroupMemory`], the imageblock's cells at the size
@@ -1040,7 +1064,7 @@ impl ComputeCommandEncoder {
     fn end(&mut self) {
         if let Some(mut building) = self.building.take() {
             if self.wrote {
-                building.owe();
+                building.owe(Owed::EncoderEnd);
             }
             self.command_buffer.close_encoder(building);
         }
@@ -1064,9 +1088,12 @@ impl ComputeCommandEncoder {
         let max = inner.whole.interface.max_total_threads;
         size_checked(&inner.whole.interface, size)?;
         // Every module of a state is the same function, with the same arguments and alignments,
-        // so the whole module answers this check and the next, once after each change.
+        // so the whole module answers this check and the next, once after each change; a buffer
+        // bound at a multiple of 4 below its argument's alignment is the variant's below.
         if !self.facts.aligned {
-            self.facts.nil = check_alignments(&self.core, &self.slots, &inner.whole.interface)?;
+            let (nil, words) =
+                check_alignments(&self.core, &self.slots, &inner.whole.interface, true)?;
+            self.facts.nil = nil;
             for &slot in &inner.whole.interface.storage_reads {
                 if matches!(self.textures.get(slot as usize), Some(Some(t)) if t.swizzled()) {
                     return Err(Error::Unsupported(Gap::SwizzledReadWrite { slot }));
@@ -1086,26 +1113,59 @@ impl ComputeCommandEncoder {
                     }
                 }
             }
+            // The texture slots the kernel writes and does not read that are bound to an 8-bit
+            // sRGB texture's UNORM twin, which its sRGB variant encodes; with the first's gap,
+            // where the state has no variant.
+            let mut srgb = 0u128;
+            let mut first = None;
+            let element = |slot, gap: StorageGap| {
+                Error::Unsupported(Gap::StorageElement {
+                    slot: Some(slot),
+                    pixel_format: gap.pixel_format,
+                    case: gap.case,
+                    backing: gap.backing,
+                })
+            };
             for &(slot, access) in &interface.textures {
                 let read = interface.storage_reads.contains(&slot);
                 let stored = access != Access::Read || read;
                 // Its format's own answers, for the writes and reads declared without a format.
                 let formatless = interface.formatless.contains(&slot);
                 let unstored = match self.textures.get(slot as usize) {
+                    Some(Some(texture)) if access.writes() && !read && texture.encodes() => {
+                        srgb |= 1 << slot;
+                        first = first.or(texture.storage_gap(true, false).map(|gap| (slot, gap)));
+                        None
+                    }
                     Some(Some(texture)) if stored => {
                         texture.storage_gap(formatless && access.writes(), formatless && read)
                     }
                     _ => None,
                 };
                 if let Some(gap) = unstored {
-                    return Err(Error::Unsupported(Gap::StorageElement {
-                        slot: Some(slot),
-                        pixel_format: gap.pixel_format,
-                        case: gap.case,
-                        backing: gap.backing,
-                    }));
+                    return Err(element(slot, gap));
                 }
             }
+            // The variant of those slots and of the buffers bound at a multiple of 4 below their
+            // argument's alignment, which holds each to what its accesses need, as it checks. A
+            // kernel the consumer compiled has none: its own module refuses such a buffer.
+            self.facts.variant = match (first, words) {
+                (None, 0) => None,
+                (first, words) => match state.variant(first.map_or(0, |_| srgb), words) {
+                    Some(variant) => {
+                        let variant = variant?;
+                        check_alignments(&self.core, &self.slots, &variant.whole.interface, false)?;
+                        Some(variant)
+                    }
+                    None => {
+                        check_alignments(&self.core, &self.slots, interface, false)?;
+                        match first {
+                            Some((slot, gap)) => return Err(element(slot, gap)),
+                            None => None,
+                        }
+                    }
+                },
+            };
             // A texture declared written with no storage element, which the kernel may reach
             // through its storage image beyond its slots.
             if let (true, Some(gap)) = (interface.unbound_storage, self.declared_unstored_write) {
@@ -1138,6 +1198,12 @@ impl ComputeCommandEncoder {
             });
             self.facts.aligned = true;
         }
+        // A variant's content runs in place of the state's, kept by the command buffer.
+        let variant = self.facts.variant.clone();
+        if let Some(variant) = &variant {
+            recording(&mut self.building).hold_content(variant);
+        }
+        let inner: &Compiled = variant.as_deref().unwrap_or(inner);
         let core = &*self.core;
         let limits = &core.limits;
         // A kernel that writes no memory has no effect a program can observe: once checked as
@@ -1181,7 +1247,9 @@ impl ComputeCommandEncoder {
             return Ok(());
         }
         let vk_pipeline = match self.last {
-            Some(last) if last.module == module && last.local == local => last.pipeline,
+            Some(last) if (last.content, last.module, last.local) == (inner.id, module, local) => {
+                last.pipeline
+            }
             _ => {
                 let lengths = threadgroup_memory(
                     kernel,
@@ -1199,6 +1267,7 @@ impl ComputeCommandEncoder {
             }
         };
         self.last = Some(Last {
+            content: inner.id,
             module,
             local,
             pipeline: vk_pipeline,
@@ -1208,19 +1277,28 @@ impl ComputeCommandEncoder {
             self.facts.managed = self.reaches_managed(interface);
             self.facts.host = self.writes_host(interface);
             self.facts.module = Some(module);
-        }
-        let wrote = {
-            let accesses = Accesses {
-                slots: &self.slots,
-                textures: &self.textures,
-                declared: &self.declared,
-                indirect: match grid {
-                    Grid::Indirect(buffer, _) => {
-                        Some(([buffer.id(), buffer.tracked_id()], buffer.span()))
+            // The Shared memory its bound slots write, once for the facts: the bindings are the
+            // same until they change, which finds the facts again (`crate::coherence`).
+            if self.facts.host {
+                if let Some(held) = (self.building.as_mut()).and_then(Building::coherence) {
+                    for range in shared_writes(&self.slots, &self.textures, interface, held.atom) {
+                        held.wrote(Some(range));
                     }
-                    Grid::Direct(_) => None,
-                },
-            };
+                }
+            }
+        }
+        let accesses = Accesses {
+            slots: &self.slots,
+            textures: &self.textures,
+            declared: &self.declared,
+            indirect: match grid {
+                Grid::Indirect(buffer, _) => {
+                    Some(([buffer.id(), buffer.tracked_id()], buffer.span()))
+                }
+                Grid::Direct(_) => None,
+            },
+        };
+        let wrote = {
             let building = recording(&mut self.building);
             // Heap textures it writes that an alias's write left stale move from undefined first
             // (`crate::alias`).
@@ -1281,6 +1359,8 @@ impl ComputeCommandEncoder {
             .ok_or(Error::Refused(Refusal::ThreadgroupSize { size, max }))
         };
         let ids = &state.numbered.ids;
+        // Where a slot's set-0 descriptor starts (`view`).
+        let align = core.ring.align();
         let recorded = match (direct, grid) {
             (Some((threads, groups, ragged)), _) => {
                 // A count past the device's limit on an axis is split, and so is one whose slots
@@ -1314,15 +1394,19 @@ impl ComputeCommandEncoder {
                             let bound = (&self.slots[..], &self.textures[..], &self.samplers[..]);
                             let address = arena.map_or(0, |(address, _)| address);
                             let regions = (&region, self.stage_in_region.as_ref(), address);
-                            self.parameters
-                                .fill(kernel, (bound, self.facts.nil), ids, regions);
+                            self.parameters.fill(
+                                kernel,
+                                (bound, self.facts.nil, align),
+                                ids,
+                                regions,
+                            );
                             let building = recording(&mut self.building);
                             // The piece reuses the slots the commands before it may have used:
                             // all but the first in a block the dispatch took new, which nothing
                             // reached before.
                             if let Some((_, fresh)) = arena {
                                 if !(first && fresh) {
-                                    building.owe();
+                                    building.owe(Owed::ArenaPiece);
                                 }
                                 building.count(Metric::PrivateArenaPieces);
                             }
@@ -1336,6 +1420,11 @@ impl ComputeCommandEncoder {
                         }
                     }
                 }
+                // The barriers before its pieces started the hazard sets again, and its later
+                // pieces come after them: what the dispatch touches goes back in the sets.
+                if arena.is_some() {
+                    recording(&mut self.building).mark_dispatch(interface, &accesses);
+                }
                 Ok(())
             }
             (None, Grid::Indirect(buffer, offset)) => {
@@ -1343,7 +1432,7 @@ impl ComputeCommandEncoder {
                 let bound = (&self.slots[..], &self.textures[..], &self.samplers[..]);
                 let regions = (&region, self.stage_in_region.as_ref(), 0);
                 self.parameters
-                    .fill(kernel, (bound, self.facts.nil), ids, regions);
+                    .fill(kernel, (bound, self.facts.nil, align), ids, regions);
                 recording(&mut self.building).record_dispatch(
                     core,
                     vk_pipeline,
@@ -1353,6 +1442,11 @@ impl ComputeCommandEncoder {
             }
             (None, Grid::Direct(_)) => return Ok(()),
         };
+        if recorded.is_ok() && self.serial && interface.writes_unbound {
+            // A write through an address outside its resources conflicts with everything after
+            // it: the barrier is owed once the dispatch is recorded, to the next command.
+            recording(&mut self.building).owe(Owed::Unbound);
+        }
         if recorded.is_ok() && module == Module::Emulated {
             recording(&mut self.building).count(Metric::EmulatedSimdgroupDispatches);
         }
@@ -1410,6 +1504,27 @@ impl ComputeCommandEncoder {
                     )
             })
     }
+}
+
+/// The Shared memory a dispatch of a kernel of `interface` writes through its bound slots: each
+/// buffer slot it writes bound to a Shared buffer, and each texture slot it writes bound to a
+/// texture over one (`crate::coherence`).
+fn shared_writes<'a>(
+    slots: &'a [Slot],
+    textures: &'a [Option<Lent<Texture>>],
+    interface: &'a Interface,
+    atom: u64,
+) -> impl Iterator<Item = Range> + 'a {
+    let buffers = (interface.buffers.iter())
+        .filter(|(_, access)| access.writes())
+        .filter_map(move |&(slot, _)| match slots.get(slot as usize) {
+            Some(Slot::Buffer { buffer, .. }) => buffer.shared_range(atom),
+            _ => None,
+        });
+    let textures = (interface.textures.iter())
+        .filter(|(_, access)| access.writes())
+        .filter_map(move |&(slot, _)| textures.get(slot as usize)?.as_deref()?.shared_range(atom));
+    buffers.chain(textures)
 }
 
 /// The length `set` gives threadgroup memory index `index`, 0 where it gives none.
@@ -1599,16 +1714,26 @@ fn recording(building: &mut Option<Building>) -> &mut Building {
 /// [`check_alignment`] of each buffer bound in `slots` that `interface` reaches, the nil buffer's
 /// address where one it reaches is bound to nothing (`Ring::nil`), else 0, and the zero range's
 /// where it checks a load (`Ring::zero`), else 0. A `set_bytes` copy is at a multiple of 16 in the
-/// ring, which every mask divides, and so is the nil buffer.
+/// ring, which every mask divides, and so is the nil buffer. Where `words`, a buffer whose
+/// argument's alignment is 8 or 16, bound at a multiple of 4 below it, is not refused: the mask
+/// of those slots, bit `i` slot `i`, which plain Metal runs, each element at its own address
+/// (`LoweringInputs::word_bound_buffers`).
 fn check_alignments(
     core: &Core,
     slots: &[Slot],
     interface: &Interface,
-) -> Result<(u64, u64), Error> {
-    let (mut nil, mut zero) = (0, 0);
+    words: bool,
+) -> Result<((u64, u64), u32), Error> {
+    let (mut nil, mut zero, mut bound) = (0, 0, 0);
     for field in &interface.fields {
         let (slot, mask) = match field.value {
             FieldValue::BufferAddress { slot, mask } => (slot, mask),
+            // A slot of set 0's: its address is checked as a pushed one's, and nothing bound
+            // there is a null descriptor.
+            FieldValue::BindOffset { slot, mask } => match slots.get(slot as usize) {
+                Some(Slot::Buffer { .. }) => (slot, mask),
+                _ => continue,
+            },
             FieldValue::ZeroAddress => {
                 zero = core.ring.zero(core)?;
                 continue;
@@ -1616,12 +1741,19 @@ fn check_alignments(
             _ => continue,
         };
         match slots.get(slot as usize) {
-            Some(Slot::Buffer { buffer, offset }) => check_alignment(slot, mask, buffer, *offset)?,
+            Some(Slot::Buffer { buffer, offset }) => {
+                let at = buffer.gpu_address().wrapping_add(*offset);
+                if words && mask > 3 && at & mask != 0 && at & 3 == 0 {
+                    bound |= 1 << slot;
+                } else {
+                    check_alignment(slot, mask, buffer, *offset)?;
+                }
+            }
             Some(Slot::Bytes(..)) => {}
             Some(Slot::Empty) | None => nil = core.ring.nil(core)?,
         }
     }
-    Ok((nil, zero))
+    Ok(((nil, zero), bound))
 }
 
 /// A slot's [`FieldValue::BufferBounds`] for a buffer of `length` bytes bound at `offset`: the
@@ -1657,7 +1789,7 @@ impl Parameters {
     fn fill(
         &mut self,
         kernel: &Kernel,
-        (bound, (nil, zero)): (Bound<'_>, (u64, u64)),
+        (bound, (nil, zero), align): (Bound<'_>, (u64, u64), u64),
         sampler_ids: &[u32],
         (region, stage_in, arena): (&[u8; 32], Option<&[u8; 32]>, u64),
     ) {
@@ -1668,6 +1800,9 @@ impl Parameters {
             .resize(interface.push_len.next_multiple_of(4) as usize, 0);
         self.block.clear();
         self.block.resize(interface.block_len as usize, 0);
+        self.views.clear();
+        self.views
+            .extend((interface.views.iter()).map(|&slot| view(slots, slot, align).0));
         for field in &interface.fields {
             let (bytes, at) = match field.place {
                 Place::Push(offset) => (&mut self.push, offset as usize),
@@ -1679,11 +1814,15 @@ impl Parameters {
                         Some(Slot::Buffer { buffer, offset }) => {
                             buffer.gpu_address().wrapping_add(*offset)
                         }
-                        Some(Slot::Bytes(address, _)) => *address,
+                        Some(Slot::Bytes(placed, _)) => placed.address,
                         Some(Slot::Empty) | None => nil,
                     };
                     let word = address_word(address);
                     bytes[at..at + 8].copy_from_slice(&word.to_le_bytes());
+                }
+                FieldValue::BindOffset { slot, .. } => {
+                    let word = view(slots, slot, align).1;
+                    bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
                 }
                 FieldValue::BufferBounds(slot) => {
                     let bounds = match slots.get(slot as usize) {
@@ -1784,13 +1923,57 @@ impl ComputeCommandEncoder {
     }
 }
 
-/// A dispatch's parameters: the push window's bytes, and the ring block's with where its address
-/// goes in the window.
+/// A dispatch's parameters: the push window's bytes, the ring block's with where its address
+/// goes in the window, and the descriptors of set 0's bindings (`crate::bound`).
 #[derive(Default)]
 struct Parameters {
     push: Vec<u8>,
     block: Vec<u8>,
     block_address: Option<u32>,
+    views: Vec<Descriptor>,
+}
+
+/// The descriptor of buffer slot `slot` of `slots` as a storage buffer of set 0 (`crate::bound`),
+/// and the slot's bind offset word, the bytes from the descriptor's first byte to the slot's
+/// address, for a device whose buffer base alignment (`DeviceProfile::buffer_base_alignment`, a
+/// power of two) is `align`:
+///
+/// - a buffer: the `VkBuffer` shaders reach it through, from its first byte there rounded down
+///   to `align`, through its last byte, with its first byte's distance from that start plus the
+///   bind offset. A buffer's first byte in that `VkBuffer` is where the placement put it, which
+///   may be any byte of a buffer over memory the consumer brought; every `VkBuffer` of the device
+///   starts at a multiple of 16 in the Metal address space (its memory requirements' alignment
+///   on every lab driver: 16, 64 or 256), so the descriptor's bytes are congruent to their Metal
+///   addresses modulo 16, as a view's `uvec4` and `uvec2` units take them. Every other placement
+///   keeps the start on `align` by construction, so the descriptor's first byte is the buffer's
+///   own: a buffer placed as `Device::heap_buffer_size_and_align` answers starts at a multiple of
+///   256 of its block (`HEAP_BUFFER_ALIGNMENT`, no less than any device's `align`), and a block at
+///   a multiple of 64 KiB of its allocation (`Device::take_block`). Only a buffer at another byte
+///   of memory the consumer brought (a no-copy buffer) has bytes before it in its descriptor, up
+///   to `align - 1`, that memory's own. Past its end the device's
+///   `robustStorageBufferAccessSizeAlignment` rounds the range up (up to 3 bytes past a length
+///   off 4 where it is 4): the block's bytes past the buffer, padding before the next buffer at a
+///   multiple of 256 that no zeroing of the buffer reaches, which hold zero or the same device's
+///   earlier bytes (a device's blocks are ranges of its own allocations), never another device's;
+/// - a `set_bytes` copy: its bytes, from its own first byte, at a multiple of `align` in the
+///   ring's buffer (`crate::ring`), with 0;
+/// - nothing bound, or a buffer or a copy of no bytes: a null descriptor, with 0.
+fn view(slots: &[Slot], slot: u32, align: u64) -> (Descriptor, u32) {
+    match slots.get(slot as usize) {
+        Some(Slot::Buffer { buffer, offset }) if buffer.length() > 0 => {
+            let (reached, at) = buffer.device_range();
+            let start = at & !(align - 1);
+            let ahead = at - start;
+            // A buffer is at most 2 GiB long, and its bind offset within it.
+            let word = u32::try_from(ahead + offset).unwrap_or(u32::MAX);
+            ((reached, start, ahead + buffer.length()), word)
+        }
+        Some(Slot::Bytes(placed, length)) if *length > 0 => {
+            debug_assert!(placed.offset % align == 0);
+            ((placed.buffer, placed.offset, u64::from(*length)), 0)
+        }
+        _ => (NULL, 0),
+    }
 }
 
 impl Drop for ComputeCommandEncoder {
@@ -1831,14 +2014,17 @@ pub(crate) struct Accesses<'a> {
 impl Accesses<'_> {
     /// Each resource the dispatch of a kernel of `interface` touches, with its access, by its id
     /// in the hazard sets ([`Buffer::tracked_id`], [`Texture::tracked_id`]: a heap's resources
-    /// take the heap's).
+    /// take the heap's) and its own as bytes ([`Buffer::id`], [`Texture::hazard_id`]), the two
+    /// equal but for a resource that takes a shared id.
     pub(crate) fn each<'b>(
         &'b self,
         interface: &'b Interface,
-    ) -> impl Iterator<Item = (u32, Access)> + 'b {
+    ) -> impl Iterator<Item = ([u32; 2], Access)> + 'b {
         let slots = interface.buffers.iter().filter_map(move |&(slot, access)| {
             match self.slots.get(slot as usize) {
-                Some(Slot::Buffer { buffer, .. }) => Some((buffer.tracked_id(), access)),
+                Some(Slot::Buffer { buffer, .. }) => {
+                    Some(([buffer.tracked_id(), buffer.id()], access))
+                }
                 _ => None,
             }
         });
@@ -1847,16 +2033,16 @@ impl Accesses<'_> {
             .iter()
             .filter_map(move |&(slot, access)| {
                 let texture = self.textures.get(slot as usize)?.as_ref()?;
-                Some((texture.tracked_id(), access))
+                Some(([texture.tracked_id(), texture.hazard_id()], access))
             });
         slots
             .chain(textures)
             .chain(
                 self.declared
                     .iter()
-                    .map(move |&(ids, access, ..)| (ids[1], access)),
+                    .map(move |&([own, tracked], access, ..)| ([tracked, own], access)),
             )
-            .chain(self.indirect.map(|(ids, _)| (ids[1], Access::Read)))
+            .chain((self.indirect).map(|([own, tracked], _)| ([tracked, own], Access::Read)))
     }
 
     /// Each resource the dispatch of a kernel of `interface` reaches, as the copies over buffers
@@ -1917,9 +2103,32 @@ impl Accesses<'_> {
     }
 }
 
+/// What a dispatch depends on in the hazard sets, where Metal orders it after what they hold.
+#[derive(Default)]
+struct Depends {
+    /// It reads or writes a resource written, by the resource's own id.
+    write: bool,
+    /// It writes a resource only read, by the resource's own id.
+    read: bool,
+    /// It conflicts through a shared id alone ([`HeapId`](crate::hazard::HeapId)): a heap's
+    /// resources, or an exported surface's, whose own ids find no dependency.
+    shared: bool,
+}
+
+impl Depends {
+    fn any(&self) -> bool {
+        self.write || self.read || self.shared
+    }
+}
+
 impl Building {
     /// Places a dispatch's barrier where it needs one, and adds what it touches to the sets.
     /// True where the dispatch writes.
+    ///
+    /// The barrier, one whatever its causes, is counted in one bucket of
+    /// [`Metrics::dispatch_hazard_barriers`](crate::Metrics::dispatch_hazard_barriers): the
+    /// dispatch's own dependency on a write or on a read where it has one, and otherwise the first
+    /// of its other causes in the buckets' order.
     fn dispatch_hazards(
         &mut self,
         serial: bool,
@@ -1928,24 +2137,70 @@ impl Building {
     ) -> Result<bool, Error> {
         let indirect = accesses.indirect.is_some();
         let reach = Reach::Dispatches { indirect };
-        let command = self.command(reach)?;
-        let hazards = self.hazards();
-        let conflict = serial
-            && (accesses
-                .each(interface)
-                .any(|(id, access)| hazards.conflicts(id, access))
-                || (interface.reads_unbound && hazards.wrote())
-                || (interface.writes_unbound && hazards.touched()));
+        let command = self.current_command()?;
+        let owed = self.owed();
         // In either kind of encoder: the barriers since a write may have left indirect argument
         // reads out.
-        if conflict || (indirect && self.args_unordered()) {
-            self.barrier(command, reach);
+        let args = indirect && self.args_unordered();
+        let hazards = self.hazards();
+        // Metal orders the dispatch after what the sets hold in a serial encoder, and after what
+        // an owed barrier orders in either kind.
+        let ordered = serial || owed.is_some();
+        let mut depends = Depends::default();
+        for ([tracked, own], access) in accesses.each(interface).filter(|_| ordered) {
+            let Some(on) = hazards.dependency(tracked, access) else {
+                continue;
+            };
+            let on = match own == tracked {
+                true => Some(on),
+                false => hazards.own_dependency(own, access),
+            };
+            match on {
+                Some(Dependency::Write) => depends.write = true,
+                Some(Dependency::Read) => depends.read = true,
+                None => depends.shared = true,
+            }
+        }
+        let unbound = ordered
+            && ((interface.reads_unbound && hazards.wrote())
+                || (interface.writes_unbound && hazards.touched()));
+        let conflict = serial && (depends.any() || unbound);
+        if owed.is_some() || conflict || args {
+            let cause = if depends.write {
+                Metric::DispatchAfterWriteBarriers
+            } else if depends.read {
+                Metric::DispatchWriteAfterReadBarriers
+            } else if owed == Some(Owed::EncoderEnd) {
+                Metric::DispatchEncoderEndBarriers
+            } else if owed == Some(Owed::PassEnd) {
+                Metric::DispatchPassEndBarriers
+            } else if args {
+                Metric::DispatchIndirectBarriers
+            } else if unbound || owed == Some(Owed::Unbound) {
+                Metric::DispatchUnboundBarriers
+            } else if owed == Some(Owed::ArenaPiece) {
+                Metric::DispatchArenaPieceBarriers
+            } else if depends.shared {
+                Metric::DispatchHeapBarriers
+            } else {
+                Metric::DispatchOtherBarriers
+            };
+            self.barrier(command, reach, cause);
             self.hazards().clear();
         }
+        Ok(self.mark_dispatch(interface, accesses))
+    }
+
+    /// Adds what a dispatch of a kernel of `interface` touches to the hazard sets. True where it
+    /// writes.
+    fn mark_dispatch(&mut self, interface: &Interface, accesses: &Accesses<'_>) -> bool {
         let hazards = self.hazards();
         let mut wrote = false;
-        for (id, access) in accesses.each(interface) {
-            hazards.mark(id, access);
+        for ([tracked, own], access) in accesses.each(interface) {
+            hazards.mark(tracked, access);
+            if own != tracked {
+                hazards.mark_own(own, access);
+            }
             wrote |= access.writes();
         }
         if interface.reads_unbound {
@@ -1954,15 +2209,11 @@ impl Building {
         if interface.writes_unbound {
             hazards.mark_wild_write();
             wrote = true;
-            if serial {
-                // Such a write conflicts with everything after it.
-                self.owe();
-            }
         }
         if wrote {
             self.wrote();
         }
-        Ok(wrote)
+        wrote
     }
 
     /// Binds `pipeline` where it is not bound, writes the parameters' ring block and its address,
@@ -1987,9 +2238,14 @@ impl Building {
         })?;
         // SAFETY: the command buffer is the current segment's, recording outside any render pass;
         // the pipeline is the device's, of its layout, and the window lies in the layout's one
-        // push range, of `PUSH_STAGES`.
+        // push range, of `PUSH_STAGES`; every buffer a view names is bound in the encoder's slots,
+        // which the command buffer keeps, or is the ring's.
         unsafe {
             self.bind_compute(core, command, pipeline);
+            match parameters.views.is_empty() {
+                true => self.count(Metric::AddressDispatches),
+                false => self.bind_views(core, command, &parameters.views)?,
+            }
             if !push.is_empty() && self.push_needed(push) {
                 device.cmd_push_constants(command, core.layout, PUSH_STAGES, 0, push);
             }

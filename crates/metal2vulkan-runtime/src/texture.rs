@@ -219,6 +219,10 @@ pub(crate) struct TextureInner {
     format: vk::Format,
     /// Its views' format reads as storage without a format ([`Plan`]'s `storage_reads`).
     storage_reads: bool,
+    /// The UNORM twin format its storage element views, for an 8-bit sRGB texture made for
+    /// shader writes ([`Plan`]'s `twin`): a function writes it only through a slot of its sRGB
+    /// variant, which encodes ([`TextureObject::encodes`]).
+    twin: Option<vk::Format>,
     /// The usage its views take where their format is not the image's, or the image is extended
     /// for its views' storage ([`Plan`]'s `extended`) (`VkImageViewUsageCreateInfo`): the image's
     /// that the format's features hold. `None` where its views take the image's.
@@ -1532,6 +1536,7 @@ impl Device {
             body: Body::Image(image),
             format: plan.format,
             storage_reads: plan.storage_reads,
+            twin: plan.twin,
             views_usage: None,
             unit: plan.unit,
             index,
@@ -1817,6 +1822,7 @@ impl Device {
             body: Body::Image(image),
             format: plan.format,
             storage_reads: plan.storage_reads,
+            twin: plan.twin,
             views_usage,
             unit: plan.unit,
             index,
@@ -1880,6 +1886,11 @@ struct Plan {
     read: bool,
     /// Whether the texture has a storage view.
     storage: bool,
+    /// The format of an 8-bit sRGB texture's storage view: its UNORM twin's
+    /// (`metal::format::srgb_raw_twin`), which the image lists and is extended for, as no sRGB
+    /// format is stored through its own view ([`stores`]). Its writes encode in the shader
+    /// (`LoweringInputs::srgb_storage`).
+    twin: Option<vk::Format>,
     /// Whether a storage view of the plan's format reads without a format: the format's
     /// `VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT`, the format query a translator's
     /// storage read by the formats' own bits takes, which a device without
@@ -2000,6 +2011,7 @@ impl Plan {
             usage: SHADOW_USAGE,
             sampled: None,
             storage: false,
+            twin: None,
             attachment_reads: false,
             resolves: false,
             linear_resolves: false,
@@ -2030,6 +2042,7 @@ impl Plan {
         Plan {
             usage,
             extended: false,
+            twin: None,
             view_formats: self.view_formats.clone(),
             ..*self
         }
@@ -2790,6 +2803,7 @@ fn planned(
         && !multisampled(d.texture_type);
     if plan.extended {
         plan.usage |= vk::ImageUsageFlags::STORAGE;
+        plan.twin = srgb_twin(profile, pf, usage).filter(|twin| plan.view_formats.contains(twin));
     }
     // A square 2D array of six slices or more is made cube-compatible where the device's image
     // format query takes the flag (`Plan::cube`).
@@ -2970,11 +2984,30 @@ fn view_formats(
 }
 
 /// Whether the device stores a texture held as `mapping` through a storage image declared without
-/// a format: the format held directly, with the storage image and its writes without a format.
+/// a format: the format held directly, with the storage image and its writes without a format,
+/// and no sRGB format on any device, whatever its features: an 8-bit sRGB texture is stored
+/// through its UNORM twin's view ([`srgb_twin`]), one form on every device.
 fn stores(profile: &metal2vulkan::device::DeviceProfile, mapping: &formats::FormatMapping) -> bool {
+    let srgb = (mapping.format.block())
+        .is_some_and(|block| block.color == Some(metal2vulkan::vk::NumericFormat::Srgb));
     mapping.emulation == FormatEmulation::Direct
+        && !srgb
         && profile.supports_format(mapping.format, FormatUsage::StorageImage)
         && profile.supports_format(mapping.format, FormatUsage::StorageImageWriteWithoutFormat)
+}
+
+/// The format of the storage view of a texture of `pf` and `usage` made for shader writes where
+/// `pf` is an 8-bit sRGB format: its UNORM twin's (`metal::format::srgb_raw_twin`) where the
+/// device stores the twin ([`stores`]). A function writes it through the twin's codes, encoded in
+/// the shader (`LoweringInputs::srgb_storage`).
+fn srgb_twin(
+    profile: &metal2vulkan::device::DeviceProfile,
+    pf: PixelFormat,
+    usage: TextureUsage,
+) -> Option<vk::Format> {
+    let twin = formats::srgb_raw_twin(pf)?;
+    let mapping = formats::vk_format(twin, &formats::texture_usages(twin, usage), profile).ok()?;
+    stores(profile, &mapping).then(|| mapping.format.into())
 }
 
 /// Whether textures of `texture_type` are multisampled, which Metal's shaders only read (the
@@ -3104,6 +3137,7 @@ fn form(core: &Core, d: &TextureDescriptor, usage: TextureUsage) -> Result<Plan,
         sampled,
         read,
         storage,
+        twin: None,
         storage_reads,
         home,
         extended: false,
@@ -3687,7 +3721,8 @@ impl Made {
     /// # Safety
     ///
     /// `image` is the device's, bound, of the plan's format, and has `usage`, the storage usage
-    /// among it where the plan has a storage view.
+    /// among it where the plan has a storage view or an sRGB twin's (`Plan::twin`), whose format
+    /// the image lists.
     unsafe fn views(
         &mut self,
         core: &Core,
@@ -3697,8 +3732,7 @@ impl Made {
         usage: vk::ImageUsageFlags,
     ) -> Result<(Option<vk::ImageView>, Option<vk::ImageView>), Error> {
         let own = plan.own_views(usage);
-        let mut view = |view_type, components, aspect| {
-            let format = plan.format;
+        let mut view = |view_type, (format, own), components, aspect| {
             // SAFETY: the caller's contract.
             let range = whole(aspect);
             let view =
@@ -3707,18 +3741,21 @@ impl Made {
             Ok::<_, Error>(view)
         };
         let sampled = match plan.sampled {
-            Some((components, aspect)) if usage.contains(vk::ImageUsageFlags::SAMPLED) => {
-                Some(view(shape.view_type, components, aspect)?)
-            }
+            Some((components, aspect)) if usage.contains(vk::ImageUsageFlags::SAMPLED) => Some(
+                view(shape.view_type, (plan.format, own), components, aspect)?,
+            ),
             _ => None,
         };
-        let storage = match plan.storage {
-            true => Some(view(
+        // An sRGB texture's storage view is its UNORM twin's, of the storage usage alone.
+        let twin = (plan.twin).map(|twin| (twin, Some(vk::ImageUsageFlags::STORAGE)));
+        let storage = match plan.storage.then_some((plan.format, own)).or(twin) {
+            Some(format) => Some(view(
                 storage_view_type(shape.view_type),
+                format,
                 vk::ComponentMapping::default(),
                 vk::ImageAspectFlags::COLOR,
             )?),
-            false => None,
+            None => None,
         };
         Ok((sampled, storage))
     }
@@ -3815,8 +3852,40 @@ impl Placed {
 /// Checks `region` of `level` and `slice` of a texture of `d` whose copy unit covers `block`
 /// texels: the level and slice are the texture's (a cube's slices are six a cube, a 3D texture
 /// has slice 0 alone), and the region lies inside the level, its origin on the block grid and its
-/// size whole blocks or reaching the level's edge. `None` for an empty region. The place is in
-/// the image, which the texture starts at `base` of: a view's first level and array layer.
+/// size whole blocks or reaching the level's edge. A size of whole blocks may also end past the
+/// edge inside the level's last block, the one an edge of no whole blocks rounds up to (the one
+/// 4 x 4 block of a level of 4 x 2 texels): plain Metal copies that block whole, by every copy
+/// that places a region, where Apple's page for the copy asks for the size clamped to the edge
+/// (probe `compressed_copies_of_small_levels.m` in the conformance crate, an Apple M3 Max,
+/// macOS 27.0.1, job m3-max-73696; Metal's validation layer bounds the region by the level
+/// rounded up to the block too, "(origin.x + adjustedSize.width)(8) must be <= paddedWidth(4)",
+/// but for a copy from a buffer, which it stops, and a guest's Metal runs without the layer).
+/// The place stops at the edge, as a copy command's extent must
+/// (`VUID-vkCmdCopyImage-srcOffset-00144`, `VUID-vkCmdCopyImage-dstOffset-00150`,
+/// `VUID-vkCmdCopyBufferToImage-imageSubresource-07971`,
+/// `VUID-vkCmdCopyImageToBuffer-imageSubresource-07971` and their other axes) and may where it
+/// is no whole blocks (`VUID-vkCmdCopyImage-srcImage-01728`,
+/// `VUID-vkCmdCopyBufferToImage-dstImage-00207`, `VUID-vkCmdCopyImageToBuffer-srcImage-00207`),
+/// so it copies the same blocks. `None` for an empty region. The place is in the image, which
+/// the texture starts at `base` of: a view's first level and array layer.
+///
+/// A size of no whole blocks that stops inside the level is off the grid, though the other side
+/// of a copy between textures stops at its own level's edge, as 4 x 2 texels of a compressed
+/// level of 4 x 2 into the second block of a level of 8 x 4 do, the size Apple's page asks for.
+/// It stays refused for three facts:
+/// - Metal's validation layer stops it, "size.height(2) must be a multiple of
+///   MTLPixelFormatBC1_RGBA blockHeight(4)", taking a size of no whole blocks only where both
+///   places reach their levels' edges, though Apple's page asks for the clamped size;
+/// - plain Metal lands the source's block by no one rule: from a level of 4 x 2 at the block the
+///   copy names, from a level of 2 x 1 at the level's first block (the same probe, BC1 and BC3,
+///   job m3-max-73696);
+/// - Vulkan's prose asks a region of no whole blocks to match each image's edge ("Copy regions
+///   for each image must be aligned to a multiple of the texel block extent in each dimension,
+///   except at the edges of the image, where region extents must match the edge of the image"),
+///   though in Vulkan 1.4.366 only the source's extent has a valid usage of that
+///   (`VUID-vkCmdCopyImage-srcImage-01728` and `-01729`), the destination's being bounded by its
+///   level alone (`VUID-vkCmdCopyImage-dstOffset-00150` and `-00151`, its offset on the grid by
+///   `VUID-vkCmdCopyImage-pRegions-07281` and `-07282`).
 ///
 /// Err: [`Refusal::TextureRegion`].
 pub(crate) fn place(
@@ -3839,13 +3908,19 @@ pub(crate) fn place(
     let extent = [d.width, d.height, d.depth].map(|e| (e >> level).max(1));
     let [bw, bh] = block;
     let block = [bw, bh, 1];
+    let mut size = region.size;
     for axis in 0..3 {
-        let (origin, size) = (region.origin[axis], region.size[axis]);
-        let end = origin.checked_add(size).ok_or_else(outside)?;
-        let on_grid = origin % block[axis] == 0 && (size % block[axis] == 0 || end == extent[axis]);
-        if end > extent[axis] || !on_grid {
+        let (origin, edge, grid) = (region.origin[axis], extent[axis], block[axis]);
+        let end = origin.checked_add(size[axis]).ok_or_else(outside)?;
+        let whole = size[axis].is_multiple_of(grid);
+        let on_grid = origin % grid == 0 && (whole || end == edge);
+        // Whole blocks may end in the level's last block past its edge, where the edge is no
+        // whole blocks: the block it rounds up to.
+        let rounded = whole && origin < edge && end <= edge.next_multiple_of(grid);
+        if (end > edge && !rounded) || !on_grid {
             return Err(outside());
         }
+        size[axis] = end.min(edge) - origin;
     }
     if region.size.contains(&0) {
         return Ok(None);
@@ -3857,7 +3932,7 @@ pub(crate) fn place(
             false => base[1] + slice,
         },
         origin: region.origin,
-        size: region.size,
+        size,
     }))
 }
 
@@ -3880,6 +3955,14 @@ impl Transfer {
     /// The staging buffer's bytes: the region's rows, packed.
     fn len(&self) -> u64 {
         self.row * self.rows * self.images
+    }
+
+    /// The bytes from the region's first byte to the end of its last, in bytes at its own pitches
+    /// (`bytes_per_row` and `bytes_per_image`).
+    fn extent(&self) -> u64 {
+        self.images.saturating_sub(1) * self.bytes_per_image
+            + self.rows.saturating_sub(1) * self.bytes_per_row
+            + self.row
     }
 
     /// The runs of bytes between the caller's bytes and the staging buffer, which holds the
@@ -4178,8 +4261,8 @@ impl TextureInner {
             }
             device.cmd_pipeline_barrier2(command, &back);
         }
-        counters.count(Metric::Barriers);
-        counters.count(Metric::Barriers);
+        counters.count(Metric::UploadBarriers);
+        counters.count(Metric::UploadBarriers);
     }
 }
 
@@ -4224,7 +4307,12 @@ impl TextureInner {
         let view_type = storage_view_type(shape.view_type);
         let [level, layer] = self.base();
         let image = self.imaged().image;
-        let usage = (self.views_usage).map(|usage| usage & vk::ImageUsageFlags::STORAGE);
+        let storage = vk::ImageUsageFlags::STORAGE;
+        // An sRGB texture's level views are its UNORM twin's, as its storage element is.
+        let (format, usage) = match self.twin {
+            Some(twin) => (twin, Some(storage)),
+            None => (self.format, (self.views_usage).map(|usage| usage & storage)),
+        };
         let mut views = Vec::with_capacity(levels as usize);
         for at in level..level + levels {
             let range = vk::ImageSubresourceRange {
@@ -4239,13 +4327,7 @@ impl TextureInner {
             // view's format, and holds the range: the texture's levels and layers.
             let made = unsafe {
                 image_view(
-                    &self.core,
-                    image,
-                    view_type,
-                    self.format,
-                    components,
-                    range,
-                    usage,
+                    &self.core, image, view_type, format, components, range, usage,
                 )
             };
             match made {
@@ -4546,7 +4628,18 @@ impl Texture {
             && !plan.storage
             && image.view_formats.contains(&plan.format)
             && !image.surface();
-        let extended = plan.storage && image.storage.is_none();
+        // An 8-bit sRGB texture's storage view is its UNORM twin's, not of its own format.
+        let root = (inner.view.as_ref()).map_or(inner, |view| &view.parent);
+        let extended = plan.storage && (image.storage.is_none() || root.twin.is_some());
+        // An 8-bit sRGB view's storage view is its UNORM twin's, where the image lists the twin
+        // and takes the storage usage (`Plan`'s `twin`).
+        let profile = inner.core.translator.profile();
+        let written = usage.contains(TextureUsage::SHADER_WRITE) && !multisampled(d.texture_type);
+        let twin = (written
+            .then(|| srgb_twin(profile, d.pixel_format, usage))
+            .flatten())
+        .filter(|twin| image.view_formats.contains(twin))
+        .filter(|_| image.usage.contains(vk::ImageUsageFlags::STORAGE));
         if !usable.contains(vk::ImageUsageFlags::SAMPLED) {
             plan.sampled = None;
         }
@@ -4565,12 +4658,15 @@ impl Texture {
         };
         let image = inner.imaged().image;
         let make = |(components, aspect, role): (_, _, vk::ImageUsageFlags)| {
-            let view_type = match role == vk::ImageUsageFlags::STORAGE {
+            let stored = role == vk::ImageUsageFlags::STORAGE;
+            let view_type = match stored {
                 true => storage_view_type(shape.view_type),
                 false => shape.view_type,
             };
-            let format = plan.format;
-            let usage = views_usage.map(|usage| usage & role);
+            let (format, usage) = match twin.filter(|_| stored) {
+                Some(twin) => (twin, Some(role)),
+                None => (plan.format, views_usage.map(|usage| usage & role)),
+            };
             // SAFETY: the image is bound, lists the view's format, has the view's usage, and holds
             // the range: the texture's levels and layers hold the view's.
             unsafe {
@@ -4588,7 +4684,7 @@ impl Texture {
         let sampled_role =
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
         let sampled = (plan.sampled).map(|(components, aspect)| (components, aspect, sampled_role));
-        let storage = (plan.storage).then_some((
+        let storage = (plan.storage || twin.is_some()).then_some((
             vk::ComponentMapping::default(),
             vk::ImageAspectFlags::COLOR,
             vk::ImageUsageFlags::STORAGE,
@@ -4656,6 +4752,7 @@ impl Texture {
             body: Body::Image(Arc::clone(image)),
             format: plan.format,
             storage_reads: plan.storage_reads,
+            twin,
             views_usage,
             unit: plan.unit,
             index,
@@ -4773,12 +4870,22 @@ impl Texture {
     /// `replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:`: the bytes of
     /// `region` of `level` and `slice` (a 3D texture's slice is 0), rows `bytes_per_row` and
     /// images `bytes_per_image` apart in `bytes`, a compressed format's rows being rows of
-    /// blocks. The call reads `bytes` in place, each byte of the region's rows once, by raw
+    /// blocks; its region may be whole blocks ending inside the level's last block past the
+    /// level's edge (the one 4 x 4 block of a level of 4 x 2 texels), which plain Metal copies
+    /// whole. The call reads `bytes` in place, each byte of the region's rows once, by raw
     /// copies ([`HostBytes`]): the CPU copies them once, at the call, as Metal's does. The bytes go
     /// to the device's staging region before the call returns (a staging buffer of their own past
     /// the region's 16 MiB), and the upload copies them into the image ahead of every command
     /// buffer committed after it, so the call is ordered as Metal's CPU write is. Where the region has no room, the call first waits for the oldest copy in it to
     /// complete. Counted in [`Metrics::bytes_copied`]. An empty region copies nothing.
+    ///
+    /// A heap texture ([`Device::new_heap_texture`]) whose bytes another resource of its heap
+    /// wrote since its last write moves from undefined ahead of the copy, counted in
+    /// [`Metrics::heap_moves`], so its next write keeps the texels the call wrote; the heap's
+    /// other textures over its bytes move before their next writes. A call while a command buffer
+    /// committed before it, and not yet completed, writes the texture's bytes or another
+    /// resource's over them is the program's race, as Metal's makes it: the upload may run ahead
+    /// of that command buffer, and the texture's next write may move it.
     ///
     /// A Managed texture with named bytes ([`Device::new_managed_texture`]) takes them there
     /// instead, as Metal writes a Managed texture's CPU copy, and then
@@ -4797,6 +4904,7 @@ impl Texture {
     /// [`Buffer::did_modify_range`] returns.
     ///
     /// [`Metrics::bytes_copied`]: crate::Metrics::bytes_copied
+    /// [`Metrics::heap_moves`]: crate::Metrics::heap_moves
     pub fn replace_region(
         &self,
         region: Region,
@@ -4841,6 +4949,11 @@ impl Texture {
             // packed; it is this call's alone until its copy is recorded.
             unsafe { bytes.copy_to(from, host.add(to), len) };
         }
+        // The rows written are the GPU's before the copy runs (`crate::coherence`).
+        if let Some(coherence) = &core.coherence {
+            let written = stage.range(copy.len(), coherence.atom);
+            coherence.flush(core, written.as_slice());
+        }
         core.counters.copied(copy.len());
         core.work.upload(
             core,
@@ -4848,6 +4961,11 @@ impl Texture {
             [Held::Texture(Arc::clone(inner.imaged()))],
             // SAFETY: recording under the work lock, the upload holding the image and the stage.
             |device, command| unsafe {
+                // A heap texture an alias's write left stale moves from undefined before the
+                // copy, and the textures over its bytes are left stale (`crate::alias`).
+                if let Some(place) = inner.placement() {
+                    crate::alias::host_write(core, command, place);
+                }
                 let region = copy.buffer_image_copy(stage.offset(), 0, 0);
                 inner.record(
                     device,
@@ -4907,6 +5025,12 @@ impl Texture {
         let (buffer, at) = bytes.device_range();
         let region = copy.buffer_image_copy(at + start, row_length, image_height);
         let core = &inner.core;
+        // The bytes the consumer wrote are the GPU's before the copy reads them
+        // (`crate::coherence`).
+        if let Some(coherence) = &core.coherence {
+            let read = bytes.shared_span(start, copy.extent(), coherence.atom);
+            coherence.flush(core, read.as_slice());
+        }
         core.work.upload(
             core,
             None,
@@ -5027,6 +5151,11 @@ impl Texture {
         let value = core.work.flush();
         let waited = core.done.wait(core, value);
         if waited.is_ok() {
+            // What the copy wrote is the host's before it reads it (`crate::coherence`).
+            if let Some(coherence) = &core.coherence {
+                let written = stage.range(copy.len(), coherence.atom);
+                coherence.settle(core, written.as_slice());
+            }
             // SAFETY: the stage holds every row packed, the copy into it completed and its writes
             // are visible to the host, and no other call takes its span while this one reads it;
             // `copy` checked that each row lies in `bytes`.
@@ -5656,13 +5785,23 @@ pub(crate) trait TextureObject {
 
     /// Where it is made for shader writes (`ShaderWrite`, or Metal's unknown usage) but has no
     /// storage element, which shaders write it and read it as storage through
-    /// (`Arrays::place_texture`): its pixel format, which [`Gap::StorageElement`] names. Never a
-    /// multisampled texture, which no shader writes (`multisampled`).
+    /// (`Arrays::place_texture`), or has its sRGB twin's ([`encodes`](Self::encodes)), which only
+    /// a write at a slot of its kernel's sRGB variant encodes: its pixel format, which
+    /// [`Gap::StorageElement`] names. Never a multisampled texture, which no shader writes
+    /// (`multisampled`).
     fn unstored(&self) -> Option<PixelFormat> {
         let d = &self.object().descriptor;
         let written = (d.usage.is_empty() || d.usage.contains(TextureUsage::SHADER_WRITE))
             && !multisampled(d.texture_type);
-        (written && !self.object().stores()).then_some(d.pixel_format)
+        let stored = self.object().stores() && !self.encodes();
+        (written && !stored).then_some(d.pixel_format)
+    }
+
+    /// Whether its storage element is an 8-bit sRGB texture's UNORM twin's view ([`Plan`]'s
+    /// `twin`), which a kernel's write at a slot encodes under the kernel's sRGB variant
+    /// (`LoweringInputs::srgb_storage`).
+    fn encodes(&self) -> bool {
+        self.object().twin.is_some()
     }
 
     /// Whether it is a view with a storage element through the storage usage its image took for
@@ -5852,6 +5991,13 @@ pub(crate) trait TextureObject {
         })
     }
 
+    /// The Shared memory of the buffer it lies over or names the bytes of, where it has one
+    /// ([`BufferObject::shared_range`]): what the flushes and invalidates of Shared memory name
+    /// (`crate::coherence`).
+    fn shared_range(&self, atom: u64) -> Option<crate::coherence::Range> {
+        (self.object().named.as_ref()).and_then(|named| named.buffer.shared_range(atom))
+    }
+
     /// Whether the host reads the GPU's writes to it with no copy: a texture in place over a
     /// Shared buffer.
     fn host_reads(&self) -> bool {
@@ -5911,6 +6057,7 @@ pub(crate) trait TextureObject {
             },
             bytes: u64::from(d.width) * u64::from(d.height) * u64::from(unit.bytes),
             shared: named.buffer.is_shared(),
+            class: device_copy.is_none().then_some(block.memory.class),
             imported: device_copy.is_none() && block.memory.imported(),
             exported: device_copy.is_none() && block.memory.exported(),
             kind: OverCopyKind {
@@ -6352,6 +6499,7 @@ impl Device {
             }),
             format: form.format,
             storage_reads: form.reads,
+            twin: None,
             views_usage: None,
             unit: Some(CopyUnit {
                 aspect: vk::ImageAspectFlags::COLOR,
@@ -6399,6 +6547,9 @@ pub(crate) struct OverCopy {
     pub(crate) bytes: u64,
     /// The buffer is Shared: the host reads what a copy back writes.
     pub(crate) shared: bool,
+    /// The class of the memory the bytes shaders reach are in, `None` for a Managed buffer's
+    /// device copy (`Metrics::over_copy_bytes_private`, `Metrics::over_copy_bytes_shared`).
+    pub(crate) class: Option<MemoryClass>,
     /// The bytes shaders reach are in an imported block (`Metrics::over_copies_imported`).
     pub(crate) imported: bool,
     /// The bytes shaders reach are in an exported block, whose copies in wait for an event that
@@ -6623,6 +6774,7 @@ impl Device {
             body: Body::Image(image),
             format: plan.format,
             storage_reads: plan.storage_reads,
+            twin: plan.twin,
             views_usage,
             unit: plan.unit,
             index,

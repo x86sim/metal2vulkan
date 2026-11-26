@@ -410,6 +410,8 @@ and the (name id, value) answer pairs.
     `depthResolveFilter`, or `clearStencil` and `stencilResolveFilter`. A nil property takes
     nothing: the descriptor keeps what it had. An object property (`visibilityResultBuffer`,
     `rasterizationRateMap`, `texture`, `resolveTexture`) set to nil is object 0, which clears it.
+    `setSamplePositions:count:` (`[list]`) sets its sample positions, the list of
+    `MTLSamplePosition`s `{x, y}`; an empty list (a count of 0) sets none, Metal's defaults.
   - `m2v.rateMapDescriptor` (`[{screenSize, mutability, minFactor}]`) makes an
     `MTLRasterizationRateMapDescriptor`; its layers are set on it afterwards.
 - **Drawables.** A `newTextureWithDescriptor:` of receiver 0 whose argument is a map
@@ -605,14 +607,26 @@ records as text, and
   `over_copy_bytes_imported` those over an imported one alone; the rest are over the runtime's own
   blocks, where the device's linear image does not take the texture. `over_copies_host_memory`,
   `over_copies_pitch` and the ten like them, each beside its `over_copy_bytes_` sum, split them by
-  the runtime's cause (`Metrics::over_copies_host_memory` and the rest). The report's `no-copy
+  the runtime's cause (`Metrics::over_copies_host_memory` and the rest), and its
+  `over_copy_bytes_private` and `over_copy_bytes_shared` split their bytes by the memory class
+  the buffer's bytes are in, the rest being over a Managed buffer's device copy. Each frame's
+  `rendering_interrupts` counts the renderings a render encoder ended and began again inside
+  itself (`Metrics::rendering_interrupts`). The report's `no-copy
   buffers` line counts the descriptor-form ones in a block, those outside every block and their
   bytes, and the bytes-form ones and their bytes imported, apart; its `textures over buffers` line
   counts the textures over buffers it made (not substituted), in place and in an image of their
   own, by whether the runtime's `textures_copied_over` gauge rose across the making (a copied
   texture freed on another thread in that moment hides one), and its `textures over buffers in an
   image of their own, by pixel format and usage` line those in an image of their own by the
-  descriptor's pixel format and usage, most first.
+  descriptor's pixel format and usage, most first. Its `over copies by frame, N frames as the
+  calls played` line gives the over-copy bytes a frame, the frames cut where the play locates
+  each frame's first call (the last counts where any call of it played), as their mean and as
+  the largest frame's (the first of a tie), each split into `bytes` (every copy's),
+  `private` and `shared` (`over_copy_bytes_private` and `over_copy_bytes_shared`), and by
+  cause `pitch`, `dma_buf`, `host_memory` and `own_image` (every other cause's), then the
+  number of those textures in an image of their own, each counted once and a view as its
+  texture, that the largest frame's calls named: an encoder's call's arguments and a render
+  pass's attachments. A texture an argument buffer or a heap holds is named by no call.
 - **Announced bytes.** On a stream whose header has bit 0 set (section 6), a
   `synchronizeResource:` of a buffer played with two copies leaves the CPU's copy as the stream's
   writes made it, so the next `didModifyRange:` puts the stream's bytes into the GPU's copy: it
@@ -697,9 +711,17 @@ records as text, and
   for each frame and in total, two sets of counts:
   - **Fixed by the stream** (`stream`), the same on every play of the stream: the
     calls played (`calls`), the command buffers committed (`commits`, a host's split included),
-    the encoders made (`encoders`: the objects a command buffer or an encoder makes), the draws
-    and dispatches their calls issued (`draws` and `dispatches`: an encoder's calls whose
-    selectors begin `draw` and `dispatch`), the written words that look like addresses
+    the encoders made (`encoders`: the objects a command buffer or an encoder makes), the draws,
+    dispatches and blit commands their calls issued (`draws`, `dispatches` and `blits`: an
+    encoder's calls whose selectors begin `draw`, `dispatch`, and `copy`, `fill`,
+    `generateMipmaps`, `synchronize`, `resetCommandsInBuffer` or `optimize`), the buffer slots
+    their set-buffer calls set (`setBuffer:offset:atIndex:`, `setBufferOffset:atIndex:` and
+    `setBuffers:offsets:withRange:`, and their `Vertex` and `Fragment` forms), on render encoders
+    (`render_buffer_binds`) and on compute encoders (`compute_buffer_binds`), and of those the
+    buffer changes (`render_buffer_changes`, `compute_buffer_changes`: another buffer than the
+    slot held in the encoder, or the slot's first set) and the offset-only changes
+    (`render_offset_changes`, `compute_offset_changes`: the buffer the slot held, at another
+    offset); a set of the buffer and offset the slot holds is neither. The written words that look like addresses
     (`address_looking_words`) and the 8-byte values at offsets 4 past a multiple of 8 that lie in
     a live range (`misaligned_address_words`), both played as recorded (section 5), but those of
     the first in a noted buffer's range, moved (`noted_words`), the address
@@ -709,8 +731,20 @@ records as text, and
     the call that waited for it counts in the next.
   - **As executed** (`executed`): the runtime's metrics (`Device::counters`): its submissions,
     passes, barriers, bytes copied, copies of textures over buffers, pipelines made, allocations
-    and the rest. They differ between commits, and between plays of one commit where what the
-    runtime records depends on timing. Only the stream's counts are compared between plays.
+    and the rest. The barriers are counted in their causes too, which sum to `barriers`:
+    `pass_start_barriers`, `pass_home_barriers`, `blit_barriers`, `dispatch_hazard_barriers`,
+    `segment_end_barriers`, `upload_barriers` and `other_barriers` (`Metrics::pass_start_barriers`
+    and the rest), and a dispatch's barriers in their sources too, which sum to
+    `dispatch_hazard_barriers`: `dispatch_after_write_barriers`,
+    `dispatch_write_after_read_barriers`, `dispatch_encoder_end_barriers`,
+    `dispatch_pass_end_barriers`, `dispatch_indirect_barriers`, `dispatch_unbound_barriers`,
+    `dispatch_arena_piece_barriers`, `dispatch_heap_barriers` and `dispatch_other_barriers`
+    (`Metrics::dispatch_after_write_barriers` and the rest), and the dispatches by the form their
+    kernel reaches its buffers in: through storage buffers of set 0 (`bound_dispatches`, with the
+    sets written for them, `buffer_sets_written`, and those that kept the set written last,
+    `buffer_sets_held`) or at their device addresses (`address_dispatches`). They differ between commits, and
+    between plays of one commit where what the runtime records depends on timing. Only the
+    stream's counts are compared between plays.
 
   Its own readbacks are not counted. The backend reads a Private buffer, which has no CPU
   mapping, through a blit copy of it into a Shared buffer of the play's own, on a queue of the
@@ -722,6 +756,14 @@ records as text, and
   Visibility results play as the runtime's: a pass's `visibilityResultBuffer` and
   `visibilityResultType`, and each `setVisibilityResultMode:offset:` (`[mode, offset]`), whose
   counts the runtime writes into the buffer at the pass's end.
+  `setSamplePositions:count:` plays as the runtime treats it, with no refusal: the runtime's
+  descriptor has no field for it, and every multisample pass rasterizes at Vulkan's standard
+  sample locations, which are Metal's default positions at 1, 2 and 4 samples. The report's
+  `passes at sample positions other than Metal's defaults N` line counts the render encoders the
+  runtime made of a pass whose positions differ from Metal's defaults for the pass's sample count
+  (its attachments'), each coordinate compared as an `f32`, with the first one's frame and call. A
+  set at a sample count whose Metal defaults the player does not hold (any but 1, 2 and 4)
+  counts as differing.
   What the runtime does not build yet it skips and counts, and never fakes:
   - objects: libraries from source, and whatever a call makes of a skipped object
     (`skipped_objects`). A call that makes an object on a skipped receiver or naming a skipped
@@ -735,9 +777,11 @@ records as text, and
     (`skipped_compute_states`), whose dispatches are skipped (`skipped_dispatches`);
   - parallel render encoders, and render encoders of a pass the runtime does not build
     (`skipped_encoders`): a pass whose setter records leave in it what the runtime's render pass
-    descriptor does not hold (a resolve texture, a depth plane other than 0, store action
-    options, a render target array length above 1, tile or imageblock sizes, or a skipped
-    texture or visibility result buffer), or one the runtime answers with a typed gap; and
+    descriptor does not hold (store action options, tile or imageblock sizes, or a skipped
+    texture, resolve texture or visibility result buffer; a color attachment's depth plane is
+    played, and a depth or stencil attachment's, which Metal reads of a 3D texture alone, is not;
+    `renderTargetArrayLength` is played, so a layered pass is the runtime's to build or answer),
+    or one the runtime answers with a typed gap; and
     every call of a skipped object (`skipped_calls`, with `useResource:usage:` and `useHeap:` of
     one, and each skipped object of a `useResources:count:usage:` or `useHeaps:count:` list);
   - dispatches whose pipeline state or bound buffer or texture is a skipped object
@@ -958,7 +1002,8 @@ stream may differ from what the program did` where the stream's header lacks bit
 6), then `range last-frame F (SOURCE); the play ends there`, `range last-frame F (SOURCE);
 --past-range yes plays past it` or `range whole (SOURCE)`, where `SOURCE` is `the stream's
 sidecar`, `the player's table, stream LABEL` or `no sidecar and no table row`, then
-`device NAME runtime rt`, then on a device that keeps a
+`device NAME runtime rt buffer alignment N` (the alignment Vulkan's memory requirements give the
+runtime's buffers, `Device::buffer_alignment`), then on a device that keeps a
 device copy of each Managed buffer, `managed digests: ...` (above), then
 `addresses address_looking_words=N misaligned_address_words=N noted_words=N address_arguments=N
 relocated_words=N differing_ids=N: written words play as recorded, the noted ones moved; NOTES`
@@ -1142,16 +1187,19 @@ the command buffer's render passes stored: a texture its attachment names under
 `MTLStoreActionMultisampleResolve` or that one, an `MTLStoreActionUnknown` decided by the
 encoder's `setColorStoreAction:atIndex:`. `cbC-objT.bin` holds the texture's parts the passes
 stored, each a level, a slice and a depth plane (`level`, `slice` and `depthPlane`, or the
-resolve's), one after another by level, then slice, then plane, each laid out as a check reads a
-texture's first level and slice; its `cbC-objT.cover` is `-`, and `cbC-objT.unread` replaces the
-bytes where the backend could not read a part (a multisample texture stored without its resolve,
-for one). It writes too each texture the command buffer's compute encoders bound
+resolve's; a pass of `renderTargetArrayLength` 2 or more stores that many slices from the slice),
+one after another by level, then slice, then plane, each laid out as a check reads a texture's
+first level and slice; and `cbC-objT.unread` replaces the bytes where the backend could not read
+a part (a multisample texture stored without its resolve, for one). It writes too each texture the command buffer's compute encoders bound
 (`setTexture:atIndex:` and `setTextures:withRange:`, a nil one left out): its first level and
 slice as a part, read once the command buffer completed as an attachment's parts are, so what the
 command buffer's last write left there; a texture both stored and bound holds each of its parts
 once, in that order. A depth or stencil attachment is not written: a texture of a combined depth and
 stencil format reads back one aspect at a time, through a copy with that aspect's blit option,
-which this read does not make. `command-replay compare-dumps --a DIR --b DIR` compares two plays' dumps word by word (4 bytes), leaving out a word
+which this read does not make. A texture's `cbC-objT.cover` is `0..N`, the whole of its `N`
+bytes, where the cover rule (above) held any byte of the texture covered then, and `-` otherwise:
+the rule's ranges are the texture's bytes in its heap, which its parts are not laid out as.
+`command-replay compare-dumps --a DIR --b DIR` compares two plays' dumps word by word (4 bytes), leaving out a word
 wholly inside a range either play held covered, and prints `differs cb #C obj #O: N words outside every cover, the first word
 W; M covered; lengths A and B` for each buffer that differs outside every cover, `only in a|b:
 cbC-objO` for a dump one play lacks, `unread in a|b: cbC-objO: WHY`, `copies differ: cbC-objO: a
