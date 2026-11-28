@@ -1,6 +1,28 @@
 //! The completion thread: it retires command buffers and uploads as the GPU completes them, runs
 //! their completed handlers, follows the event signals it submitted and runs listeners, and ends
 //! the work in flight at a loss.
+//!
+//! **What a value seen on the host means.** A retirement, a host read of bytes the GPU wrote, a
+//! value the guest sees that a GPU signal raised, and a free are gated by a host wait on the
+//! semaphore's value (`vkWaitSemaphores`, a timeout of 0 allowed), never by a counter read
+//! (`vkGetSemaphoreCounterValue`) alone; the counter read may find which value to confirm. The
+//! Vulkan specification states an execution dependency for waiting on a fence, by
+//! `vkWaitForFences` or by polling `vkGetFenceStatus` (Fences, 7.3), and for a semaphore names
+//! the host's wait alone: the semaphores' overview (7.4) has them "insert a dependency ... between
+//! a queue operation and the host", and the memory model's System-Synchronizes-With note lists
+//! "signal operations happening before host operations that wait on them". Host Operations on
+//! Semaphores (7.4.4) carries no "defines an execution dependency" sentence. Once a wait has seen
+//! a value, the Queue Operation section (3.2.1) gives what came before its signal: "Before a
+//! fence or semaphore is signaled, it is guaranteed that any previously submitted queue
+//! operations have completed execution, and that memory writes from those queue operations are
+//! available to future queue operations."
+//!
+//! Host visibility does not come from the semaphore: it comes from the barrier `record::end`
+//! records at the end of each segment that writes Shared memory or signals an event
+//! (`Reach::Host`, whose second scope is `ALL_COMMANDS | HOST` with `HOST_READ` among its
+//! accesses). After it, host-coherent memory holds the writes for the host, and where the Shared
+//! memory type is not host-coherent, the flush then invalidate of `crate::coherence` makes them
+//! visible.
 
 use crate::capture::CopyIn;
 use crate::command::{self, CbInner, CommandBufferError, DeviceLoss, Gpu, Handlers, Pending};
@@ -205,6 +227,14 @@ impl Done {
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn enter(&self, step: String) {
         *lock(&self.step) = step;
+    }
+
+    /// For the device tests: the values of the completion thread's GPU wait, where it waits on the
+    /// GPU (the progress semaphore's first, then the watched events', the wake semaphore's last).
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn gpu_wait(&self) -> Option<Vec<u64>> {
+        let state = self.lock();
+        matches!(state.waiting, Waiting::Gpu { .. }).then(|| state.waits_for.clone())
     }
 
     /// For the device tests: what the completion side holds, read at once, for a wait that timed
@@ -697,7 +727,11 @@ pub(crate) fn run(core: Arc<Core>) {
             let mut index = 0;
             while index < state.watched.len() {
                 let event = &state.watched[index];
-                if event.observe(event.counter().ok(), &mut fire) {
+                // Only a value a host wait confirmed is the event's (`EventInner::reached`); a
+                // value read that none confirmed leaves the event watched, and the round's GPU
+                // wait below blocks on its next pending value.
+                let reached = event.reached(event.next_pending()).ok();
+                if event.observe(reached, &mut fire) {
                     index += 1;
                 } else {
                     state.watched.swap_remove(index);
@@ -755,7 +789,8 @@ pub(crate) fn run(core: Arc<Core>) {
             for (retiree, stamps) in retire.into_iter().zip(stamps) {
                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
                 if let Some((start, end)) = stamps {
-                    lock(&core.tick_spans).push(core.ticks.span(start, end));
+                    let own = false;
+                    lock(&core.stamped).push(times::Stamped { own, start, end });
                 }
                 if let Some((start, end)) = stamps {
                     // Retirees come in submission order: the first of a held group's command
@@ -793,6 +828,14 @@ pub(crate) fn run(core: Arc<Core>) {
                 // Its GPU span joins those the later ones' spans lie under: a command buffer's as
                 // placed, an upload's or a copy-in's by the calibration as it stands.
                 let own = retiree.retire(&core, completion);
+                #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                if let Some((start, end)) = own {
+                    lock(&core.stamped).push(times::Stamped {
+                        own: true,
+                        start,
+                        end,
+                    });
+                }
                 let own = own
                     .zip(calibration.as_ref())
                     .map(|((start, end), calibration)| {
@@ -867,6 +910,8 @@ pub(crate) fn run(core: Arc<Core>) {
         // SAFETY: every semaphore is a timeline semaphore of the device, live while the state
         // holds its event or the core lives.
         let result = unsafe { device.wait_semaphores(&wait, u64::MAX) };
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        core.counters.event_read(crate::counters::event_step::WAKE);
         state = done.lock();
         state.waiting = Waiting::Not;
         match result {

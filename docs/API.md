@@ -792,9 +792,19 @@ through buffer arguments it reads at any index.
     buffer 0, `get_local_id`, `get_group_id`, `get_local_size`, `get_global_size` and
     `get_num_groups` are the built-ins of those names, and a dimension the kernel reads from its
     data selects among the three. A dimension past 2 answers OpenCL's 0 for an id or an offset
-    and 1 for a size or a count. A compiled kernel serves only a pipeline of the mode it was
-    compiled in (`RuntimeFact::OpenClMode`, `InvalidDescriptor(OpenClMode)` otherwise). Without
-    the mode Metal refuses the pipeline ("Internal compiler error"); the crate compiles the AIR as
+    and 1 for a size or a count. OpenCL C's `barrier(flags)` passes OpenCL's
+    `cl_mem_fence_flags` to `air.wg.barrier` unconverted, and Apple's `cl_kernel.h` defines them
+    as `CLK_LOCAL_MEM_FENCE = 1U << 0` and `CLK_GLOBAL_MEM_FENCE = 1U << 1`, the bits Metal's
+    `mem_flags` read as `mem_device` (1) and `mem_threadgroup` (2). In the mode each
+    `air.wg.barrier`'s flags are read as OpenCL's, its call site's where the barrier is out of
+    line: `CLK_LOCAL_MEM_FENCE` orders threadgroup memory and `CLK_GLOBAL_MEM_FENCE` device memory.
+    A barrier whose flags set any other bit is refused (`Unsupported` with `UnknownIntrinsic`,
+    naming `air.wg.barrier`), as one whose flags fall outside Metal's `mem_flags` is. The header
+    declares no other barrier on these flags, so `air.simdgroup.barrier` and `air.atomic.fence`
+    (which `mem_fence` reaches with flags Apple's compiler converts itself) keep Metal's. A
+    compiled kernel serves only a pipeline of the mode it was compiled in
+    (`RuntimeFact::OpenClMode`, `InvalidDescriptor(OpenClMode)` otherwise). Without the mode
+    Metal refuses the pipeline ("Internal compiler error"); the crate compiles the AIR as
     Metal AIR, its buffers at their own indices, and refuses a read of `get_global_offset` or
     `get_work_dim` (`Unsupported` with `Lowering(Dispatch)`).
   - Images in OpenCL mode. `get_image_channel_order(image)` and
@@ -819,9 +829,10 @@ through buffer arguments it reads at any index.
     channel orders as a swizzled view (on an M3 Max, macOS 27.0.1, with `CL_UNORM_INT8`: `CL_R`,
     `CL_RG`, `CL_A`, `CL_RA` and `CL_INTENSITY` as `R8Unorm` or `RG8Unorm` views, `CL_BGRA`,
     `CL_ARGB` and `CL_RGB` as `RGBA8Unorm` views). A read (with a sampler or without) answers the
-    swizzled texel, a write stores it with the swizzle undone (each channel from the first lane
-    whose source it is), and a query answers the view's size and the hidden buffer's words, which
-    no swizzle reaches, as plain Metal answers for the same view; the order is never applied twice.
+    swizzled texel and a query answers the view's size and the hidden buffer's words, which no
+    swizzle reaches, as plain Metal answers for the same view; the order is never applied twice. A
+    write stores the value as written, where the M3 Max stores it with the swizzle undone (each
+    channel from the first lane whose source it is; section 10, Kernels).
     A storage slot the kernel only queries binds the texture's view with no swizzle. The reflection
     states each image argument as the texture bound for it, an `image1d_t` `TextureType::Type2D`
     and an `image1d_array_t` `Type2DArray`, of data type `DataType::None` (the AIR names its component
@@ -2562,6 +2573,11 @@ named states the rule in full.
   same precise count as `Counting`, nonzero exactly where a sample passed
   (`RenderCommandEncoder::VISIBILITY_NOTE`, section 9). The conformance cases `visibility-boolean-*`
   compare its word as nonzero alone.
+- **A render pipeline state whose fragment function writes depth, with no depth attachment format,
+  is made, and its depth output goes nowhere**, where the driver of an Apple M3 Max (macOS
+  27.0.1) refuses it outside the private OpenGL mode with "depthAttachmentPixelFormat is not valid
+  and shader writes to depth" (the probe `metal2vulkan-conformance/probes/opengl_mode.m`), a
+  refusal no Metal document states (`MTLRenderPipeline.h`, `depthAttachmentPixelFormat`).
 
 **Resource IDs and identifiers**
 
@@ -2868,6 +2884,12 @@ named states the rule in full.
   for `get_local_size`, `get_global_size` and `get_num_groups`, as OpenCL C defines them. The M3
   Max (macOS 27.0.1) leaves unwritten the store of `get_global_id(3) + get_local_size(4) +
   get_global_size(5)`, where the runtime stores 2.
+- **A kernel's write through a texture view whose swizzle permutes its format's channels is
+  stored as written** (`metal2vulkan-runtime`'s `Texture::new_texture_view_with_swizzle`), where
+  an Apple M3 Max (macOS 27.0.1) stores it through the swizzle (a write of `(0x33, 0x66, 0xb3,
+  0xcc)` through an `RGBA8Unorm` view of `(Blue, Green, Red, Alpha)` leaves `(0xb3, 0x66, 0x33,
+  0xcc)`, `crates/metal2vulkan-conformance/probes/swizzled_view_stores.m`) and Metal's validation
+  refuses the write, the view reporting no `ShaderWrite` usage.
 
 **Queues and command buffers**
 

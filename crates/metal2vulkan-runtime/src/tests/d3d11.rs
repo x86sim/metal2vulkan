@@ -1,6 +1,6 @@
 //! The Direct3D 11 surface import, a Windows host's, under a device cfg. On every device of the
-//! cfg's kind, its typed refusals: no plane, five planes, and a plane whose image format's texel
-//! is not its descriptor's. Under `m2v_gpu`, on every device: a picture's two planes made as shared
+//! cfg's kind, its typed refusals: no plane, five planes, a plane whose image format's texel is
+//! not its descriptor's, and a plane wider than the import query's `maxExtent` for its image. Under `m2v_gpu`, on every device: a picture's two planes made as shared
 //! Direct3D 11 textures on the DXGI adapter of the device's LUID (luma `R8_UNORM` at 64x32, chroma
 //! `R16_UINT` at 32x16, which rt's texture views as `RG8Unorm`), imported by their NT handles
 //! with no submission. Direct3D 11 draws picture 1 (one triangle a plane, its pixel shader
@@ -40,6 +40,7 @@
 
 #[cfg(all(windows, any(m2v_gpu, m2v_cpu_icd)))]
 mod on_device {
+    use crate::d3d11::import_query;
     use crate::tests::command::on_device::each_device;
     use crate::{
         D3d11Plane, Error, ImportHandle, Limit, PixelFormat, Refusal, TextureDescriptor,
@@ -101,6 +102,39 @@ mod on_device {
                     ),
                     "{name}: a two-byte view of a one-byte texture: {error:?}"
                 );
+                // A plane one texel wider than the import query's `maxExtent` for its image with
+                // the handle: `Limit::TextureSize`, at that answer or the plain query's below it.
+                let core = device.core();
+                let (usage, list) =
+                    (device.d3d11_plane_form(core, &luma)).expect("the luma's form");
+                let format = (device.plane_plan(&luma.descriptor))
+                    .expect("a plan")
+                    .format;
+                let (_, made) =
+                    (import_query(core, format, usage, &list)).expect("the import query");
+                let most = made.max_extent.width;
+                let mut past = luma;
+                past.descriptor.width = most + 1;
+                let error = device.import_d3d11_surface(&[past]).err();
+                let max = made.max_extent;
+                println!(
+                    "d3d11: {name}: the import query's maxExtent for the luma {:?}; a plane {} wide: \
+                     {error:?}",
+                    [max.width, max.height, max.depth],
+                    most + 1
+                );
+                assert!(
+                    matches!(
+                        error,
+                        Some(Error::Limit(Limit::TextureSize {
+                            extent: [width, 32, 1],
+                            layers: 1,
+                            max_extent: [max, ..],
+                            ..
+                        })) if width == most + 1 && max <= most
+                    ),
+                    "{name}: a plane past the import's maxExtent: {error:?}"
+                );
             } else {
                 assert!(
                     matches!(
@@ -124,16 +158,21 @@ mod on_device {
     mod picture {
         use super::d3d::{self, D3d, SharedTexture};
         use super::{RENDER_TARGET, SHADER_RESOURCE};
-        use crate::tests::command::on_device::{each_device, finished, on_each_device, within};
+        use crate::device::lock;
+        use crate::submit::IN_FLIGHT;
+        use crate::tests::command::on_device::{
+            behind_busy, each_device, finished, on_each_device, within,
+        };
         use crate::texture::TextureObject;
         use crate::{
-            Buffer, BufferLayout, CommandBuffer, D3d11Plane, Device, Error, Gap, IndexClass,
-            MemoryClass, PixelFormat, Surface, TextureDescriptor, TexturePlace, TextureSwizzle,
-            TextureSwizzleChannels, TextureType, TextureUsage, TextureViewKind,
+            Buffer, BufferLayout, CommandBuffer, CommandBufferStatus, D3d11Plane, Device, Error,
+            Gap, IndexClass, MemoryClass, PixelFormat, Surface, TextureDescriptor, TexturePlace,
+            TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage, TextureViewKind,
         };
         use ash::vk;
         use metal2vulkan::metal::format::srgb_sibling;
         use std::os::windows::io::AsHandle;
+        use std::sync::Arc;
         use std::time::Instant;
 
         /// The bind flags each plane's texture is made with, as a video's are: rendered and
@@ -542,6 +581,242 @@ mod on_device {
                     handed,
                     [2, 2, 2],
                     "{name}: each read's submission hands the planes over once"
+                );
+            });
+        }
+
+        /// The planes' hand-over in each part of a group sent member by member. On one queue,
+        /// behind as many busy submissions as a queue keeps in flight, a read of the planes
+        /// Direct3D 11 drew (A) and a second command buffer join one group: a second read (B), or
+        /// a copy between two buffers that uses no plane (F). Sent at once at the queue's run
+        /// (`CommandQueue::send_now`), A and B go as one part: one `vkQueueSubmit2`, one acquire
+        /// and one release. Sent once a run of 1 s was seen (`QueueInner::ran`, the state the
+        /// completion thread sets as a command buffer retires), the group goes member by member,
+        /// one `vkQueueSubmit2` a member and none more: A and B each acquire the planes at their
+        /// part's head and release them at its end, two of each; A and F acquire and release
+        /// once, in A's part, so A, seen complete at its own part's value, is seen complete after
+        /// the planes' release. Each such call of a group sent apart counts in
+        /// `Metrics::d3d11_plane_parts`, two and one, and the group sent as one part counts none
+        /// there. Every read is picture 1's exactly. The order within each part is the part
+        /// builder's (`plane_parts`).
+        #[test]
+        fn every_device_hands_direct3d_11_planes_over_in_each_part_of_a_group_sent_apart() {
+            each_device("import_d3d11_surface_apart", |name, _, device| {
+                let luid = luid(&device).unwrap_or_else(|| panic!("{name}: no valid LUID"));
+                let d3d = D3d::on_luid(luid)
+                    .unwrap_or_else(|| panic!("{name}: no DXGI adapter of LUID {luid:02x?}"));
+                let textures = PLANES
+                    .each_ref()
+                    .map(|p| d3d.shared_texture(p.width, p.height, p.dxgi, BOUND));
+                let surface = import(name, &device, &textures);
+                d3d_draw(&d3d, &textures, 1);
+                surface.external_writes_done().expect("the acquire");
+                let one = picture(1);
+                let ahead = IN_FLIGHT as u64;
+                let counters = device.counters();
+                // Each case: its name, whether the second member reads the planes, whether the
+                // group goes member by member, and the hand-overs, submissions and hand-overs of
+                // parts sent apart it makes.
+                let cases = [
+                    ("A and B as one part", true, false, 1, 1, 0),
+                    ("A and B apart", true, true, 2, 2, 2),
+                    ("A and F apart", false, true, 1, 2, 1),
+                ];
+                for (case, reads, apart, hands, parts, part_hands) in cases {
+                    let outs = [picture_buffer(&device), picture_buffer(&device)];
+                    let from = picture_buffer(&device);
+                    let queue = device.new_command_queue(64).expect("a queue");
+                    behind_busy(name, &device, &queue, |busy, submitted, _| {
+                        let before = counters.metrics();
+                        let a = queue.command_buffer().expect("a command buffer");
+                        encode_read(name, &a, &surface, &outs[0]);
+                        a.commit().expect("a commit");
+                        let second = queue.command_buffer().expect("a command buffer");
+                        match reads {
+                            true => encode_read(name, &second, &surface, &outs[1]),
+                            false => {
+                                let mut blit = second.blit_command_encoder().expect("an encoder");
+                                (blit.copy_from_buffer_to_buffer(&from, 0, &outs[1], 0, 256))
+                                    .expect("a copy");
+                                blit.end_encoding();
+                            }
+                        }
+                        second.commit().expect("a commit");
+                        for command_buffer in [&a, &second] {
+                            within(name, || {
+                                command_buffer.status() != CommandBufferStatus::Committed
+                            });
+                        }
+                        let sent = || counters.metrics().submissions - submitted;
+                        assert_eq!(sent(), ahead, "{name}: {case}: held in one group");
+                        match apart {
+                            true => second.queue().ran(1_000_000_000),
+                            false => {
+                                queue.send_now(&second);
+                                within(name, || sent() > ahead);
+                            }
+                        }
+                        busy.open();
+                        let got = [
+                            read_bytes(name, (a.clone(), outs[0].clone())),
+                            read_bytes(name, (second.clone(), outs[1].clone())),
+                        ];
+                        let metrics = counters.metrics();
+                        let handed = [
+                            metrics.d3d11_plane_submissions - before.d3d11_plane_submissions,
+                            metrics.external_acquires - before.external_acquires,
+                            metrics.external_releases - before.external_releases,
+                        ];
+                        let group = sent() - ahead;
+                        let part_handed = metrics.d3d11_plane_parts - before.d3d11_plane_parts;
+                        println!(
+                            "d3d11-apart: {name}: {case}: the group's vkQueueSubmit2 calls {group}; \
+                             plane-keeping submissions, acquires, releases {handed:?}; \
+                             d3d11_plane_parts {part_handed}"
+                        );
+                        assert_eq!(
+                            compare(&one, &got[0]).0,
+                            None,
+                            "{name}: {case}: A read picture 1"
+                        );
+                        if reads {
+                            assert_eq!(
+                                compare(&one, &got[1]).0,
+                                None,
+                                "{name}: {case}: B read picture 1"
+                            );
+                        }
+                        if apart {
+                            assert!(group >= 2, "{name}: {case}: went member by member");
+                        }
+                        assert_eq!(
+                            handed, [hands; 3],
+                            "{name}: {case}: one acquire and one release in each part that uses \
+                             the planes"
+                        );
+                        assert_eq!(
+                            group, parts,
+                            "{name}: {case}: one vkQueueSubmit2 a part, and no more"
+                        );
+                        assert_eq!(
+                            part_handed, part_hands,
+                            "{name}: {case}: the parts of a group sent apart that hand planes over"
+                        );
+                    });
+                }
+            });
+        }
+
+        /// The old layout of each plane's acquire. A plane is made undefined
+        /// (`VUID-VkImageCreateInfo-pNext-01443`) and is general only after Direct3D 11's access
+        /// (section 12.5.2), which the consumer reports by `Surface::external_writes_done`. On a
+        /// surface rt writes first, with no such call (a blit of picture 3 into both planes),
+        /// each plane's first acquire names the undefined layout, and the acquire of rt's next
+        /// read names the general layout; Direct3D 11 reads picture 3 exactly between them, and
+        /// that read is picture 3's exactly. On a surface Direct3D 11 draws first, reported by
+        /// `external_writes_done`, every acquire names the general layout, the first included,
+        /// and rt reads picture 1 exactly. The acquires are read from the record the hand-over
+        /// keeps for the device tests (`Work::acquired`). The Khronos validation layer does not
+        /// track this import's layout, so it is no check here: on the UHD 630 its 1.4.363.0
+        /// reported neither the old form's first acquire from the general layout (job
+        /// m3-max-76170) nor this form's from the undefined layout (job m3-max-76174).
+        #[test]
+        fn every_device_acquires_a_direct3d_11_plane_from_undefined_only_before_any_access() {
+            each_device("import_d3d11_surface_first_use", |name, _, device| {
+                let luid = luid(&device).unwrap_or_else(|| panic!("{name}: no valid LUID"));
+                let d3d = D3d::on_luid(luid)
+                    .unwrap_or_else(|| panic!("{name}: no DXGI adapter of LUID {luid:02x?}"));
+                let core = device.core();
+                // The old layouts of the acquires of `surface`'s planes recorded since `from`,
+                // each plane's in order, the luma's first, as their raw values (undefined 0,
+                // general 1).
+                let acquires = |surface: &Surface, from: usize| -> Vec<Vec<i32>> {
+                    let recorded = lock(&core.work.acquired);
+                    (surface.planes().iter())
+                        .map(|texture| {
+                            let image = Arc::as_ptr(&texture.held_image()) as usize;
+                            (recorded[from..].iter())
+                                .filter(|&&(at, _)| at == image)
+                                .map(|&(_, layout)| layout.as_raw())
+                                .collect()
+                        })
+                        .collect()
+                };
+                let mark = || lock(&core.work.acquired).len();
+                let (undefined, general) = (
+                    vk::ImageLayout::UNDEFINED.as_raw(),
+                    vk::ImageLayout::GENERAL.as_raw(),
+                );
+
+                // rt's first use, with no Direct3D 11 access before it.
+                let textures = PLANES
+                    .each_ref()
+                    .map(|p| d3d.shared_texture(p.width, p.height, p.dxgi, BOUND));
+                let surface = import(name, &device, &textures);
+                let from = mark();
+                let three = picture(3);
+                rt_write(name, &device, &surface, &three);
+                let written = acquires(&surface, from);
+                let read = d3d_read(&d3d, &textures);
+                let from = mark();
+                let again = rt_read(name, &device, &surface);
+                let later = acquires(&surface, from);
+                println!(
+                    "d3d11-first-use: {name}: written first by rt: acquires {written:?}, then \
+                     after D3D11's read {later:?}"
+                );
+                assert_eq!(
+                    compare(&three, &read).0,
+                    None,
+                    "{name}: picture 3 read by D3D11"
+                );
+                assert_eq!(
+                    compare(&three, &again).0,
+                    None,
+                    "{name}: picture 3 read by rt"
+                );
+                assert_eq!(
+                    written,
+                    [vec![undefined], vec![undefined]],
+                    "{name}: a plane's first acquire before any Direct3D 11 access names the \
+                     undefined layout"
+                );
+                assert_eq!(
+                    later,
+                    [vec![general], vec![general]],
+                    "{name}: a plane's later acquire names the general layout"
+                );
+
+                // Direct3D 11's first use, reported, then rt's.
+                let textures = PLANES
+                    .each_ref()
+                    .map(|p| d3d.shared_texture(p.width, p.height, p.dxgi, BOUND));
+                let surface = import(name, &device, &textures);
+                d3d_draw(&d3d, &textures, 1);
+                surface.external_writes_done().expect("the acquire");
+                let from = mark();
+                let first = rt_read(name, &device, &surface);
+                let second = rt_read(name, &device, &surface);
+                let reported = acquires(&surface, from);
+                println!(
+                    "d3d11-first-use: {name}: drawn first by D3D11 and reported: acquires \
+                     {reported:?}"
+                );
+                let one = picture(1);
+                assert_eq!(
+                    compare(&one, &first).0,
+                    None,
+                    "{name}: picture 1 read by rt"
+                );
+                assert_eq!(
+                    compare(&one, &second).0,
+                    None,
+                    "{name}: picture 1 read again"
+                );
+                assert_eq!(
+                    reported,
+                    [vec![general, general], vec![general, general]],
+                    "{name}: after external_writes_done, every acquire names the general layout"
                 );
             });
         }
@@ -1098,7 +1373,7 @@ mod on_device {
                 held.contains(feature)
             };
             let imports = |usage: vk::ImageUsageFlags, list: &[vk::Format]| {
-                (import_query(core, format, usage, list)).is_ok_and(|features| {
+                (import_query(core, format, usage, list)).is_ok_and(|(features, _)| {
                     features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
                 })
             };

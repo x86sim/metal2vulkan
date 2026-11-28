@@ -41,6 +41,7 @@
 use crate::alias::{Moved, Placement};
 use crate::arrays::{Owner, ResourceId};
 use crate::buffer::{Buffer, BufferInner, BufferObject};
+use crate::coherence::Point;
 use crate::copy_out;
 use crate::counters::{Counters, Gauge, Metric, OverCause, OverCopyKind, Part, Site};
 use crate::device::{lock, Core, Device};
@@ -500,7 +501,9 @@ pub(crate) struct Image {
     linear_attachment: bool,
     /// The layout its move home starts from: undefined; preinitialized for a texture over a buffer
     /// in place, whose move home keeps the bytes (over a dma-buf's import, the layout of the
-    /// bytes the host wrote, which the move's acquire names, `foreign`).
+    /// bytes the host wrote, which the move's acquire names, `foreign`). A Direct3D 11 plane's is
+    /// undefined too, the layout it is made in, which its first acquire names
+    /// ([`handed`](Self::handed)).
     first: vk::ImageLayout,
     /// A heap texture's image placed over bytes another resource of its heap reaches
     /// (`crate::alias`): its move home waits for every earlier command's writes. False for every
@@ -511,7 +514,11 @@ pub(crate) struct Image {
     /// queue family (`VK_QUEUE_FAMILY_FOREIGN_EXT`) in one barrier with the image, so that both
     /// keep the bytes. `None` for every other image.
     foreign: Option<(vk::Buffer, u64, u64)>,
-    /// An upload recorded its move from `first` to `home`. Read and set under the work lock.
+    /// An upload recorded its move from `first` to `home`. Read and set under the work lock. A
+    /// Direct3D 11 plane, which no upload moves, is set by its first acquire, which moves it from
+    /// `first`, recorded on the submit thread ([`handed`](Self::handed)), or by the consumer's
+    /// report of Direct3D 11's access, after which Vulkan takes it as general
+    /// ([`external_access`](Self::external_access)).
     homed: AtomicBool,
     /// How the move home zeroes it, for an image the runtime places for a texture of its own
     /// (`Source::Plain` and `Source::Managed`); `None` for every other image.
@@ -738,28 +745,39 @@ impl Zeroing {
 
 impl Image {
     /// Adds the image to `planes` where it is a Direct3D 11 texture's plane
-    /// (`Device::import_d3d11_surface`, on Windows) not yet there: each submission that reaches
-    /// such an image hands it over at its start and its end ([`handed`](Self::handed)).
+    /// (`Device::import_d3d11_surface`, on Windows) not yet there: each `vkQueueSubmit2` that
+    /// reaches such an image hands it over at its start and its end ([`handed`](Self::handed)).
     pub(crate) fn keep_plane(self: &Arc<Image>, planes: &mut Vec<Arc<Image>>) {
-        let plane = matches!(self._under, Some(Under::Surface { d3d11: true, .. }));
-        if plane && !planes.iter().any(|kept| Arc::ptr_eq(kept, self)) {
+        if self.d3d11_plane() && !planes.iter().any(|kept| Arc::ptr_eq(kept, self)) {
             planes.push(Arc::clone(self));
         }
     }
 
+    /// Whether it is a Direct3D 11 texture's plane (`Device::import_d3d11_surface`, on Windows).
+    fn d3d11_plane(&self) -> bool {
+        matches!(self._under, Some(Under::Surface { d3d11: true, .. }))
+    }
+
     /// A Direct3D 11 plane's hand-over between `VK_QUEUE_FAMILY_EXTERNAL` and the runtime's
-    /// queue family `family`, the general layout kept
+    /// queue family `family`, to the general layout
     /// (`VUID-VkImageMemoryBarrier-srcQueueFamilyIndex-12332`, `...-dstQueueFamilyIndex-12331`):
     /// its acquire (`acquire`), made visible to every later command, or its release, after every
-    /// earlier command's writes.
+    /// earlier command's writes. The plane's first acquire recorded, where the consumer reported
+    /// no Direct3D 11 access before it ([`external_access`](Self::external_access)), names the
+    /// undefined layout it is made in as its old layout (`VUID-VkImageCreateInfo-pNext-01443`),
+    /// and every later one, and every release, the general layout. Recorded on the submit thread.
     pub(crate) fn handed(&self, family: u32, acquire: bool) -> vk::ImageMemoryBarrier2<'static> {
         let (all, access) = (
             vk::PipelineStageFlags2::ALL_COMMANDS,
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
         );
+        let old = match acquire && !self.homed.swap(true, Ordering::Relaxed) {
+            true => self.first,
+            false => self.home,
+        };
         let barrier = vk::ImageMemoryBarrier2::default()
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
+            .old_layout(old)
+            .new_layout(self.home)
             .image(self.image)
             .subresource_range(whole(self.aspects));
         match acquire {
@@ -779,7 +797,9 @@ impl Image {
     /// for each acquire, [`Work::home`](crate::submit::Work::home)), with its zeroing between
     /// two moves where it has one ([`Zero`]). Under the work lock.
     pub(crate) fn homing(&self) -> Option<Homing> {
-        if self.homed.swap(true, Ordering::Relaxed) {
+        // A Direct3D 11 plane moves home in its first acquire, or is general after Direct3D 11's
+        // access ([`handed`](Self::handed)): no upload moves it.
+        if self.d3d11_plane() || self.homed.swap(true, Ordering::Relaxed) {
             return None;
         }
         // A drawable's image moves home at each acquire: from the present layout after a present.
@@ -876,6 +896,14 @@ impl Image {
     /// Whether its move home copies from the zero source ([`Zero::Copy`]).
     pub(crate) fn copies_zeros(&self) -> bool {
         matches!(self.zero, Some(Zero::Copy { .. }))
+    }
+
+    /// A Direct3D 11 plane's access by Direct3D 11 has completed, as the consumer reports it
+    /// ([`Surface::external_writes_done`](crate::Surface::external_writes_done)): Vulkan takes it
+    /// as general from then on (section 12.5.2), so its next acquire names the general layout
+    /// ([`handed`](Self::handed)). On the host alone.
+    pub(crate) fn external_access(&self) {
+        self.homed.store(true, Ordering::Relaxed);
     }
 
     /// Its move home is owed, recorded by the next upload that holds it ([`homing`](Self::homing)):
@@ -2398,6 +2426,43 @@ pub(crate) fn kept_features(usage: vk::ImageUsageFlags) -> vk::FormatFeatureFlag
     kept
 }
 
+/// Whether an image of `extent` in `layers` layers is within what an image format query answered
+/// (`properties`), its `maxExtent` and `maxArrayLayers` (`VUID-VkImageCreateInfo-extent-02252`,
+/// `...-arrayLayers-02256`).
+///
+/// Err: [`Limit::TextureSize`] where it is past either.
+pub(crate) fn size_within(
+    extent: [u32; 3],
+    layers: u32,
+    properties: &vk::ImageFormatProperties,
+) -> Result<(), Error> {
+    let max = properties.max_extent;
+    let max_extent = [max.width, max.height, max.depth];
+    if extent.iter().zip(max_extent).any(|(&e, m)| e > m) || layers > properties.max_array_layers {
+        return Err(Error::Limit(Limit::TextureSize {
+            extent,
+            layers,
+            max_extent,
+            max_layers: properties.max_array_layers,
+        }));
+    }
+    Ok(())
+}
+
+/// Whether a surface plane of `d`, one 2D layer, is within what the image format query answered
+/// of its image with its import's handle type (`import`): a Direct3D 11 plane's
+/// (`Device::import_d3d11_surface`, on Windows), whose import can make a smaller image than the
+/// query without the handle answers (`VUID-VkImageCreateInfo-extent-02252`).
+///
+/// Err: [`Limit::TextureSize`] carrying the import's `maxExtent` where the plane is past it.
+#[cfg(any(windows, test))]
+pub(crate) fn plane_within(
+    d: &TextureDescriptor,
+    import: &vk::ImageFormatProperties,
+) -> Result<(), Error> {
+    size_within([d.width, d.height, 1], 1, import)
+}
+
 /// The largest extent of a linear image of `plan`'s format and usage of `shape`'s type, where the
 /// device makes one; made for memory of the import `handle`, where the device makes one that such
 /// memory binds at any place: its external query (`VkPhysicalDeviceExternalImageFormatInfo`)
@@ -2903,18 +2968,7 @@ fn planned(
         }
     }
     let properties = properties.ok_or_else(gap)?;
-    let max = properties.max_extent;
-    let max_extent = [max.width, max.height, max.depth];
-    if shape.extent.iter().zip(max_extent).any(|(&e, m)| e > m)
-        || shape.layers > properties.max_array_layers
-    {
-        return Err(Error::Limit(Limit::TextureSize {
-            extent: shape.extent,
-            layers: shape.layers,
-            max_extent,
-            max_layers: properties.max_array_layers,
-        }));
-    }
+    size_within(shape.extent, shape.layers, &properties)?;
     if !d.sample_count.is_power_of_two() || !properties.sample_counts.contains(plan.samples) {
         return Err(Error::Limit(Limit::TextureSamples {
             sample_count: d.sample_count,
@@ -4094,6 +4148,48 @@ impl TextureInner {
             .dst_access_mask(access)
     }
 
+    /// The barrier that moves `placed`'s level and layer, every aspect, from home to the copy
+    /// layout of `TRANSFER_DST_OPTIMAL` for a copy of `aspect` from a buffer into it: `away`'s,
+    /// its scopes over every earlier access of the image, from undefined where the copy writes
+    /// every texel the barrier names ([`writes_whole`](Self::writes_whole)). Vulkan discards the
+    /// contents of that range alone, which the copy then writes whole, so no earlier texel is
+    /// left for a program to see.
+    fn away_into(
+        &self,
+        placed: &Placed,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageMemoryBarrier2<'static> {
+        let away = self.away(
+            placed,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        match self.writes_whole(placed, aspect) {
+            true => away.old_layout(vk::ImageLayout::UNDEFINED),
+            false => away,
+        }
+    }
+
+    /// Whether a copy of `aspect` into `placed` writes every texel of the range its barrier names
+    /// (one level, its one layer, every aspect): `aspect` is every aspect of the image, and the
+    /// region starts at the level's first texel and reaches its edge on every axis, a 3D level's
+    /// depth included (its barrier names every slice), a compressed level's edge as
+    /// [`place`] clamps the region to it. Only an image whose contents are its own, in memory of
+    /// its own or placed in a heap: one in place over a buffer, a surface plane's and an
+    /// import's keep the bytes another reaches, and a copy into them never discards.
+    fn writes_whole(&self, placed: &Placed, aspect: vk::ImageAspectFlags) -> bool {
+        let image = self.imaged();
+        let own = image.first == vk::ImageLayout::UNDEFINED
+            && !image.surface()
+            && image.foreign.is_none();
+        let Some(level) = placed.level.checked_sub(self.base()[0]) else {
+            return false;
+        };
+        let d = &self.descriptor;
+        let extent = [d.width, d.height, d.depth].map(|e| (e >> level).max(1));
+        own && aspect == image.aspects && placed.origin == [0; 3] && placed.size == extent
+    }
+
     /// The barrier that moves `placed`'s level and layer back home from the copy layout of
     /// `layout` once a copy has run, its writes (a copy into the image, whose transfer layout is
     /// `TRANSFER_DST_OPTIMAL`, or within one subresource, in `GENERAL`) visible to every later
@@ -4227,7 +4323,12 @@ impl TextureInner {
             ),
             false => (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, Access::TRANSFER_READ),
         };
-        let away = [self.away(&copy.placed, layout, access)];
+        // A copy into the image that writes its whole subresource moves it from undefined
+        // (`away_into`).
+        let away = match to_image {
+            true => [self.away_into(&copy.placed, copy.unit.aspect)],
+            false => [self.away(&copy.placed, layout, access)],
+        };
         let home = [self.back(&copy.placed, layout)];
         let image = self.imaged();
         let named = image.copy_layout(layout);
@@ -4424,11 +4525,31 @@ impl Texture {
         Some((bytes, &named.places))
     }
 
+    /// Of a texture over a Managed buffer that keeps a device copy ([`Buffer::new_texture`], in
+    /// place or in an image of its own): the buffer, and the bytes of it its texels lie in, from
+    /// the texture's offset through the last texel of its last row, within the buffer. `None` for
+    /// any other texture.
+    pub(crate) fn over_device_copy(&self) -> Option<(Buffer, u64, u64)> {
+        let inner = &self.inner;
+        let named = (inner.named.as_ref()).filter(|named| named.form != Form::Managed)?;
+        named.buffer.held().1?;
+        let unit = inner.unit?;
+        let place = named.places[0];
+        let d = &inner.descriptor;
+        let rows = u64::from(d.height.max(1) - 1) * place.bytes_per_row;
+        let span = rows + u64::from(d.width) * u64::from(unit.bytes);
+        let bytes = Buffer::of(Arc::clone(&named.buffer), self.device.clone());
+        let length = span.min(bytes.length().saturating_sub(place.offset));
+        Some((bytes, place.offset, length))
+    }
+
     /// `newTextureViewWithPixelFormat:textureType:levels:slices:`: a texture over `levels` and
     /// `slices` of this one's image, of `texture_type`, at `index`, with elements of set 1 of its
     /// own and no copy; `newTextureViewWithPixelFormat:` is the call with the texture's own type,
-    /// every level and every slice. The view keeps this texture, as Metal's `parentTexture`, and
-    /// its descriptor is a view's in Metal: the extent of its first level, `levels.len()` levels
+    /// every level and every slice. The view keeps the texture that owns the image (this one, or
+    /// for a view of a view the texture under it); Metal's `parentTexture` answers the texture the
+    /// view was made from, which the consumer answers to the guest. Its descriptor is a view's in
+    /// Metal: the extent of its first level, `levels.len()` levels
     /// and `slices.len()` slices (a cube's six faces each one). Copies and encoders that name the
     /// view reach the levels and slices under it; its hazards are its parent's own. A view of a
     /// Managed texture names the texture's bytes of those levels and slices, so the CPU's reads
@@ -4841,7 +4962,10 @@ impl Texture {
         TextureObject::gpu_resource_id(self)
     }
 
-    /// `textureType`, `pixelFormat`, `width` and the rest, as made.
+    /// `textureType`, `pixelFormat`, `width` and the rest, as made. A view's `usage` is its base
+    /// texture's, which is what the view may be used with, where Metal's `usage` answers only
+    /// `ShaderRead` and `PixelFormatView` of a base of those, `ShaderWrite` and `RenderTarget`,
+    /// for a view made with a swizzle other than the identity and for every view of such a view.
     pub fn descriptor(&self) -> &TextureDescriptor {
         TextureObject::descriptor(self)
     }
@@ -4952,7 +5076,7 @@ impl Texture {
         // The rows written are the GPU's before the copy runs (`crate::coherence`).
         if let Some(coherence) = &core.coherence {
             let written = stage.range(copy.len(), coherence.atom);
-            coherence.flush(core, written.as_slice());
+            coherence.flush(core, Point::Staging, written.as_slice());
         }
         core.counters.copied(copy.len());
         core.work.upload(
@@ -5029,7 +5153,7 @@ impl Texture {
         // (`crate::coherence`).
         if let Some(coherence) = &core.coherence {
             let read = bytes.shared_span(start, copy.extent(), coherence.atom);
-            coherence.flush(core, read.as_slice());
+            coherence.flush(core, Point::Staging, read.as_slice());
         }
         core.work.upload(
             core,
@@ -5154,7 +5278,7 @@ impl Texture {
             // What the copy wrote is the host's before it reads it (`crate::coherence`).
             if let Some(coherence) = &core.coherence {
                 let written = stage.range(copy.len(), coherence.atom);
-                coherence.settle(core, written.as_slice());
+                coherence.settle(core, Point::Staging, written.as_slice());
             }
             // SAFETY: the stage holds every row packed, the copy into it completed and its writes
             // are visible to the host, and no other call takes its span while this one reads it;
@@ -5685,6 +5809,17 @@ pub(crate) trait TextureObject {
         access: vk::AccessFlags2,
     ) -> vk::ImageMemoryBarrier2<'static> {
         TextureInner::away(self.object(), placed, layout, access)
+    }
+
+    /// The barrier that moves `placed` from home to `TRANSFER_DST_OPTIMAL` for a copy of `aspect`
+    /// from a buffer into it, after every earlier command's writes: from undefined where the copy
+    /// writes the whole subresource (`TextureInner::away_into`).
+    fn away_into(
+        &self,
+        placed: &Placed,
+        aspect: vk::ImageAspectFlags,
+    ) -> vk::ImageMemoryBarrier2<'static> {
+        TextureInner::away_into(self.object(), placed, aspect)
     }
 
     /// The barrier that moves `placed` back home from the copy layout of the transfer `layout`
@@ -6586,9 +6721,9 @@ pub(crate) struct SurfaceImage {
     pub(crate) format: vk::Format,
     pub(crate) view_formats: Vec<vk::Format>,
     pub(crate) block: Option<Arc<Block>>,
-    /// A Direct3D 11 texture's (`Device::import_d3d11_surface`, on Windows): its image is in the
-    /// general layout from its first use, with no move from undefined, which Vulkan takes as
-    /// general after Direct3D 11's access (section 12.5.2).
+    /// A Direct3D 11 texture's (`Device::import_d3d11_surface`, on Windows): no upload moves its
+    /// image, made undefined: its first acquire moves it to the general layout, or Vulkan takes
+    /// it as general after Direct3D 11's access (section 12.5.2, [`Image::handed`]).
     pub(crate) d3d11: bool,
     /// The image is `LINEAR` and its format renders only through
     /// `VK_FORMAT_FEATURE_2_LINEAR_COLOR_ATTACHMENT_BIT_NV` (`crate::surface::Query::plane`):
@@ -6634,10 +6769,11 @@ impl Device {
 
     /// The texture of a surface plane's image, at `index` as for [`Device::new_texture`]: its
     /// home layout general, from undefined in the next upload, which goes ahead of every command
-    /// buffer committed after the make, or already general where the image is (a Direct3D 11
-    /// texture's). Its format is the descriptor's, a view of the image's own where they differ.
-    /// The texture holds the image, which its drop frees with its memory. It takes `unit`'s id in
-    /// the hazard sets, the surface's ([`HeapId::unit`]).
+    /// buffer committed after the make, or, a Direct3D 11 texture's, from undefined in its first
+    /// acquire or general after Direct3D 11's access ([`Image::handed`]). Its format is the
+    /// descriptor's, a view of the image's own where they differ. The texture holds the image,
+    /// which its drop frees with its memory. It takes `unit`'s id in the hazard sets, the
+    /// surface's ([`HeapId::unit`]).
     ///
     /// Err: [`Refusal::TextureIndex`]; [`Gap::SurfaceUsage`] for a usage the texture's uses ask
     /// that the image lacks; [`Error::Vulkan`] where a view cannot be made; what the texture's
@@ -6730,13 +6866,11 @@ impl Device {
             view_formats: made.view_formats,
             cube: false,
             linear_attachment: made.linear_attachment,
-            first: match general {
-                true => home,
-                false => vk::ImageLayout::UNDEFINED,
-            },
+            first: vk::ImageLayout::UNDEFINED,
             over: false,
-            // An image already general owes no move.
-            homed: AtomicBool::new(general),
+            // A Direct3D 11 plane's move from undefined is its first acquire's, or its access by
+            // Direct3D 11 makes it general: no upload moves it (`Image::handed`).
+            homed: AtomicBool::new(false),
             foreign: None,
             zero: None,
             drawable: None,
@@ -6753,8 +6887,8 @@ impl Device {
                 let element = sampled.filter(|_| plan.read).map(|view| (view, home));
                 let looped = sampled.filter(|_| image.looped());
                 // SAFETY: the texture's views are live; its image is in its home layout whenever
-                // work uses it: the upload that moves it goes ahead of that work, or it is general
-                // after the other API's access.
+                // work uses it: the upload that moves it goes ahead of that work, or its acquire
+                // does, or it is general after the other API's access.
                 let owner = unsafe {
                     (core.arrays).place_texture(
                         &core.device,

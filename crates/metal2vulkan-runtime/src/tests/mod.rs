@@ -17,6 +17,8 @@ mod cache;
 mod choice;
 mod coherence;
 pub(crate) mod command;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod completion_orders;
 mod compute;
 mod copy_out;
 mod copy_over;
@@ -33,6 +35,8 @@ mod device;
 mod dispatch_tiles;
 mod dma_bufs;
 mod draw;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod event_values;
 mod export;
 mod exported_overs;
 mod fault;
@@ -84,6 +88,20 @@ mod nil_slots;
 mod no_attachment;
 mod null_descriptor;
 mod one_path;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_barriers;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_data;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_kernels;
+mod opencl_local;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_mode;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_shapes;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod opencl_swizzles;
+mod opengl_mode;
 mod over;
 mod over_aliases;
 mod over_causes;
@@ -92,6 +110,8 @@ mod patch;
 mod pixel_format_info;
 mod pixel_interlock;
 mod places;
+mod plane_parts;
+mod point_size_note;
 mod pool_reach;
 mod present;
 mod private_arena;
@@ -133,8 +153,10 @@ mod take_split;
 mod texture;
 mod texture_accesses;
 mod texture_buffers;
+mod times;
 mod translate;
 mod translator_fields;
+mod unattached_colors;
 mod upload;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod validation;
@@ -142,6 +164,8 @@ mod view;
 mod viewports;
 mod visibility;
 mod wg_lattice;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod whole_copy_in;
 
 /// This crate's directory: the test process's `CARGO_MANIFEST_DIR` where it holds the crate's
 /// sources (cargo and nextest set it for each test, and an archive run elsewhere remaps it to the

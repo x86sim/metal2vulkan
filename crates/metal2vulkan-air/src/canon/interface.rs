@@ -59,6 +59,7 @@ use crate::budget::Meter;
 use crate::error::{AbiError, CanonError, DiagName, InputError, InputErrorKind, Location};
 use crate::intrinsics::{AbsentAccess, AtomicSpace, NumTy, Texture};
 use crate::intrinsics::{AirIntrinsic, FunctionConstant, LlvmIntrinsic, Operand, TexOp, TexRole};
+use crate::ir::TypeTable;
 use crate::ir::{Arena, ArgIdx, Body, Callee, Const, ConstId, ConstTable, Constant, FuncId};
 use crate::ir::{CastOp, FastMath, Inst, TailKind, TypeLayouts, Value};
 use crate::ir::{Global, GlobalId, Idx, InstId, InstKind, Layout, ModuleParts, Type, TypeId};
@@ -75,6 +76,7 @@ use private::Private;
 
 /// Read-only view of the globals once they hold their pipeline values.
 pub(super) struct Values<'a> {
+    pub types: &'a TypeTable,
     pub globals: &'a Arena<GlobalId, Global>,
     pub consts: &'a ConstTable,
     /// Function constants and the globals derived from them.
@@ -111,6 +113,46 @@ impl Values<'_> {
         }
     }
 
+    /// What [`static_values`](super::static_values) answers for global `g`: a `half` or `float`
+    /// predicate's truth as 1 or 0, by its bits as [`Self::present`] reads it, else the integer it
+    /// holds ([`Self::int`]).
+    pub(super) fn static_value(&self, g: GlobalId) -> Result<u64, Error> {
+        match self.holds_float(g) {
+            true => self.float_nonzero(g).map(u64::from),
+            false => self.int(g),
+        }
+    }
+
+    /// Whether global `g`'s initializer is a floating-point constant.
+    fn holds_float(&self, g: GlobalId) -> bool {
+        let init = self.globals.get(g).and_then(|g| g.init);
+        matches!(
+            init.and_then(|c| self.consts.get(c)).map(|c| &c.value),
+            Some(Const::Float(_))
+        )
+    }
+
+    /// Whether the floating-point constant global `g` holds has a bit set, as Metal reads a float
+    /// predicate (`-0.0` and a NaN are non-zero, as the predicate's normalization makes them); an
+    /// unsupplied one's is not. A global of neither `half` nor `float` type is not evaluable.
+    fn float_nonzero(&self, g: GlobalId) -> Result<bool, Error> {
+        let global = self.globals.get(g).ok_or_else(not_evaluable)?;
+        if !matches!(
+            self.types.get(global.value_ty),
+            Some(Type::Half | Type::Float)
+        ) {
+            return Err(not_evaluable());
+        }
+        if self.fcs.get(&g).is_some_and(|f| !f.supplied) {
+            return Ok(false);
+        }
+        let init = global.init.and_then(|c| self.consts.get(c));
+        match init.map(|c| &c.value) {
+            Some(Const::Float(bits)) => Ok(*bits != 0),
+            _ => Err(not_evaluable()),
+        }
+    }
+
     fn resolve(&self, v: &mut AbiInt) -> Result<(), Error> {
         if let AbiInt::Global(g) = *v {
             let x = u32::try_from(self.int(g)?).map_err(|_| not_evaluable())?;
@@ -127,6 +169,10 @@ impl Values<'_> {
     /// Whether the argument or output a predicate gates is present.
     fn present(&self, p: &Option<Predicate>) -> Result<bool, Error> {
         match p {
+            // A function constant that is not a `bool`, of floating-point type, is normalized to
+            // 1.0 where it is supplied and its bits are not all zero (`-0.0` and a NaN included)
+            // and to 0.0 otherwise.
+            Some(p) if self.holds_float(p.global) => self.float_nonzero(p.global),
             Some(p) => Ok(self.int(p.global)? != 0),
             None => Ok(true),
         }

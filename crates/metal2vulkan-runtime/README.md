@@ -560,8 +560,9 @@ at these points:
   interface writes, a resource it declares with `use_resource` for writing, a render pass's
   attachments and resolve targets, a visibility result buffer, a synchronize's buffer, the
   whole Shared memory of every heap it uses, and every texture over a Shared buffer in an image
-  of its own. The flush comes first because Vulkan leaves a range undefined when the host wrote
-  it and it is invalidated without a flush.
+  of its own. A texture over a Shared buffer among these counts as the whole buffer it lies over,
+  not only its own bytes in it. The flush comes first because Vulkan leaves a range undefined when
+  the host wrote it and it is invalidated without a flush.
 - Around its own host accesses: the bytes `Texture::replace_region` stages are flushed before
   their copy, and so are the bytes `Texture::upload_region` copies from a Managed texture's
   named buffer, at the call; the bytes a copy stages for `Texture::get_bytes` are flushed and
@@ -571,13 +572,23 @@ Each range is widened to whole multiples of the device's `nonCoherentAtomSize`, 
 pool's allocation, which the runtime maps whole. `Metrics::shared_flushes` and
 `shared_invalidates` count the calls, `shared_flushed_bytes` and `shared_invalidated_bytes` their
 bytes, and `shared_coherence_failures` the calls that did not return success; the work goes on
-after one. On a device whose Shared type is host-coherent all five stay 0.
+after one. `shared_reach_flushed_bytes`, `shared_retire_flushed_bytes`,
+`shared_event_flushed_bytes` and `shared_staging_flushed_bytes` count each flush's bytes again by
+the point that made it (before a submission, as a command buffer completes, before a shared
+event's value is seen, around the runtime's own host accesses), a settle's flush at its settle's
+point, so they sum to `shared_flushed_bytes`; `shared_invalidated_bytes` is the completions' and
+the events' plus what `get_bytes` settled. `shared_flush_nanos` and `shared_invalidate_nanos` are
+the host time inside the calls, read at each call and its return. These are the runtime's own
+measures; Metal has no counterpart. On a device whose Shared type is host-coherent all eleven stay
+0, and no clock is read for them.
 
 On a device whose Shared type is not host-coherent, a range that a command buffer reaches only
 through an address, with no binding or `use_resource` declaration naming its buffer, is neither
 flushed nor invalidated: the consumer declares what its commands reach. The consumer's own host
 reads and writes, through its own mappings (The consumer's mappings) or between those points, are
-its own. Imported blocks (below) are host-coherent memory and take no call. Exported blocks and
+its own. Imported blocks (below) take no call: a pointer import is host-coherent memory by its
+type's flag, and such a device imports no dma-buf (`Limit::ImportCoherence`), whose pages the
+consumer writes through its own cached mapping, which no flush reaches. Exported blocks and
 surfaces are Private memory with no host mapping, and take none either.
 
 ### Imported blocks
@@ -599,9 +610,12 @@ consumer's.
   process's later allocations fail too: a device-local one after either refusal, and a host-cached
   one after the refusal in the host-cached type.
 - `Device::import_dma_buf(fd, len, release)` (unix) imports a dma-buf
-  (`VK_EXT_external_memory_dma_buf`) only into the first memory type the fd's query offers, and
-  only where that type is host-visible and host-coherent and the buffer's requirements list it;
-  anything else is `Limit::ImportType`, with nothing imported. It takes the fd (the consumer's
+  (`VK_EXT_external_memory_dma_buf`) only on a device whose Shared memory type is host-coherent,
+  only into the first memory type the fd's query offers, and only where that type is host-visible
+  and host-coherent and the buffer's requirements list it. A device whose Shared type is not
+  host-coherent (Shared memory's coherence) refuses every dma-buf with `Limit::ImportCoherence`,
+  whatever its query offers; anything else is `Limit::ImportType`; nothing is imported after
+  either. It takes the fd (the consumer's
   dup): after `Ok` the driver owns it; after a refusal or a failed query the runtime closes it, as
   no driver was given it; after a failed import it closes it only where it still names the same
   file, as a driver may have closed it and the number may name another file since. The block's
@@ -613,7 +627,8 @@ consumer's.
   (`Limit::NoImport`). The block's buffer is one sparse buffer (`VK_BUFFER_CREATE_SPARSE_BINDING_BIT`)
   with each dma-buf's import bound at its offset, so the block's `gpu_address` and its buffers run
   across the dma-bufs as over one range, and its `contents` is `None` as for one dma-buf. Each fd
-  takes the dma-buf rule's type of the sparse buffer's types, and every fd the same one. One
+  takes the dma-buf rule's type of the sparse buffer's types, and every fd the same one; a device
+  whose Shared type is not host-coherent refuses them with `Limit::ImportCoherence`. One
   `vkQueueBindSparse` on the runtime's queue binds the imports (`Metrics::sparse_binds`); the call
   does not wait for it. Vulkan orders no sparse bind against command buffers, so the runtime's next
   `vkQueueSubmit2` waits for it, once: a semaphore wait orders every later command in submission
@@ -655,7 +670,25 @@ imports, a GPU write reaches them, where Metal drops it.
 The two rules differ because a failed dma-buf import is not harmless: on NVIDIA's Linux driver
 (620.70.06, an RTX 3090) one failed dma-buf import into a later type the query offered broke every
 later allocation of that type, the Shared type among them, so the dma-buf rule attempts nothing it
-is not sure of. The host-memory rule takes the first host-visible, host-coherent type offered:
+is not sure of.
+
+They differ in coherence too. A type's `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT` speaks only for the
+mappings Vulkan makes (`vkMapMemory`); Vulkan promises nothing for writes outside them, and the
+consumer writes a dma-buf's pages through its own cached mapping. No Vulkan query says whether a
+driver's GPU mapping of a dma-buf from another driver sees the CPU's caches. So the dma-buf rule's
+coherence condition is a proxy: the Shared type's flag, which tells whether the device's
+host-cached memory is coherent. Where it is not, the rule refuses every dma-buf
+(`Limit::ImportCoherence`), which errs to the safe side: there the pointer import of the same pages
+(`import_host_memory`) is coherent by its type's flag. On one such device, a Meteor Lake GPU under
+Mesa's Intel driver and the i915 kernel driver (read in the sources of Mesa 26.3.1 and Linux 7.3,
+not run), the fd's query offers a write-combined, host-coherent type first, and the kernel driver
+maps a dma-buf from another driver with no cache coherency, so the GPU can read bytes older than
+host writes still in the CPU's cache; its pointer import is snooped. The rule is verified by its
+unit test over that device's memory types; on a device of that shape the refusal is expected, and
+no device of ours has that shape, so none meets it. Where the Shared type is coherent, as on every
+device of ours, the proxy refuses nothing, and a dma-buf's coherence there rests on the driver.
+
+The host-memory rule takes the first host-visible, host-coherent type offered:
 where RADV (Mesa 26.2, an RX 7900 XTX) refused the pages of a shared mapping of a memfd at the
 import, its Shared allocations and a dma-buf import still worked after it. A device that does not
 list a handle's extensions, or whose buffers do not import it, refuses that call with
@@ -1021,30 +1054,45 @@ The import submits nothing and waits for nothing. Vulkan 1.4's section 12.5.2 sa
 created with external memory handle types listed in the external image implied layouts table are
 accessed outside of Vulkan, they must be in the layout specified in the table, and can be assumed
 to be in that layout when they are accessed in Vulkan after external access", and the table's row
-for `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` is `VK_IMAGE_LAYOUT_GENERAL`. Each
-submission whose command buffers or uploads use a plane acquires it from
-`VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own ahead of everything, and releases it
-to that family in another after everything, both in the general layout: one barrier each, counted
-in `Metrics::external_acquires` and `Metrics::external_releases`. The acquire follows a global
-barrier from and to every stage, so an earlier submission's release on rt's one queue happens
-before it (Vulkan 1.4, section 7.7.6). The submission counts in
+for `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` is `VK_IMAGE_LAYOUT_GENERAL`. A plane's
+image is made in the undefined layout, and no upload moves it. Each `vkQueueSubmit2` whose command
+buffers or uploads use a plane acquires it from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of
+rt's own ahead of everything in it, and releases it to that family in another after everything in
+it, both to the general layout: one barrier each, counted in `Metrics::external_acquires` and
+`Metrics::external_releases`. A plane's first acquire names the undefined layout as its old layout
+where the consumer reported no Direct3D 11 access of it before (`Surface::external_writes_done`),
+and the general layout where it did; every later acquire, and every release, names the general
+layout. The acquire
+follows a global barrier from and to every stage, so an earlier submission's release on rt's one
+queue happens before it (Vulkan 1.4, section 7.7.6). The call counts in
 `Metrics::d3d11_plane_submissions` and the two command buffers in
-`Metrics::runtime_command_buffers`. The release takes the submission's last signals, so it adds
-no `VkSubmitInfo2`, and no submission or semaphore wait is added. Direct3D 11 thus owns the
-planes' memory between rt's submissions, and `Surface::external_writes_done()` and
-`BlitCommandEncoder::release_surface_to_external(&surface)` record nothing for such a surface. So
-the consumer's precondition is that Direct3D 11's work that accesses a plane has completed before
-the consumer commits the command buffers that use it, and that those command buffers have
-completed before Direct3D 11 accesses it again. No keyed mutex is used, by rt or on the textures:
-each is made with `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, not
+`Metrics::runtime_command_buffers`. The release takes the call's last signals, its progress value
+among them, so it adds no `VkSubmitInfo2`, no submission or semaphore wait is added, and a command
+buffer that uses a plane is seen complete only once the plane's release has run. A group of
+command buffers rt sends member by member, one `vkQueueSubmit2` a member, each signalling its own
+progress value, hands each member's planes over in that member's call, so a member ahead of the
+last is seen complete after its own planes' release and not before it; each such call counts in
+`Metrics::d3d11_plane_parts` too. Direct3D 11 thus owns the planes' memory between rt's
+submissions. `Surface::external_writes_done()` records nothing and makes no GPU work for such a
+surface: it marks each plane accessed by Direct3D 11, on the host, so each acquire from then on
+names the general layout. `BlitCommandEncoder::release_surface_to_external(&surface)` records
+nothing. So the consumer's precondition is that Direct3D 11's work that accesses a plane has
+completed before the consumer commits the command buffers that use it, that the consumer calls
+`Surface::external_writes_done()` after each such access and before that commit, and that rt's
+command buffers that use a plane have completed before Direct3D 11 accesses it again. Without the
+call after Direct3D 11's first access, rt's first acquire of the plane names the undefined layout,
+which does not preserve the contents (Vulkan 1.4, section 12.5.1: "implying that the contents of
+the image subresource need not be preserved"), so the device may discard what Direct3D 11 wrote.
+No keyed mutex is used, by rt or on the textures: each is made with
+`D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, not
 `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, whose mutex the device that makes the texture and each
 device that opens it must acquire before rendering to it; the consumer orders the two APIs' work
 by its waits. A plane rt uses before any Direct3D 11 access has undefined contents, as a Metal
-texture nothing wrote does. The surface has no buffer: `Surface::buffer()` is `Gap::D3d11SurfaceBuffer`, as its
-planes lie in memories of their own, and `Surface::handle()` is `None`. No move goes ahead of the
-planes' first use, so `Surface::wait_until_ready()` returns at once. The planes' imports are freed
-as an exported surface's memory is (above); rt keeps no handle of its own, and each import holds
-the Direct3D 11 texture's payload until it is freed.
+texture nothing wrote does. The surface has no buffer: `Surface::buffer()` is
+`Gap::D3d11SurfaceBuffer`, as its planes lie in memories of their own, and `Surface::handle()` is
+`None`. No upload's move goes ahead of the planes' first use, so `Surface::wait_until_ready()`
+returns at once. The planes' imports are freed as an exported surface's memory is (above); rt keeps
+no handle of its own, and each import holds the Direct3D 11 texture's payload until it is freed.
 
 ### Known gaps of memory blocks
 
@@ -1059,7 +1107,14 @@ the Direct3D 11 texture's payload until it is freed.
   cached and not coherent can. The device tests run the calls on our devices through a view that
   reads their cached types as not coherent (`--cfg m2v_shared_view`, docs/VALIDATION.md), on memory
   that is coherent in fact; neither the calls' time nor their effect has been measured on a device
-  whose memory is not.
+  whose memory is not. On a device that makes the calls, `Metrics::shared_reach_flushed_bytes`,
+  `shared_retire_flushed_bytes`, `shared_event_flushed_bytes` and `shared_staging_flushed_bytes`
+  measure which of those points carries their bytes, and `shared_flush_nanos` and
+  `shared_invalidate_nanos` the host time inside them.
+- On a device whose Shared type is not host-coherent, every dma-buf import is refused
+  (`Limit::ImportCoherence`, Imported blocks), so pages that only a dma-buf imports there (a
+  mapping no pointer import takes) have no no-copy route. The refusal is a proxy, and where the
+  Shared type is coherent a dma-buf's coherence rests on the driver (Imported blocks).
 - On such a device, a host write to a range a command buffer may write, made while the command
   buffer runs, may be lost, and so may the GPU's writes to the same atoms. The runtime flushes
   each such range just before it invalidates it, and Vulkan states: "If a range of non-coherent
@@ -2066,7 +2121,12 @@ made, with no lock, and never rewritten for layouts.
   such a texture, is `Gap::SwizzledReadWrite`, found when the pipeline state or a binding
   changes: its read would answer the texel unswizzled, where Metal reads it through the swizzle. A texture's
   own descriptor takes a swizzle only without shader-write and render-target usage
-  (`Refusal::TextureSwizzleWithWrites`), so this reaches views alone.
+  (`Refusal::TextureSwizzleWithWrites`), so this reaches views alone. A view's descriptor reports
+  its base texture's usage, which is what the view may be used with, so a draw into such a view
+  and a kernel's write through it run, where Metal reports only `ShaderRead` and
+  `PixelFormatView` of a base of those, `ShaderWrite` and `RenderTarget`, for a view made with a
+  swizzle other than the identity and for every view of such a view (M3 Max, macOS 27.0.1,
+  `metal2vulkan-conformance/probes/swizzled_view_stores.m`).
 - A kernel, a vertex function or a fragment function samples a 2D texture slot through a bicubic
   constexpr sampler, at normalized or at pixel coordinates, by the arm its slot's pushed word
   selects, which the runtime writes from the bound texture's format and swizzle
@@ -2377,7 +2437,11 @@ made, with no lock, and never rewritten for layouts.
   the semaphore only rises and never races a host set.
   `signaled_value` is the higher of the semaphore and the floor. `notify_listener` runs its
   listener on the completion thread when the value is reached, at a signal in the middle of a
-  command buffer as well as at its end; `wait_until_signaled_value` wakes then too.
+  command buffer as well as at its end; `wait_until_signaled_value` wakes then too. A value the
+  host sees that a GPU signal raised (`signaled_value`, `wait_until_signaled_value`, a
+  listener's value) is one a host wait with a timeout of 0 (`vkWaitSemaphores`) confirmed after
+  the semaphore's counter read found it, never the counter read alone; a read at or below the
+  value last confirmed asks for no wait.
 - `Fence` is `MTLFence`, and `update_fence` and `wait_for_fence` on compute and blit encoders are
   `updateFence:` and `waitForFence:`, on one queue or across queues. They record nothing: every
   queue's command buffers go to the device's one `VkQueue`, and each encoder's writes reach every
@@ -2688,6 +2752,14 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   m3-max-68314), and 1 failing suite run of 11 (m3-max-68142). No other device the suites run on
   shows it, no split dispatch has shown it, and a kernel that checks each of its reads met no wrong
   one in 5 runs (m3-max-68367). The cause is not found.
+- An event's encoded signal or wait puts Metal's value on the event's timeline semaphore as it is.
+  Vulkan requires that value to lie within the device's `maxTimelineSemaphoreValueDifference` of
+  the semaphore's value and of every signal and wait pending on it
+  (`VUID-VkSubmitInfo2-semaphore-03883`, `VUID-VkSubmitInfo2-semaphore-03884`), and a device may
+  report a limit as low as 2,147,483,647. So on a device whose limit is below the jump, a program
+  whose encoded signal or wait moves an event's value further than that limit is outside Vulkan's
+  valid usage. A host's `set_signaled_value` raises the event's host value without signalling the
+  semaphore, so it meets no such limit.
 
 ## Compute encoders
 
@@ -2953,11 +3025,14 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
 - `synchronize_resource` is `synchronizeResource:`, counted in `Metrics::synchronizations` and
   never a submission of its own. Of a Managed buffer with a device copy it records one
   `vkCmdCopyBuffer` of the copy into the consumer's bytes between the same two barriers; of a
-  Managed texture with named bytes, on every device, one `vkCmdCopyImageToBuffer` of each level
-  and slice into its place in them, between one pair of barriers. Either marks the segment so its
-  end barrier reaches the host: the host reads the GPU's writes before the call once the command
-  buffer completes or it sees an event signaled after it. Of any other buffer, which the host
-  reads where shaders write it, and of a texture without named bytes, which has none the host
+  texture over such a buffer (`Buffer::new_texture`), whose texels are the buffer's bytes as in
+  Metal, the same copy of the bytes its texels lie in, from its offset through its last texel,
+  after its image of its own, where it has one, goes back to the copy; of a Managed texture with
+  named bytes, on every device, one `vkCmdCopyImageToBuffer` of each level and slice into its
+  place in them, between one pair of barriers. Each marks the segment so its end barrier reaches
+  the host: the host reads the GPU's writes before the call once the command buffer completes or
+  it sees an event signaled after it. Of any other buffer, which the host reads where shaders
+  write it, of a texture over one, and of a texture without named bytes, which has none the host
   reads apart from its image, it records nothing. Metal's validation stops it on a resource
   that is not Managed; the runtime keeps no storage mode for those and does not refuse it.
 - `generate_mipmaps` is `generateMipmapsForTexture:`: each level below the texture's first made
@@ -2991,6 +3066,19 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   range is refused alike (`Gap::OverlappingCopy`): the device lays the heap texture's texels out
   as it chooses, and Metal leaves the contents of aliased heap resources undefined, so nothing is
   emulated.
+- Measured on R8Unorm at 1920 x 1080 on a Radeon 780M under RADV (Mesa 26.2.6): a copy from a
+  buffer into part of a one-sample colour texture (`copy_from_buffer`; `replace_region` of part
+  of a texture records the same copy, not measured) can leave one aligned 4 x 2 cell of the
+  texture's earlier contents, in about 4 of 1,000 copies whose region covers the texture's last
+  56 rows; refilling rows 864 to 1079, the cells lay in rows 1026 to 1058. A copy of a whole
+  level and slice does not, as it discards the earlier contents first: a blit encoder's, and the
+  runtime's own copy of a texture over a buffer (`Buffer::new_texture`) into the image of its own
+  that the texture takes where the device's linear image does not hold it. A driver fault: the same
+  copy in plain Vulkan does it, and the validation layer, with its synchronization checks, reports
+  nothing on the same calls refilling the whole texture. At 1920 x 1088 and 1024 x 1024, refills
+  of the bottom 216 rows left such a cell 10 to 18 rows below the band's top in 4 and 3 of 4,000;
+  at 2048 x 2048, in none of 4,000 (the plain Vulkan repro). Other sizes and formats of partial
+  copies are not measured.
 
 ## Compute pipeline states
 
@@ -3162,7 +3250,8 @@ while the driver's exit handler waited on a lock, with every runtime thread alre
   render content's line-class pipeline), `first_use_point_waits` (its point-class pipeline),
   `first_use_raster_waits` (its pipeline under the depth clip mode `Clamp` or the triangle fill
   mode `Lines`) and `first_use_unfinished_waits` (a state's main pipeline, compute or render,
-  before its `finish_pipeline` made it).
+  before its `finish_pipeline` made it, and the pipeline of a render state drawn without the
+  colours its pass lacks, which no `finish_pipeline` makes).
   No dispatch lowers a function. `Counters::variant_makes(from)` answers the kept makes of
   kernels' `VkPipeline`s numbered `from` or later, the last 256 to end on the device, each a
   `VariantMake`: its key (the `DispatchVariant` its dispatches answer), who started it
@@ -3635,7 +3724,10 @@ cache is answered compile-required on both.
     1.02x and +1,842, 1.26x-1.27x and +490, 1.29x and +489, and 0.99x-1.00x and +2,422;
   - the kernel's access, in a row of one large dispatch whose buffers are bound once: a 3x3 filter
     over a 1920x1080 image (`image_filter`) takes 1.07x-1.08x on the Iris Xe (m3-max-75203), and
-    1.00x on the 780M, the RX 7900 XTX and the RTX 3090;
+    1.00x on the 780M, the RX 7900 XTX and the RTX 3090; a plain Vulkan program of that filter,
+    holding none of the runtime's code and with no robustness enabled, takes 1.07x with its
+    buffers bound against the same program reaching them by address on the Iris Xe
+    (m3-max-75320, two alternated pairs at p50);
   - a recorded stream with compute dispatches took 7.98% more GPU time a frame on the Iris Xe,
     41.528 ms against 38.460 ms over its 1,050 frames, its four checked frames equal
     (m3-max-75206). How much of that is the sets' and how much the kernels' slower access is not
@@ -3882,6 +3974,13 @@ cache is answered compile-required on both.
   (`Gap::KernelInput`, whose `KernelInputKind` names what the runtime found: `Slot` for an
   intersection-function table). So is a state for indirect command buffers
   (`Gap::IndirectCommandBuffers`, `IndirectCommandsKind::ComputeCommands`).
+- An OpenCL program's kernel that takes a 1D image (`image1d_t` or `image1d_array_t`) cannot be
+  made into a compute pipeline state of OpenCL mode (`open_cl_mode_enabled`), where Metal makes
+  it: Apple's OpenCL binds such an image as a 2D texture of height 1 (a 1D array as a 2D array of
+  that height), and the translator's form of the kernel depends on whether the texture bound for
+  the image is 1D (`RuntimeFact::OpenClLineTexture`), state of the bound texture beyond its
+  resource ID, which the runtime does not supply. The making fails with `Error::Translation`
+  (`Unsupported{IdentityDomains, NotImplemented}`), whatever else the kernel does.
 - A visible-function table's words take a Shared block of their own, 64 KiB at the least, for a
   table of any size.
 - A state whose kernel the consumer compiled (`StageSource::Compiled`) holds no linked functions
@@ -4238,6 +4337,11 @@ cache is answered compile-required on both.
   The states-only plays of the 35 replay streams on lavapipe refuse none of their render or compute
   states (jobs m3-max-63105 to 63108, and m3-max-63132 and m3-max-63156 for the two streams that
   ran past those jobs' 300-second limit).
+- Under the private OpenGL mode (`PrivateRenderState::open_gl_mode_enabled`), a render pipeline
+  whose vertex function returns `void` with rasterization enabled is refused, an
+  `Error::Translation` naming `RasterizedVoidVertex`, where Metal makes a state that runs the
+  vertex function and rasterizes nothing (an Apple M3 Max, macOS 27.0.1, the probe
+  `metal2vulkan-conformance/probes/opengl_mode.m`).
 - On a device that does not list `VK_EXT_shader_stencil_export`, a fragment function's `[[stencil]]`
   output is drawn by bits (`RuntimeFact::StencilBitDraws`). Each draw through its state is drawn
   once under the stencil reference 0, then once for each bit of the low 8 of the write masks of
@@ -4667,6 +4771,28 @@ cache is answered compile-required on both.
   indices past the buffer (`Refusal::IndexBufferOffset`), a viewport field NaN or infinite but its
   origin's x (`Refusal::ViewportNotFinite`), and a stencil test in a pass without a stencil
   attachment (`Refusal::StencilAttachment`).
+- A pipeline state that names colours past its pass's last colour attachment, its colour formats
+  up to that attachment, its depth and stencil formats and its raster sample count all the pass's,
+  which Metal's validation stops ("For color attachment 1, the renderPipelineState pixelFormat
+  must be MTLPixelFormatInvalid, as no texture is set."), is drawn, as plain Metal draws it
+  (`pass-pipeline-color-unattached`, an Apple M3 Max under macOS 27.0.1, job m3-max-75903):
+  `set_render_pipeline_state` binds the state of its descriptor without those colours, whose
+  fragment function stores them nowhere. The first such set makes that state's content, which the
+  device's map of contents keeps as any content, and its first draw makes its `VkPipeline`, a
+  first-use wait (`first_use_unfinished_waits`): about 3.3 ms once per state and pass shape on an
+  RTX 5080 Laptop card, from a proxy (a state of the same functions with colour 0 alone; jobs
+  m3-max-75918 and m3-max-75925). Each later such set keys that descriptor and looks its content
+  up: about 14,500 user-space instructions on lavapipe, where a set of a state that renders into
+  its pass is 140 and takes neither, nor do its draws (job m3-max-75974). Every render state keeps
+  its descriptor, and through it its functions' libraries, while it lives: in states-only plays of
+  two recorded replay streams on lavapipe, that kept no library alive that was not alive without it
+  (jobs m3-max-75968 and m3-max-75969). Keeping it costs every render state's make the descriptor's
+  copy, and its drop the copy's: a make of a content the device already holds takes about 13,500
+  user-space instructions on lavapipe against about 11,800 without it (jobs m3-max-75974 and
+  m3-max-75975), once a state and never a draw. A state that names a colour its pass leaves unset
+  between two colour attachments stays refused (`DrawKind::AttachmentFormats`): there plain Metal
+  writes that colour's value into the next attachment (`pass-pipeline-color-unattached-between`, job
+  m3-max-75934).
 
 ### Known gaps of render encoders
 
@@ -4700,7 +4826,8 @@ cache is answered compile-required on both.
   the floor does not require; a
   viewport Vulkan's is not (a
   negative width, a depth range past `[0, 1]`, bounds past the device's viewport limits), a
-  pipeline state whose formats are not the pass's attachments', a draw that binds a texture
+  pipeline state whose formats are not the pass's attachments' (but for colours past the pass's
+  last colour attachment, above), a draw that binds a texture
   whose image the pass renders, where neither the feedback loop nor a copy reads it: on a device
   without the attachment reads, from the vertex function at the rendered level and layer, written, of a
   depth or stencil attachment, of an image over a buffer in place or whose format the device

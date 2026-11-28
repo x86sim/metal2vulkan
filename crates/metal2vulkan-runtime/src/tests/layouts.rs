@@ -7,6 +7,11 @@
 //! renderings each colour attachment's view and image as made ([`rendered`]). Its barrier commands are counted too. The core commands that name a layout and that rt does not record get no entry, so
 //! that a call of one panics (ash's stub for a command it did not load) and the test learns of it.
 //!
+//! The same table counts each `vkFlushMappedMemoryRanges` and `vkInvalidateMappedMemoryRanges`
+//! call and the bytes of the ranges it names, a range of `VK_WHOLE_SIZE` to the end of its
+//! memory's mapping as `vkMapMemory` named it ([`coherence_calls`]): the calls themselves, which
+//! the runtime's own counters of them claim (`crate::coherence`).
+//!
 //! Each command buffer's barriers, copies to a buffer and timestamp writes are kept in the order
 //! recorded, for every command buffer submitted ([`submitted`]).
 //!
@@ -14,10 +19,12 @@
 //! command buffer's steps, as recorded, are taken in the order `vkQueueSubmit2` hands the command
 //! buffers to the queue. An image made while recording moves home once: a barrier of its first
 //! level from the undefined or the preinitialized layout, which keeps no bytes (the undefined
-//! one) or the host's (the preinitialized one). A second such move of an image that moved home
-//! is a step that drops its bytes, and any other command that names it before its move home (a
-//! copy into it among them) reads or writes it in a layout it is not in; either is noted
-//! against the device.
+//! one) or the host's (the preinitialized one). A later move of its first level from the
+//! undefined layout is a discard, which the image's next step must be a copy from a buffer into
+//! its whole first level to make good. Any other second move of an image that moved home is a
+//! step that drops its bytes, as is a discard that any other step follows, and any other command
+//! that names it before its move home (a copy into it among them) reads or writes it in a layout
+//! it is not in; each is noted against the device.
 //!
 //! Under a device cfg, on every device of the cfg's kind: one command buffer runs every blit
 //! entry that takes a texture over a texture over a Shared buffer in place (a copy from and to
@@ -26,10 +33,13 @@
 //! read of its image, and every layout recorded for the image, its descriptor's included, is the
 //! general layout but the move home's old one, preinitialized. The image is host-accessible at
 //! every moment, so it and the buffer are aliases that interpret their bytes alike (Vulkan's
-//! memory aliasing): a copy that moved it to a transfer layout fails this.
+//! memory aliasing): a copy that moved it to a transfer layout fails this. A copy from a buffer
+//! into a texture of its own memory moves it from the undefined layout where the copy writes the
+//! whole level and slice, through a blit and through `replace_region` alike, and from home where
+//! it does not.
 
 use ash::vk;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
@@ -75,6 +85,8 @@ impl Named {
 enum Step {
     /// A barrier's move of its first level from `layout`, undefined or preinitialized.
     Home(vk::ImageLayout),
+    /// A copy from a buffer into it, and whether a region of it writes its whole first level.
+    CopyIn { whole: bool },
     /// Any other command that names it, `what` saying which.
     Use(&'static str),
 }
@@ -101,6 +113,9 @@ pub(crate) struct Moves {
     pub(crate) uses: u64,
     /// Of `uses`, the copies from a buffer into an image.
     pub(crate) copies_in: u64,
+    /// The moves from the undefined layout of an image that had moved home, each followed by a
+    /// copy into its whole first level.
+    pub(crate) discards: u64,
     /// The steps out of order: a second move home of an image, or a step before its move home.
     pub(crate) broken: Vec<String>,
 }
@@ -124,6 +139,9 @@ struct Driver {
     cmd_clear_depth_stencil_image: vk::PFN_vkCmdClearDepthStencilImage,
     cmd_begin_rendering: vk::PFN_vkCmdBeginRendering,
     cmd_write_timestamp2: vk::PFN_vkCmdWriteTimestamp2,
+    map_memory: vk::PFN_vkMapMemory,
+    flush_mapped_memory_ranges: vk::PFN_vkFlushMappedMemoryRanges,
+    invalidate_mapped_memory_ranges: vk::PFN_vkInvalidateMappedMemoryRanges,
 }
 
 #[derive(Default)]
@@ -133,6 +151,12 @@ struct Record {
     barriers: HashMap<vk::Device, u64>,
     /// Each recorded device's driver commands.
     drivers: HashMap<vk::Device, Driver>,
+    /// Each recorded device's `vkFlushMappedMemoryRanges` and `vkInvalidateMappedMemoryRanges`
+    /// calls and their ranges' bytes ([`coherence_calls`]).
+    coherence: HashMap<vk::Device, [u64; 4]>,
+    /// The end of each memory's mapping where `vkMapMemory` named its size, `None` where it named
+    /// `VK_WHOLE_SIZE`.
+    mapped: HashMap<(vk::Device, vk::DeviceMemory), Option<u64>>,
     /// Each command buffer's device.
     devices: HashMap<vk::CommandBuffer, vk::Device>,
     /// Each image view's image, type and range.
@@ -142,6 +166,11 @@ struct Record {
     >,
     /// Each image's type and create flags, as made while recording.
     made: HashMap<(vk::Device, vk::Image), (vk::ImageType, vk::ImageCreateFlags)>,
+    /// Each image's extent, as made while recording.
+    extents: HashMap<(vk::Device, vk::Image), vk::Extent3D>,
+    /// The images whose last step was a discard: a move of their first level from the undefined
+    /// layout after their move home.
+    discarding: HashSet<(vk::Device, vk::Image)>,
     /// Each queue's device.
     queues: HashMap<vk::Queue, vk::Device>,
     /// Each command buffer's steps since its begin, in the order recorded.
@@ -209,6 +238,14 @@ pub(crate) fn forget() {
     record().named.clear();
 }
 
+/// `device`'s `vkFlushMappedMemoryRanges` and `vkInvalidateMappedMemoryRanges` calls since it was
+/// made, and the bytes of the ranges they named: the flushes, their bytes, the invalidates, their
+/// bytes. A range whose end is unknown (`VK_WHOLE_SIZE` past a mapping of `VK_WHOLE_SIZE`) counts
+/// `u64::MAX` bytes. `None` for a device made while no [`Recording`] lived.
+pub(crate) fn coherence_calls(device: vk::Device) -> Option<[u64; 4]> {
+    record().coherence.get(&device).copied()
+}
+
 /// Every copy between images `device` recorded so far, in the order recorded.
 pub(crate) fn image_copies(device: vk::Device) -> Vec<ImageCopied> {
     (record().copies.iter())
@@ -256,7 +293,15 @@ fn take(record: &mut Record, device: vk::Device, command_buffer: vk::CommandBuff
             continue;
         };
         let shown = format!("image {:#x}", ash::vk::Handle::as_raw(image));
+        let discarded = record.discarding.remove(&(device, image));
+        if discarded && !matches!(step, Step::CopyIn { whole: true }) {
+            let broken = format!("{shown}: a move from the undefined layout not followed by a copy into its whole first level");
+            moves.broken.push(broken);
+        }
         match step {
+            Step::Home(vk::ImageLayout::UNDEFINED) if *homed => {
+                record.discarding.insert((device, image));
+            }
             Step::Home(layout) => {
                 if *homed {
                     let layout = layout.as_raw();
@@ -266,6 +311,16 @@ fn take(record: &mut Record, device: vk::Device, command_buffer: vk::CommandBuff
                 *homed = true;
                 moves.homes += 1;
             }
+            Step::CopyIn { whole } => {
+                if !*homed {
+                    moves
+                        .broken
+                        .push(format!("{shown}: {COPY_IN} before its move home"));
+                }
+                moves.uses += 1;
+                moves.copies_in += 1;
+                moves.discards += u64::from(discarded && whole);
+            }
             Step::Use(what) => {
                 if !*homed {
                     moves
@@ -273,7 +328,6 @@ fn take(record: &mut Record, device: vk::Device, command_buffer: vk::CommandBuff
                         .push(format!("{shown}: {what} before its move home"));
                 }
                 moves.uses += 1;
-                moves.copies_in += u64::from(what == COPY_IN);
             }
         }
     }
@@ -368,9 +422,25 @@ pub(crate) unsafe fn recorded(instance: &ash::Instance, device: ash::Device) -> 
             cmd_write_timestamp2: std::mem::transmute::<*const c_void, vk::PFN_vkCmdWriteTimestamp2>(
                 load(c"vkCmdWriteTimestamp2"),
             ),
+            map_memory: std::mem::transmute::<*const c_void, vk::PFN_vkMapMemory>(load(
+                c"vkMapMemory",
+            )),
+            flush_mapped_memory_ranges: std::mem::transmute::<
+                *const c_void,
+                vk::PFN_vkFlushMappedMemoryRanges,
+            >(load(c"vkFlushMappedMemoryRanges")),
+            invalidate_mapped_memory_ranges: std::mem::transmute::<
+                *const c_void,
+                vk::PFN_vkInvalidateMappedMemoryRanges,
+            >(load(c"vkInvalidateMappedMemoryRanges")),
         }
     };
-    record().drivers.insert(handle, driver);
+    let mut fresh = record();
+    fresh.drivers.insert(handle, driver);
+    // A handle made again starts again.
+    fresh.coherence.insert(handle, [0; 4]);
+    fresh.mapped.retain(|&(device, _), _| device != handle);
+    drop(fresh);
     let ours = |name: &CStr| -> Option<*const c_void> {
         let function: *const c_void = match name.to_bytes() {
             b"vkBeginCommandBuffer" => begin_command_buffer as *const c_void,
@@ -389,6 +459,9 @@ pub(crate) unsafe fn recorded(instance: &ash::Instance, device: ash::Device) -> 
             b"vkCmdClearDepthStencilImage" => cmd_clear_depth_stencil_image as *const c_void,
             b"vkCmdBeginRendering" => cmd_begin_rendering as *const c_void,
             b"vkCmdWriteTimestamp2" => cmd_write_timestamp2 as *const c_void,
+            b"vkMapMemory" => map_memory as *const c_void,
+            b"vkFlushMappedMemoryRanges" => flush_mapped_memory_ranges as *const c_void,
+            b"vkInvalidateMappedMemoryRanges" => invalidate_mapped_memory_ranges as *const c_void,
             _ => return None,
         };
         Some(function)
@@ -451,6 +524,68 @@ unsafe fn slice<'a, T>(pointer: *const T, count: u32) -> &'a [T] {
     }
 }
 
+unsafe extern "system" fn map_memory(
+    device: vk::Device,
+    memory: vk::DeviceMemory,
+    offset: vk::DeviceSize,
+    size: vk::DeviceSize,
+    flags: vk::MemoryMapFlags,
+    data: *mut *mut c_void,
+) -> vk::Result {
+    let driver = record().drivers[&device];
+    let end = match size {
+        vk::WHOLE_SIZE => None,
+        size => Some(offset + size),
+    };
+    record().mapped.insert((device, memory), end);
+    // SAFETY: the caller's arguments, passed on.
+    unsafe { (driver.map_memory)(device, memory, offset, size, flags, data) }
+}
+
+/// Counts one call of `device`'s at `at` of its [`coherence_calls`] (0 a flush, 2 an
+/// invalidate), and the bytes of its `ranges` one further.
+fn mapped_call(device: vk::Device, at: usize, ranges: &[vk::MappedMemoryRange<'_>]) {
+    let mut record = record();
+    let bytes = (ranges.iter())
+        .map(|range| match range.size {
+            vk::WHOLE_SIZE => (record
+                .mapped
+                .get(&(device, range.memory))
+                .copied()
+                .flatten())
+            .map_or(u64::MAX, |end| end.saturating_sub(range.offset)),
+            size => size,
+        })
+        .fold(0, u64::saturating_add);
+    let tally = record.coherence.entry(device).or_default();
+    tally[at] += 1;
+    tally[at + 1] = tally[at + 1].saturating_add(bytes);
+}
+
+unsafe extern "system" fn flush_mapped_memory_ranges(
+    device: vk::Device,
+    count: u32,
+    ranges: *const vk::MappedMemoryRange<'_>,
+) -> vk::Result {
+    let driver = record().drivers[&device];
+    // SAFETY: the caller's `count` ranges.
+    mapped_call(device, 0, unsafe { slice(ranges, count) });
+    // SAFETY: the caller's arguments, passed on.
+    unsafe { (driver.flush_mapped_memory_ranges)(device, count, ranges) }
+}
+
+unsafe extern "system" fn invalidate_mapped_memory_ranges(
+    device: vk::Device,
+    count: u32,
+    ranges: *const vk::MappedMemoryRange<'_>,
+) -> vk::Result {
+    let driver = record().drivers[&device];
+    // SAFETY: the caller's `count` ranges.
+    mapped_call(device, 2, unsafe { slice(ranges, count) });
+    // SAFETY: the caller's arguments, passed on.
+    unsafe { (driver.invalidate_mapped_memory_ranges)(device, count, ranges) }
+}
+
 unsafe extern "system" fn allocate_command_buffers(
     device: vk::Device,
     info: *const vk::CommandBufferAllocateInfo<'_>,
@@ -498,7 +633,9 @@ unsafe extern "system" fn create_image(
         let (image, info) = unsafe { (*image, &*info) };
         let mut record = record();
         record.homed.insert((device, image), false);
+        record.discarding.remove(&(device, image));
         (record.made).insert((device, image), (info.image_type, info.flags));
+        (record.extents).insert((device, image), info.extent);
     }
     result
 }
@@ -704,7 +841,19 @@ unsafe extern "system" fn cmd_copy_buffer_to_image(
 ) {
     let (device, driver) = driver_of(command_buffer);
     note(device, [(COPY_IN, image, layout)]);
-    step(command_buffer, [(image, Step::Use(COPY_IN))]);
+    let extent = record().extents.get(&(device, image)).copied();
+    // SAFETY: the caller's regions.
+    let regions_given = unsafe { slice(regions, count) };
+    let whole = regions_given.iter().any(|region| {
+        let at = region.image_offset;
+        region.image_subresource.mip_level == 0
+            && [at.x, at.y, at.z] == [0; 3]
+            && extent.is_some_and(|extent| {
+                let size = region.image_extent;
+                [size.width, size.height, size.depth] == [extent.width, extent.height, extent.depth]
+            })
+    });
+    step(command_buffer, [(image, Step::CopyIn { whole })]);
     // SAFETY: the caller's arguments, passed on.
     unsafe {
         (driver.cmd_copy_buffer_to_image)(command_buffer, buffer, image, layout, count, regions)
@@ -873,12 +1022,12 @@ unsafe extern "system" fn cmd_begin_rendering(
 }
 
 mod on_device {
-    use super::{barriers, forget, named, submitted, Ordered, Recording};
+    use super::{barriers, forget, moves, named, submitted, Ordered, Recording, COPY_IN};
     use crate::tests::command::on_device::{each_device, finished};
     use crate::texture::TextureObject;
     use crate::{
-        BufferLayout, ClearColor, IndexClass, LoadAction, MemoryClass, PixelFormat, Region,
-        RenderPassDescriptor, StorageMode, StoreAction, TextureDescriptor, TexturePlace,
+        BufferLayout, ClearColor, HostBytes, IndexClass, LoadAction, MemoryClass, PixelFormat,
+        Region, RenderPassDescriptor, StorageMode, StoreAction, TextureDescriptor, TexturePlace,
         TextureType, TextureUsage,
     };
     use ash::vk;
@@ -1202,6 +1351,183 @@ mod on_device {
             println!("end stamp: {name}: image of its own {copied}; {tails} tails: {submitted:?}");
             assert_eq!(tails, usize::from(copied), "{name}: {submitted:?}");
             drop((command_buffer, queue, texture, source, buffer));
+            (device.release_block(block)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        });
+    }
+
+    /// A texture over a Shared buffer in an image of its own (its rows one alignment past the
+    /// device's own pitch, which no linear image takes), used by a blit and written by one in each
+    /// of two command buffers: every copy of the buffer's bytes into its image moves the image from
+    /// the undefined layout, as the copy writes its whole level and slice, and every copy back
+    /// moves it from home, which keeps its texels. In the order the queue runs them, each move from
+    /// undefined after the image's move home is a discard that a copy into its whole level
+    /// follows, and no step is out of order (`moves`).
+    #[test]
+    fn an_over_image_is_copied_in_from_undefined_and_back_from_home() {
+        let _recording = Recording::start();
+        each_device("over copy layouts", |name, _, device| {
+            let handle = device.core().device.handle();
+            let answer = (device.minimum_linear_texture_alignment(PixelFormat::RGBA8Unorm))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let pitch = ROW.next_multiple_of(answer) + answer;
+            let block = (device.take_block(MemoryClass::Shared, AT + LEN))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let buffer = (device.new_buffer(block.id, AT, LEN, Some(0)))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let first = IndexClass::Texture.range().start;
+            (device.grant_indices(IndexClass::Texture, first, 2)).expect("a grant");
+            let mut d =
+                TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, WIDTH, HEIGHT);
+            d.usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+            let texture = (buffer.new_texture(&d, Some(first), 0, pitch))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let (_, over) = (texture.copied_over()).unwrap_or_else(|| {
+                panic!("{name}: rows one alignment past the pitch take an image of its own")
+            });
+            let mut plain_d = d;
+            plain_d.usage = TextureUsage::SHADER_READ;
+            plain_d.storage_mode = StorageMode::Private;
+            let plain = (device.new_texture(&plain_d, Some(first + 1)))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let size = [WIDTH, HEIGHT, 1];
+            let at = TexturePlace::default();
+            let queue = device.new_command_queue(4).expect("a queue");
+            let before = moves(handle);
+            for _ in 0..2 {
+                let command_buffer = queue.command_buffer().expect("a command buffer");
+                let mut blit = command_buffer.blit_command_encoder().expect("an encoder");
+                let done = |result: Result<(), crate::Error>| {
+                    result.unwrap_or_else(|error| panic!("{name}: {error}"))
+                };
+                done(blit.copy_from_texture(&texture, at, size, &plain, at));
+                done(blit.copy_from_texture(&plain, at, size, &texture, at));
+                blit.end_encoding();
+                command_buffer.commit().expect("a commit");
+                finished(name, &command_buffer);
+                assert_eq!(command_buffer.error(), None, "{name}");
+            }
+            // Each copy's old layout: the last barrier's for the image before it.
+            let (mut old, mut into, mut back) = (None, Vec::new(), Vec::new());
+            for n in named(handle, over.image) {
+                match n.what {
+                    "a barrier's old layout" => old = Some(n.layout),
+                    COPY_IN => into.push(old),
+                    "a copy to a buffer" => back.push(old),
+                    _ => {}
+                }
+            }
+            // Each layout by its number (`VkImageLayout`).
+            let shown = |froms: &[Option<vk::ImageLayout>]| -> Vec<Option<i32>> {
+                froms
+                    .iter()
+                    .map(|from| from.map(vk::ImageLayout::as_raw))
+                    .collect()
+            };
+            let (ins, backs, home) = (shown(&into), shown(&back), over.home.as_raw());
+            println!("over copy layouts: {name}: copies in from {ins:?}, back from {backs:?}, home {home}");
+            assert!(
+                into.len() >= 2 && !back.is_empty(),
+                "{name}: two copies in and a copy back: in {ins:?}, back {backs:?}"
+            );
+            assert!(
+                into.iter()
+                    .all(|&from| from == Some(vk::ImageLayout::UNDEFINED)),
+                "{name}: each copy in from undefined (0): {ins:?}"
+            );
+            assert!(
+                back.iter().all(|&from| from == Some(over.home)),
+                "{name}: each copy back from home ({home}): {backs:?}"
+            );
+            let after = moves(handle);
+            assert!(
+                after.broken.is_empty(),
+                "{name}: steps out of order: {:?}",
+                after.broken
+            );
+            assert!(
+                after.discards - before.discards >= 2,
+                "{name}: the discards taken, each with its whole copy: {after:?}"
+            );
+            drop((queue, plain, texture, buffer));
+            (device.release_block(block)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        });
+    }
+
+    /// A copy from a buffer into a texture of its own memory moves its level and layer from the
+    /// undefined layout where it writes the whole subresource, and from home where it does not
+    /// (`TextureObject::away_into`), through each entry that records one: a blit's
+    /// `copy_from_buffer` into the whole first level, then into the second short of its edge, and
+    /// `replace_region` of the whole first level. Each copy's move is the last barrier naming the
+    /// image before it.
+    #[test]
+    fn a_whole_copy_in_moves_from_undefined_through_each_entry_and_a_short_one_from_home() {
+        let _recording = Recording::start();
+        each_device("whole copy in layouts", |name, _, device| {
+            let handle = device.core().device.handle();
+            let block = (device.take_block(MemoryClass::Shared, LEN))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let source = (device.new_buffer(block.id, 0, LEN, None))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut d =
+                TextureDescriptor::new(TextureType::Type2D, PixelFormat::RGBA8Unorm, WIDTH, HEIGHT);
+            d.mipmap_level_count = 2;
+            d.usage = TextureUsage::SHADER_READ;
+            d.storage_mode = StorageMode::Shared;
+            let texture = (device.new_texture_for_views(&d))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let packed = BufferLayout {
+                offset: 0,
+                bytes_per_row: ROW,
+                bytes_per_image: 0,
+            };
+            let level = |level| TexturePlace {
+                level,
+                ..TexturePlace::default()
+            };
+            let queue = device.new_command_queue(4).expect("a queue");
+            let command_buffer = queue.command_buffer().expect("a command buffer");
+            let mut blit = command_buffer.blit_command_encoder().expect("an encoder");
+            let done = |result: Result<(), crate::Error>| {
+                result.unwrap_or_else(|error| panic!("{name}: {error}"))
+            };
+            done(blit.copy_from_buffer(&source, packed, [WIDTH, HEIGHT, 1], &texture, level(0)));
+            let short = [WIDTH / 2 - 1, HEIGHT / 2, 1];
+            done(blit.copy_from_buffer(&source, packed, short, &texture, level(1)));
+            blit.end_encoding();
+            command_buffer.commit().expect("a commit");
+            finished(name, &command_buffer);
+            assert_eq!(command_buffer.error(), None, "{name}");
+            let texels = vec![0x5a; (ROW * u64::from(HEIGHT)) as usize];
+            let whole = Region {
+                origin: [0; 3],
+                size: [WIDTH, HEIGHT, 1],
+            };
+            (texture.replace_region(whole, 0, 0, HostBytes::from(&texels[..]), ROW, 0))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            // The upload runs ahead of a command buffer committed after it.
+            let after = queue.command_buffer().expect("a command buffer");
+            after.commit().expect("a commit");
+            finished(name, &after);
+            // Each copy's old layout, by its number: the last barrier's for the image before it.
+            let (mut old, mut froms) = (None, Vec::new());
+            for n in named(handle, texture.image()) {
+                match n.what {
+                    "a barrier's old layout" => old = Some(n.layout.as_raw()),
+                    COPY_IN => froms.push(old),
+                    _ => {}
+                }
+            }
+            println!("whole copy in layouts: {name}: copies in from {froms:?}");
+            let undefined = Some(vk::ImageLayout::UNDEFINED.as_raw());
+            assert!(
+                froms.len() == 3
+                    && froms[0] == undefined
+                    && froms[1].is_some_and(|from| Some(from) != undefined)
+                    && froms[2] == undefined,
+                "{name}: the blit's whole copy from undefined (0), its short copy from home, \
+                 replace_region's whole copy from undefined: {froms:?}"
+            );
+            drop((after, command_buffer, queue, texture, source));
             (device.release_block(block)).unwrap_or_else(|error| panic!("{name}: {error}"));
         });
     }

@@ -59,8 +59,12 @@ use std::time::{Duration, Instant};
 /// retires the rest as the GPU completes it; the threads are joined; then every allocation is
 /// freed, after [`BlockMappings::unmap`] for each the consumer mapped, and the
 /// `VkDevice` is destroyed; every gauge reads zero only then. A last handle dropped on the
-/// consumer's thread tears the device down in that drop. Where the last handle drops in a handler
-/// or a listener, the reaper runs the teardown once the handler returns, and the consumer calls
+/// consumer's thread tears the device down in that drop, and so the drop waits, with no deadline,
+/// for every scheduled and completed handler of a command buffer still to retire, every listener
+/// whose value is reached before the threads end, and every [`BlockMappings`] hook or import
+/// release the block-maker thread runs, to return: a handler, listener or hook that waits for a
+/// lock the dropping thread holds never lets the drop return. Where the last handle drops in a
+/// handler or a listener, the reaper runs the teardown once the handler returns, and the consumer calls
 /// [`Instance::wait_until_devices_torn_down`](crate::Instance::wait_until_devices_torn_down)
 /// before it drops its instance or exits. Nothing relies on a static destructor or an `atexit`
 /// handler: the consumer drops every handle before the process exits, or, where a handle is still
@@ -311,10 +315,11 @@ pub(crate) struct Core {
     /// calibration whose host clock is read that long after its GPU tick.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) calibration_lateness: std::sync::atomic::AtomicU64,
-    /// For the device tests: the span of each command buffer's two timestamps the completion
-    /// thread placed, in the order it placed them ([`Ticks::span`](crate::times::Ticks::span)).
+    /// For the device tests: each pair of timestamps the completion thread read, a Metal command
+    /// buffer's or the runtime's own (an upload's or a copy-in's), in the order it retired them,
+    /// in raw ticks ([`Stamped`](crate::times::Stamped)).
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-    pub(crate) tick_spans: Mutex<Vec<u64>>,
+    pub(crate) stamped: Mutex<Vec<crate::times::Stamped>>,
     /// For the device tests: where set, the making of the staging region meets the test at
     /// the barrier twice before it allocates, once parked and once released.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -490,6 +495,12 @@ pub struct DeviceOptions {
     /// only takes flags away from a type or leaves it.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) memory: Option<fn(&mut vk::PhysicalDeviceMemoryProperties)>,
+    /// For the device tests: the two-copy view. Where true, the device keeps a device copy of
+    /// every Managed buffer whatever Vulkan's device type, as a discrete or virtual GPU does, and
+    /// [`Device::has_unified_memory`] answers false; where false, Vulkan's device type decides
+    /// both. The Vulkan device, its memory types and every other answer are the same.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) two_copies: bool,
 }
 
 /// Takes a lock. A panic while another thread held it leaves what it guards usable (a queue, the
@@ -747,6 +758,8 @@ impl Device {
             properties.properties.device_type,
             vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
         );
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        let unified_memory = unified_memory && !options.two_copies;
         let ticks = Ticks::new(
             properties.properties.limits.timestamp_period,
             families[family as usize].timestamp_valid_bits,
@@ -864,7 +877,7 @@ impl Device {
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             calibration_lateness: std::sync::atomic::AtomicU64::new(0),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-            tick_spans: Mutex::default(),
+            stamped: Mutex::default(),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             park_region: Mutex::new(None),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -1044,9 +1057,12 @@ impl Device {
     /// so `f` and the runtime never submit at once.
     ///
     /// The queue is externally synchronized only inside `f`, so the Vulkan calls `f` makes with it
-    /// keep no handle past its return. `f` waits for no work of the runtime's, which may need the
-    /// lock `f` holds; a present in `f` waits only on semaphores whose signal is already submitted:
-    /// the command buffer that presents the image
+    /// keep no handle past its return. `f` waits for nothing that needs a thread of the runtime's
+    /// or the lock `f` holds. A wait for work already submitted to the queue ends
+    /// (`vkQueueWaitIdle` included: no batch the runtime submits waits on a signal that only a
+    /// later submission gives), and where the family has one queue it holds every submission of
+    /// the runtime for its length. A present in `f` waits only on semaphores whose signal is
+    /// already submitted: the command buffer that presents the image
     /// ([`CommandBuffer::present_drawable`](crate::CommandBuffer::present_drawable)) is
     /// scheduled ([`CommandBuffer::wait_until_scheduled`](crate::CommandBuffer::wait_until_scheduled)
     /// has returned for it, or `f` runs in its scheduled handler).

@@ -226,6 +226,46 @@ pub(crate) mod on_device {
         open_each_device(test, &instance, options, body);
     }
 
+    /// [`each_device`], for a test whose work a Managed buffer's form decides: each device runs
+    /// `body` in its own form, then, where it keeps one copy of a Managed buffer
+    /// (`Device::has_unified_memory` true: an integrated GPU or a CPU device), once more opened
+    /// through the two-copy view (`DeviceOptions::two_copies`), where it keeps a device copy as
+    /// a discrete GPU does and `has_unified_memory` answers false. The second run's name is the
+    /// device's with ", two copies" after it.
+    pub(crate) fn each_device_in_both_forms(test: &str, body: impl FnMut(&str, &Instance, Device)) {
+        each_device_in_both_forms_with(test, DeviceOptions::default, body);
+    }
+
+    /// [`each_device_in_both_forms`] with `options` for each device, the two-copy view's run
+    /// opened with them too.
+    pub(crate) fn each_device_in_both_forms_with(
+        test: &str,
+        options: impl Fn() -> DeviceOptions,
+        mut body: impl FnMut(&str, &Instance, Device),
+    ) {
+        let instance = crate::tests::validation::instance(&[]);
+        let devices = devices_of_the_cfgs_kind(&instance);
+        assert!(!devices.is_empty(), "no device of this cfg's kind");
+        for (name, physical) in &devices {
+            let device =
+                Device::new(physical, options()).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let unified = device.has_unified_memory();
+            run_settled(test, &instance, name, device, &mut body);
+            if !unified {
+                continue;
+            }
+            let view = DeviceOptions {
+                two_copies: true,
+                ..options()
+            };
+            let device =
+                Device::new(physical, view).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(!device.has_unified_memory(), "{name}: two copies");
+            let name = format!("{name}, two copies");
+            run_settled(test, &instance, &name, device, &mut body);
+        }
+    }
+
     /// What a test opens each device with ([`each_device_with`]).
     pub(crate) type Options = fn() -> DeviceOptions;
 
@@ -1627,7 +1667,7 @@ pub(crate) mod on_device {
             thread::sleep(Duration::from_nanos(
                 crate::times::CALIBRATION_PERIOD * 3 / 2,
             ));
-            lock(&core.tick_spans).clear();
+            lock(&core.stamped).clear();
             // Each command buffer's GPU start and end, and the host time its completed handler
             // read.
             type Ends = Arc<Mutex<Vec<(u64, u64, u64)>>>;
@@ -1652,7 +1692,10 @@ pub(crate) mod on_device {
                 finished(name, command_buffer);
             }
             let ends = lock(&ends).clone();
-            let spans = lock(&core.tick_spans).clone();
+            let spans: Vec<u64> = (lock(&core.stamped).iter())
+                .filter(|pair| !pair.own)
+                .map(|pair| core.ticks.span(pair.start, pair.end))
+                .collect();
             assert_eq!(
                 (ends.len(), spans.len()),
                 (8, 8),

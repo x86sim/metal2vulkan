@@ -323,6 +323,8 @@ pub(crate) enum Metric {
     ExternalReleases,
     /// [`Metrics::d3d11_plane_submissions`].
     D3d11PlaneSubmissions,
+    /// [`Metrics::d3d11_plane_parts`].
+    D3d11PlaneParts,
     /// [`Metrics::surfaces_in_place`].
     SurfacesInPlace,
     /// [`Metrics::surfaces_copied`].
@@ -420,6 +422,7 @@ const METRIC_ORDER: [Metric; METRICS] = [
     Metric::ExternalAcquires,
     Metric::ExternalReleases,
     Metric::D3d11PlaneSubmissions,
+    Metric::D3d11PlaneParts,
     Metric::SurfacesInPlace,
     Metric::SurfacesCopied,
     Metric::ExportedBlocksAddressed,
@@ -711,6 +714,33 @@ pub struct Counters {
     atomics: Arc<Atomics>,
 }
 
+/// An event's value reads (`EventInner::reached`) and the completion thread's wake-ups, for the
+/// tests ([`Counters::event_reads`]).
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EventReads {
+    /// Counter reads.
+    pub(crate) reads: u64,
+    /// Host waits with a timeout of 0 that a read above the value confirmed asked for.
+    pub(crate) waits: u64,
+    /// Reads whose value no wait confirmed.
+    pub(crate) not_yet: u64,
+    /// Of those, the completion thread's.
+    pub(crate) not_yet_completing: u64,
+    /// The completion thread's returns from its GPU wait.
+    pub(crate) wakes: u64,
+}
+
+/// [`EventReads`]' steps, as [`Counters::event_read`] takes them.
+#[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+pub(crate) mod event_step {
+    pub(crate) const READ: usize = 0;
+    pub(crate) const WAIT: usize = 1;
+    pub(crate) const NOT_YET: usize = 2;
+    pub(crate) const NOT_YET_COMPLETING: usize = 3;
+    pub(crate) const WAKE: usize = 4;
+}
+
 #[derive(Default)]
 struct Atomics {
     /// [`Gauges::threads`]: each slot a running thread's id, 0 where none holds it.
@@ -868,6 +898,7 @@ struct Atomics {
     external_acquires: AtomicU64,
     external_releases: AtomicU64,
     d3d11_plane_submissions: AtomicU64,
+    d3d11_plane_parts: AtomicU64,
     surfaces_in_place: AtomicU64,
     surfaces_copied: AtomicU64,
     exported_blocks_addressed: AtomicU64,
@@ -975,9 +1006,20 @@ struct Atomics {
     shared_invalidates: AtomicU64,
     shared_invalidated_bytes: AtomicU64,
     shared_coherence_failures: AtomicU64,
+    shared_reach_flushed_bytes: AtomicU64,
+    shared_retire_flushed_bytes: AtomicU64,
+    shared_event_flushed_bytes: AtomicU64,
+    shared_staging_flushed_bytes: AtomicU64,
+    shared_flush_nanos: AtomicU64,
+    shared_invalidate_nanos: AtomicU64,
     /// Segment ends whose barrier reaches the host, for the tests.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     host_reaches: AtomicU64,
+    /// An event's value reads (`EventInner::reached`), for the tests: its counter reads, the host
+    /// waits they made, the waits that did not confirm a value read ("not yet"), those of them on
+    /// the completion thread, and the completion thread's returns from its GPU wait.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    event_reads: [AtomicU64; 5],
     /// Barriers that ended a blit of an image, and the global memory barriers they held, for the
     /// tests.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -1069,6 +1111,7 @@ impl Counters {
             Metric::ExternalAcquires => &a.external_acquires,
             Metric::ExternalReleases => &a.external_releases,
             Metric::D3d11PlaneSubmissions => &a.d3d11_plane_submissions,
+            Metric::D3d11PlaneParts => &a.d3d11_plane_parts,
             Metric::SurfacesInPlace => &a.surfaces_in_place,
             Metric::SurfacesCopied => &a.surfaces_copied,
             Metric::ExportedBlocksAddressed => &a.exported_blocks_addressed,
@@ -1196,18 +1239,44 @@ impl Counters {
     }
 
     /// A `vkFlushMappedMemoryRanges` or `vkInvalidateMappedMemoryRanges` call over `bytes` bytes
-    /// of Shared memory ([`Metrics::shared_flushes`] and the three after it), `failed` where it
-    /// did not return success ([`Metrics::shared_coherence_failures`]).
-    pub(crate) fn coherence(&self, call: crate::coherence::Call, bytes: u64, failed: bool) {
+    /// of Shared memory ([`Metrics::shared_flushes`] and the three after it) that took `nanos`
+    /// nanoseconds ([`Metrics::shared_flush_nanos`], [`Metrics::shared_invalidate_nanos`]), a
+    /// flush's bytes counted again by its point ([`Metrics::shared_reach_flushed_bytes`] and the
+    /// three after it), `failed` where it did not return success
+    /// ([`Metrics::shared_coherence_failures`]).
+    pub(crate) fn coherence(
+        &self,
+        call: crate::coherence::Call,
+        bytes: u64,
+        nanos: u64,
+        failed: bool,
+    ) {
+        use crate::coherence::{Call, Point};
         let a = &self.atomics;
-        let (calls, total) = match call {
-            crate::coherence::Call::Flush => (&a.shared_flushes, &a.shared_flushed_bytes),
-            crate::coherence::Call::Invalidate => {
-                (&a.shared_invalidates, &a.shared_invalidated_bytes)
+        let (calls, total, time) = match call {
+            Call::Flush(point) => {
+                let at = match point {
+                    Point::Reach => &a.shared_reach_flushed_bytes,
+                    Point::Retirement => &a.shared_retire_flushed_bytes,
+                    Point::EventSeen => &a.shared_event_flushed_bytes,
+                    Point::Staging => &a.shared_staging_flushed_bytes,
+                };
+                at.fetch_add(bytes, Relaxed);
+                (
+                    &a.shared_flushes,
+                    &a.shared_flushed_bytes,
+                    &a.shared_flush_nanos,
+                )
             }
+            Call::Invalidate => (
+                &a.shared_invalidates,
+                &a.shared_invalidated_bytes,
+                &a.shared_invalidate_nanos,
+            ),
         };
         calls.fetch_add(1, Relaxed);
         total.fetch_add(bytes, Relaxed);
+        time.fetch_add(nanos, Relaxed);
         if failed {
             a.shared_coherence_failures.fetch_add(1, Relaxed);
         }
@@ -1696,6 +1765,26 @@ impl Counters {
         self.atomics.host_reaches.load(Relaxed)
     }
 
+    /// One more of an event's value reads' steps, [`EventReads`]'s field `step` in its order.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn event_read(&self, step: usize) {
+        self.atomics.event_reads[step].fetch_add(1, Relaxed);
+    }
+
+    /// The event value reads' steps so far.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) fn event_reads(&self) -> EventReads {
+        let [reads, waits, not_yet, not_yet_completing, wakes] =
+            (self.atomics.event_reads.each_ref()).map(|n| n.load(Relaxed));
+        EventReads {
+            reads,
+            waits,
+            not_yet,
+            not_yet_completing,
+            wakes,
+        }
+    }
+
     /// The calibrations made.
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) fn calibrations(&self) -> u64 {
@@ -1901,6 +1990,12 @@ impl Counters {
             shared_invalidates: a.shared_invalidates.load(Relaxed),
             shared_invalidated_bytes: a.shared_invalidated_bytes.load(Relaxed),
             shared_coherence_failures: a.shared_coherence_failures.load(Relaxed),
+            shared_reach_flushed_bytes: a.shared_reach_flushed_bytes.load(Relaxed),
+            shared_retire_flushed_bytes: a.shared_retire_flushed_bytes.load(Relaxed),
+            shared_event_flushed_bytes: a.shared_event_flushed_bytes.load(Relaxed),
+            shared_staging_flushed_bytes: a.shared_staging_flushed_bytes.load(Relaxed),
+            shared_flush_nanos: a.shared_flush_nanos.load(Relaxed),
+            shared_invalidate_nanos: a.shared_invalidate_nanos.load(Relaxed),
             submit_call_nanos: a.submit_call_nanos.load(Relaxed),
             submit_call_max_nanos: a.submit_call_max_nanos.load(Relaxed),
             pipeline_creation_nanos: a.pipeline_creation_nanos.load(Relaxed),
@@ -2095,6 +2190,7 @@ impl Counters {
             external_acquires: a.external_acquires.load(Relaxed),
             external_releases: a.external_releases.load(Relaxed),
             d3d11_plane_submissions: a.d3d11_plane_submissions.load(Relaxed),
+            d3d11_plane_parts: a.d3d11_plane_parts.load(Relaxed),
             surfaces_in_place: a.surfaces_in_place.load(Relaxed),
             surfaces_copied: a.surfaces_copied.load(Relaxed),
             exported_blocks_addressed: a.exported_blocks_addressed.load(Relaxed),
@@ -2246,7 +2342,7 @@ pub struct Metrics {
     /// ([`shared_invalidates`](Self::shared_invalidates)), one after each `replace_region` through
     /// a staging span, one at each `upload_region` of named bytes in Shared memory, and one at the
     /// zero source's make. Only a device whose Shared type is not host-coherent makes them; on
-    /// one whose type is, this and the four after it stay 0 (the runtime README, "Shared memory's
+    /// one whose type is, this and the ten after it stay 0 (the runtime README, "Shared memory's
     /// coherence").
     pub shared_flushes: u64,
     /// The bytes those calls named, each range widened to whole multiples of the device's
@@ -2264,6 +2360,49 @@ pub struct Metrics {
     /// (`VK_ERROR_OUT_OF_HOST_MEMORY` or `VK_ERROR_OUT_OF_DEVICE_MEMORY`): the work went on as
     /// it would after a success.
     pub shared_coherence_failures: u64,
+    /// No Metal counterpart, the runtime's own measure: of
+    /// [`shared_flushed_bytes`](Self::shared_flushed_bytes), those the flush before each
+    /// submission named, over the Shared memory its command buffers reach (each buffer, buffer
+    /// under a texture and heap block they keep, whole) and the bytes its Managed copy-ins read.
+    ///
+    /// This and the three after it count each flush's bytes once, at the point that made it, so
+    /// they sum to [`shared_flushed_bytes`](Self::shared_flushed_bytes); a settle's flush counts
+    /// at its settle's point. Every invalidate follows a settle's flush of the same ranges, so
+    /// [`shared_invalidated_bytes`](Self::shared_invalidated_bytes) is
+    /// [`shared_retire_flushed_bytes`](Self::shared_retire_flushed_bytes) and
+    /// [`shared_event_flushed_bytes`](Self::shared_event_flushed_bytes), plus the part of
+    /// [`shared_staging_flushed_bytes`](Self::shared_staging_flushed_bytes) that `get_bytes`
+    /// settled. Both hold for a read made while no call is under way, and for the difference of
+    /// two such reads.
+    pub shared_reach_flushed_bytes: u64,
+    /// No Metal counterpart, the runtime's own measure: of
+    /// [`shared_flushed_bytes`](Self::shared_flushed_bytes), those the settle as each command
+    /// buffer retires named, over what its commands may write, before its status reads completed
+    /// or its handlers run; each is invalidated after its flush.
+    pub shared_retire_flushed_bytes: u64,
+    /// No Metal counterpart, the runtime's own measure: of
+    /// [`shared_flushed_bytes`](Self::shared_flushed_bytes), those the settles before a shared
+    /// event's value a GPU signal raised reaches the host named, each over what every command
+    /// buffer then committed and not yet retired may write, once for each value seen above the
+    /// last; each is invalidated after its flush.
+    pub shared_event_flushed_bytes: u64,
+    /// No Metal counterpart, the runtime's own measure: of
+    /// [`shared_flushed_bytes`](Self::shared_flushed_bytes), those the runtime's own host
+    /// accesses named: the staging span `Texture::replace_region` writes, the named bytes
+    /// `Texture::upload_region` copies, the staging span `Texture::get_bytes` reads (flushed,
+    /// then invalidated) and the zero source of fills, at its make.
+    pub shared_staging_flushed_bytes: u64,
+    /// No Metal counterpart, the runtime's own measure: the nanoseconds of
+    /// [`host_time`](crate::host_time) the `vkFlushMappedMemoryRanges` calls over Shared memory
+    /// took, from each call to its return, in total: the time inside the driver, on the thread
+    /// that made the call. A device whose Shared type is host-coherent makes none and reads no
+    /// clock for them, so this and the one after it stay 0 there.
+    pub shared_flush_nanos: u64,
+    /// No Metal counterpart, the runtime's own measure: the nanoseconds of
+    /// [`host_time`](crate::host_time) the `vkInvalidateMappedMemoryRanges` calls over Shared
+    /// memory took, from each call to its return, in total, as
+    /// [`shared_flush_nanos`](Self::shared_flush_nanos) counts the flushes'.
+    pub shared_invalidate_nanos: u64,
     /// The nanoseconds of [`host_time`](crate::host_time) those calls took, from each call to
     /// its return, in total: the time inside the driver, which a driver may spend holding the call
     /// while another thread is inside a memory call
@@ -3116,7 +3255,7 @@ pub struct Metrics {
     /// Also one for each texture in place over a buffer in a dma-buf's import
     /// (`Device::import_dma_buf`, on Unix), whose move home acquires its image and the buffer's
     /// range under it from the foreign queue family, in the barrier of the upload's moves home.
-    /// Also one for each submission that uses a Direct3D 11 plane
+    /// Also one for each `vkQueueSubmit2` that uses a Direct3D 11 plane
     /// ([`d3d11_plane_submissions`](Self::d3d11_plane_submissions)), in a command buffer of its
     /// own.
     pub external_acquires: u64,
@@ -3124,17 +3263,20 @@ pub struct Metrics {
     /// ([`BlitCommandEncoder::release_to_external`](crate::BlitCommandEncoder::release_to_external),
     /// [`BlitCommandEncoder::release_surface_to_external`](crate::BlitCommandEncoder::release_surface_to_external)):
     /// one barrier each, in the command buffer's work, also counted in
-    /// [`barriers`](Self::barriers). Also one for each submission that uses a Direct3D 11 plane
-    /// ([`d3d11_plane_submissions`](Self::d3d11_plane_submissions)), in a command buffer of its
-    /// own.
+    /// [`barriers`](Self::barriers). Also one for each `vkQueueSubmit2` that uses a Direct3D 11
+    /// plane ([`d3d11_plane_submissions`](Self::d3d11_plane_submissions)), in a command buffer of
+    /// its own.
     pub external_releases: u64,
-    /// Submissions whose command buffers keep a plane of a Direct3D 11 surface
+    /// `vkQueueSubmit2` calls whose command buffers keep a plane of a Direct3D 11 surface
     /// (`Device::import_d3d11_surface`, on Windows), or whose uploads copy into or out of one:
     /// each acquires those planes from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of the
-    /// runtime's own ahead of everything and releases them to it in another after everything,
-    /// which takes the submission's last signals, both in the general layout, so Direct3D 11
-    /// owns the planes' memory between the runtime's submissions. A group that goes member by
-    /// member counts once, its first `vkQueueSubmit2` acquiring and its last releasing. Each
+    /// runtime's own ahead of everything in it and releases them to it in another after
+    /// everything, which takes its last signals, its progress value among them, both in the
+    /// general layout, so Direct3D 11 owns the planes' memory between them and a command buffer
+    /// is seen complete only after the release of the planes it used. A group sent as one
+    /// submission counts once; a group that goes member by member, one `vkQueueSubmit2` a member,
+    /// counts once for each of its calls that uses a plane, each handing over its own planes
+    /// ([`d3d11_plane_parts`](Self::d3d11_plane_parts)), the uploads' going with its first. Each
     /// acquire and release is one barrier, also counted in
     /// [`external_acquires`](Self::external_acquires),
     /// [`external_releases`](Self::external_releases) and [`barriers`](Self::barriers); the
@@ -3143,6 +3285,11 @@ pub struct Metrics {
     /// [`runtime_command_buffers`](Self::runtime_command_buffers). No Metal counterpart: an
     /// IOSurface needs no hand-over between APIs.
     pub d3d11_plane_submissions: u64,
+    /// Of those [`d3d11_plane_submissions`](Self::d3d11_plane_submissions), the ones that are a
+    /// part of a group sent member by member: each such `vkQueueSubmit2` whose command buffers
+    /// or uploads use a Direct3D 11 plane acquires and releases that part's planes itself. 0 where
+    /// no group with a plane went member by member. No Metal counterpart, as above.
+    pub d3d11_plane_parts: u64,
     /// Surfaces made in place
     /// ([`Device::new_exported_surface`](crate::Device::new_exported_surface),
     /// [`SurfaceForm::InPlace`](crate::SurfaceForm::InPlace)).

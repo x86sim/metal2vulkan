@@ -61,7 +61,10 @@
 //!    as far as those indices reach; one index with no bound keeps its declared type (`reach`).
 //!    Before SCCP, each OpenCL C vector data load
 //!    or store becomes its element accesses (`vector_data`), and in OpenCL mode each operation of
-//!    a 1D image becomes the 2D texture's that Apple's OpenCL binds for it (`opencl_1d`).
+//!    a 1D image becomes the 2D texture's that Apple's OpenCL binds for it (`opencl_1d`). After
+//!    the last SCCP, in OpenCL mode, each `air.wg.barrier`'s flags, bound to its call site's
+//!    constants where the barrier is out of line, are read as OpenCL C's `cl_mem_fence_flags`
+//!    ([`opencl`]).
 //! 8. **Post-check**: no unknown or unbound intrinsic, indirect call, or call to an undefined
 //!    non-intrinsic function survives, and no reachable branch tests `undef`. A table call's refused candidate,
 //!    a table call no linked function answers, and a function pointer used as a value are refused
@@ -775,6 +778,14 @@ pub fn specialize_dynamic(
     // Each private array of nested arrays allocated as far as its accesses reach, where the
     // constants bound every index of it.
     let body = reach::narrow(body, &mut parts, func, m)?;
+    // OpenCL mode: each threadgroup barrier's flags, its call site's now where it is out of line,
+    // are OpenCL's `cl_mem_fence_flags`, read again as such; the post-check refuses one with a
+    // flag OpenCL does not name.
+    let body = if req.open_cl_mode && matches!(ep.stage, Stage::Kernel { .. }) {
+        opencl::barriers(body, &parts, m)?
+    } else {
+        body
+    };
     matmul2d::refuse_left(&body, &parts, &ep.stage, &name, m)?;
     post_check(&body, &parts, &stubs, &name, &control_points(ep), m)?;
     // A branch's short arms that Metal's backend speculates, where a group operation in them
@@ -835,6 +846,7 @@ pub fn specialize_dynamic(
 
     // ABI resolution, the absent arguments' values, then pruning.
     let values = interface::Values {
+        types: &parts.types,
         globals: &parts.globals,
         consts: &parts.consts,
         fcs: &fcs,
@@ -1276,9 +1288,13 @@ fn recursion(body: &Body, parts: &ModuleParts, name: &DiagName) -> Error {
 /// undeclared index or a value of another type is `InvalidRequest`). With no `globals` the
 /// static initializers are not run: only the constants are checked.
 ///
+/// A `half` or `float` global, the predicate of a function constant of that type, answers its
+/// truth as the predicate gates: 1 where its bits are not all zero (`-0.0` and a NaN included), 0
+/// where they are or the constant is unsupplied.
+///
 /// Each entry of the result answers the global at the same position: `NeedsInput
 /// (FunctionConstant)` when it is computed from an unsupplied constant, and
-/// `Unsupported{StaticInitializer}` when it does not hold an integer or is computed through a
+/// `Unsupported{StaticInitializer}` when it holds neither an integer nor such a predicate or is computed through a
 /// pure operation the interpreter does not evaluate (float arithmetic outside the operations it
 /// models). Such an operation taints only the globals it reaches: a global computed without it
 /// still resolves. A branch on its result, an address computed from it, or any other construct the
@@ -1315,6 +1331,7 @@ pub fn static_values(
         );
     }
     let values = interface::Values {
+        types: &parts.types,
         globals: &parts.globals,
         consts: &parts.consts,
         fcs: &fcs,
@@ -1323,7 +1340,7 @@ pub fn static_values(
         .iter()
         .map(|&g| match evaluated.opaque.contains(&g) {
             true => Err(interface::not_evaluable()),
-            false => values.int(g),
+            false => values.static_value(g),
         })
         .collect())
 }

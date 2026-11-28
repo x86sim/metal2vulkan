@@ -395,8 +395,9 @@ pub(crate) struct Segment {
     /// before it (`crate::over::ManagedOvers`).
     pub(crate) managed_reached: Vec<Arc<BufferInner>>,
     /// The images of the Direct3D 11 planes its commands use (`Device::import_d3d11_surface`, on
-    /// Windows): its submission acquires them from `VK_QUEUE_FAMILY_EXTERNAL` at its start and
-    /// releases them to it at its end (`crate::submit`).
+    /// Windows): the `vkQueueSubmit2` that carries it acquires them from
+    /// `VK_QUEUE_FAMILY_EXTERNAL` at its start and releases them to it at its end, before its
+    /// signals (`crate::submit::parts`).
     pub(crate) planes: Vec<Arc<Image>>,
     /// The checks at its head and its writes of heap placements with links (`crate::alias`),
     /// where it has any: staged, a command buffer of moves leads it where the checks find one
@@ -638,8 +639,9 @@ impl CommandBuffer {
     /// `vkQueueSubmit2`, and is not yet in flight for the completion thread. In the handler the
     /// command buffer's status is
     /// [`CommandBufferStatus::Scheduled`] and its kernel times are set, and it runs before the
-    /// command buffer's completed handlers. Its queue's later submissions wait while it runs, and
-    /// it may run while another command buffer's completed handler runs on the completion thread.
+    /// command buffer's completed handlers. The device has one submit thread, so its later
+    /// submissions, of every queue, wait while it runs, and it may run while another command
+    /// buffer's completed handler runs on the completion thread.
     ///
     /// A scheduled handler may read the command buffer's status and times, enqueue command
     /// buffers, make objects that take no upload, and do the consumer's own work. Each call that
@@ -647,7 +649,8 @@ impl CommandBuffer {
     /// [`commit`](Self::commit), the waits, the uploads and readbacks, and the objects that take
     /// an upload. [`Device::quiesce`](crate::Device::quiesce) answers false in it, and a device
     /// whose last handle drops in it ends once the handler returns, as in a completed handler.
-    /// Metal runs a scheduled handler on a thread of its own, where those calls run.
+    /// Those calls are refused because the handler runs on the submit thread, the one they would
+    /// wait for.
     ///
     /// Err: [`Refusal::Committed`].
     pub fn add_scheduled_handler(
@@ -661,9 +664,10 @@ impl CommandBuffer {
     }
 
     /// `addCompletedHandler:`: runs on the completion thread once the command buffer has
-    /// completed or ended, after its scheduled handlers. The completion thread runs the device's
-    /// completed handlers and listeners in turn, so a wait in one for what that thread has not
-    /// yet done is [`Refusal::WaitOnOwnThread`], and one already met answers at once.
+    /// completed or ended, after its scheduled handlers. The device has one completion thread,
+    /// which runs the completed handlers and listeners of all its queues in turn, so a wait in one
+    /// for what that thread has not yet done is [`Refusal::WaitOnOwnThread`], and one already met
+    /// answers at once.
     ///
     /// Err: [`Refusal::Committed`].
     pub fn add_completed_handler(
@@ -843,7 +847,14 @@ impl CommandBuffer {
     /// or a listener of its device, on the completion thread, which runs the handlers: at once
     /// for one completed or ended, its own handler's command buffer among them, where Metal's
     /// call never returns (Metal's wait is for the command buffer's completion handlers too, the
-    /// one it is called from among them).
+    /// one it is called from among them). Elsewhere it waits for the command buffer's completed
+    /// handlers to return, as Metal's does: on an Apple M3 Max (macOS 27.0.1, job m3-max-75735), a
+    /// thread that held a lock across the commit and `waitUntilCompleted`, with the command
+    /// buffer's completed handler taking that lock, did not return within 10 s, and the same
+    /// program without the handler's lock ended in 15 to 69 ms. They run on the device's one
+    /// completion thread, which runs every queue's completed handlers and listeners in turn: a
+    /// handler or listener of any queue that runs before them and waits for a lock this call's
+    /// thread holds never lets the call return.
     ///
     /// Err: [`Refusal::InScheduledHandler`] in a scheduled handler; [`Refusal::WaitOnOwnThread`]
     /// in a completed handler or a listener of its device for one not yet completed or ended.
@@ -1617,7 +1628,7 @@ impl Building {
 
     /// Keeps `texture` until the command buffer retires, as Metal's command buffer retains every
     /// object its encoders bind: each object once, a view apart from its parent. A Direct3D 11
-    /// plane's image is kept by the current segment too, whose submission hands it over
+    /// plane's image is kept by the current segment too, whose `vkQueueSubmit2` hands it over
     /// ([`Segment::planes`]).
     pub(crate) fn keep_texture(&mut self, texture: &Texture) {
         if self.gpu.kept.textures.hold(texture) {
@@ -1948,7 +1959,7 @@ pub(crate) fn retire(
     let held = gpu.coherence;
     if let Some(held) = held {
         if let (Some(reach), Some(coherence)) = (&held.reach, &core.coherence) {
-            coherence.settle(core, &reach.written);
+            coherence.settle(core, coherence::Point::Retirement, &reach.written);
             coherence.retired(reach);
         }
     }

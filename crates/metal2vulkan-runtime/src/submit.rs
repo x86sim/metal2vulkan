@@ -63,7 +63,7 @@
 use crate::alias;
 use crate::buffer::{BufferInner, BufferObject, DeviceCopy};
 use crate::capture::{self, Changes, CopyIn, Modified};
-use crate::coherence::{self, Range, Ranges};
+use crate::coherence::{self, Point, Range, Ranges};
 use crate::command::{self, CbInner, CommandBufferError, DeviceLoss, Handler, Pending, Segment};
 use crate::complete;
 use crate::counters::{Counters, Gauge, Metric, Part, Site};
@@ -216,6 +216,11 @@ pub(crate) struct Work {
     /// For the device tests: the times the thread was poked to pass again ([`Work::poke`]).
     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
     pub(crate) pokes: AtomicU64,
+    /// For the device tests: each Direct3D 11 plane's acquire recorded ([`Upload::hand_over`]),
+    /// in recording order, as the plane's image (its address) and the old layout its barrier
+    /// names.
+    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+    pub(crate) acquired: Mutex<Vec<(usize, vk::ImageLayout)>>,
 }
 
 pub(crate) struct WorkState {
@@ -476,6 +481,12 @@ impl Upload {
         let barriers: Vec<_> = (planes.iter())
             .map(|image| image.handed(core.family, acquire))
             .collect();
+        #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+        if acquire {
+            let recorded = (planes.iter().zip(&barriers))
+                .map(|(image, barrier)| (Arc::as_ptr(image) as usize, barrier.old_layout));
+            lock(&core.work.acquired).extend(recorded);
+        }
         let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
         // SAFETY: the upload's command buffer is recording, and only the submit thread has it;
         // each image is the device's, held by the submission until it retires, and general
@@ -552,8 +563,10 @@ struct Batch {
     /// The Managed buffers with textures over their device copies its segments reach, to which
     /// its upload takes the copies back owed by writes submitted before (`crate::over`).
     reached: Vec<Arc<BufferInner>>,
-    /// The images of the Direct3D 11 planes its segments use (`Segment::planes`).
-    planes: Vec<Arc<Image>>,
+    /// The images of the Direct3D 11 planes its segments use (`Segment::planes`), by the part
+    /// each segment is in where it goes member by member: the leads before it, 0 for the part
+    /// ahead of the first lead's ([`parts`]). Empty where none uses one.
+    planes: Vec<Vec<Arc<Image>>>,
     /// What it flushes before it is submitted, where the Shared type is not host-coherent and
     /// a command buffer with a segment in it or a copy-in it carries reaches Shared memory
     /// (`crate::coherence`); `None` where none does.
@@ -668,6 +681,8 @@ impl Work {
             asking: AtomicBool::new(false),
             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
             pokes: AtomicU64::new(0),
+            #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+            acquired: Mutex::new(Vec::new()),
         }
     }
 
@@ -1963,8 +1978,14 @@ impl WorkState {
                 group.overs.push(copy);
             }
         }
-        for image in &segment.planes {
-            image.keep_plane(&mut group.planes);
+        if !segment.planes.is_empty() {
+            let part = group.starts.len();
+            if group.planes.len() <= part {
+                group.planes.resize_with(part + 1, Vec::new);
+            }
+            for image in &segment.planes {
+                image.keep_plane(&mut group.planes[part]);
+            }
         }
         // The moves its checks find owed lead it, in its submit info (`crate::alias`).
         if let Some(part) = &segment.aliased {
@@ -2548,6 +2569,85 @@ pub(crate) fn put_ahead<S, C>(
     kept
 }
 
+/// A submission's parts, each one `vkQueueSubmit2` with the progress value it signals, from its
+/// `segments`, the first `ahead` of them its uploads': one part, or, where the group goes member
+/// by member, `leads` holding where each command buffer that leads in it begins among the
+/// segments past the uploads, one ahead of the first lead's, with the uploads, and one for each
+/// lead (`WorkState::close`). The last part's value is `progress`'s `value`, which also covers
+/// the parts left empty, and each part's one above the one before. A segment with no commands
+/// and no signals is left out, and so is a part left empty.
+///
+/// `planes[p]` holds the Direct3D 11 planes part `p` uses, and `hand` the command buffer that
+/// acquires (`true`) or releases (`false`) such planes ([`Upload::hand_over`]), None where its
+/// make failed: each part that uses planes acquires them at its head, ahead of its uploads
+/// where it has them, and releases them at its end, the release taking that part's last
+/// signals, its progress value among them, so it adds no submit info ([`infos`]) and the part's
+/// command buffers are seen complete only after it. A part that uses none takes neither.
+pub(crate) fn parts<P>(
+    mut segments: Vec<Staged>,
+    ahead: usize,
+    leads: &[usize],
+    (progress, value): (vk::Semaphore, u64),
+    planes: &[Vec<P>],
+    mut hand: impl FnMut(&[P], bool) -> Option<vk::CommandBuffer>,
+) -> Vec<(u64, Vec<Staged>)> {
+    let staged = |command: vk::CommandBuffer| Staged {
+        command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(command)),
+        ..Staged::default()
+    };
+    // Each part's progress value: the part ahead of the first lead's `value` less the leads,
+    // each lead's one above the one before.
+    let count = leads.len();
+    let mut parts: Vec<(u64, Vec<Staged>)> = Vec::with_capacity(1);
+    for (lead, &start) in leads.iter().enumerate().rev() {
+        let at = value - (count - 1 - lead) as u64;
+        parts.push((at, segments.split_off(start + ahead)));
+    }
+    parts.push((value - count as u64, segments));
+    parts.reverse();
+    for ((_, part), used) in parts.iter_mut().zip(planes) {
+        part.retain(|staged| staged.command.is_some() || !staged.signals.is_empty());
+        if used.is_empty() {
+            continue;
+        }
+        let (head, tail) = (hand(used, true), hand(used, false));
+        if let Some(head) = head {
+            part.insert(0, staged(head));
+        }
+        // The release goes after every segment of the part and takes its last signals.
+        if let Some(tail) = tail {
+            let last = part.pop().unwrap_or_default();
+            let release = Staged {
+                signals: last.signals,
+                ..staged(tail)
+            };
+            let last = Staged {
+                signals: Vec::new(),
+                ..last
+            };
+            part.extend([last, release]);
+        }
+    }
+    for (_, part) in parts.iter_mut().skip(planes.len()) {
+        part.retain(|staged| staged.command.is_some() || !staged.signals.is_empty());
+    }
+    parts.retain(|(_, part)| !part.is_empty());
+    match parts.last_mut() {
+        Some((last, _)) => *last = value,
+        None => parts.push((value, vec![Staged::default()])),
+    }
+    for (at, part) in &mut parts {
+        let signal = vk::SemaphoreSubmitInfo::default()
+            .semaphore(progress)
+            .value(*at)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+        if let Some(last) = part.last_mut() {
+            last.signals.push(signal);
+        }
+    }
+    parts
+}
+
 /// Orders the zero fills of the uploads one submission carries, oldest first: where a fill an
 /// upload records before any barrier of its own meets bytes a fill of an earlier one wrote since
 /// the last barrier, a barrier ends the upload before it, so the two do not write the same bytes
@@ -2665,31 +2765,28 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         let ended = unsafe { device.end_command_buffer(last.command) };
         ok = ok.and(ended.map_err(DeviceLoss::of("vkEndCommandBuffer")));
     }
-    // Each Direct3D 11 plane its command buffers or uploads use is the runtime's from the
-    // submission's start to its end: acquired from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer
-    // of its own ahead of everything, and released to it in another after everything, which holds
-    // the images (`Metrics::d3d11_plane_submissions`).
+    // Each Direct3D 11 plane a part's command buffers or uploads use is the runtime's from that
+    // part's start to its end: acquired from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of its
+    // own ahead of everything in the part, and released to it in another after everything, which
+    // holds the images (`Metrics::d3d11_plane_submissions`). The uploads' planes go with the first
+    // part, and where the group goes as one part, every segment's go with it.
+    if !apart && planes.len() > 1 {
+        let mut one = Vec::new();
+        for image in planes.iter().flatten() {
+            image.keep_plane(&mut one);
+        }
+        planes = vec![one];
+    }
     for upload in &uploads {
         for held in &upload.held {
             if let Held::Texture(image) = held {
-                image.keep_plane(&mut planes);
+                if planes.is_empty() {
+                    planes.push(Vec::new());
+                }
+                image.keep_plane(&mut planes[0]);
             }
         }
     }
-    let (head, tail) = match planes.is_empty() {
-        true => (None, None),
-        false => {
-            let (head, began) = Upload::hand_over(core, &planes, true);
-            let (tail, ended) = Upload::hand_over(core, &planes, false);
-            ok = ok.and(began).and(ended);
-            (head, tail)
-        }
-    };
-    if let Some(head) = head {
-        uploads.insert(0, head);
-        core.counters.count(Metric::D3d11PlaneSubmissions);
-    }
-    let ahead = uploads.len();
     segments.splice(
         0..0,
         uploads.iter().map(|upload| Staged {
@@ -2697,60 +2794,37 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
             ..Staged::default()
         }),
     );
-    // One part, or, where the group goes member by member, one for each command buffer that leads
-    // in it, the uploads with the first; each with its progress value (`WorkState::close`): the
-    // part ahead of the first lead's `value` less the leads, each lead's one above the one before.
     let leads = match apart {
-        true => starts.len(),
-        false => 0,
+        true => &starts[..],
+        false => &[][..],
     };
-    let mut parts: Vec<(u64, Vec<Staged>)> = Vec::with_capacity(1);
-    for (lead, &start) in starts[..leads].iter().enumerate().rev() {
-        let at = value - (leads - 1 - lead) as u64;
-        parts.push((at, segments.split_off(start + ahead)));
-    }
-    parts.push((value - leads as u64, segments));
-    parts.reverse();
-    for (_, part) in &mut parts {
-        part.retain(|staged| staged.command.is_some() || !staged.signals.is_empty());
-    }
-    parts.retain(|(_, part)| !part.is_empty());
-    // The release goes after every segment and takes its last signals, so it adds no submit info
-    // (`infos`).
-    if let Some(mut tail) = tail {
-        let last = (parts.last_mut())
-            .and_then(|(_, part)| part.pop())
-            .unwrap_or_default();
-        let release = Staged {
-            waits: Vec::new(),
-            command: Some(vk::CommandBufferSubmitInfo::default().command_buffer(tail.command)),
-            signals: last.signals,
-        };
-        let last = Staged {
-            signals: Vec::new(),
-            ..last
-        };
-        match parts.last_mut() {
-            Some((_, part)) => part.extend([last, release]),
-            None => parts.push((value, vec![last, release])),
-        }
-        tail.held.extend(planes.into_iter().map(Held::Texture));
-        uploads.push(tail);
-    }
-    // Each part signals its value, the last `value`, which also covers the parts left empty.
-    match parts.last_mut() {
-        Some((last, _)) => *last = value,
-        None => parts.push((value, vec![Staged::default()])),
-    }
-    for (at, part) in &mut parts {
-        let progress = vk::SemaphoreSubmitInfo::default()
-            .semaphore(core.done.progress)
-            .value(*at)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
-        if let Some(last) = part.last_mut() {
-            last.signals.push(progress);
-        }
-    }
+    let mut handed = Vec::new();
+    let mut parts = self::parts(
+        segments,
+        uploads.len(),
+        leads,
+        (core.done.progress, value),
+        &planes,
+        |planes, acquire| {
+            let (upload, done) = Upload::hand_over(core, planes, acquire);
+            if let (true, Err(loss)) = (ok.is_ok(), done) {
+                ok = Err(loss);
+            }
+            let mut upload = upload?;
+            match (acquire, apart) {
+                (true, false) => core.counters.count(Metric::D3d11PlaneSubmissions),
+                (true, true) => {
+                    core.counters.count(Metric::D3d11PlaneSubmissions);
+                    core.counters.count(Metric::D3d11PlaneParts);
+                }
+                (false, _) => (upload.held).extend(planes.iter().cloned().map(Held::Texture)),
+            }
+            let command = upload.command;
+            handed.push(upload);
+            Some(command)
+        },
+    );
+    uploads.extend(handed);
     if ok.is_ok() {
         // The host's writes to the Shared memory its command buffers and copy-ins reach are the
         // GPU's before it runs, where the Shared type is not host-coherent (`crate::coherence`).
@@ -2759,14 +2833,14 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
             let Flushes { reached, copied } = *flushes;
             if let Some(coherence) = &core.coherence {
                 match (copied.is_empty(), &reached[..]) {
-                    (true, [one]) => coherence.flush(core, &one.reached),
+                    (true, [one]) => coherence.flush(core, Point::Reach, &one.reached),
                     _ => {
                         let mut flushed = copied;
                         flushed.extend(
                             (reached.iter()).flat_map(|ranges| ranges.reached.iter().copied()),
                         );
                         coherence::merge(&mut flushed);
-                        coherence.flush(core, &flushed);
+                        coherence.flush(core, Point::Reach, &flushed);
                     }
                 }
             }
@@ -2780,7 +2854,11 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
         // it, and every later command, in this submission and after it, is ordered after that
         // wait (`crate::import::Sparse`).
         #[cfg(unix)]
-        if let Some((timeline, value)) = (core.imports.sparse.as_ref()).and_then(|s| s.owed()) {
+        let owed = (core.imports.sparse.as_ref()).and_then(|s| s.owed());
+        // No such import on any other host.
+        #[cfg(not(unix))]
+        let owed: Option<(vk::Semaphore, u64)> = None;
+        if let Some((timeline, value)) = owed {
             if let Some(first) = parts.first_mut().and_then(|(_, part)| part.first_mut()) {
                 first.waits.push(
                     vk::SemaphoreSubmitInfo::default()

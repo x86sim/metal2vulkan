@@ -1,0 +1,425 @@
+{
+  "format": 1,
+  "case": "pass-pipeline-color-unattached",
+  "suite_version": 1,
+  "shaders": [
+    {
+      "fixture": "rt6_pair.ll",
+      "entry": "rt6_pair_vertex+rt6_pair_two",
+      "source_sha256": "df95fc8504ed266dd72b14ddc460366aa4eb456a60d32204d10223b60b11de8b"
+    },
+    {
+      "fixture": "rt6_pair.air.ll",
+      "entry": "rt6_pair_vertex+rt6_pair_two",
+      "source_sha256": "9fcfdf6c6627919775884bc44cfaeaa846380b3f48dc44f052efe0ea8efe07ed"
+    }
+  ],
+  "answers": [
+    {
+      "key": {
+        "chip": "apple-m3-max",
+        "os_version": "27.0.1",
+        "os_build": "26A434",
+        "metal_level": "27.0.1"
+      },
+      "provenance": "metal_run",
+      "device": "Apple M3 Max",
+      "runs": 3,
+      "outcomes": [
+        {
+          "runs": 3,
+          "transcript": {
+            "root": {
+              "name": "case",
+              "observed": {
+                "value": "absent"
+              },
+              "children": [
+                {
+                  "name": "inputs",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "air",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "df95fc8504ed266dd72b14ddc460366aa4eb456a60d32204d10223b60b11de8b"
+                        }
+                      }
+                    },
+                    {
+                      "name": "air-typed",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "9fcfdf6c6627919775884bc44cfaeaa846380b3f48dc44f052efe0ea8efe07ed"
+                        }
+                      }
+                    },
+                    {
+                      "name": "buffer:color0",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "4403b6dd643ac3becfb9b41a97892da966769058b8d3e0edfb5eae05f130d588"
+                        }
+                      }
+                    },
+                    {
+                      "name": "buffer:color1",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "d0588f3d6d4327732550c7262717e2a3a558cf11a948ea46ea231ee33ea32379"
+                        }
+                      }
+                    },
+                    {
+                      "name": "buffer:width",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "dc765660b06ee03dd16fd7ca5b957e8c805161ac2c4af28c5a100ab2ab432ca1"
+                        }
+                      }
+                    },
+                    {
+                      "name": "render-pipeline",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "5141943b27249e3a72e3e681b0b7acc3878988edcdd26c792f8c33dab8e815b3"
+                        }
+                      }
+                    },
+                    {
+                      "name": "target",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "417966ecee724a43e4bdb9d66ec6b356383e5ee401411c1b424d02676fa8a800"
+                        }
+                      }
+                    },
+                    {
+                      "name": "pass",
+                      "observed": {
+                        "value": "absent",
+                        "digest": {
+                          "kind": "sha256",
+                          "hex": "203271a13a933775bff5183728c36d8dad1e660695bcb48c99dd07b51e30ac64"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "library",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "render-pipeline",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "target",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "buffer:color0",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "buffer:width",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "buffer:color1",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "render",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": {
+                          "variant": {
+                            "name": "Completed",
+                            "payload": "absent"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "read-back",
+                  "observed": {
+                    "value": {
+                      "variant": {
+                        "name": "Ok",
+                        "payload": "absent"
+                      }
+                    }
+                  }
+                },
+                {
+                  "name": "drawn",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "pass",
+                      "observed": {
+                        "value": {
+                          "variant": {
+                            "name": "Ok",
+                            "payload": "absent"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "command-buffer-error",
+                      "observed": {
+                        "value": {
+                          "variant": {
+                            "name": "None",
+                            "payload": "absent"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "name": "color0",
+                      "observed": {
+                        "value": {
+                          "bytes": "wIBAAMGBQQHCgkICw4NDA8SERATFhUUFxoZGBseHRwfIiEgIyYlJCcqKSgrLi0sLzIxMDM2NTQ3Ojk4Oz49PD9CQUBDRkVER0pJSEtOTUxPUlFQU1ZVVFdaWVhbXl1cX2JhYGNmZWRnamloa25tbG9ycXBzdnV0d3p5eHt+fXx8HBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+gcFA/oHBQP6BwUD+g=="
+                        },
+                        "shape": {
+                          "bytes": {
+                            "region": {
+                              "texture": {
+                                "level": 0,
+                                "slice": 0,
+                                "aspect": "color",
+                                "sample": 0,
+                                "origin": [
+                                  0,
+                                  0,
+                                  0
+                                ],
+                                "size": [
+                                  8,
+                                  8,
+                                  1
+                                ]
+                              }
+                            },
+                            "element": "u8",
+                            "row_offset": 0,
+                            "row_elements": 32,
+                            "row_pitch": 32,
+                            "rows": 8,
+                            "image_pitch": 256,
+                            "images": 1,
+                            "gaps": "compared"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "name": "notices",
+                  "observed": {
+                    "value": "absent"
+                  },
+                  "children": [
+                    {
+                      "name": "set",
+                      "observed": {
+                        "value": {
+                          "nothing": "announced_nothing"
+                        }
+                      }
+                    },
+                    {
+                      "name": "counts",
+                      "observed": {
+                        "value": {
+                          "fields": {}
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "validated": {
+        "stopped": {
+          "call": "render",
+          "message": "Set Render Pipeline State Validation\nFor color attachment 1, the renderPipelineState pixelFormat must be MTLPixelFormatInvalid, as no texture is set.\nthe pipelineState's per sample imageBlock usage(8) is greater than the encoder's perSample imageBlock usage(4)"
+        }
+      }
+    }
+  ],
+  "times": [
+    {
+      "venue": "native Metal",
+      "chip": "apple-m3-max",
+      "os_build": "26A434",
+      "rounds": 8,
+      "measured": "8 round(s) of the whole selection, in the case set's own order; a figure is the median of the rounds' own medians; Metal's leg ran at a one-minute load average of 5.21",
+      "instrument": 443,
+      "times": {
+        "case": "pass-pipeline-color-unattached",
+        "calls": 8,
+        "in_calls": 35783083,
+        "on_cpu": 1215374,
+        "blocked": 34596166,
+        "elsewhere": 4987958,
+        "spend": 40877375,
+        "spend_least": 38131251,
+        "spend_most": 414541042,
+        "per_call": [
+          {
+            "call": "buffer",
+            "least_calls": 3,
+            "most_calls": 3,
+            "wall": 2625,
+            "on_cpu": 2750,
+            "blocked": 0,
+            "wall_least": 2375,
+            "wall_most": 7708,
+            "wall_total": 9750,
+            "on_cpu_total": 10167,
+            "blocked_total": 0
+          },
+          {
+            "call": "library",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 29110000,
+            "on_cpu": 797375,
+            "blocked": 28420709,
+            "wall_least": 27642834,
+            "wall_most": 400960875,
+            "wall_total": 29110000,
+            "on_cpu_total": 797375,
+            "blocked_total": 28420709
+          },
+          {
+            "call": "read_texture",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 3125,
+            "on_cpu": 3375,
+            "blocked": 0,
+            "wall_least": 3042,
+            "wall_most": 13833,
+            "wall_total": 3125,
+            "on_cpu_total": 3375,
+            "blocked_total": 0
+          },
+          {
+            "call": "render",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 5570542,
+            "on_cpu": 198209,
+            "blocked": 5339958,
+            "wall_least": 5442125,
+            "wall_most": 6503250,
+            "wall_total": 5570542,
+            "on_cpu_total": 198209,
+            "blocked_total": 5339958
+          },
+          {
+            "call": "render_pipeline",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 157583,
+            "on_cpu": 157875,
+            "blocked": 0,
+            "wall_least": 152000,
+            "wall_most": 1877292,
+            "wall_total": 157583,
+            "on_cpu_total": 157875,
+            "blocked_total": 0
+          },
+          {
+            "call": "target",
+            "least_calls": 1,
+            "most_calls": 1,
+            "wall": 27834,
+            "on_cpu": 28041,
+            "blocked": 0,
+            "wall_least": 16166,
+            "wall_most": 63666,
+            "wall_total": 27834,
+            "on_cpu_total": 28041,
+            "blocked_total": 0
+          }
+        ]
+      }
+    }
+  ]
+}

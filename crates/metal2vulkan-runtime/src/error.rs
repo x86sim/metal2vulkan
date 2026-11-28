@@ -270,8 +270,10 @@ pub enum Refusal {
     /// [`Device::new_buffer`](crate::Device::new_buffer) zeroing a buffer in a Private block).
     /// Refused on every device and whatever the runtime holds: a scheduled handler runs on the
     /// submit thread, before its command buffer's submission, and each of these calls may wait
-    /// for that thread to submit. Metal runs a scheduled handler on a thread of its own, where
-    /// each of these calls runs.
+    /// for that thread to submit. On Metal (Apple M3 Max, macOS 27.0.1, the conformance probe
+    /// `cross_queue_handler_waits`, 10 runs a case), a scheduled handler that waits for another
+    /// queue's completed handler holds neither queue back, and one queue's handlers run one at a
+    /// time, on one thread.
     ///
     /// Basis: ours (the consumer's scheduled handlers run on the submit thread, and the one
     /// consumer's make none of these calls; a guest's scheduled handler runs in the guest).
@@ -287,7 +289,10 @@ pub enum Refusal {
     /// [`CommandQueue::command_buffer`](crate::CommandQueue::command_buffer) on a queue whose
     /// maximum count of command buffers are made and not yet completed. A wait already met
     /// answers at once there. The condition is the program's own state: what it committed, and
-    /// what has completed. Metal runs handlers on a thread of its own, where the wait would end.
+    /// what has completed. On Metal (the same probe, 10 runs a case), a handler's wait for another
+    /// queue's completed handler ended, 7.6 to 9.3 ms after it began, and a scheduled handler's wait
+    /// for a completed handler of its own queue never did (its 5 s bound in every run, both handlers
+    /// on one thread): one queue's handlers run one at a time.
     ///
     /// Basis: ours (no wait of the runtime's hangs by construction).
     WaitOnOwnThread,
@@ -1789,10 +1794,15 @@ pub enum DrawKind {
     /// A viewport Vulkan's is not: a negative width (Metal mirrors the draw), a depth range past
     /// `[0, 1]`, or bounds past the device's viewport limits.
     Viewport,
-    /// A pipeline state whose colour or stencil formats are not its pass's attachments', or
-    /// whose `rasterSampleCount` is not their sample count: Metal's validation stops most such
-    /// draws, and plain Metal zeroes or drops the colours. Vulkan draws no other count
-    /// (VUID-vkCmdDraw-multisampledRenderToSingleSampled-07285).
+    /// A pipeline state whose colour, depth or stencil formats are not its pass's attachments',
+    /// or whose `rasterSampleCount` is not their sample count: Metal's validation stops such
+    /// draws. A colour the state names between two its pass attaches, the pass leaving it unset,
+    /// is among them: plain Metal writes the next colour's value into the attachment after it
+    /// (`pass-pipeline-color-unattached-between`, an Apple M3 Max under macOS 27.0.1, job
+    /// m3-max-75934). Vulkan draws no other sample count
+    /// (VUID-vkCmdDraw-multisampledRenderToSingleSampled-07285). A state whose colours past the
+    /// pass's last colour attachment are the only difference is drawn, as plain Metal draws it
+    /// ([`RenderCommandEncoder::set_render_pipeline_state`](crate::RenderCommandEncoder::set_render_pipeline_state)).
     AttachmentFormats,
     /// A draw that binds a texture whose image the pass renders, where neither the attachment
     /// feedback loop nor a copy into the image's shadow reads it: on a device without the
@@ -2139,10 +2149,12 @@ pub enum Limit {
     },
     /// A texture whose extent or array layers are past what the device makes of its format,
     /// type, usage and sample count. A cube's layers are six a cube. A texture buffer's width past
-    /// the device's texel buffer elements, its extent `[width, 1, 1]` in 1 layer.
+    /// the device's texel buffer elements, its extent `[width, 1, 1]` in 1 layer. A Direct3D 11
+    /// plane's extent past what the device makes of its image imported from the plane's handle
+    /// (`Device::import_d3d11_surface`, on Windows).
     ///
-    /// Basis: device (the image format query's `maxExtent` and `maxArrayLayers`, and
-    /// `maxTexelBufferElements`).
+    /// Basis: device (the image format query's `maxExtent` and `maxArrayLayers`, an import's with
+    /// its handle type, and `maxTexelBufferElements`).
     TextureSize {
         /// The extent asked for.
         extent: [u32; 3],
@@ -2254,6 +2266,25 @@ pub enum Limit {
         offered: u32,
         /// The types the buffer's (or plane image's) memory requirements list, one bit each.
         listed: u32,
+    },
+    /// An import of a dma-buf (`Device::import_dma_buf` and `Device::import_dma_bufs`, on Unix) on
+    /// a device whose Shared memory type, the first host-visible, host-cached type a buffer can
+    /// use, is not host-coherent, whatever type the fd's query offers: nothing is imported. The
+    /// device then lacks a dma-buf import coherent with the host's cached mappings. The consumer
+    /// writes the pages through its own cached mapping, which no Vulkan flush reaches, and no
+    /// Vulkan query says whether the driver's GPU mapping of a dma-buf from another driver sees the
+    /// host's caches, so the Shared type's flag is a proxy and the refusal its safe side: on one
+    /// such device (a Meteor Lake GPU under Mesa's Intel driver and the i915 kernel driver) the
+    /// kernel driver's source maps such a dma-buf with no cache coherency. A pointer import of the
+    /// same pages
+    /// ([`Device::import_host_memory`](crate::Device::import_host_memory)) takes a host-coherent
+    /// type by its flag. Metal's counterpart,
+    /// `newBufferWithBytesNoCopy:length:options:deallocator:`, takes any page-aligned memory.
+    ///
+    /// Basis: device (the Shared memory type's `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`).
+    ImportCoherence {
+        /// The handle asked for.
+        handle: ImportHandle,
     },
     /// An import of no bytes, or one whose address or length is not a multiple of `alignment`:
     /// for host memory the device's `minImportedHostPointerAlignment`, for several dma-bufs each
@@ -3074,6 +3105,11 @@ impl fmt::Display for Limit {
                 f,
                 "the {handle:?}'s query offers types {offered:#x}, and no host-visible, \
                  host-coherent type the import takes of the buffer's {listed:#x}"
+            ),
+            Limit::ImportCoherence { handle } => write!(
+                f,
+                "the device has no {handle:?} import coherent with the host's cached mappings: \
+                 its host-cached memory is not host-coherent"
             ),
             Limit::ImportAlignment {
                 handle,

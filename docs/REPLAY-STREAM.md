@@ -463,7 +463,9 @@ and the (name id, value) answer pairs.
     indexType, indexBufferIndex}`: the layouts and attributes in the vertex descriptor's form,
     Metal's raw step functions and attribute formats, and the index type and index buffer as
     Metal's `MTLStageInputOutputDescriptor` holds them. A player gives it to the pipeline; an
-    attribute's buffer that no layout names takes Metal's unset layout.
+    attribute's buffer that no layout names takes Metal's unset layout. A player gives
+    `openClMode` to the pipeline too (off where absent), whose kernel then takes the three hidden
+    buffers ahead of its own buffers as Metal's OpenCL mode does.
 - **Keys that are not Metal's property names:**
 
 | key | Metal's |
@@ -1201,7 +1203,8 @@ bytes, where the cover rule (above) held any byte of the texture covered then, a
 the rule's ranges are the texture's bytes in its heap, which its parts are not laid out as.
 `command-replay compare-dumps --a DIR --b DIR` compares two plays' dumps word by word (4 bytes), leaving out a word
 wholly inside a range either play held covered, and prints `differs cb #C obj #O: N words outside every cover, the first word
-W; M covered; lengths A and B` for each buffer that differs outside every cover, `only in a|b:
+W (a X, b Y); M covered; lengths A and B` for each buffer that differs outside every cover, `X` and `Y` that word in each
+play's dump as `0x` and 8 hex digits (a short end's bytes with zeros above them, `none` past a dump's end), `only in a|b:
 cbC-objO` for a dump one play lacks, `unread in a|b: cbC-objO: WHY`, `copies differ: cbC-objO: a
 read its COPY, b its COPY` for a buffer the two plays read different copies of (`one copy` where a
 dump holds no `.copy` file), which it does not compare, then `compared N buffers (C as both plays'

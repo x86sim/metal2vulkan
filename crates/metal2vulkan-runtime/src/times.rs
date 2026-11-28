@@ -138,15 +138,16 @@ impl Ticks {
         }
     }
 
-    /// Whole nanoseconds from timestamp `start` to `end`, 0 where `end` is the earlier.
+    /// Nanoseconds from timestamp `start` to `end`, to the nearest whole one, 0 where `end` is
+    /// the earlier.
     pub(crate) fn span(&self, start: u64, end: u64) -> u64 {
-        self.nanos(start, end) as u64
+        self.nanos(start, end).round() as u64
     }
 
     /// Nanoseconds from timestamp `from` to `to`, negative where `to` is the earlier, within the
     /// valid bits: exact across the counter's wrap for two timestamps less than half its range
     /// apart.
-    fn nanos(&self, from: u64, to: u64) -> f64 {
+    pub(crate) fn nanos(&self, from: u64, to: u64) -> f64 {
         let ahead = to.wrapping_sub(from) & self.mask;
         if ahead <= self.mask / 2 {
             ahead as f64 * self.period
@@ -156,12 +157,24 @@ impl Ticks {
     }
 }
 
+/// For the tests: one pair of timestamps the completion thread read as it retired their command
+/// buffer, in the GPU's raw ticks ([`Ticks`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stamped {
+    /// Whether the pair is the runtime's own command buffer's (an upload or a Managed buffer's
+    /// copy-in) rather than a Metal command buffer's.
+    pub(crate) own: bool,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
 /// One reading of the GPU's clock and the host's together (`vkGetCalibratedTimestampsEXT`): the
 /// device's tick and the host nanoseconds of the same moment.
 #[derive(Clone, Copy)]
 pub(crate) struct Calibration {
-    tick: u64,
-    host: u64,
+    pub(crate) tick: u64,
+    pub(crate) host: u64,
 }
 
 impl Calibration {
@@ -217,9 +230,10 @@ impl Calibration {
     }
 
     /// The host time of timestamp `tick` by this calibration as it stands, which moves nothing:
-    /// for the spans of the runtime's own command buffers ([`Spans`]).
+    /// for the spans of the runtime's own command buffers ([`Spans`]). To the nearest whole
+    /// nanosecond.
     pub(crate) fn at(&self, ticks: &Ticks, tick: u64) -> u64 {
-        (self.host as f64 + ticks.nanos(self.tick, tick)) as u64
+        (self.host as f64 + ticks.nanos(self.tick, tick)).round() as u64
     }
 }
 

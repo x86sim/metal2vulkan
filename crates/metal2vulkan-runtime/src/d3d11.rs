@@ -2,10 +2,12 @@
 //! host's: the planes another API decodes or draws into, shared by their NT handles, each
 //! imported as an optimal image of its own and read by rt's shaders in place.
 //!
-//! The import makes no submission and waits for nothing: Vulkan takes such an image as already
-//! in the general layout once Direct3D 11 has accessed it (section 12.5.2, below), so no move out
-//! of the undefined layout comes before its first use. Each submission that uses a plane takes it
-//! from `VK_QUEUE_FAMILY_EXTERNAL` at its start and gives it back at its end (`crate::submit`).
+//! The import makes no submission and waits for nothing. A plane's image is made undefined, and
+//! Vulkan takes it as general once Direct3D 11 has accessed it (section 12.5.2, below), which the
+//! consumer reports by `Surface::external_writes_done`: no upload moves it, and its first acquire
+//! names the undefined layout where no such access was reported before it. Each `vkQueueSubmit2`
+//! that uses a plane takes it from `VK_QUEUE_FAMILY_EXTERNAL` at its start and gives it back at
+//! its end, before its signals (`crate::submit::parts`).
 
 use crate::counters::Gauge;
 use crate::device::{Core, Device};
@@ -14,7 +16,7 @@ use crate::hazard::HeapId;
 use crate::import::ImportHandle;
 use crate::memory;
 use crate::surface::{Surface, MAX_PLANES};
-use crate::texture::{Backing, SurfaceImage, Texture, TextureDescriptor};
+use crate::texture::{plane_within, Backing, SurfaceImage, Texture, TextureDescriptor};
 use crate::PixelFormat;
 use ash::vk;
 use metal2vulkan::metal::format as formats;
@@ -106,35 +108,57 @@ impl Device {
     /// ([`Texture::new_texture_view`](crate::Texture::new_texture_view)) is [`Gap::TextureView`]
     /// of [`TextureViewKind::SurfacePixelFormat`](crate::TextureViewKind::SurfacePixelFormat).
     ///
-    /// **Layout.** The call makes no submission and waits for nothing: no move out of the
-    /// undefined layout comes before a plane's first use. Vulkan 1.4, section 12.5.2 (Image
-    /// Layout Rules with External Memory): "When images created with external memory handle
-    /// types listed in the external image implied layouts table are accessed outside of Vulkan,
-    /// they must be in the layout specified in the table, and can be assumed to be in that layout
-    /// when they are accessed in Vulkan after external access", and its Table 17 gives
+    /// **Layout.** The call makes no submission and waits for nothing, and no upload moves a
+    /// plane. Each plane's image is made in the undefined layout
+    /// (`VUID-VkImageCreateInfo-pNext-01443`). Vulkan 1.4, section 12.5.2 (Image Layout Rules
+    /// with External Memory): "When images created with external memory handle types listed in
+    /// the external image implied layouts table are accessed outside of Vulkan, they must be in
+    /// the layout specified in the table, and can be assumed to be in that layout when they are
+    /// accessed in Vulkan after external access", and its Table 17 gives
     /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT` the layout `VK_IMAGE_LAYOUT_GENERAL`.
+    /// So a plane's first acquire names the undefined layout as its old layout where the
+    /// consumer reported no Direct3D 11 access of it before
+    /// ([`Surface::external_writes_done`]), and the general layout where it did; every later
+    /// acquire names the general layout, the plane being general after rt's own first acquire
+    /// and release. "First" is the first acquire rt records for the plane. The Khronos validation
+    /// layer does not track this import's layout: on the UHD 630 its 1.4.363.0 reported neither
+    /// a first acquire from the general layout nor one from the undefined layout, so its silence
+    /// is no evidence of either.
     ///
-    /// **Ownership.** Each submission whose command buffers or uploads use a plane acquires it
-    /// from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own ahead of everything, from
-    /// and to the general layout (`VUID-VkImageMemoryBarrier-srcQueueFamilyIndex-12332`), and
-    /// releases it to that family in another after everything, in the general layout
-    /// (`...-dstQueueFamilyIndex-12331`), which takes the submission's last signals, so it adds
-    /// no submit info: Direct3D 11 owns the planes' memory between rt's submissions, each counted
-    /// in [`Metrics::d3d11_plane_submissions`](crate::Metrics::d3d11_plane_submissions). The
-    /// acquire follows a global barrier from and to every stage, so an earlier submission's
-    /// release on rt's one queue happens before it (Vulkan 1.4, section 7.7.6).
+    /// **Ownership.** Each `vkQueueSubmit2` whose command buffers or uploads use a plane acquires
+    /// it from `VK_QUEUE_FAMILY_EXTERNAL` in a command buffer of rt's own ahead of everything in
+    /// it, from the general layout, or from the undefined layout at its first acquire as
+    /// **Layout** says (`VUID-VkImageMemoryBarrier-srcQueueFamilyIndex-12332` allows either), to
+    /// the general layout, and releases it to that family in another after everything in it, in
+    /// the general layout
+    /// (`...-dstQueueFamilyIndex-12331`), which takes that call's last signals, its progress value
+    /// among them, so it adds no submit info and a command buffer that uses a plane is seen
+    /// complete only once the plane's release has run: Direct3D 11 owns the planes' memory
+    /// between rt's submissions, each counted in
+    /// [`Metrics::d3d11_plane_submissions`](crate::Metrics::d3d11_plane_submissions). A group of
+    /// command buffers rt sends member by member, one `vkQueueSubmit2` a member, hands each
+    /// member's planes over in that member's call
+    /// ([`Metrics::d3d11_plane_parts`](crate::Metrics::d3d11_plane_parts)). The acquire follows
+    /// a global barrier from and to every stage, so an earlier submission's release on rt's one
+    /// queue happens before it (Vulkan 1.4, section 7.7.6).
     /// [`Surface::external_writes_done`] and
     /// [`release_surface_to_external`](crate::BlitCommandEncoder::release_surface_to_external)
-    /// record nothing for such a surface. No keyed mutex is used, by rt or on the textures: each
+    /// record nothing for such a surface; the first marks its planes accessed by Direct3D 11, on
+    /// the host (**Layout**). No keyed mutex is used, by rt or on the textures: each
     /// is made with `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, not
     /// `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, whose mutex the device that makes the texture and
     /// each device that opens it must acquire before rendering to it; the consumer orders the two
     /// APIs' work by its waits.
     ///
     /// **The consumer's precondition.** Direct3D 11's work that accesses a plane has completed
-    /// before the consumer commits the command buffers that use it, and rt's command buffers that
-    /// use a plane have completed before Direct3D 11 accesses it again. A plane rt uses before
-    /// any Direct3D 11 access has undefined contents, as a Metal texture nothing wrote does.
+    /// before the consumer commits the command buffers that use it, the consumer calls
+    /// [`Surface::external_writes_done`] after each such access and before that commit, and rt's
+    /// command buffers that use a plane have completed before Direct3D 11 accesses it again.
+    /// Without the call after Direct3D 11's first access, rt's first acquire of the plane names
+    /// the undefined layout, and a transition from it does not preserve the contents (section
+    /// 12.5.1: "implying that the contents of the image subresource need not be preserved"), so
+    /// the device may discard what Direct3D 11 wrote. A plane rt uses before any Direct3D 11
+    /// access has undefined contents, as a Metal texture nothing wrote does.
     ///
     /// The surface has no buffer: [`Surface::buffer`] is [`Gap::D3d11SurfaceBuffer`], as its
     /// planes lie in memories of their own.
@@ -148,7 +172,10 @@ impl Device {
     /// not import the handle (`vkGetPhysicalDeviceImageFormatProperties2`); [`Gap::SurfaceUsage`]
     /// for a usage the descriptor asks that the texture's bind flags do not give or the import
     /// does not offer (`ShaderWrite` on a texture made without `D3D11_BIND_UNORDERED_ACCESS`);
-    /// [`Limit::ImportType`]
+    /// [`Limit::TextureSize`] where a plane's extent is past the `maxExtent` the image format
+    /// query answers of its image with the Direct3D 11 handle type
+    /// (`VkPhysicalDeviceExternalImageFormatInfo`), which can be less than the query's without
+    /// it; [`Limit::ImportType`]
     /// where the handle's properties and the image's requirements share no memory type;
     /// [`Limit::MemoryAllocations`]; [`Error::Vulkan`] where the handle's properties, the image,
     /// its import or its binding fail; what the texture's index takes; [`Error::Quiesced`].
@@ -183,8 +210,9 @@ impl Device {
     }
 
     /// One plane's image usage and the formats it lists, which the plane's bind flags and
-    /// descriptor give ([`Device::import_d3d11_surface`]).
-    fn d3d11_plane_form(
+    /// descriptor give ([`Device::import_d3d11_surface`]), its extent within what the import
+    /// query answers of that image.
+    pub(crate) fn d3d11_plane_form(
         &self,
         core: &Arc<Core>,
         plane: &D3d11Plane<'_>,
@@ -248,8 +276,9 @@ impl Device {
             held.contains(feature)
         };
         let imports = |usage: vk::ImageUsageFlags, list: &[vk::Format]| {
-            (import_query(core, format, usage, list))
-                .is_ok_and(|features| features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE))
+            (import_query(core, format, usage, list)).is_ok_and(|(features, _)| {
+                features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            })
         };
         // The usage the texture's bind flags give, no other.
         let wanted = bound_usage(plane.bind_flags);
@@ -283,6 +312,13 @@ impl Device {
             Some(siblings) if imports(usage, &siblings) => siblings,
             _ => pair,
         };
+        // The plane's extent within what the query answers of its image with the handle, which
+        // can be less than the plain query's that `plane_plan` checked
+        // (`VUID-VkImageCreateInfo-extent-02252`: its limit is the query's with the image's
+        // external memory handle type).
+        let (_, made) = (import_query(core, format, usage, &list))
+            .map_err(|_| Error::Limit(Limit::NoImport { handle }))?;
+        plane_within(d, &made)?;
         Ok((usage, list))
     }
 
@@ -329,8 +365,9 @@ impl Device {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            // An external image is made undefined (`VUID-VkImageCreateInfo-pNext-01443`); after
-            // Direct3D 11's access it is in the general layout (section 12.5.2).
+            // An external image is made undefined (`VUID-VkImageCreateInfo-pNext-01443`), which
+            // its first acquire names where no Direct3D 11 access was reported; after one, it is
+            // in the general layout (section 12.5.2, `Image::handed`).
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut external);
         if !list.is_empty() {
@@ -424,13 +461,15 @@ impl Device {
 
 /// What `vkGetPhysicalDeviceImageFormatProperties2` answers of an optimal 2D image of `format`
 /// and `usage` imported from a Direct3D 11 texture, mutable and listing `list` where it is not
-/// empty: the handle's external memory features, or the query's error.
+/// empty: the handle's external memory features and the image's properties with the handle
+/// (its `maxExtent` the limit of such an image's extent, `VUID-VkImageCreateInfo-extent-02252`),
+/// or the query's error.
 pub(crate) fn import_query(
     core: &Core,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     list: &[vk::Format],
-) -> Result<vk::ExternalMemoryFeatureFlags, vk::Result> {
+) -> Result<(vk::ExternalMemoryFeatureFlags, vk::ImageFormatProperties), vk::Result> {
     let (instance, physical) = (core.instance.vk(), core.physical);
     let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(HANDLE);
     let mut listed = vk::ImageFormatListCreateInfo::default().view_formats(list);
@@ -450,7 +489,9 @@ pub(crate) fn import_query(
     // SAFETY: `physical` is `instance`'s, and the handle's extension is enabled (the caller holds
     // the device's `VK_KHR_external_memory_win32`).
     unsafe { instance.get_physical_device_image_format_properties2(physical, &info, &mut out) }?;
-    Ok(external_out
+    let properties = out.image_format_properties;
+    let features = external_out
         .external_memory_properties
-        .external_memory_features)
+        .external_memory_features;
+    Ok((features, properties))
 }

@@ -1378,6 +1378,149 @@ fn copied_flag() -> (Module, AirAbi) {
     (module, abi)
 }
 
+/// `air.normalize_function_constant_predicate.<f16|f32>(v)`, of `half` where `half`.
+fn normalize_float(f: &mut FunctionBuilder<'_>, ty: TypeId, half: bool, v: Value) -> Value {
+    use crate::intrinsics::Elem;
+    let (name, elem) = match half {
+        true => ("air.normalize_function_constant_predicate.f16", Elem::F16),
+        false => ("air.normalize_function_constant_predicate.f32", Elem::F32),
+    };
+    let decl_ty = f.module().fn_ty(ty, &[ty]);
+    let decl = f.module().declare(name, decl_ty);
+    call(
+        f,
+        ty,
+        Callee::Air {
+            decl,
+            op: AirIntrinsic::FunctionConstant(FunctionConstant::NormalizePredicate(elem)),
+        },
+        &[v],
+    )
+}
+
+fn float_constant(v: f32) -> ConstValue {
+    ConstValue {
+        ty: DataType::Float,
+        bytes: Box::new(v.to_le_bytes()),
+    }
+}
+
+fn half_constant(bits: u16) -> ConstValue {
+    ConstValue {
+        ty: DataType::Half,
+        bytes: Box::new(bits.to_le_bytes()),
+    }
+}
+
+/// Apple's OpenGL front end's shape for a function constant that is a `float` (a point size), as
+/// the shading language compiler also writes it for a `float` or `half` constant named by an
+/// argument's `function_constant` attribute: the static initializer stores the constant's
+/// normalized predicate, of the constant's type, into `pred`, which gates parameter 1. Of `half`
+/// where `half`. With `normalized` false it stores the constant itself, so `pred` holds the value
+/// as supplied.
+fn float_predicate(half: bool, normalized: bool) -> (Module, AirAbi) {
+    let mut m = ModuleBuilder::new();
+    let void = m.void();
+    let ft = match half {
+        true => m.ty(Type::Half),
+        false => m.float(),
+    };
+    let dev = m.ptr(AddrSpace::Device);
+    let size = fc_global(&mut m, "size", ft);
+    let zero = m.constant(ft, Const::Float(0));
+    let pred = m.simple_global("pred", ft, AddrSpace::Constant, Some(zero));
+    let (size_addr, pred_addr) = (m.global_addr(size), m.global_addr(pred));
+    static_init(&mut m, "init", |f| {
+        let v = load(f, ft, size_addr);
+        let p = match normalized {
+            true => normalize_float(f, ft, half, v),
+            false => v,
+        };
+        store(f, p, pred_addr);
+    });
+    let fty = m.fn_ty(void, &[dev, dev]);
+    let mut f = m.define("k", fty);
+    f.ret(None);
+    let k = f.finish();
+    let module = m.finish().unwrap();
+    let gated = ParamBinding {
+        predicate: Some(Predicate {
+            global: pred,
+            name: DiagName::new("pred"),
+        }),
+        ..buffer(1, 1)
+    };
+    let abi = abi(
+        vec![kernel(k, vec![buffer(0, 0), gated])],
+        vec![fc_decl(0, size, ft)],
+    );
+    (module, abi)
+}
+
+#[test]
+fn a_float_function_constant_gates_a_parameter_where_it_is_supplied_and_non_zero() {
+    for normalized in [true, false] {
+        let kept = |constants: &[(u32, ConstValue)]| -> Vec<u32> {
+            let (module, abi) = float_predicate(false, normalized);
+            let e = specialize(module, &abi, &request(constants), &mut meter()).unwrap();
+            e.ep.params.iter().map(|p| p.param).collect()
+        };
+        let at = format!("normalized {normalized}");
+        assert_eq!(
+            kept(&[(0, float_constant(1.5))]),
+            [0, 1],
+            "non-zero is on, {at}"
+        );
+        assert_eq!(kept(&[(0, float_constant(0.0))]), [0], "zero is off, {at}");
+        // By its bits, as Metal reads it (an authored case's gated sample mask on the Apple M3
+        // Max, job m3-max-75714): -0.0 keeps the argument.
+        assert_eq!(
+            kept(&[(0, float_constant(-0.0))]),
+            [0, 1],
+            "-0.0 is on, {at}"
+        );
+        assert_eq!(
+            kept(&[(0, float_constant(f32::NAN))]),
+            [0, 1],
+            "NaN is on, {at}"
+        );
+        assert_eq!(kept(&[]), [0], "unsupplied is off, {at}");
+    }
+}
+
+#[test]
+fn a_half_function_constant_gates_a_parameter_where_it_is_supplied_and_non_zero() {
+    for normalized in [true, false] {
+        let kept = |constants: &[(u32, ConstValue)]| -> Vec<u32> {
+            let (module, abi) = float_predicate(true, normalized);
+            let e = specialize(module, &abi, &request(constants), &mut meter()).unwrap();
+            e.ep.params.iter().map(|p| p.param).collect()
+        };
+        let at = format!("normalized {normalized}");
+        assert_eq!(
+            kept(&[(0, half_constant(0x3e00))]),
+            [0, 1],
+            "1.5 is on, {at}"
+        );
+        assert_eq!(
+            kept(&[(0, half_constant(0x0000))]),
+            [0],
+            "zero is off, {at}"
+        );
+        assert_eq!(
+            kept(&[(0, half_constant(0x8000))]),
+            [0, 1],
+            "-0.0 is on, {at}"
+        );
+        assert_eq!(
+            kept(&[(0, half_constant(0x7e00))]),
+            [0, 1],
+            "NaN is on, {at}"
+        );
+        assert_eq!(kept(&[]), [0], "unsupplied is off, {at}");
+    }
+}
+
 #[test]
 fn a_static_initializer_bakes_its_stores_into_constant_globals() {
     let (module, abi) = copied_flag();
@@ -1462,6 +1605,42 @@ fn static_values_resolve_abi_globals_without_canonicalizing_a_body() {
             index: 1
         }))
     );
+}
+
+#[test]
+fn static_values_answer_a_float_predicate_by_its_bits() {
+    for half in [false, true] {
+        let (module, abi) = float_predicate(half, true);
+        let pred = abi.entries[0].params[1].predicate.as_ref().unwrap().global;
+        let value = |constants: BTreeMap<u32, ConstValue>| {
+            static_values(module.clone(), &abi, &constants, &[pred], &mut meter()).unwrap()
+        };
+        let c = |f: f32, h: u16| match half {
+            true => half_constant(h),
+            false => float_constant(f),
+        };
+        assert_eq!(
+            value([(0, c(1.5, 0x3e00))].into()),
+            [Ok(1)],
+            "1.5, half {half}"
+        );
+        assert_eq!(
+            value([(0, c(0.0, 0x0000))].into()),
+            [Ok(0)],
+            "0.0, half {half}"
+        );
+        assert_eq!(
+            value([(0, c(-0.0, 0x8000))].into()),
+            [Ok(1)],
+            "-0.0, half {half}"
+        );
+        assert_eq!(
+            value([(0, c(f32::NAN, 0x7e00))].into()),
+            [Ok(1)],
+            "NaN, half {half}"
+        );
+        assert_eq!(value(BTreeMap::new()), [Ok(0)], "unsupplied, half {half}");
+    }
 }
 
 /// A module whose static initializer computes `pred` from function constant 0 and `bits` through
