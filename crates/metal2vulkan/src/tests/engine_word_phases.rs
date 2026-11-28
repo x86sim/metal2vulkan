@@ -345,8 +345,10 @@ fn a_word_bound_variant_claims_and_states_4() {
 /// On the CPU interpreter, with `vwp_vec16`'s `float4` buffers bound 4 and 8 bytes past a
 /// multiple of 16 ([`VEC16_AT_WORDS`]), every buffer above 4 GiB, the [`word_bound`] variant
 /// leaves Metal's words in both buffers, every access at its own address as plain Metal places
-/// it, and no access traps on its `Aligned` operand. The plain module, which claims the 16 its
-/// offsets are proven to be from the buffer's address, traps there.
+/// it, and no access traps on its `Aligned` operand. Upstream's plain module, which claims the 16
+/// its offsets are proven to be from the buffer's address, traps there; x86Sim's never uses
+/// `uvec4` units (memory::leaf::VEC4_UNITS: Apple GPUs load a 16-byte vector at any 4-aligned
+/// address), so its plain module must leave Metal's words too.
 #[test]
 fn vec16_answers_metal_bound_at_a_multiple_of_4() {
     let Some(bc) = bitcode() else {
@@ -366,20 +368,20 @@ fn vec16_answers_metal_bound_at_a_multiple_of_4() {
         .filter(|(s, _)| s == "lavapipe" || s == "moltenvk-m3")
     {
         let what = format!("{stem}: {VEC16} at {a_at} and {b_at}");
-        let plain = dispatch(&bc, (VEC16, &LowerInputs::new()), p, buffers());
-        assert!(plain.is_err(), "{what}: the plain module ran");
-        let [a, b] = dispatch(&bc, (VEC16, &word_bound()), p, buffers())
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
-        for (buffer, got, want) in [("a", &a, &want.a), ("b", &b, &want.b)] {
-            let words = |b: &[u8]| b.as_chunks::<4>().0.to_vec();
-            let first = words(got)
-                .iter()
-                .zip(&words(want))
-                .position(|(x, y)| x != y);
-            assert!(
-                got.len() == want.len() && first.is_none(),
-                "{what}: {buffer} differs from Metal's words first at word {first:?}"
-            );
+        for (module, inputs) in [("plain", LowerInputs::new()), ("word-bound", word_bound())] {
+            let [a, b] = dispatch(&bc, (VEC16, &inputs), p, buffers())
+                .unwrap_or_else(|e| panic!("{what}, {module} module: {e}"));
+            for (buffer, got, want) in [("a", &a, &want.a), ("b", &b, &want.b)] {
+                let words = |b: &[u8]| b.as_chunks::<4>().0.to_vec();
+                let first = words(got)
+                    .iter()
+                    .zip(&words(want))
+                    .position(|(x, y)| x != y);
+                assert!(
+                    got.len() == want.len() && first.is_none(),
+                    "{what}, {module} module: {buffer} differs from Metal's words first at word {first:?}"
+                );
+            }
         }
     }
 }

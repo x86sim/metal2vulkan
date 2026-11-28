@@ -333,22 +333,26 @@ impl DeviceProfile {
 /// Count one derivation ([`FINGERPRINTS_DERIVED`]).
 #[cfg(test)]
 fn note_fingerprint_derived() {
-    FINGERPRINTS_DERIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    FINGERPRINTS_DERIVED.with(|n| n.set(n.get() + 1));
 }
 
 /// Count one derivation; nothing outside the crate's own tests.
 #[cfg(not(test))]
 fn note_fingerprint_derived() {}
 
-/// The profile fingerprints derived in this process, which `tests::profile`'s count reads: a
-/// device's compiles must add none to what its own making derived.
+/// The profile fingerprints derived on this thread, which `tests::profile`'s count reads: a
+/// device's compiles must add none to what its own making derived. Per thread, because the test
+/// harness runs other tests at the same time and their devices derive fingerprints too (a
+/// process-wide count failed the test whenever one did so between its two readings).
 #[cfg(test)]
-static FINGERPRINTS_DERIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static FINGERPRINTS_DERIVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// [`FINGERPRINTS_DERIVED`].
 #[cfg(test)]
 pub(crate) fn fingerprints_derived() -> u64 {
-    FINGERPRINTS_DERIVED.load(std::sync::atomic::Ordering::Relaxed)
+    FINGERPRINTS_DERIVED.with(std::cell::Cell::get)
 }
 
 /// The fingerprint of `fields` ([`DeviceProfile::fingerprint`]): the rendering streams into the
